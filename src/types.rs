@@ -62,12 +62,15 @@ impl TypeLists {
         }
     }
 
-    /// Load both lists from `<data_dir>/types/`, creating defaults if missing.
-    pub fn load() -> Self {
+    /// Load both lists from `<data_dir>/types/`. Existing files are always read;
+    /// missing files are seeded with the built-in defaults **only when `writable`**
+    /// — so a read-only session writes nothing to disk (it just uses the defaults
+    /// in memory).
+    pub fn load(writable: bool) -> Self {
         let dir = ProjectDirs::from("dev", "passmgr", "pass-mgr")
             .map(|d| d.data_dir().join("types"));
-        let asset = load_or_init(dir.as_deref(), ASSET_FILE, ASSET_DEFAULTS);
-        let account = load_account_types(dir.as_deref());
+        let asset = load_or_init(dir.as_deref(), ASSET_FILE, ASSET_DEFAULTS, writable);
+        let account = load_account_types(dir.as_deref(), writable);
         TypeLists { asset, account, dir }
     }
 
@@ -154,7 +157,7 @@ impl TypeLists {
 /// Read a JSON string array from `dir/name`. A **missing** file is seeded with
 /// defaults; an **existing** file is never overwritten — if invalid/empty we
 /// fall back to defaults in memory only, so a hand-edited list is never clobbered.
-fn load_or_init(dir: Option<&Path>, name: &str, defaults: &[&str]) -> Vec<String> {
+fn load_or_init(dir: Option<&Path>, name: &str, defaults: &[&str], seed: bool) -> Vec<String> {
     let to_vec = || defaults.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     let Some(dir) = dir else { return to_vec() };
     let path = dir.join(name);
@@ -164,10 +167,14 @@ fn load_or_init(dir: Option<&Path>, name: &str, defaults: &[&str]) -> Vec<String
             .ok()
             .filter(|list| !list.is_empty())
             .unwrap_or_else(to_vec),
+        // Missing: seed the file with defaults only when allowed to write;
+        // otherwise return defaults in memory and touch nothing.
         Err(_) => {
-            let _ = fs::create_dir_all(dir);
-            if let Ok(json) = serde_json::to_string_pretty(&to_vec()) {
-                let _ = fs::write(&path, json);
+            if seed {
+                let _ = fs::create_dir_all(dir);
+                if let Ok(json) = serde_json::to_string_pretty(&to_vec()) {
+                    let _ = fs::write(&path, json);
+                }
             }
             to_vec()
         }
@@ -177,7 +184,7 @@ fn load_or_init(dir: Option<&Path>, name: &str, defaults: &[&str]) -> Vec<String
 /// Load the hierarchical account types, accepting either the new
 /// `[{name, subtypes}]` form or a legacy flat `["Checking", ...]` array (each
 /// legacy entry becomes a type with no subtypes). Missing file -> seed defaults.
-fn load_account_types(dir: Option<&Path>) -> Vec<AccountType> {
+fn load_account_types(dir: Option<&Path>, seed: bool) -> Vec<AccountType> {
     let Some(dir) = dir else { return account_defaults() };
     let path = dir.join(ACCOUNT_FILE);
 
@@ -199,11 +206,14 @@ fn load_account_types(dir: Option<&Path>) -> Vec<AccountType> {
             // Present but unparsable: defaults in memory, don't clobber the file.
             account_defaults()
         }
+        // Missing: seed only when allowed to write; otherwise defaults in memory.
         Err(_) => {
             let defaults = account_defaults();
-            let _ = fs::create_dir_all(dir);
-            if let Ok(json) = serde_json::to_string_pretty(&defaults) {
-                let _ = fs::write(&path, json);
+            if seed {
+                let _ = fs::create_dir_all(dir);
+                if let Ok(json) = serde_json::to_string_pretty(&defaults) {
+                    let _ = fs::write(&path, json);
+                }
             }
             defaults
         }
@@ -279,8 +289,8 @@ mod tests {
         assert!(t.add_account_subtype("Crypto", "Exchange"));
 
         // Reload from the files on disk and confirm everything was written.
-        let asset = load_or_init(Some(&dir), ASSET_FILE, ASSET_DEFAULTS);
-        let account = load_account_types(Some(&dir));
+        let asset = load_or_init(Some(&dir), ASSET_FILE, ASSET_DEFAULTS, true);
+        let account = load_account_types(Some(&dir), true);
         assert!(asset.contains(&"Annuity".to_string()));
         let crypto = account.iter().find(|a| a.name == "Crypto").unwrap();
         assert_eq!(crypto.subtypes, vec!["Exchange".to_string()]);
@@ -292,15 +302,32 @@ mod tests {
     fn load_or_init_seeds_then_honors_user_edits() {
         let dir = tmp_dir("seed");
         // Missing -> seeded with defaults.
-        let first = load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS);
+        let first = load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS, true);
         assert_eq!(first.len(), ASSET_DEFAULTS.len());
         // A user edit is honored (not clobbered) on the next load.
         std::fs::write(dir.join("asset_types.json"), r#"["OnlyMine"]"#).unwrap();
-        assert_eq!(load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS), vec!["OnlyMine".to_string()]);
+        assert_eq!(load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS, true), vec!["OnlyMine".to_string()]);
         // An invalid file falls back to defaults in memory WITHOUT overwriting.
         std::fs::write(dir.join("asset_types.json"), "not json").unwrap();
-        assert_eq!(load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS).len(), ASSET_DEFAULTS.len());
+        assert_eq!(load_or_init(Some(&dir), "asset_types.json", ASSET_DEFAULTS, true).len(), ASSET_DEFAULTS.len());
         assert_eq!(std::fs::read_to_string(dir.join("asset_types.json")).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_load_does_not_seed_missing_files() {
+        // A read-only launch (seed=false) must return defaults in memory and
+        // write NOTHING to disk — not even the directory.
+        let dir = tmp_dir("ro-noseed");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let asset = load_or_init(Some(&dir), ASSET_FILE, ASSET_DEFAULTS, false);
+        let account = load_account_types(Some(&dir), false);
+
+        assert_eq!(asset.len(), ASSET_DEFAULTS.len());
+        assert!(!account.is_empty());
+        // Nothing was created on disk.
+        assert!(!dir.exists(), "read-only load must not create the types dir");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -309,7 +336,7 @@ mod tests {
         let dir = tmp_dir("legacy");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(ACCOUNT_FILE), r#"["Checking","Savings"]"#).unwrap();
-        let account = load_account_types(Some(&dir));
+        let account = load_account_types(Some(&dir), true);
         assert_eq!(account.len(), 2);
         assert_eq!(account[0].name, "Checking");
         assert!(account[0].subtypes.is_empty());

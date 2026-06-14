@@ -148,6 +148,11 @@ enforced in two layers:
   generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
   (browse, reveal, copy, export, backup) remain available.
 
+The guarantee extends past the vault files: `TypeLists::load(writable)` only
+seeds the default category JSON files (`types/*.json`) when writable, so a
+read-only launch writes **nothing** to disk — it reads any existing type files
+but falls back to in-memory defaults rather than creating them.
+
 Creating a vault is itself a write, so first-run creation requires `--write`.
 
 ## 5. Cryptography

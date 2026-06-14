@@ -85,8 +85,10 @@ Five record types, one per UI tab, each with `id` (128-bit hex), `created_at`,
 
 ## 5. Type lists (`types.rs`)
 
-`TypeLists::load()` reads `<data_dir>/types/{asset_types,account_types}.json`,
-seeding defaults when missing and **never clobbering** a user-edited file.
+`TypeLists::load(writable)` reads `<data_dir>/types/{asset_types,account_types}.json`,
+seeding defaults when missing **only in a writable session** (a read-only launch
+uses the defaults in memory and writes nothing — honoring the §4.4 guarantee) and
+**never clobbering** a user-edited file.
 Account types are hierarchical (`AccountType { name, subtypes }`) and the loader
 accepts a legacy flat `["..."]` array for back-compat. `add_asset_type`,
 `add_account_type`, `add_account_subtype` mutate and persist; the Config screen

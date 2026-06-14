@@ -93,7 +93,9 @@ fn main() -> ExitCode {
         // interactive UI (graphical by default, terminal with --tui).
         _ => {
             let path = pos.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
-            let types = types::TypeLists::load();
+            // Seed the default type-list files only in a writable session; a
+            // read-only launch uses the defaults in memory and writes nothing.
+            let types = types::TypeLists::load(writable);
             if tui {
                 run_ui(path, types, writable)
             } else {
