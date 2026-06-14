@@ -1,0 +1,33 @@
+[package]
+name = "pass-mgr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pass-mgr]
+path = ".."
+
+# Each target is one libfuzzer binary. They feed random bytes into the
+# untrusted-input parsers and assert the code never panics/over-allocates.
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_archive"
+path = "fuzz_targets/parse_archive.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the parent package's build; it is its own package.
+[workspace]

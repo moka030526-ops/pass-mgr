@@ -1,0 +1,5 @@
+# cargo-fuzz build output, generated corpus, and crash artifacts — not source.
+target/
+corpus/
+artifacts/
+coverage/
