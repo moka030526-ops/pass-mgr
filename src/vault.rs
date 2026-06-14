@@ -1077,4 +1077,259 @@ mod tests {
         assert_eq!(compact_timestamp(1_609_459_200), "20210101-000000");
         assert!(!compact_timestamp(records::unix_now()).contains([':', ' ', '/']));
     }
+
+    // ---- Phase 4: exhaustive rekey crash-injection -------------------------
+    //
+    // Protocol: stage a complete new-key tree under `.rekey/`, mark it `READY`,
+    // then commit by roll-forward — move `volume/`, then `manifest/`, then
+    // `vault.pmv` **last** — and finally delete `.rekey/`. A crash at *any*
+    // point must leave either the old tree (no `READY`) or the new tree
+    // (`READY`) fully working, never a mix. Each test below reproduces the
+    // on-disk state after a crash at one step and asserts recovery on reopen.
+
+    /// Seed a vault whose documents span several partitions (one tiny doc each).
+    /// Returns the vault path plus every stored `(id, body)` for later readback.
+    fn seed_multi_partition(tag: &str, pw1: &[u8], pw2: &[u8]) -> (PathBuf, Vec<(String, Vec<u8>)>) {
+        let path = tmp_path(tag);
+        let mut v = OpenVault::create(path.clone(), pw1, pw2, fast()).unwrap();
+        v.vault.settings.volume_max_size = 1024; // tiny cap → one doc per partition
+        records::upsert(&mut v.vault.accounts, sample_account("user", "secret"));
+        v.save().unwrap();
+        // Reopen so the store picks up the small cap before we add documents.
+        let mut v = OpenVault::open(path.clone(), pw1, pw2).unwrap();
+        let mut docs = Vec::new();
+        for i in 0..3u8 {
+            let body = vec![i + 1; 600];
+            let src = write_src(&format!("{tag}-{i}"), &body);
+            let id = v.add_document(&format!("/dir{i}"), &format!("f{i}.bin"), &src).unwrap();
+            fs::remove_file(&src).ok();
+            docs.push((id, body));
+        }
+        drop(v);
+        (path, docs)
+    }
+
+    /// Build a complete, `READY`-marked staging tree under `<dir>/.rekey`,
+    /// re-encrypting the live vault + every blob under the new passwords —
+    /// exactly like `change_password`, but stopping **before** the commit.
+    fn stage_ready_rekey(path: &Path, old1: &[u8], old2: &[u8], new1: &[u8], new2: &[u8]) -> PathBuf {
+        let open = OpenVault::open(path.to_path_buf(), old1, old2).unwrap();
+        let dir = parent_dir(path);
+        let staging = dir.join(REKEY_DIR);
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+        let new_salt = crypto::random_bytes::<SALT_LEN>().unwrap();
+        let new_key = crypto::derive_key_chained(new1, new2, &new_salt, &open.params).unwrap();
+        let mut new_store =
+            VolumeStore::open(&staging, &new_key, &open.vault.id, open.vault.settings.volume_max_size).unwrap();
+        let ids: Vec<String> = open.storage.ids().map(|s| s.to_string()).collect();
+        for id in &ids {
+            let bytes = open.storage.read(id, &open.key).unwrap();
+            let (vpath, uploaded_at) =
+                open.storage.entry(id).map(|e| (e.path.clone(), e.uploaded_at)).unwrap_or_default();
+            new_store.put(id, &vpath, &bytes, uploaded_at, &new_key).unwrap();
+        }
+        drop(new_store);
+        let mut staged_vault = open.vault.clone();
+        staged_vault.audit.push(Change::new("password_changed", String::new()));
+        write_vault_file(&staging.join(VAULT_FILE), &staged_vault, &new_key, &new_salt, open.params).unwrap();
+        write_new_bytes(&staging.join(REKEY_READY), b"ready").unwrap();
+        staging
+    }
+
+    /// After a roll-forward: only the NEW passwords open the vault, every doc
+    /// reads back, the audit records the change, and no staging/`.old` debris
+    /// is left behind.
+    fn assert_rolled_forward(path: &Path, old: (&[u8], &[u8]), new: (&[u8], &[u8]), docs: &[(String, Vec<u8>)]) {
+        assert!(OpenVault::open(path.to_path_buf(), old.0, old.1).is_err(), "old passwords must fail");
+        let v = OpenVault::open(path.to_path_buf(), new.0, new.1).unwrap();
+        for (id, body) in docs {
+            assert_eq!(&v.read_document(id).unwrap()[..], &body[..], "doc {id} survives rekey");
+        }
+        assert!(v.vault.audit.iter().any(|c| c.action == "password_changed"), "audit records rekey");
+        let dir = parent_dir(path);
+        assert!(!dir.join(REKEY_DIR).exists(), "staging removed");
+        assert!(!sibling_old(&dir.join("volume")).exists(), "no .volume.old debris");
+        assert!(!sibling_old(&dir.join("manifest")).exists(), "no .manifest.old debris");
+    }
+
+    /// After a discard: only the OLD passwords open the vault, every doc reads
+    /// back unchanged, and staging is gone.
+    fn assert_discarded(path: &Path, old: (&[u8], &[u8]), new: (&[u8], &[u8]), docs: &[(String, Vec<u8>)]) {
+        // The first open (any password) runs recovery and discards the staging.
+        assert!(OpenVault::open(path.to_path_buf(), new.0, new.1).is_err(), "new passwords must fail");
+        let v = OpenVault::open(path.to_path_buf(), old.0, old.1).unwrap();
+        for (id, body) in docs {
+            assert_eq!(&v.read_document(id).unwrap()[..], &body[..], "doc {id} intact after discard");
+        }
+        assert!(!parent_dir(path).join(REKEY_DIR).exists(), "staging discarded");
+    }
+
+    #[test]
+    fn rekey_across_partitions_roundtrip() {
+        let (path, docs) = seed_multi_partition("rkmulti", b"o1", b"o2");
+        {
+            let mut v = OpenVault::open(path.clone(), b"o1", b"o2").unwrap();
+            v.change_password(b"n1", b"n2").unwrap();
+            // The in-memory handle is already on the new key.
+            for (id, body) in &docs {
+                assert_eq!(&v.read_document(id).unwrap()[..], &body[..]);
+            }
+        }
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_chained_twice_only_last_password_opens() {
+        let (path, docs) = seed_multi_partition("rkchain", b"a1", b"a2");
+        {
+            let mut v = OpenVault::open(path.clone(), b"a1", b"a2").unwrap();
+            v.change_password(b"b1", b"b2").unwrap();
+            v.change_password(b"c1", b"c2").unwrap();
+        }
+        assert!(OpenVault::open(path.clone(), b"a1", b"a2").is_err());
+        assert!(OpenVault::open(path.clone(), b"b1", b"b2").is_err());
+        let v = OpenVault::open(path.clone(), b"c1", b"c2").unwrap();
+        for (id, body) in &docs {
+            assert_eq!(&v.read_document(id).unwrap()[..], &body[..]);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_before_any_commit_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkp0", b"o1", b"o2");
+        // Crash right after READY, before a single item is moved.
+        stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_after_volume_commit_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkp1", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        // Volume moved into place; manifest + vault.pmv still staged.
+        replace_dir(&dir.join("volume"), &staging.join("volume")).unwrap();
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_after_manifest_commit_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkp2", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        // Volume + manifest moved; vault.pmv still staged → old key still on disk.
+        replace_dir(&dir.join("volume"), &staging.join("volume")).unwrap();
+        replace_dir(&dir.join("manifest"), &staging.join("manifest")).unwrap();
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_after_vault_commit_before_cleanup_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkp3", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        // Everything moved (new key is live), but `.rekey/` not yet removed.
+        replace_dir(&dir.join("volume"), &staging.join("volume")).unwrap();
+        replace_dir(&dir.join("manifest"), &staging.join("manifest")).unwrap();
+        replace_path(&dir.join(VAULT_FILE), &staging.join(VAULT_FILE)).unwrap();
+        assert!(staging.exists(), "staging still present at this crash point");
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_mid_volume_swap_rolls_forward() {
+        // The dangerous window inside replace_dir: the live dir has been moved
+        // aside to `.volume.old` but the staged dir is not yet renamed in.
+        let (path, docs) = seed_multi_partition("rkmidv", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        let old = sibling_old(&dir.join("volume"));
+        fs::rename(dir.join("volume"), &old).unwrap(); // crash here: live gone, staged intact
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        let _ = &staging;
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_crash_mid_manifest_swap_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkmidm", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        // Volume already committed; crash mid-manifest swap.
+        replace_dir(&dir.join("volume"), &staging.join("volume")).unwrap();
+        let old = sibling_old(&dir.join("manifest"));
+        fs::rename(dir.join("manifest"), &old).unwrap();
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_commit_is_idempotent() {
+        // Running the roll-forward twice (e.g. a crash during the second
+        // recovery) must not panic or corrupt state.
+        let (path, docs) = seed_multi_partition("rkidem", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        let dir = parent_dir(&path);
+        commit_rekey(&dir, &staging).unwrap();
+        commit_rekey(&dir, &staging).unwrap(); // no-op the second time
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_complete_tree_without_ready_is_discarded() {
+        // A fully-staged tree missing only the READY marker is NOT trusted: it
+        // is discarded and the old (intact) tree stands.
+        let (path, docs) = seed_multi_partition("rknoready", b"o1", b"o2");
+        let staging = stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        fs::remove_file(staging.join(REKEY_READY)).unwrap(); // the only thing missing
+        assert_discarded(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_partial_staging_with_docs_discarded() {
+        let (path, docs) = seed_multi_partition("rkpartial", b"o1", b"o2");
+        let staging = parent_dir(&path).join(REKEY_DIR);
+        fs::create_dir_all(staging.join("volume")).unwrap();
+        fs::write(staging.join("vault.pmv"), b"half-written").unwrap();
+        assert_discarded(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_with_ready_rekey_is_reported_then_rw_rolls_forward() {
+        let (path, docs) = seed_multi_partition("rkro", b"o1", b"o2");
+        stage_ready_rekey(&path, b"o1", b"o2", b"n1", b"n2");
+        // Read-only cannot finish the commit, so it must refuse, untouched.
+        let err = OpenVault::open_read_only(path.clone(), b"n1", b"n2").err().unwrap();
+        assert!(matches!(err, VaultError::RekeyPending));
+        assert!(parent_dir(&path).join(REKEY_DIR).exists(), "read-only left staging in place");
+        // A read-write open then completes the roll-forward.
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn stale_staging_cleared_then_rekey_succeeds() {
+        // A leftover incomplete `.rekey/` from a prior aborted attempt must not
+        // block a fresh password change.
+        let (path, docs) = seed_multi_partition("rkstale", b"o1", b"o2");
+        let staging = parent_dir(&path).join(REKEY_DIR);
+        fs::create_dir_all(staging.join("volume")).unwrap(); // stale, no READY
+        {
+            // Open discards the stale staging, then change_password stages anew.
+            let mut v = OpenVault::open(path.clone(), b"o1", b"o2").unwrap();
+            v.change_password(b"n1", b"n2").unwrap();
+        }
+        assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
 }
