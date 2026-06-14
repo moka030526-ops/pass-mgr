@@ -48,6 +48,10 @@ pub type DecryptedDoc = (ManifestEntry, Zeroizing<Vec<u8>>);
 const MAGIC: &[u8; 8] = b"PMVAULT\0";
 const FORMAT_VERSION: u8 = 4;
 const HEADER_LEN: usize = 61;
+/// Hard ceiling on the vault file read into memory before any auth/decrypt — a
+/// DoS guard against a crafted, oversized `vault.pmv` (the record JSON is small;
+/// 256 MiB is far above any legitimate vault).
+const MAX_VAULT_SIZE: u64 = 256 * 1024 * 1024;
 /// Fixed vault-file name inside the user's directory.
 const VAULT_FILE: &str = "vault.pmv";
 /// Staging directory used during a password-change re-encryption.
@@ -308,6 +312,11 @@ impl OpenVault {
     ) -> Result<Vec<DecryptedDoc>, VaultError> {
         let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
         let dir = parent_dir(path);
+        // Refuse to read a half-committed rekey tree (old vault.pmv vs new-key
+        // volume/manifest); this read-only path cannot finish the roll-forward.
+        if dir.join(REKEY_DIR).exists() {
+            return Err(VaultError::RekeyPending);
+        }
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         // Collect entries first so the immutable borrow for reads is clean.
         let entries: Vec<ManifestEntry> = selected_entries(&store, part)?;
@@ -329,6 +338,9 @@ impl OpenVault {
     ) -> Result<Vec<ManifestEntry>, VaultError> {
         let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
         let dir = parent_dir(path);
+        if dir.join(REKEY_DIR).exists() {
+            return Err(VaultError::RekeyPending);
+        }
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         selected_entries(&store, part)
     }
@@ -374,12 +386,24 @@ impl OpenVault {
         drop(new_store);
 
         // Stage the re-encrypted vault, mark the staging complete, then commit.
+        // Bump the write-generation so a rekeyed vault is detectably newer than
+        // any pre-rekey snapshot (stale/rollback detection across a rotation).
         let mut staged_vault = self.vault.clone();
+        staged_vault.generation = staged_vault.generation.saturating_add(1);
         staged_vault.audit.push(Change::new("password_changed", String::new()));
         write_vault_file(&staging.join(VAULT_FILE), &staged_vault, &new_key, &new_salt, self.params)?;
         write_new_bytes(&staging.join(REKEY_READY), b"ready")?;
         sync_parent_dir(&staging.join(REKEY_READY));
-        commit_rekey(&dir, &staging)?;
+        // commit_rekey moves volume/ then manifest/ then vault.pmv. If it fails
+        // PARTWAY (a rename errors), the on-disk tree is half-new while this live
+        // handle still holds the OLD key — a subsequent save/put would corrupt the
+        // new-key tree. Poison the handle (read-only) so the caller must reopen,
+        // which finishes the idempotent roll-forward. A crash here is handled the
+        // same way by recover_pending_rekey on the next open.
+        if let Err(e) = commit_rekey(&dir, &staging) {
+            self.read_only = true;
+            return Err(e);
+        }
 
         // Adopt the new key/salt/state and reopen the store under the new key.
         self.key = new_key;
@@ -552,6 +576,15 @@ fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
 
 /// Read, parse, and decrypt the vault file at `path`. Performs no writes.
 fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, Key), VaultError> {
+    // Bound the read before slurping the whole file (DoS guard): a crafted,
+    // oversized vault.pmv must be rejected before allocation, not after.
+    match fs::metadata(path) {
+        Ok(m) if m.len() > MAX_VAULT_SIZE => return Err(VaultError::TooLarge),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VaultError::NotFound(path.to_path_buf()));
+        }
+        _ => {}
+    }
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -697,6 +730,12 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
         return Err(VaultError::NotFound(vault_path.to_path_buf()));
     }
     let src_dir = parent_dir(vault_path);
+    // Don't snapshot a tree mid-rekey: the volume/manifest may be the new key while
+    // vault.pmv is still the old one, yielding an unopenable backup. Finish (or
+    // discard) the pending rekey by opening with --write first.
+    if src_dir.join(REKEY_DIR).exists() {
+        return Err(VaultError::RekeyPending);
+    }
     fs::create_dir_all(dest_dir)?;
     harden_dir(dest_dir);
 
@@ -1551,6 +1590,62 @@ mod tests {
             v.change_password(b"n1", b"n2").unwrap();
         }
         assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn oversized_vault_file_is_rejected() {
+        let path = tmp_path("toobig");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // Sparse-extend vault.pmv beyond the cap (no real bytes written); the
+        // metadata-size guard must reject it before the wholesale read.
+        {
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(MAX_VAULT_SIZE + 1).unwrap();
+        }
+        assert!(matches!(OpenVault::open(path.clone(), b"a", b"b"), Err(VaultError::TooLarge)));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn orphaned_blob_after_unlink_save_opens_cleanly() {
+        // The fixed delete/detach order saves the unlinked vault FIRST, then drops
+        // the blob. A crash in that window leaves an orphaned blob (harmless) but no
+        // dangling reference; this reproduces that state and asserts a clean reopen.
+        let path = tmp_path("orphan");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("orphan", b"body");
+        let id = v.add_document("/d", "f.txt", &src).unwrap();
+        let mut tw = crate::records::TrustWill::new().unwrap();
+        tw.file = Some(id.clone());
+        records::upsert(&mut v.vault.trust_wills, tw.clone());
+        v.save().unwrap();
+        // Unlink the record and save (the blob is still present == orphan).
+        tw.file = None;
+        records::upsert(&mut v.vault.trust_wills, tw);
+        v.save().unwrap();
+        drop(v); // simulate a crash before the blob reclaim runs
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(reopened.has_document(&id), "orphan blob lingers but is harmless");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn pending_rekey_blocks_read_facilities_and_backup() {
+        let (path, _docs) = seed_multi_partition("rkblock", b"a", b"b");
+        stage_ready_rekey(&path, b"a", b"b", b"n1", b"n2"); // a complete READY staging
+        assert!(matches!(
+            OpenVault::export_documents(&path, b"a", b"b", None),
+            Err(VaultError::RekeyPending)
+        ));
+        assert!(matches!(
+            OpenVault::export_manifests(&path, b"a", b"b", None),
+            Err(VaultError::RekeyPending)
+        ));
+        let dest = std::env::temp_dir().join(format!("pmbk-{}", nanos()));
+        assert!(matches!(backup(&path, &dest), Err(VaultError::RekeyPending)));
+        let _ = fs::remove_dir_all(&dest);
         cleanup(&path);
     }
 

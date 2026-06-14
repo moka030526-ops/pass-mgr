@@ -1128,6 +1128,12 @@ impl GuiApp {
                     },
                     None => return,
                 };
+                // Capture any document this record already had, so re-attaching
+                // reclaims the replaced blob instead of orphaning it (matches TUI).
+                let previous = match target {
+                    DocTarget::TrustWill => self.edit_trustwill.as_ref().and_then(|r| r.file.clone()),
+                    DocTarget::Asset => self.edit_asset.as_ref().and_then(|r| r.statement.clone()),
+                };
                 match target {
                     DocTarget::TrustWill => {
                         if let Some(r) = self.edit_trustwill.as_mut() {
@@ -1144,6 +1150,12 @@ impl GuiApp {
                 // entry is referenced (no orphan if the user navigates away).
                 self.upsert_doc_target(target);
                 self.persist();
+                // Reclaim a replaced attachment's blob AFTER persisting the new link.
+                if let Some(old) = previous
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    let _ = ov.remove_document(&old);
+                }
                 self.clear_doc_inputs();
                 self.status = "Document uploaded to the encrypted volume.".into();
             }
@@ -1184,6 +1196,11 @@ impl GuiApp {
                     }
                 }
                 self.upsert_doc_target(target);
+                // Persist the unlink BEFORE reclaiming the blob: a crash in between
+                // would otherwise leave vault.pmv referencing a doc whose manifest
+                // entry is already gone (ArchiveMismatch -> unopenable). An
+                // orphaned blob is harmless (it lingers until a future compaction).
+                self.persist();
                 if let Some(id) = id
                     && let Some(ov) = self.vault.as_mut()
                     && let Err(e) = ov.remove_document(&id)
@@ -1191,7 +1208,6 @@ impl GuiApp {
                     self.status = format!("Unlinked, but blob cleanup failed: {e}");
                     return;
                 }
-                self.persist();
                 self.status = "Removed document from the vault.".into();
             }
         }
@@ -1236,12 +1252,14 @@ impl GuiApp {
                 }
             }
         }
+        // Persist the record removal BEFORE reclaiming its blobs, so a crash can't
+        // leave the vault referencing a doc whose manifest entry is already gone.
+        self.persist();
         for id in doc_ids {
             if let Some(ov) = self.vault.as_mut() {
                 let _ = ov.remove_document(&id);
             }
         }
-        self.persist();
         self.status = "Deleted.".into();
     }
 

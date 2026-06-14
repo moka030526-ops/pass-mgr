@@ -45,6 +45,10 @@ pub const DEFAULT_VOLUME_MAX_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 const MAX_MANIFEST_SIZE: u64 = 256 * 1024 * 1024;
 
 const FRAME_PREFIX_LEN: u64 = 4; // the `[u32 frame_len]`
+/// Worst-case per-frame on-disk overhead (prefix + nonce + tag + the two length
+/// prefixes + a full-length virtual path), reserved when deciding partition
+/// rollover so a partition does not overshoot its size cap.
+const FRAME_OVERHEAD_EST: u64 = 512;
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -213,8 +217,21 @@ impl VolumeStore {
         let loc = *self.index.get(id).ok_or_else(|| StorageError::NotFound(id.to_string()))?;
         let mut f = File::open(self.volume_path(loc.partition))?;
         let file_len = f.metadata()?.len();
-        let (_id, _path, bytes) =
+        let (frame_id, frame_path, bytes) =
             read_frame_at(&mut f, file_len, loc.offset, loc.length, key, &self.aad(loc.partition))?;
+        // The frame's id/path are authenticated (inside the AEAD plaintext) but the
+        // AAD binds only vault_id+partition, so any equal-length authentic frame in
+        // the same partition would otherwise decrypt here. Verify the frame's id
+        // (and path) match the manifest entry, so a relocated/substituted frame
+        // cannot be served under the wrong document identity.
+        if frame_id != id {
+            return Err(StorageError::Corrupt(format!("frame id mismatch in partition {}", loc.partition)));
+        }
+        if let Some(expected) = self.entry(id)
+            && frame_path != expected.path
+        {
+            return Err(StorageError::Corrupt(format!("frame path mismatch for {id}")));
+        }
         Ok(bytes)
     }
 
@@ -288,8 +305,12 @@ impl VolumeStore {
             return loc.partition;
         }
         match self.manifests.last() {
-            // Rough frame size estimate (doc + framing/crypto overhead) for the cap.
-            Some(m) if m.end_offset + doc_size + 256 <= self.max_size => (self.manifests.len() - 1) as u32,
+            // Reserve the worst-case per-frame overhead (prefix + nonce + tag +
+            // id/path length prefixes + a full-length path ~= 340 B; round up) so a
+            // partition does not overshoot `max_size`.
+            Some(m) if m.end_offset + doc_size + FRAME_OVERHEAD_EST <= self.max_size => {
+                (self.manifests.len() - 1) as u32
+            }
             Some(_) => self.manifests.len() as u32, // full → new partition
             None => 0,
         }
@@ -304,6 +325,12 @@ impl VolumeStore {
         fs::create_dir_all(&self.volume_dir)?;
         harden_dir(&self.manifest_dir);
         harden_dir(&self.volume_dir);
+        // Make the volume/ and manifest/ directory entries themselves durable, so a
+        // crash right after the first write can't lose the subdirectory that holds
+        // a just-committed file.
+        if let Some(vault_dir) = self.manifest_dir.parent() {
+            sync_dir(vault_dir);
+        }
         Ok(())
     }
 
@@ -486,6 +513,19 @@ fn parse_plaintext(plain: &[u8]) -> Result<(String, String, Zeroizing<Vec<u8>>),
 /// Append `frame` to the volume at `start`, truncating any torn tail beyond it,
 /// then fsync. Opens read/write (create if absent).
 fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageError> {
+    // Refuse to write through a symlink planted at the volume path: an attacker
+    // with write access to the vault dir could otherwise redirect our writes (and
+    // the 0600 chmod) to an arbitrary file the user can write. The atomic
+    // manifest/vault writes use O_EXCL + rename; this append path opens the file
+    // directly, so it needs its own guard.
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write through a symlink at the volume path",
+        )));
+    }
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -500,6 +540,12 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     // Drop any pre-existing garbage tail beyond the new committed end.
     f.set_len(start + frame.len() as u64)?;
     f.sync_all()?;
+    // Make the (possibly newly created) vol.<N> directory entry durable BEFORE its
+    // referencing manifest is committed, so a crash can never leave a committed
+    // manifest pointing at a volume the filesystem never durably linked.
+    if let Some(dir) = path.parent() {
+        sync_dir(dir);
+    }
     Ok(())
 }
 
@@ -938,6 +984,100 @@ mod tests {
         let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
         assert_eq!(&*s2.read("a", &key).unwrap(), b"data");
         assert_eq!(s2.partition_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frame_substitution_within_partition_is_rejected() {
+        // Two equal-length, individually-authentic frames in the same partition.
+        let dir = tmp_dir("swap");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/x", b"AAAAAAAAAA", 1, &key).unwrap();
+        s.put("b", "/y", b"BBBBBBBBBB", 2, &key).unwrap();
+        let ea = s.entry("a").unwrap().clone();
+        let eb = s.entry("b").unwrap().clone();
+        assert_eq!(ea.length, eb.length, "frames must be equal length for the swap");
+        // Swap the two frames' bytes in the volume (the manifest is untouched).
+        let volp = dir.join("volume/vol.0");
+        let mut bytes = std::fs::read(&volp).unwrap();
+        let (oa, ob, len) = (ea.offset as usize, eb.offset as usize, ea.length as usize);
+        let fa = bytes[oa..oa + len].to_vec();
+        let fb = bytes[ob..ob + len].to_vec();
+        bytes[oa..oa + len].copy_from_slice(&fb);
+        bytes[ob..ob + len].copy_from_slice(&fa);
+        std::fs::write(&volp, &bytes).unwrap();
+        // The substituted frame's authenticated id no longer matches the manifest.
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(matches!(s2.read("a", &key), Err(StorageError::Corrupt(_))), "swap into a detected");
+        assert!(matches!(s2.read("b", &key), Err(StorageError::Corrupt(_))), "swap into b detected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_frame_refuses_to_write_through_a_symlink() {
+        let dir = tmp_dir("symlink");
+        let key = fast_key();
+        std::fs::create_dir_all(dir.join("volume")).unwrap();
+        let target = dir.join("secret_target");
+        std::fs::write(&target, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("volume/vol.0")).unwrap();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(matches!(s.put("a", "/a", b"data", 1, &key), Err(StorageError::Io(_))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch", "symlink target untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_manifest_on_higher_partition_is_rebuilt() {
+        // Kills the `&&` -> `||` mutant in the partition scan: a partition with a
+        // present volume but missing manifest must still be loaded (rebuilt).
+        let dir = tmp_dir("higherrebuild");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", 1024).unwrap();
+        let big = vec![5u8; 600];
+        s.put("a", "/a", &big, 1, &key).unwrap();
+        s.put("b", "/b", &big, 2, &key).unwrap();
+        assert!(s.partition_count() >= 2, "docs span >= 2 partitions");
+        std::fs::remove_file(dir.join("manifest/manifest.1")).unwrap();
+        let s2 = VolumeStore::open(&dir, &key, "v", 1024).unwrap();
+        assert!(s2.contains("a"), "partition 0 intact");
+        assert!(s2.contains("b"), "partition 1 rebuilt from its volume");
+        assert_eq!(&*s2.read("b", &key).unwrap(), &big[..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_frame_at_rejects_subnonce_frame_length() {
+        // Kills the `||` -> `&&` mutant in the plausibility check: a frame_len below
+        // NONCE_LEN must be rejected, not cause an OOB split_at on a short buffer.
+        let dir = tmp_dir("subnonce");
+        let key = fast_key();
+        let aad = volume_aad("v", 0);
+        let vol = dir.join("vol");
+        let mut raw = 10u32.to_le_bytes().to_vec(); // frame_len = 10 (< NONCE_LEN = 24)
+        raw.extend_from_slice(&[0u8; 10]);
+        std::fs::write(&vol, &raw).unwrap();
+        let mut f = File::open(&vol).unwrap();
+        let len = f.metadata().unwrap().len();
+        assert!(read_frame_at(&mut f, len, 0, 0, &key, &aad).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_and_manifest_files_are_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("perms");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"data", 1, &key).unwrap();
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.join("volume/vol.0")), 0o600, "volume file is 0600");
+        assert_eq!(mode(dir.join("manifest/manifest.0")), 0o600, "manifest file is 0600");
+        assert_eq!(mode(dir.join("volume")), 0o700, "volume dir is 0700");
+        assert_eq!(mode(dir.join("manifest")), 0o700, "manifest dir is 0700");
         std::fs::remove_dir_all(&dir).ok();
     }
 

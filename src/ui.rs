@@ -1032,12 +1032,14 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
+        // Persist the new link BEFORE reclaiming the replaced blob: a crash in
+        // between must not leave the vault referencing a dropped doc.
+        self.persist();
         if let Some(old) = previous
             && let Some(ov) = self.vault.as_mut()
         {
             let _ = ov.remove_document(&old);
         }
-        self.persist();
         self.status = "Document uploaded to the encrypted volume.".into();
         self.edit = Some(es);
     }
@@ -1059,6 +1061,9 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
+        // Persist the unlink BEFORE reclaiming the blob (crash-safety: a dangling
+        // reference is fatal on reopen, an orphaned blob is harmless).
+        self.persist();
         let mut cleanup_err = None;
         if let Some(id) = id
             && let Some(ov) = self.vault.as_mut()
@@ -1066,7 +1071,6 @@ impl App {
         {
             cleanup_err = Some(e);
         }
-        self.persist();
         // Surface a failed blob reclaim instead of silently reporting success.
         self.status = match cleanup_err {
             Some(e) => format!("Unlinked, but blob cleanup failed: {e}"),
@@ -1220,12 +1224,13 @@ impl App {
                 }
             }
         }
+        // Persist the record removal before reclaiming blobs (crash-safety).
+        self.persist();
         for fid in doc_ids {
             if let Some(ov) = self.vault.as_mut() {
                 let _ = ov.remove_document(&fid);
             }
         }
-        self.persist();
         self.clamp_selection();
         self.status = "Deleted.".into();
     }
