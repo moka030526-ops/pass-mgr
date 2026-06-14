@@ -16,6 +16,8 @@
 mod crypto;
 mod gui;
 mod password;
+mod records;
+mod types;
 mod ui;
 mod vault;
 
@@ -62,12 +64,12 @@ fn main() -> ExitCode {
         }
         Some("--tui") => {
             let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
-            run_ui(path)
+            run_ui(path, types::TypeLists::load())
         }
         // Otherwise the (optional) first argument is the vault path for the GUI.
         _ => {
             let path = args.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
-            gui::run(path)
+            gui::run(path, types::TypeLists::load())
         }
     };
 
@@ -78,12 +80,12 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_ui(path: PathBuf) -> anyhow::Result<()> {
+fn run_ui(path: PathBuf, types: types::TypeLists) -> anyhow::Result<()> {
     // `ratatui::init` enters the alternate screen + raw mode and installs a
     // panic hook that restores the terminal before printing the panic, so a
     // crash never leaves the user's terminal in a broken state.
     let mut terminal = ratatui::init();
-    let result = ui::run(&mut terminal, path);
+    let result = ui::run(&mut terminal, path, types);
     ratatui::restore();
     result
 }

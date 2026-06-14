@@ -1,10 +1,15 @@
-//! Vault data model and the encrypted on-disk file format.
+//! The encrypted on-disk file format and the encrypted document volume.
+//!
+//! The decrypted data model itself lives in [`crate::records`]; this module owns
+//! the *file* (header + AEAD ciphertext of the JSON vault) and the sidecar
+//! *archive* file that stores all uploaded documents together, encrypted as a
+//! single unit ("encrypted zip").
 //!
 //! File layout (all integers little-endian):
 //! ```text
 //!   offset  len  field
 //!   0       8    magic  b"PMVAULT\0"          (identifies a pass-mgr vault)
-//!   8       1    format version (currently 2)
+//!   8       1    format version (currently 3)
 //!   9       4    Argon2 m_cost (KiB)
 //!   13      4    Argon2 t_cost
 //!   17      4    Argon2 p_cost
@@ -12,41 +17,59 @@
 //!   37      24   nonce   (XChaCha20-Poly1305)
 //!   61      ..   XChaCha20-Poly1305 ciphertext of the JSON vault
 //! ```
-//! The 61-byte header is passed to the AEAD as associated data, so tampering
-//! with the version, KDF parameters, or salt is detected on decrypt.
+//! The first 37 header bytes (everything but the nonce) are the AEAD associated
+//! data, so tampering with the version/params/salt is detected on decrypt.
 //!
-//! The encryption key is derived from **two** passwords via a chained Argon2id
-//! derivation (see [`crate::crypto::derive_key_chained`] and `docs/DESIGN.md`).
-//! Format version 2 reflects both the two-password scheme and the richer schema
-//! (custom types, per-entry history, last-access time). Version 1 prototype
-//! files are intentionally not auto-migrated.
+//! The key is derived from **two** passwords via a chained Argon2id derivation
+//! (see [`crate::crypto::derive_key_chained`] and `docs/DESIGN.md`). Format
+//! version 3 holds the five estate-record collections plus the document-volume
+//! manifest; earlier versions are not auto-migrated.
+//!
+//! Document volume: uploaded files are encrypted together with the vault key and
+//! stored in a single archive `<vault-filename>.vol` (`nonce ‖ ciphertext`),
+//! decrypted as one unit on open. The vault JSON holds the virtual directory
+//! tree, per-file metadata, and the upload history.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError, KdfParams, Key, NONCE_LEN, SALT_LEN};
+use crate::records::{self, Change, Vault, VolumeFile};
+
+/// Fixed prefix of the document-archive associated data (app/format tag). The
+/// vault's `volume.id` is appended so the archive is bound to its specific vault.
+const ARCHIVE_AAD_PREFIX: &[u8] = b"PMVAULT-DOC-ARCHIVE-v1\0";
+
+/// AEAD associated data for the document archive: the fixed prefix plus the
+/// vault's instance id. Binding the id means a `.vol` from a different vault (or
+/// a swapped one) fails authentication on decrypt.
+fn archive_aad(vault_id: &str) -> Vec<u8> {
+    let mut aad = ARCHIVE_AAD_PREFIX.to_vec();
+    aad.extend_from_slice(vault_id.as_bytes());
+    aad
+}
+
+/// All documents, decrypted, keyed by their volume file id. The values wipe on
+/// drop. This is the in-memory form of the single encrypted archive file.
+type DocArchive = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
 const MAGIC: &[u8; 8] = b"PMVAULT\0";
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const HEADER_LEN: usize = 61;
 
 // Sanity bounds for KDF parameters read from an untrusted file header. They are
 // validated *before* the (expensive, memory-hard) key derivation runs, so a
 // crafted header cannot force a huge Argon2 allocation as a denial-of-service.
-// The defaults (64 MiB / 3 / 1) sit well inside these limits.
 const MAX_M_COST: u32 = 1 << 20; // 1 GiB, expressed in KiB
 const MAX_T_COST: u32 = 64;
 const MAX_P_COST: u32 = 16;
 /// Bytes of the header used as AEAD associated data: everything *except* the
-/// 24-byte nonce (magic + version + KDF params + salt = the first 37 bytes).
-/// The nonce is not included because it is already bound as the cipher's nonce
-/// input — altering it makes decryption fail the authentication tag anyway.
+/// 24-byte nonce. The nonce is bound implicitly as the cipher's nonce input.
 const AAD_LEN: usize = HEADER_LEN - NONCE_LEN;
 
 #[derive(Error, Debug)]
@@ -63,196 +86,14 @@ pub enum VaultError {
     Truncated,
     #[error("vault KDF parameters are out of the allowed range")]
     BadParams,
+    #[error("document archive does not match the vault (possible tampering or rollback)")]
+    ArchiveMismatch,
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("vault contents are not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// A single timestamped audit record (req. 4). Pushed onto an entry's history
-/// on every edit, or onto the vault-level audit log for vault-wide events.
-/// History `detail` strings can contain old plaintext passwords, so this type
-/// wipes its fields on drop.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
-pub struct Change {
-    /// Unix-seconds timestamp of the change.
-    pub at: i64,
-    /// Machine-readable action, e.g. "created", "updated", "password_changed".
-    pub action: String,
-    /// Human-readable summary, e.g. `username: "a" -> "b"`.
-    pub detail: String,
-}
-
-impl Change {
-    fn new(action: &str, detail: String) -> Self {
-        Change { at: unix_now(), action: action.to_string(), detail }
-    }
-}
-
-/// A single stored credential. Holds the plaintext password and history, so it
-/// wipes all its fields on drop.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
-pub struct Entry {
-    pub id: String,
-    pub title: String,
-    /// Custom user-defined type/category, e.g. "Login", "Server" (req. 2).
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub url: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    /// Append-only log of changes to this entry (req. 4, 5).
-    #[serde(default)]
-    pub history: Vec<Change>,
-}
-
-impl Entry {
-    /// Build a new entry with a random id and current timestamps.
-    pub fn new(title: String) -> Result<Self, CryptoError> {
-        // Built field-by-field rather than with `..Default::default()` because
-        // Entry implements Drop (ZeroizeOnDrop), which forbids the FRU move.
-        let now = unix_now();
-        let mut entry = Entry::default();
-        entry.id = random_id()?;
-        entry.title = title;
-        entry.created_at = now;
-        entry.updated_at = now;
-        Ok(entry)
-    }
-
-    /// Case-insensitive match against title, type, username, url, and description.
-    pub fn matches(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let q = query.to_lowercase();
-        [&self.title, &self.kind, &self.username, &self.url, &self.description]
-            .iter()
-            .any(|field| field.to_lowercase().contains(&q))
-    }
-
-    /// Compute the list of changes needed to turn `self` into `new`. The full
-    /// before/after value of every field — including the password — is recorded
-    /// so the history is a complete record (see `docs/DESIGN.md` §4.1, §9.4).
-    fn diff(&self, new: &Entry, at: i64) -> Vec<Change> {
-        let mut changes = Vec::new();
-        let mut track = |name: &str, action: &str, old: &str, new: &str| {
-            if old != new {
-                changes.push(Change {
-                    at,
-                    action: action.into(),
-                    detail: format!("{name}: {old:?} -> {new:?}"),
-                });
-            }
-        };
-        track("title", "updated", &self.title, &new.title);
-        track("type", "updated", &self.kind, &new.kind);
-        track("description", "updated", &self.description, &new.description);
-        track("username", "updated", &self.username, &new.username);
-        track("url", "updated", &self.url, &new.url);
-        // The old and new password values ARE recorded in history (req. 4/5).
-        track("password", "password_changed", &self.password, &new.password);
-        changes
-    }
-}
-
-/// The decrypted contents of a vault. Wipes all entries/history on drop so the
-/// decrypted secrets do not linger in freed memory after the vault is closed.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
-pub struct Vault {
-    /// Schema version of the decrypted JSON (mirrors the file format version).
-    #[serde(default)]
-    pub version: u8,
-    /// Unix-seconds time the vault was last successfully unlocked (req. 6).
-    #[serde(default)]
-    pub last_opened_at: i64,
-    /// The set of custom types the user has created (req. 2).
-    #[serde(default)]
-    pub types: Vec<String>,
-    /// Vault-level audit log: creation, password changes, deletions (req. 4).
-    #[serde(default)]
-    pub audit: Vec<Change>,
-    #[serde(default)]
-    pub entries: Vec<Entry>,
-}
-
-impl Vault {
-    /// Insert or replace an entry by id. On replace, the field-level diff is
-    /// appended to the entry's history and the original creation time is kept.
-    /// On insert, a "created" record is added. The entry's type is registered.
-    pub fn upsert(&mut self, mut entry: Entry) {
-        let now = unix_now();
-        entry.updated_at = now;
-        // Normalize the type once so the stored value matches the registered
-        // (trimmed) type string — otherwise a leading/trailing space would hide
-        // the entry from its own type filter.
-        if entry.kind != entry.kind.trim() {
-            entry.kind = entry.kind.trim().to_string();
-        }
-        self.register_type(&entry.kind);
-
-        match self.entries.iter().position(|e| e.id == entry.id) {
-            Some(i) => {
-                let old = &self.entries[i];
-                let changes = old.diff(&entry, now);
-                entry.created_at = old.created_at; // preserve original creation time
-                entry.history = old.history.clone(); // preserve prior history
-                entry.history.extend(changes);
-                self.entries[i] = entry;
-            }
-            None => {
-                entry.history.push(Change::new("created", entry.title.clone()));
-                self.entries.push(entry);
-            }
-        }
-    }
-
-    /// Remove an entry by id, recording a timestamped deletion in the vault audit
-    /// log (the entry itself is gone, so its own history cannot hold the record).
-    pub fn remove(&mut self, id: &str) -> bool {
-        match self.entries.iter().position(|e| e.id == id) {
-            Some(i) => {
-                let title = self.entries[i].title.clone();
-                self.entries.remove(i);
-                self.audit.push(Change::new("deleted", title));
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Register a custom type so it shows up in the filter bar. Case-insensitive
-    /// dedup; ignores blank input.
-    pub fn register_type(&mut self, kind: &str) {
-        let k = kind.trim();
-        if k.is_empty() || self.types.iter().any(|t| t.eq_ignore_ascii_case(k)) {
-            return;
-        }
-        self.types.push(k.to_string());
-        self.types.sort_by_key(|t| t.to_lowercase());
-    }
-
-    /// Entries matching `query` and (optionally) a custom type, sorted by title.
-    /// Pass `kind = None` to search across all types.
-    pub fn filter(&self, query: &str, kind: Option<&str>) -> Vec<&Entry> {
-        let mut out: Vec<&Entry> = self
-            .entries
-            .iter()
-            .filter(|e| e.matches(query))
-            .filter(|e| kind.is_none_or(|k| e.kind.eq_ignore_ascii_case(k)))
-            .collect();
-        out.sort_by_key(|e| e.title.to_lowercase());
-        out
-    }
 }
 
 /// Self-describing header parsed from / written to the vault file.
@@ -309,22 +150,25 @@ impl Header {
     }
 }
 
-/// An unlocked vault: holds the decrypted entries plus the derived key and KDF
-/// salt/params needed to re-encrypt on save. The key zeroizes when dropped.
+/// An unlocked vault: the decrypted data plus the derived key and KDF salt/params
+/// needed to re-encrypt on save and to encrypt/decrypt the document archive. The
+/// key zeroizes when dropped; the `vault` zeroizes via its own `ZeroizeOnDrop`.
 pub struct OpenVault {
     pub vault: Vault,
     key: Key,
     params: KdfParams,
     salt: [u8; SALT_LEN],
     path: PathBuf,
-    /// The `last_opened_at` value read from disk *before* this session updated
-    /// it — i.e. the previous access time, for display on the unlock screen.
+    /// `last_opened_at` read from disk before this session updated it (the prior
+    /// access time, for display on the unlock screen).
     previous_access: i64,
+    /// All documents, decrypted, held together (the "encrypted zip" decrypted as
+    /// a unit on open and re-encrypted as a unit on change).
+    archive: DocArchive,
 }
 
 impl OpenVault {
-    /// Create a brand-new vault at `path` protected by two passwords. Fails if a
-    /// file is already there.
+    /// Create a brand-new vault at `path` protected by two passwords.
     pub fn create(
         path: PathBuf,
         pw1: &[u8],
@@ -337,10 +181,10 @@ impl OpenVault {
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &params)?;
 
-        let now = unix_now();
         let mut vault = Vault::default();
         vault.version = FORMAT_VERSION;
-        vault.last_opened_at = now;
+        vault.last_opened_at = records::unix_now();
+        vault.volume.id = records::random_id()?; // binds the document archive to this vault
         vault.audit.push(Change::new("vault_created", String::new()));
 
         let open = OpenVault {
@@ -350,19 +194,30 @@ impl OpenVault {
             salt,
             path,
             previous_access: 0,
+            archive: DocArchive::new(),
         };
         open.save()?;
         Ok(open)
     }
 
-    /// Unlock an existing vault with both passwords (entered sequentially).
-    /// Updates and persists `last_opened_at` (req. 6); the prior value is kept in
-    /// [`OpenVault::previous_access`] for display.
+    /// Unlock an existing vault with both passwords. Updates and persists
+    /// `last_opened_at`; the prior value is kept in [`OpenVault::previous_access`].
     pub fn open(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
         let (mut vault, header, key) = decrypt_file(&path, pw1, pw2)?;
 
         let previous_access = vault.last_opened_at;
-        vault.last_opened_at = unix_now();
+        vault.last_opened_at = records::unix_now();
+
+        // Decrypt the whole document archive at once (empty if none yet), bound
+        // to this vault's id. Then verify it is consistent with the manifest:
+        // every document referenced by the manifest must be present, so a stale
+        // or swapped `.vol` (missing newer documents) is rejected.
+        let archive = load_archive(&archive_path(&path), &key, &vault.volume.id)?;
+        for f in &vault.volume.files {
+            if !archive.contains_key(&f.id) {
+                return Err(VaultError::ArchiveMismatch);
+            }
+        }
 
         let open = OpenVault {
             vault,
@@ -371,31 +226,24 @@ impl OpenVault {
             salt: header.salt,
             path,
             previous_access,
+            archive,
         };
-        // Persist the refreshed access time so it survives to the next session.
         open.save()?;
         Ok(open)
     }
 
-    /// Decrypt the vault at `path` and return its contents **without** modifying
-    /// the file (no `last_opened_at` update, no re-encrypt). Used by the
-    /// command-line decrypt/export path. The derived key is dropped immediately.
+    /// Decrypt the vault and return its contents **without** modifying the file.
+    /// Used by the command-line decrypt/export path.
     pub fn export(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vault, VaultError> {
         let (vault, _header, _key) = decrypt_file(path, pw1, pw2)?;
         Ok(vault)
     }
 
-    /// Re-encrypt the current entries and write them atomically (temp + rename),
-    /// with a fresh random nonce. The on-disk file is tightened to owner-only
-    /// where the platform supports it (see [`harden_file`]).
+    /// Re-encrypt the current data and write it atomically (unique temp file +
+    /// fsync + rename + dir fsync), with a fresh random nonce and owner-only mode.
     pub fn save(&self) -> Result<(), VaultError> {
-        // Zeroizing so the serialized plaintext's final allocation is wiped on
-        // drop (serde's transient reallocations are an accepted residual).
         let plaintext = Zeroizing::new(serde_json::to_vec(&self.vault)?);
 
-        // The AAD covers magic/version/params/salt (the first AAD_LEN bytes) and
-        // is independent of the nonce, so we can compute it before encrypt()
-        // chooses the nonce. encrypt() returns the fresh nonce it used.
         let mut header = Header { params: self.params, salt: self.salt, nonce: [0u8; NONCE_LEN] };
         let aad = header.to_bytes();
         let (nonce, ciphertext) = crypto::encrypt(&self.key, &plaintext, &aad[..AAD_LEN])?;
@@ -409,9 +257,6 @@ impl OpenVault {
             harden_dir(parent);
         }
 
-        // Write to a uniquely-named, hidden temp file created with O_EXCL and
-        // (on Unix) mode 0600 atomically, so there is no world-readable window
-        // and a pre-planted symlink at a predictable path cannot be followed.
         let tmp = self.temp_path()?;
         if let Err(e) = write_new_file(&tmp, &header_bytes, &ciphertext) {
             let _ = fs::remove_file(&tmp);
@@ -421,34 +266,17 @@ impl OpenVault {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
-        // Make the rename itself durable so a crash can't lose the whole vault.
         sync_parent_dir(&self.path);
         Ok(())
     }
 
-    /// A unique, hidden temp path beside the vault file, e.g.
-    /// `.vault.pmv.<random>.tmp`. Randomized to avoid prediction/collision.
+    /// A unique, hidden temp path beside the vault file.
     fn temp_path(&self) -> Result<PathBuf, VaultError> {
-        let suffix = crypto::random_bytes::<8>()?
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let name = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("vault");
-        let file = format!(".{name}.{suffix}.tmp");
-        Ok(match self.path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.join(file),
-            _ => PathBuf::from(file),
-        })
+        sibling_tmp(&self.path)
     }
 
-    /// Re-key the vault under two new passwords (new salt) and persist. This is
-    /// transactional: the in-memory key/salt/audit are only kept if the save
-    /// succeeds, so a failed write never desyncs in-memory crypto state from the
-    /// on-disk file.
+    /// Re-key under two new passwords (new salt) and persist. Transactional: the
+    /// in-memory key/salt/audit are only kept if the save succeeds.
     pub fn change_password(&mut self, pw1: &[u8], pw2: &[u8]) -> Result<(), VaultError> {
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &self.params)?;
@@ -457,27 +285,167 @@ impl OpenVault {
         let old_salt = std::mem::replace(&mut self.salt, salt);
         self.vault.audit.push(Change::new("password_changed", String::new()));
 
-        match self.save() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Roll back to the previous key/salt/audit on failure.
-                self.key = old_key;
-                self.salt = old_salt;
-                self.vault.audit.pop();
-                Err(e)
-            }
+        // Re-encrypt the document archive under the new key FIRST (atomic write).
+        // If it fails the archive file is untouched, so we can fully revert.
+        if let Err(e) = self.save_archive() {
+            self.key = old_key;
+            self.salt = old_salt;
+            self.vault.audit.pop();
+            return Err(e);
         }
+        // Then write the vault under the new key.
+        if let Err(e) = self.save() {
+            // The vault file is still under the OLD key. Restore the archive to
+            // the old key too, then revert, so vault + archive stay consistent.
+            self.key = old_key;
+            self.salt = old_salt;
+            self.vault.audit.pop();
+            // Surface a failure to restore the archive (don't silently ignore):
+            // if this errors, the on-disk archive may be under the new key while
+            // the vault is under the old — the caller must know to retry.
+            self.save_archive()?;
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// The previous access time (unix seconds), or 0 if this is a new vault.
+    /// The previous access time (unix seconds), or 0 for a new vault.
     pub fn previous_access(&self) -> i64 {
         self.previous_access
     }
+
+    // --- Encrypted document volume (single archive) -------------------------
+    //
+    // All documents live together in one encrypted container, `<vault>.vol`,
+    // decrypted as a unit on open and re-encrypted as a unit on change. The
+    // vault JSON holds only the lightweight metadata (id/location/filename/...).
+
+    /// Add the file at `source` to the document archive under virtual directory
+    /// `location` with name `filename`; record its metadata + upload history and
+    /// persist both the archive and the vault. Returns the new file id.
+    pub fn add_document(
+        &mut self,
+        location: &str,
+        filename: &str,
+        source: &Path,
+    ) -> Result<String, VaultError> {
+        let data = Zeroizing::new(fs::read(source)?);
+        let size = data.len() as u64;
+        let id = records::random_id()?;
+
+        self.archive.insert(id.clone(), data);
+        if let Err(e) = self.save_archive() {
+            self.archive.remove(&id);
+            return Err(e);
+        }
+
+        let location = normalize_dir(location);
+        let display_loc = if location.is_empty() { "/".to_string() } else { location.clone() };
+        // Snapshot the directory list so the rollback can restore it exactly.
+        let dirs_before = self.vault.volume.directories.clone();
+        self.vault.volume.register_directory(&location);
+        self.vault.volume.files.push(VolumeFile {
+            id: id.clone(),
+            location: location.clone(),
+            filename: filename.to_string(),
+            size,
+            uploaded_at: records::unix_now(),
+            source: source.display().to_string(),
+        });
+        self.vault
+            .volume
+            .uploads
+            .push(Change::new("uploaded", format!("{display_loc}/{filename}")));
+
+        if let Err(e) = self.save() {
+            // Roll back the manifest (files, uploads, directories) and the archive.
+            self.vault.volume.files.pop();
+            self.vault.volume.uploads.pop();
+            self.vault.volume.directories = dirs_before;
+            self.archive.remove(&id);
+            let _ = self.save_archive();
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Permanently remove a stored document by id: drop it from the archive and
+    /// the manifest, log the removal, and persist. Called when a record holding
+    /// the document is deleted or its attachment is detached, so "deleted"
+    /// documents do not linger in the encrypted archive.
+    pub fn remove_document(&mut self, file_id: &str) -> Result<(), VaultError> {
+        let existed = self.archive.remove(file_id).is_some();
+        let label = self
+            .vault
+            .volume
+            .files
+            .iter()
+            .find(|f| f.id == file_id)
+            .map(|f| {
+                let loc = if f.location.is_empty() { "/".to_string() } else { f.location.clone() };
+                format!("{loc}/{}", f.filename)
+            })
+            .unwrap_or_else(|| file_id.to_string());
+        self.vault.volume.files.retain(|f| f.id != file_id);
+        if existed {
+            self.vault.volume.uploads.push(Change::new("removed", label));
+        }
+        self.save_archive()?;
+        self.save()
+    }
+
+    /// Return a stored document by id (already decrypted in memory).
+    pub fn read_document(&self, file_id: &str) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        match self.archive.get(file_id) {
+            Some(data) => Ok(Zeroizing::new(data.to_vec())),
+            None => Err(VaultError::NotFound(archive_path(&self.path))),
+        }
+    }
+
+    /// Write a stored document out to `dest` (to view/open it). This produces an
+    /// **unencrypted** copy; on Unix it is created owner-only (0600).
+    pub fn export_document(&self, file_id: &str, dest: &Path) -> Result<(), VaultError> {
+        let data = self.read_document(file_id)?;
+        fs::write(dest, &data)?;
+        harden_file(dest)?; // tighten to 0600 on unix (no-op elsewhere)
+        Ok(())
+    }
+
+    /// Encrypt the whole document archive and write it atomically to `<vault>.vol`.
+    fn save_archive(&self) -> Result<(), VaultError> {
+        let archive_file = archive_path(&self.path);
+        if self.archive.is_empty() {
+            // Nothing to store; remove any stale archive file.
+            let _ = fs::remove_file(&archive_file);
+            return Ok(());
+        }
+        let plaintext = Zeroizing::new(serialize_archive(&self.archive));
+        let aad = archive_aad(&self.vault.volume.id);
+        let (nonce, ciphertext) = crypto::encrypt(&self.key, &plaintext, &aad)?;
+
+        if let Some(parent) = archive_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+            harden_dir(parent);
+        }
+        // Unique temp file + rename, like the vault save, so a crash can't corrupt
+        // the existing archive.
+        let tmp = sibling_tmp(&archive_file)?;
+        if let Err(e) = write_new_file(&tmp, &nonce, &ciphertext) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&tmp, &archive_file) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        sync_parent_dir(&archive_file);
+        Ok(())
+    }
 }
 
-/// Read, parse, and decrypt the vault file at `path`, returning the decoded
-/// [`Vault`] together with its [`Header`] and the derived [`Key`]. Performs no
-/// writes. Shared by [`OpenVault::open`] and [`OpenVault::export`].
+/// Read, parse, and decrypt the vault file at `path`. Performs no writes.
 fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, Key), VaultError> {
     let raw = match fs::read(path) {
         Ok(b) => b,
@@ -495,27 +463,100 @@ fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, K
     Ok((vault, header, key))
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// Normalize a virtual directory path to `/a/b/c` form (empty string == root).
+fn normalize_dir(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
 }
 
-fn random_id() -> Result<String, CryptoError> {
-    let bytes = crypto::random_bytes::<16>()?;
-    let mut s = String::with_capacity(32);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+/// A short random hex suffix for temp filenames.
+fn rand_suffix() -> Result<String, CryptoError> {
+    Ok(crypto::random_bytes::<8>()?.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A unique, hidden temp path beside `path` (same directory).
+fn sibling_tmp(path: &Path) -> Result<PathBuf, VaultError> {
+    let suffix = rand_suffix()?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let file = format!(".{name}.{suffix}.tmp");
+    Ok(match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(file),
+        _ => PathBuf::from(file),
+    })
+}
+
+/// The single encrypted document-archive path for a vault: `<vault-name>.vol`.
+fn archive_path(vault: &Path) -> PathBuf {
+    let name = vault.file_name().and_then(|n| n.to_str()).unwrap_or("vault");
+    let file = format!("{name}.vol");
+    match vault.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(file),
+        _ => PathBuf::from(file),
     }
-    Ok(s)
+}
+
+/// Read and decrypt the whole document archive (empty map if the file is absent),
+/// authenticated against `vault_id` so a foreign/swapped archive is rejected.
+fn load_archive(path: &Path, key: &Key, vault_id: &str) -> Result<DocArchive, VaultError> {
+    let raw = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DocArchive::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if raw.len() < NONCE_LEN {
+        return Err(VaultError::Truncated);
+    }
+    let (nonce, ciphertext) = raw.split_at(NONCE_LEN);
+    let aad = archive_aad(vault_id);
+    let plaintext = Zeroizing::new(crypto::decrypt(key, nonce, ciphertext, &aad)?);
+    parse_archive(&plaintext)
+}
+
+/// Serialize the archive map to a length-prefixed binary buffer:
+/// `[u32 count]` then per entry `[u32 id_len][id][u64 data_len][data]`.
+fn serialize_archive(map: &DocArchive) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for (id, data) in map {
+        let idb = id.as_bytes();
+        buf.extend_from_slice(&(idb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(idb);
+        buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(data);
+    }
+    buf
+}
+
+/// Parse the archive buffer with bounds-checked reads (the archive is attacker-
+/// controllable, so a malformed buffer must fail closed, never panic). Every
+/// read is bounded by the actual buffer length, so a huge length field cannot
+/// trigger an over-read or over-allocation.
+fn parse_archive(buf: &[u8]) -> Result<DocArchive, VaultError> {
+    fn take<'a>(buf: &'a [u8], cur: &mut usize, n: usize) -> Result<&'a [u8], VaultError> {
+        let end = cur.checked_add(n).ok_or(VaultError::Truncated)?;
+        let slice = buf.get(*cur..end).ok_or(VaultError::Truncated)?;
+        *cur = end;
+        Ok(slice)
+    }
+    let mut map = DocArchive::new();
+    let mut cur = 0usize;
+    let count = u32::from_le_bytes(take(buf, &mut cur, 4)?.try_into().unwrap());
+    for _ in 0..count {
+        let id_len = u32::from_le_bytes(take(buf, &mut cur, 4)?.try_into().unwrap()) as usize;
+        let id = String::from_utf8(take(buf, &mut cur, id_len)?.to_vec())
+            .map_err(|_| VaultError::Truncated)?;
+        let data_len = u64::from_le_bytes(take(buf, &mut cur, 8)?.try_into().unwrap()) as usize;
+        let data = take(buf, &mut cur, data_len)?.to_vec();
+        map.insert(id, Zeroizing::new(data));
+    }
+    Ok(map)
 }
 
 // --- Cross-platform file hardening (req: compile on Windows + Linux) ---------
-//
-// On Unix we set explicit owner-only permission bits. Windows has no portable
-// std equivalent of mode bits; the vault directory under %APPDATA% inherits the
-// per-user profile ACL, so we rely on that. See `docs/DESIGN.md` §9.9.
 
 #[cfg(unix)]
 fn harden_file(path: &Path) -> std::io::Result<()> {
@@ -543,12 +584,12 @@ fn harden_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn harden_dir(_dir: &Path) {}
 
-/// Create a brand-new file at `path`, write `header` + `ciphertext`, and fsync.
-/// Uses `create_new` (O_EXCL) so an existing path — including a pre-planted
-/// symlink — makes this fail instead of being followed/clobbered. On Unix the
-/// 0600 mode is applied atomically at creation, so the file is never readable
-/// by other users even momentarily.
-fn write_new_file(path: &Path, header: &[u8], ciphertext: &[u8]) -> Result<(), VaultError> {
+/// Create a brand-new file at `path`, write `part1` + `part2`, and fsync. Uses
+/// `create_new` (O_EXCL) so an existing path — including a pre-planted symlink —
+/// makes this fail instead of being followed. On Unix the 0600 mode is applied
+/// atomically at creation. Used for both the vault file (header+ciphertext) and
+/// the document archive (nonce+ciphertext).
+fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultError> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -558,14 +599,13 @@ fn write_new_file(path: &Path, header: &[u8], ciphertext: &[u8]) -> Result<(), V
     }
     let mut f = opts.open(path)?;
     harden_file(path)?; // belt-and-suspenders (no-op on non-unix)
-    f.write_all(header)?;
-    f.write_all(ciphertext)?;
+    f.write_all(part1)?;
+    f.write_all(part2)?;
     f.sync_all()?;
     Ok(())
 }
 
-/// fsync the directory containing `path` so a rename into it is durable across a
-/// crash/power loss. No-op on platforms without directory fsync.
+/// fsync the directory containing `path` so a rename into it is durable.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
     let parent = path
@@ -583,38 +623,42 @@ fn sync_parent_dir(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::{self, Account};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fast() -> KdfParams {
         KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
     }
 
+    fn nanos() -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    }
+
     fn tmp_path(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        p.push(format!("passmgr-test-{tag}-{nanos}.pmv"));
+        p.push(format!("passmgr-test-{tag}-{}.pmv", nanos()));
         p
+    }
+
+    fn sample_account(user: &str, pw: &str) -> Account {
+        let mut a = Account::new().unwrap();
+        a.account_type = "Checking".into();
+        a.username = user.into();
+        a.password = pw.into();
+        a
     }
 
     #[test]
     fn create_open_round_trip() {
         let path = tmp_path("roundtrip");
         let mut v = OpenVault::create(path.clone(), b"first", b"second", fast()).unwrap();
-        let mut e = Entry::new("GitHub".into()).unwrap();
-        e.username = "octocat".into();
-        e.password = "hunter2".into();
-        e.kind = "Login".into();
-        v.vault.upsert(e);
+        records::upsert(&mut v.vault.accounts, sample_account("octocat", "hunter2"));
         v.save().unwrap();
 
         let reopened = OpenVault::open(path.clone(), b"first", b"second").unwrap();
-        assert_eq!(reopened.vault.entries.len(), 1);
-        assert_eq!(reopened.vault.entries[0].title, "GitHub");
-        assert_eq!(reopened.vault.entries[0].password, "hunter2");
+        assert_eq!(reopened.vault.accounts.len(), 1);
+        assert_eq!(reopened.vault.accounts[0].password, "hunter2");
         assert_eq!(reopened.vault.version, FORMAT_VERSION);
-
         fs::remove_file(&path).ok();
     }
 
@@ -622,10 +666,8 @@ mod tests {
     fn both_passwords_required() {
         let path = tmp_path("twopw");
         OpenVault::create(path.clone(), b"right1", b"right2", fast()).unwrap();
-        // Either password wrong -> decrypt fails.
         assert!(OpenVault::open(path.clone(), b"wrong1", b"right2").is_err());
         assert!(OpenVault::open(path.clone(), b"right1", b"wrong2").is_err());
-        // Both right -> succeeds.
         assert!(OpenVault::open(path.clone(), b"right1", b"right2").is_ok());
         fs::remove_file(&path).ok();
     }
@@ -634,7 +676,6 @@ mod tests {
     fn password_order_matters() {
         let path = tmp_path("order");
         OpenVault::create(path.clone(), b"alpha", b"beta", fast()).unwrap();
-        // Swapping the two passwords must not unlock.
         assert!(OpenVault::open(path.clone(), b"beta", b"alpha").is_err());
         fs::remove_file(&path).ok();
     }
@@ -654,12 +695,29 @@ mod tests {
     fn change_password_works() {
         let path = tmp_path("changepw");
         let mut v = OpenVault::create(path.clone(), b"old1", b"old2", fast()).unwrap();
-        v.vault.upsert(Entry::new("Item".into()).unwrap());
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
         v.change_password(b"new1", b"new2").unwrap();
 
         assert!(OpenVault::open(path.clone(), b"old1", b"old2").is_err());
         let reopened = OpenVault::open(path.clone(), b"new1", b"new2").unwrap();
-        assert_eq!(reopened.vault.entries.len(), 1);
+        assert_eq!(reopened.vault.accounts.len(), 1);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn change_password_keeps_documents_readable() {
+        let path = tmp_path("rekeydoc");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut src = std::env::temp_dir();
+        src.push(format!("passmgr-src-{}.txt", nanos()));
+        fs::write(&src, b"will body").unwrap();
+        let id = v.add_document("/wills", "will.txt", &src).unwrap();
+        v.change_password(b"c", b"d").unwrap();
+
+        let reopened = OpenVault::open(path.clone(), b"c", b"d").unwrap();
+        assert_eq!(&reopened.read_document(&id).unwrap()[..], b"will body");
+        fs::remove_file(&src).ok();
+        fs::remove_file(archive_path(&path)).ok();
         fs::remove_file(&path).ok();
     }
 
@@ -667,7 +725,7 @@ mod tests {
     fn truncated_file_detected() {
         let path = tmp_path("trunc");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        fs::write(&path, b"PMVAULT\0").unwrap(); // header-only, no body
+        fs::write(&path, b"PMVAULT\0").unwrap();
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_err());
         fs::remove_file(&path).ok();
     }
@@ -676,99 +734,20 @@ mod tests {
     fn last_access_is_tracked() {
         let path = tmp_path("access");
         let created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        assert_eq!(created.previous_access(), 0, "new vault has no prior access");
+        assert_eq!(created.previous_access(), 0);
         let first_access = created.vault.last_opened_at;
-
         let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        // The reopen reports the access time written by create() as the previous one.
         assert_eq!(reopened.previous_access(), first_access);
         fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn export_reads_without_mutating() {
-        let path = tmp_path("export");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        v.vault.upsert(Entry::new("Thing".into()).unwrap());
-        v.save().unwrap();
-        let before = fs::read(&path).unwrap();
-
-        let exported = OpenVault::export(&path, b"a", b"b").unwrap();
-        assert_eq!(exported.entries.len(), 1);
-        assert_eq!(exported.entries[0].title, "Thing");
-
-        // export() must not rewrite the file.
-        let after = fs::read(&path).unwrap();
-        assert_eq!(before, after, "export must not modify the vault file");
-
-        // Wrong passwords still rejected.
-        assert!(OpenVault::export(&path, b"a", b"WRONG").is_err());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn upsert_records_history() {
-        let mut vault = Vault::default();
-        let mut e = Entry::new("Mail".into()).unwrap();
-        e.username = "alice".into();
-        let id = e.id.clone();
-        vault.upsert(e);
-        assert_eq!(vault.entries[0].history.len(), 1); // "created"
-        assert_eq!(vault.entries[0].history[0].action, "created");
-
-        // Edit username + password.
-        let mut edited = vault.entries[0].clone();
-        edited.username = "bob".into();
-        edited.password = "s3cret".into();
-        vault.upsert(edited);
-
-        let hist = &vault.entries[0].history;
-        assert!(hist.iter().any(|c| c.action == "updated" && c.detail.contains("username")));
-        // History records the full before/after password values (req. 4/5).
-        let pw = hist.iter().find(|c| c.action == "password_changed").unwrap();
-        assert!(pw.detail.contains("s3cret"), "history should record the new password");
-        assert!(pw.detail.starts_with("password:"));
-
-        // id is stable across edits.
-        assert_eq!(vault.entries[0].id, id);
-    }
-
-    #[test]
-    fn types_register_and_filter() {
-        let mut vault = Vault::default();
-        let mut login = Entry::new("Bank".into()).unwrap();
-        login.kind = "Login".into();
-        let mut server = Entry::new("Prod".into()).unwrap();
-        server.kind = "Server".into();
-        vault.upsert(login);
-        vault.upsert(server);
-
-        assert_eq!(vault.types, vec!["Login".to_string(), "Server".to_string()]);
-        assert_eq!(vault.filter("", Some("Server")).len(), 1);
-        assert_eq!(vault.filter("", Some("server")).len(), 1); // case-insensitive
-        assert_eq!(vault.filter("", None).len(), 2);
-    }
-
-    #[test]
-    fn deletion_logged_in_audit() {
-        let mut vault = Vault::default();
-        let e = Entry::new("Temp".into()).unwrap();
-        let id = e.id.clone();
-        vault.upsert(e);
-        assert!(vault.remove(&id));
-        assert!(vault.audit.iter().any(|c| c.action == "deleted" && c.detail == "Temp"));
-        assert!(!vault.remove(&id)); // already gone
     }
 
     #[test]
     fn rejects_absurd_kdf_params() {
         let path = tmp_path("badparams");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        // Corrupt the m_cost field (header bytes 9..13) to u32::MAX.
         let mut raw = fs::read(&path).unwrap();
         raw[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &raw).unwrap();
-        // Must be rejected at header-parse time, before the memory-hard KDF runs.
         let err = OpenVault::open(path.clone(), b"a", b"b")
             .err()
             .expect("absurd KDF params must be rejected");
@@ -777,29 +756,107 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_trimmed_on_upsert() {
-        let mut vault = Vault::default();
-        let mut e = Entry::new("Bank".into()).unwrap();
-        e.kind = "  Login  ".into();
-        vault.upsert(e);
-        // Stored kind and registered type match, and the entry is filterable.
-        assert_eq!(vault.entries[0].kind, "Login");
-        assert_eq!(vault.types, vec!["Login".to_string()]);
-        assert_eq!(vault.filter("", Some("Login")).len(), 1);
+    fn export_reads_without_mutating() {
+        let path = tmp_path("export");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("octocat", "pw"));
+        v.save().unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let exported = OpenVault::export(&path, b"a", b"b").unwrap();
+        assert_eq!(exported.accounts.len(), 1);
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(before, after, "export must not modify the vault file");
+        assert!(OpenVault::export(&path, b"a", b"WRONG").is_err());
+        fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn search_filters_and_sorts() {
-        let mut vault = Vault::default();
-        let mut a = Entry::new("Zebra".into()).unwrap();
-        a.username = "z@x.com".into();
-        let b = Entry::new("Apple".into()).unwrap();
-        let c = Entry::new("Banana".into()).unwrap();
-        vault.upsert(a);
-        vault.upsert(b);
-        vault.upsert(c);
-        let titles: Vec<&str> = vault.filter("", None).iter().map(|e| e.title.as_str()).collect();
-        assert_eq!(titles, vec!["Apple", "Banana", "Zebra"]);
-        assert_eq!(vault.filter("zeb", None).len(), 1);
+    fn document_volume_round_trip() {
+        let path = tmp_path("vol");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+
+        let mut src = std::env::temp_dir();
+        src.push(format!("passmgr-src-{}.txt", nanos()));
+        fs::write(&src, b"statement contents").unwrap();
+
+        let id1 = v.add_document("/statements/2026", "q1.txt", &src).unwrap();
+        let id2 = v.add_document("/wills", "will.txt", &src).unwrap();
+        assert_eq!(v.vault.volume.files.len(), 2);
+        assert!(v.vault.volume.directories.contains(&"/statements".to_string()));
+        assert!(v.vault.volume.uploads.iter().any(|c| c.action == "uploaded"));
+
+        // Both documents live in ONE archive file decrypted as a unit.
+        let arc = archive_path(&path);
+        assert!(arc.exists(), "single archive file should exist");
+        let raw = fs::read(&arc).unwrap();
+        assert!(
+            raw.windows(b"statement contents".len()).all(|w| w != b"statement contents"),
+            "archive must be encrypted"
+        );
+
+        assert_eq!(&v.read_document(&id1).unwrap()[..], b"statement contents");
+
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&v2.read_document(&id1).unwrap()[..], b"statement contents");
+        assert_eq!(&v2.read_document(&id2).unwrap()[..], b"statement contents");
+        assert!(v2.read_document("deadbeef").is_err());
+
+        fs::remove_file(&src).ok();
+        fs::remove_file(&arc).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn archive_mismatch_detected_when_stale() {
+        let path = tmp_path("mismatch");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut src = std::env::temp_dir();
+        src.push(format!("passmgr-src-{}.txt", nanos()));
+        fs::write(&src, b"doc").unwrap();
+        v.add_document("/d", "f.txt", &src).unwrap();
+
+        // Drop the archive: the manifest still references the document id, so the
+        // on-open consistency check must reject it (a stale/missing/rolled-back .vol).
+        fs::remove_file(archive_path(&path)).unwrap();
+        let err = OpenVault::open(path.clone(), b"a", b"b")
+            .err()
+            .expect("a manifest id with no archive entry must be rejected");
+        assert!(matches!(err, VaultError::ArchiveMismatch));
+        fs::remove_file(&src).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn remove_document_reclaims_blob() {
+        let path = tmp_path("rmdoc");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut src = std::env::temp_dir();
+        src.push(format!("passmgr-src-{}.txt", nanos()));
+        fs::write(&src, b"doc").unwrap();
+        let id = v.add_document("/d", "f.txt", &src).unwrap();
+        assert!(v.read_document(&id).is_ok());
+
+        v.remove_document(&id).unwrap();
+        assert!(v.read_document(&id).is_err(), "blob is gone from the archive");
+        assert!(v.vault.volume.files.iter().all(|f| f.id != id), "manifest entry removed");
+
+        // Reopen: archive is now empty and consistent with the empty manifest.
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v2.vault.volume.files.is_empty());
+        fs::remove_file(&src).ok();
+        let _ = fs::remove_file(archive_path(&path));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn malformed_archive_fails_closed() {
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&5u32.to_le_bytes()); // claims 5 entries
+        bad.extend_from_slice(&9999u32.to_le_bytes()); // absurd id_len, no data
+        assert!(parse_archive(&bad).is_err());
+        assert!(parse_archive(&[]).is_err());
+        assert!(parse_archive(&0u32.to_le_bytes()).unwrap().is_empty());
     }
 }

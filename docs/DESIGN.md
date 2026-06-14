@@ -55,38 +55,44 @@ load-bearing design decision, not an omission (req. 1).
 
 ## 4. Data model
 
-All types live in `vault.rs` and serialize to JSON.
+The model lives in `records.rs` and serializes to JSON. The app is a five-tab
+estate vault: each tab is a `Vec` of one record type. Every record shares an
+`id` (128-bit random hex, stable across edits), `created_at`/`updated_at`, and an
+append-only `history: Vec<Change>` (req. 4, 5). The shared insert/edit/diff logic
+is the `Record` trait + generic `upsert`/`remove`.
 
 ```text
 Vault
-├── version: u8                  // schema version for forward migration
-├── last_opened_at: i64          // unix seconds, set on each successful unlock (req. 6)
-├── types: Vec<String>           // the set of custom types the user has created (req. 2)
-├── audit: Vec<Change>           // vault-level log: created, password changed, etc. (req. 4)
-└── entries: Vec<Entry>
+├── version: u8                  // schema version (currently 3)
+├── last_opened_at: i64          // set on each successful unlock (req. 6)
+├── instructions:  Vec<Instruction>   // Tab 1: title, description
+├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
+├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
+│                                     //         institution, type, statement (doc id)
+├── accounts:      Vec<Account>       // Tab 4: account_type, owner, username, password, url, description
+├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account
+├── volume: Volume               // document-archive manifest (metadata only)
+└── audit: Vec<Change>           // vault-level log: created, password changed, deletions, uploads
 
-Entry
-├── id: String                   // 128-bit random hex, stable across edits
-├── title: String                // short label, used for sorting/search
-├── kind: String                 // the custom "type" (e.g. "Login", "Server") (req. 2)
-├── description: String          // free text (req. 3)
-├── username: String             // (req. 3)
-├── password: String             // (req. 3)
-├── url: String                  // (req. 3)
-├── created_at: i64              // unix seconds
-├── updated_at: i64              // unix seconds, refreshed on edit
-└── history: Vec<Change>         // append-only log of edits to THIS entry (req. 4, 5)
+Volume                            // metadata for the encrypted document archive
+├── directories: Vec<String>     // virtual directory tree (e.g. "/statements/2026")
+├── files: Vec<VolumeFile>       // {id, location, filename, size, uploaded_at, source}
+└── uploads: Vec<Change>         // upload history: location / date / file (req)
 
 Change
 ├── at: i64                      // unix-seconds timestamp
-├── action: String               // "created" | "updated" | "deleted" | "password_changed" | ...
+├── action: String               // "created" | "updated" | "deleted" | "uploaded" | ...
 └── detail: String               // human-readable summary, e.g. "username: alice -> bob"
 ```
 
+The `kind`/`asset_type`/`account_type` dropdown values come from external,
+editable JSON lists in the data dir (`types/asset_types.json`,
+`types/account_types.json`), auto-created with defaults (req. 2).
+
 ### 4.1 History semantics (req. 4 & 5)
 
-- **Append-only.** A `Change` is pushed to `Entry.history` on every mutation. We
-  never rewrite or drop earlier entries, so the audit trail is tamper-evident
+- **Append-only.** A `Change` is pushed to a record's history on every mutation.
+  We never rewrite or drop earlier entries, so the audit trail is tamper-evident
   _within_ the (already integrity-protected) vault.
 - The `detail` string records **field-name + before/after** for every changed
   field, **including the password** (e.g. `password: "old" -> "new"`). This
@@ -96,12 +102,37 @@ Change
 - Deletions are recorded in the **vault-level** `audit` log (the entry itself is
   gone, so it cannot hold its own tombstone).
 
-### 4.2 Custom types (req. 2)
+### 4.2 Category types (req. 2)
 
-`kind` is a freeform string. New values entered in the UI are added to
-`Vault.types` so they appear in the filter bar and in an autocomplete list. The
-filter bar offers `All` plus one chip per known type. Filtering is combined with
-the existing case-insensitive text search (title / username / url).
+The Asset/Liability "type" and the Account "account type" are chosen from
+dropdowns populated by external JSON lists (`types/asset_types.json`,
+`types/account_types.json`) created with sensible defaults on first run and
+editable by the user. They are stored unencrypted (category names only).
+
+### 4.3 Encrypted document volume
+
+Statements, wills, and other documents are uploaded into a **single encrypted
+archive** file `<vault>.vol`, decrypted as one unit on unlock and re-encrypted
+as one unit on change (an "encrypted zip"):
+
+- The archive holds the document bytes keyed by a random file id, encrypted with
+  the same vault key (XChaCha20-Poly1305, fresh random nonce per write). On disk:
+  `nonce ‖ ciphertext`.
+- **Identity binding:** the AEAD associated data is a fixed tag plus the vault's
+  random `volume.id`, so a `.vol` from a different vault (or a swapped one) fails
+  authentication. On open, a **consistency check** also requires every document
+  referenced by the manifest to be present in the archive, rejecting a stale or
+  rolled-back `.vol` that is missing newer documents.
+- **Lifecycle:** deleting a record or detaching a document **reclaims** its blob
+  from the archive (and logs the removal), so "deleted" documents do not linger.
+  Attaching immediately persists the record→document link, so no orphan is left.
+- The vault JSON's `Volume` holds only metadata (vault id, virtual location,
+  filename, size, upload time/source) and the upload/removal history.
+- The archive plaintext is a length-prefixed binary frame
+  (`[count][id_len][id][data_len][data]…`); parsing is fully bounds-checked so a
+  crafted/corrupted archive fails closed rather than panicking or over-allocating.
+- Whole archive is held decrypted in memory while the vault is open (acceptable
+  for the standalone, single-user use case; see §9).
 
 ## 5. Cryptography
 
@@ -327,6 +358,16 @@ complete new one — never a half-written vault. On platforms without directory
 fsync a hard power loss could still lose the last save (never corrupt the file).
 Any truncated/garbled file is additionally caught by the AEAD tag on open (fails
 closed). See §6.
+
+### 9.12 Whole-snapshot rollback is out of scope
+The document archive is bound to its vault (`volume.id` in the AEAD AAD) and an
+on-open check rejects a `.vol` that is *inconsistent* with the vault manifest
+(missing referenced documents) — so an attacker can't swap in another vault's
+archive or a stale archive that drops newer documents. What no at-rest scheme
+can prevent without an external trusted counter is an attacker restoring a
+**matched older pair** of `vault.pmv` + `vault.pmv.vol` (a full, self-consistent
+snapshot): that simply looks like the vault as it was at that time. This is the
+same inherent limitation that applies to the main vault file on its own.
 
 ## 10. Non-goals
 

@@ -1,16 +1,20 @@
 # pass-mgr
 
-A **standalone, offline** password manager with both a **graphical** and a
-**terminal** UI. Credentials are stored in a single, strongly-encrypted file
-that never leaves your machine — no network, no sync, no telemetry.
+A **standalone, offline** estate vault with both a **graphical** and a
+**terminal** UI. Everything is stored strongly-encrypted on your machine — no
+network, no sync, no telemetry.
 
+- **Five tabs:** Instructions · Trust and Will · Assets and Liabilities ·
+  Accounts · Real Estate.
 - **Two passwords**, entered in sequence, are required to open a vault
   (chained Argon2id key derivation).
 - **XChaCha20-Poly1305** authenticated encryption; the data is JSON, encrypted
   at rest.
-- **Custom types + filters**, full-text search, per-entry **change history**
-  with timestamps, and **last-access** tracking.
-- Built-in **random password generator**.
+- **Encrypted document volume:** statements/wills are uploaded into a single
+  encrypted container (`<vault>.vol`) decrypted as a unit.
+- Per-record **change history** with timestamps, **last-access** tracking, and a
+  built-in **random password generator**.
+- Asset/Account category dropdowns from editable external JSON lists.
 - Cross-platform: **Linux and Windows**.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture, crypto details, and
@@ -74,10 +78,10 @@ pass-mgr decrypt [VAULT]    Decrypt the vault and print its JSON to stdout
 pass-mgr --help             Show help
 ```
 
-Both UIs read and write the same vault file and expose the same features
-(create/unlock, search + type filters, history, random password generation,
-change master passwords). The key-binding tables below apply to the **terminal**
-UI; the graphical UI uses on-screen buttons.
+Both UIs read and write the same vault and expose the same features across the
+five tabs (record list + edit form, document upload/export, history, random
+password generation, change master passwords). The graphical UI uses on-screen
+buttons; the terminal key bindings are below.
 
 The default vault location is per-user:
 
@@ -94,40 +98,33 @@ With no vault present you'll see the **Create** screen: choose two passwords,
 each entered twice to confirm. Afterwards every launch shows the **Unlock**
 screen, which needs both passwords in sequence.
 
-### Key bindings
+### Terminal key bindings
 
-**List screen**
+**Browse screen**
 
 | Key | Action |
 |-----|--------|
-| type | filter entries (search) |
+| ← / → or Tab, or 1–5 | switch tab |
 | ↑ / ↓ | move selection |
-| Enter | open entry |
-| Tab / Ctrl+F | cycle the type filter |
-| Ctrl+N | new entry |
-| Ctrl+D | delete selected |
-| Ctrl+P | change master passwords |
-| Esc | clear search, or quit if empty |
-
-**Detail screen**
-
-| Key | Action |
-|-----|--------|
-| r | reveal / hide password |
-| c | copy password to clipboard |
-| h | toggle change history |
-| e | edit |
-| Ctrl+D | delete |
-| Esc | back to list |
+| Enter | edit selected record |
+| n | new record |
+| d | delete selected |
+| p | change master passwords |
+| q / Esc | quit |
 
 **Edit screen**
 
 | Key | Action |
 |-----|--------|
 | Tab / ↑ / ↓ | move between fields |
-| Ctrl+G | generate a random password |
-| Ctrl+R | reveal / hide password field |
+| ← / → | cycle a dropdown field |
 | Ctrl+S | save |
+| Ctrl+G | generate a random password |
+| Ctrl+R | reveal / hide password |
+| Ctrl+Y | copy password to clipboard |
+| Ctrl+U | upload document into the encrypted volume (Trust/Will, Assets) |
+| Ctrl+E | export the attached document to a path |
+| Ctrl+K | detach document from the record |
 | Esc | cancel |
 
 ## Decrypting at the command line
@@ -150,10 +147,16 @@ cargo test       # run the unit test suite
 cargo clippy     # lints
 ```
 
-## The vault file
+## The vault files
 
-The file starts with the magic bytes `PMVAULT\0` so it is easily identifiable.
-Its 61-byte header (magic, version, KDF parameters, salt, nonce) is plaintext and
-self-describing; everything after it is authenticated ciphertext. Saves are
-atomic (write to a temp file, then rename), so an interrupted write cannot
-corrupt an existing vault.
+- `vault.pmv` — the main vault. Starts with magic bytes `PMVAULT\0` (identifiable);
+  its 61-byte header (magic, version, KDF parameters, salt, nonce) is plaintext and
+  self-describing, and everything after it is authenticated ciphertext (the JSON of
+  all records + document metadata).
+- `vault.pmv.vol` — the single encrypted **document archive**: every uploaded
+  statement/will/document, encrypted together and decrypted as one unit. Created
+  only once you upload a document.
+
+Saves are atomic (write to a unique temp file, fsync, rename, then fsync the
+directory), so an interrupted write cannot corrupt an existing vault or archive.
+Type-list JSON files live (unencrypted) under the data dir's `types/`.
