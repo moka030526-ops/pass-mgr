@@ -17,8 +17,9 @@
 //!   37      24   nonce   (XChaCha20-Poly1305)
 //!   61      ..   XChaCha20-Poly1305 ciphertext of the JSON vault
 //! ```
-//! The first 37 header bytes (everything but the nonce) are the AEAD associated
-//! data, so tampering with the version/params/salt is detected on decrypt.
+//! The **entire 61-byte header** (magic, version, params, salt, and nonce) is the
+//! AEAD associated data, so tampering with any of it — a cost-parameter
+//! downgrade, a swapped salt, a flipped nonce — fails the Poly1305 tag on decrypt.
 //!
 //! The key is derived from **two** passwords via a chained Argon2id derivation
 //! (see [`crate::crypto::derive_key_chained`] and `docs/DESIGN.md`). Format
@@ -81,9 +82,6 @@ const MAX_P_COST: u32 = 16;
 // and fail closed.
 const MAX_DOCUMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB per uploaded document
 const MAX_ARCHIVE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB total archive on disk
-/// Bytes of the header used as AEAD associated data: everything *except* the
-/// 24-byte nonce. The nonce is bound implicitly as the cipher's nonce input.
-const AAD_LEN: usize = HEADER_LEN - NONCE_LEN;
 
 #[derive(Error, Debug)]
 pub enum VaultError {
@@ -354,11 +352,14 @@ impl OpenVault {
         self.vault.generation = self.vault.generation.saturating_add(1);
         let plaintext = Zeroizing::new(serde_json::to_vec(&self.vault)?);
 
-        let mut header = Header { params: self.params, salt: self.salt, nonce: [0u8; NONCE_LEN] };
-        let aad = header.to_bytes();
-        let (nonce, ciphertext) = crypto::encrypt(&self.key, &plaintext, &aad[..AAD_LEN])?;
-        header.nonce = nonce;
+        // Generate the nonce first and place it in the header, so the WHOLE header
+        // (magic, version, Argon2 params, salt, nonce) is authenticated as AAD —
+        // nobody can downgrade the cost parameters or swap the salt/nonce without
+        // invalidating the Poly1305 tag.
+        let nonce = crypto::random_bytes::<NONCE_LEN>()?;
+        let header = Header { params: self.params, salt: self.salt, nonce };
         let header_bytes = header.to_bytes();
+        let ciphertext = crypto::encrypt_with_nonce(&self.key, &nonce, &plaintext, &header_bytes)?;
 
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
@@ -641,8 +642,10 @@ fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, K
     let header = Header::parse(&raw)?;
     let ciphertext = &raw[HEADER_LEN..];
     let key = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params)?;
+    // The full header (including the nonce) is the AEAD associated data, so any
+    // tampering with version/params/salt/nonce fails the tag check.
     let aad = header.to_bytes();
-    let plaintext = Zeroizing::new(crypto::decrypt(&key, &header.nonce, ciphertext, &aad[..AAD_LEN])?);
+    let plaintext = Zeroizing::new(crypto::decrypt(&key, &header.nonce, ciphertext, &aad)?);
     let vault: Vault = serde_json::from_slice(&plaintext)?;
     Ok((vault, header, key))
 }
@@ -880,6 +883,24 @@ fn sync_parent_dir(path: &Path) {
 
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
+
+/// Fuzzing entry points (hidden from the public API / docs). They feed
+/// attacker-controlled bytes straight into the two untrusted-input parsers so a
+/// fuzzer can assert the invariant: **never panic, never over-allocate, only
+/// ever return `Err` on malformed input.** Used by the targets under `fuzz/`.
+#[doc(hidden)]
+pub mod fuzz {
+    /// Drive the vault-file header parser (magic, version, KDF-param bounds).
+    pub fn header(buf: &[u8]) {
+        let _ = super::Header::parse(buf);
+    }
+
+    /// Drive the decrypted document-archive binary parser (length-prefixed
+    /// entries — the hand-rolled, bounds-checked format).
+    pub fn archive(buf: &[u8]) {
+        let _ = super::parse_archive(buf);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1325,6 +1346,34 @@ mod tests {
         drop(f);
         assert!(matches!(OpenVault::open(path.clone(), b"a", b"b"), Err(VaultError::TooLarge)));
         fs::remove_file(&vol).ok();
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn header_tampering_is_detected() {
+        // The whole header is AEAD associated data: flipping the KDF params, the
+        // salt, or the nonce must make the file fail to open (no silent downgrade
+        // or salt/nonce swap).
+        let path = tmp_path("hdrtamper");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let good = fs::read(&path).unwrap();
+
+        let flipped_fails = |offset: usize| -> bool {
+            let mut bad = good.clone();
+            bad[offset] ^= 0x01;
+            let p = tmp_path("hdrtamper-x");
+            fs::write(&p, &bad).unwrap();
+            let failed = OpenVault::open(p.clone(), b"a", b"b").is_err();
+            fs::remove_file(&p).ok();
+            failed
+        };
+
+        // Header layout: m_cost@9, salt@21, nonce@37 (see the module docs).
+        assert!(flipped_fails(9), "KDF-parameter tampering must be detected");
+        assert!(flipped_fails(21), "salt tampering must be detected");
+        assert!(flipped_fails(37), "nonce tampering must be detected");
+        // Sanity: the untouched file still opens.
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
         fs::remove_file(&path).ok();
     }
 }

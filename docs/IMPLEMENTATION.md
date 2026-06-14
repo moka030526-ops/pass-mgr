@@ -71,11 +71,14 @@ the editable type lists travel with the encrypted vault (see §5).
 
 - **Vault file** (`vault.pmv`): a 61-byte plaintext header (magic `PMVAULT\0`,
   format version 3, Argon2 params, salt, nonce) followed by the
-  XChaCha20-Poly1305 ciphertext of the JSON `Vault`. The first 37 header bytes
-  (everything but the nonce) are the AEAD associated data. KDF params are
-  range-checked on parse (DoS guard). Saves are atomic: write a unique hidden
-  temp file with `create_new`+0600, fsync, rename, fsync the directory; the write
-  `generation` is bumped each save.
+  XChaCha20-Poly1305 ciphertext of the JSON `Vault`. The **entire 61-byte header
+  — including the nonce — is the AEAD associated data**: `save` generates the
+  nonce first, writes it into the header, and passes the whole header to
+  `crypto::encrypt_with_nonce`, so a downgrade of the Argon2 params or a swap of
+  the salt/nonce can't go undetected (verified by `header_tampering_is_detected`).
+  KDF params are range-checked on parse (DoS guard). Saves are atomic: write a
+  unique hidden temp file with `create_new`+0600, fsync, rename, fsync the
+  directory; the write `generation` is bumped each save.
 - **Document archive** (`vault.pmv.vol` by default): a *single* encrypted
   container holding all uploaded document bytes (`nonce ‖ ciphertext`), decrypted
   as a unit on open. Bound to the vault via `volume.id` in the AEAD AAD; on open,
@@ -99,7 +102,10 @@ the editable type lists travel with the encrypted vault (see §5).
 - **KDF:** Argon2id, 64 MiB / 3 / 1 defaults. Two passwords are chained:
   `k1 = Argon2id(pw1, salt1)`, `key = Argon2id(pw2, k1)`. Both required; order
   matters; neither verifiable independently.
-- **AEAD:** XChaCha20-Poly1305, fresh 24-byte random nonce per write.
+- **AEAD:** XChaCha20-Poly1305, fresh 24-byte random nonce per write. The vault
+  path uses `encrypt_with_nonce` so the nonce can be placed in the header and the
+  **whole header authenticated as associated data** (`encrypt` — which picks its
+  own nonce — is kept for the document archive, whose AAD is the `volume.id`).
 - **Key memory:** the derived `Key` is a boxed `[u8;32]` whose page(s) are
   `mlock`/`VirtualLock`'d (the `region` crate) so the key is not paged to swap;
   wiped then unlocked on drop. Transient stack copies are zeroized.

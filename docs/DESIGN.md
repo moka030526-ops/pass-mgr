@@ -164,12 +164,17 @@ Creating a vault is itself a write, so first-run creation requires `--write`.
   32-byte output. Parameters are stored in the file header so the vault stays
   self-describing and the cost can be raised later without breaking old files.
 - **AEAD:** XChaCha20-Poly1305. 24-byte random nonce per write (large enough that
-  random nonces won't collide in practice). The header bytes *excluding the
-  nonce* (magic + version + KDF parameters + salt — the first 37 bytes) are fed
-  in as **associated data**, so any tampering with the version, KDF parameters,
-  or salt is detected on decrypt. The nonce itself is not part of the AAD because
-  it is already bound as the cipher's nonce input — altering it makes the
-  authentication tag fail regardless.
+  random nonces won't collide in practice). The **entire 61-byte header** — magic,
+  version, all three Argon2 parameters, salt, **and the nonce** — is fed in as
+  **associated data**, so every header field is bound under the Poly1305 tag.
+  Tampering with any of it (a cost-parameter *downgrade*, a *swapped salt*, a
+  *flipped nonce*) is detected on decrypt. To bind the nonce, the nonce is
+  generated first, written into the header, and the whole header is passed as AAD
+  to `encrypt_with_nonce` (rather than letting the cipher pick the nonce after the
+  AAD is fixed). This is belt-and-suspenders: the params/salt already influence
+  the derived key and the nonce is already the cipher nonce, but authenticating
+  them explicitly closes any room for an undetected downgrade/swap and makes the
+  property auditable. See §5.4 and the `header_tampering_is_detected` test.
 
 ### 5.2 Two-password chained derivation (req. 9)
 
@@ -204,6 +209,63 @@ key  = Argon2id(password2, salt = k1, params) // 32 bytes, used for AEAD
 - Decrypted plaintext buffers are explicitly `zeroize()`d after use.
 - `k1` (the intermediate key) is also zeroized after the second derivation.
 
+### 5.4 Encryption scheme — end-to-end methodology
+
+Putting §5.1–§5.3 together, this is exactly what happens to your data.
+
+**Creating / saving the vault**
+
+1. On create, generate a random 16-byte `salt1` and a random `volume.id`.
+2. Derive the key from the two passwords (chained Argon2id, §5.2):
+   `k1 = Argon2id(pw1, salt1)`, `key = Argon2id(pw2, salt = k1)`.
+3. Serialize the whole vault (records, history, document manifest, **and the
+   category lists**) to JSON.
+4. Generate a fresh random 24-byte nonce and write it into the header.
+5. AEAD-encrypt the JSON: `ct = XChaCha20-Poly1305(key, nonce, plaintext,
+   aad = full 61-byte header)`. The header (magic, version, Argon2 params, salt,
+   nonce) is the associated data, so it is authenticated but not encrypted.
+6. Write `header ‖ ct` atomically (temp file + `fsync` + rename + dir `fsync`).
+
+**Opening the vault**
+
+1. Parse and range-check the header (reject absurd Argon2 params before doing any
+   memory-hard work — a DoS guard).
+2. Re-derive `key` from the two passwords + the header's salt/params.
+3. AEAD-decrypt, verifying the Poly1305 tag over `(full header, ciphertext)`. A
+   wrong password, a corrupted body, or **any** altered header field fails here —
+   there is no separate password check, so the tag is the single source of truth.
+
+**Documents** are encrypted separately into `<vault>.vol` with the same `key`
+(`nonce ‖ ciphertext`), with the vault's `volume.id` as associated data so a
+foreign or swapped archive is rejected, and an open-time manifest⊆archive check
+rejects a stale archive that drops newer documents (§9.12).
+
+**Methodology / rationale.** Standard, well-reviewed primitives only (Argon2id,
+XChaCha20-Poly1305) from audited Rust crates; no home-grown crypto and no
+`unsafe`. Encrypt-then-MAC is provided by the AEAD construction itself. The file
+is self-describing (params in the header) so cost can be raised over time without
+breaking old vaults. Secrets are memory-locked (§9.6) and zeroized on drop.
+
+**Weaknesses / limits of the scheme** (details in §9):
+
+- **Password-grade security.** The vault is only as strong as the two passwords.
+  Argon2id makes guessing expensive but cannot save weak passwords; chaining does
+  **not** make brute force quadratic (§5.2 caveat, §9.1).
+- **No password verifier.** The only way to know a password is right is a full
+  AEAD decrypt; conversely there is no rate-limiting/lockout against an attacker
+  who has the file and guesses offline (§9.2, §9.7).
+- **History retains old passwords** in the (encrypted) vault by design (§9.4).
+- **Confidentiality, not anti-forensics.** The plaintext header leaks that this
+  is a pass-mgr vault and its KDF cost; file size leaks the rough data volume.
+- **At-rest only.** Once unlocked, the key and plaintext live in process memory;
+  a compromised host (malware, keylogger, debugger, cold-boot) defeats every
+  in-process measure (§9.14). Memory zeroization/locking is best-effort (§9.6).
+- **Rollback of a full matched pair** (`vault.pmv` + `.vol`) can't be detected at
+  rest without an external trusted counter (§9.12).
+- **Nonce reuse** would be catastrophic for any stream cipher; here nonces are
+  random per write, and the 24-byte XChaCha nonce space makes collision
+  negligible — but this relies on the OS CSPRNG being sound.
+
 ## 6. On-disk file format (req. 8, 11)
 
 All integers little-endian. The header is plaintext (so the file is
@@ -212,18 +274,19 @@ self-identifying and self-describing); the body is ciphertext.
 ```text
 offset  len  field
 0       8    magic            b"PMVAULT\0"            (req. 11 — identifiable)
-8       1    format version   currently 2
+8       1    format version   currently 3
 9       4    Argon2 m_cost (KiB)
 13      4    Argon2 t_cost
 17      4    Argon2 p_cost
 21      16   salt1            (first-pass KDF salt)
 37      24   nonce            (XChaCha20-Poly1305)
-61      ..   ciphertext       AEAD(JSON vault), header[0..61] as associated data
+61      ..   ciphertext       AEAD(JSON vault), full 61-byte header as assoc. data
 ```
 
-- The first 37 header bytes (everything except the nonce) are the AEAD
-  associated data, so the magic/version/params/salt are authenticated even
-  though they are not secret. The nonce is bound implicitly as the cipher nonce.
+- The **entire 61-byte header** (magic, version, params, salt, nonce) is the AEAD
+  associated data, so every field is authenticated under the Poly1305 tag even
+  though none of it is secret — a cost-parameter downgrade, a swapped salt, or a
+  flipped nonce all fail the tag on open (§5.1, §5.4).
 - **Atomic writes:** the vault is written to a uniquely-named, hidden temp file
   (`.<name>.<random>.tmp`) created with `create_new`/`O_EXCL` so a pre-planted
   symlink at a predictable path cannot be followed, `fsync`'d, then renamed over
@@ -236,10 +299,12 @@ offset  len  field
   range-checked before the memory-hard derivation runs, so a crafted header
   cannot force a huge Argon2 allocation (DoS).
 
-> Note: format version bumps from 1 → 2 because the two-password scheme and the
-> richer schema (types/history/last_opened_at) change both the header meaning and
-> the JSON shape. Version 1 files (if any exist from early prototyping) are not
-> auto-migrated; see §9.5.
+> Note: the current format is **version 3** (the estate-vault schema with the
+> embedded document manifest and category lists). Earlier prototype versions are
+> not auto-migrated; an unsupported version is reported rather than risk a lossy
+> migration (see §9.5). The byte layout above is unchanged from v3's introduction;
+> the AAD now covers the full header (it previously covered the first 37 bytes),
+> a binding tightened deliberately — older test vaults must be recreated.
 
 ## 7. User interface (req. 10)
 

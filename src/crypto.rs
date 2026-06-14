@@ -5,8 +5,11 @@
 //!   random per-vault salt. KDF parameters are stored in the vault header so the
 //!   file stays self-describing and we can raise the cost over time.
 //! - Vault bytes are encrypted with **XChaCha20-Poly1305** (AEAD). The 24-byte
-//!   nonce is random per write; the vault header is fed in as *associated data*
-//!   so any tampering with the version/params/salt is detected on decrypt.
+//!   nonce is random per write; the **entire vault header — magic, version,
+//!   Argon2 parameters, salt, AND the nonce — is fed in as associated data**, so
+//!   any tampering with it (a cost-parameter downgrade, a swapped salt, a flipped
+//!   nonce) is detected by the Poly1305 tag on decrypt. To make that possible the
+//!   nonce is generated first and authenticated via [`encrypt_with_nonce`].
 //! - The derived [`Key`] zeroizes its bytes on drop.
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -153,20 +156,34 @@ pub fn derive_key_chained(
     derive_key(pw2, k1.as_bytes(), params)
 }
 
-/// Encrypt `plaintext` with a freshly generated nonce, binding `aad` (the vault
-/// header) into the authentication tag. Returns `(nonce, ciphertext)`.
+/// Encrypt `plaintext` with a freshly generated nonce, binding `aad` into the
+/// authentication tag. Returns `(nonce, ciphertext)`. Used for the document
+/// archive, whose nonce is stored alongside the ciphertext and bound implicitly
+/// (the AAD there is the vault-instance id).
 pub fn encrypt(
     key: &Key,
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<([u8; NONCE_LEN], Vec<u8>), CryptoError> {
     let nonce_bytes = random_bytes::<NONCE_LEN>()?;
-    let nonce = XNonce::from_slice(&nonce_bytes);
-    let ciphertext = key
-        .cipher()
-        .encrypt(nonce, Payload { msg: plaintext, aad })
-        .map_err(|_| CryptoError::Encrypt)?;
-    Ok((nonce_bytes, ciphertext))
+    encrypt_with_nonce(key, &nonce_bytes, plaintext, aad).map(|ct| (nonce_bytes, ct))
+}
+
+/// Encrypt `plaintext` under a **caller-supplied** nonce, binding `aad` into the
+/// authentication tag. This lets the caller place the nonce into the header and
+/// then authenticate that whole header (nonce included) as `aad` — closing any
+/// gap for an undetected nonce/salt/parameter swap. The caller must supply a
+/// fresh, unique nonce per encryption (we always pass a random one).
+pub fn encrypt_with_nonce(
+    key: &Key,
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let xnonce = XNonce::from_slice(nonce);
+    key.cipher()
+        .encrypt(xnonce, Payload { msg: plaintext, aad })
+        .map_err(|_| CryptoError::Encrypt)
 }
 
 /// Decrypt `ciphertext`, verifying the tag against `aad`. Returns the plaintext
@@ -222,6 +239,18 @@ mod tests {
         let (nonce, mut ct) = encrypt(&key, b"secret", b"aad").unwrap();
         ct[0] ^= 0xff;
         assert!(decrypt(&key, &nonce, &ct, b"aad").is_err());
+    }
+
+    #[test]
+    fn encrypt_with_nonce_round_trips_and_binds_nonce() {
+        let key = derive_key(b"pw", b"sixteen-byte-slt", &fast()).unwrap();
+        let nonce = [7u8; NONCE_LEN];
+        let aad = b"full-header-bytes";
+        let ct = encrypt_with_nonce(&key, &nonce, b"secret", aad).unwrap();
+        assert_eq!(decrypt(&key, &nonce, &ct, aad).unwrap(), b"secret");
+        // A different nonce (or different aad) must not verify.
+        assert!(decrypt(&key, &[9u8; NONCE_LEN], &ct, aad).is_err());
+        assert!(decrypt(&key, &nonce, &ct, b"other-header").is_err());
     }
 
     #[test]
