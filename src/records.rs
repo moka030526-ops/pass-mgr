@@ -548,9 +548,14 @@ mod tests {
     fn civil_from_unix_known_dates() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil_from_unix(1_609_459_200), (2021, 1, 1, 0, 0, 0));
-        // A leap day: 2024-02-29 12:34:56 UTC = 1709209? compute precisely.
-        // 2024-02-29T00:00:00Z = 1709164800.
+        // A leap day: 2024-02-29T00:00:00Z = 1709164800.
         assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
+        // The day AFTER the leap day exercises the Feb->Mar month transition.
+        assert_eq!(civil_from_unix(1_709_251_200), (2024, 3, 1, 0, 0, 0));
+        // Non-zero time-of-day pins the h/m/s extraction (sod/3600, %3600/60, %60).
+        assert_eq!(civil_from_unix(1_609_459_200 + 3600 + 120 + 45), (2021, 1, 1, 1, 2, 45));
+        // The last second of a year (year rollover boundary).
+        assert_eq!(civil_from_unix(1_609_459_199), (2020, 12, 31, 23, 59, 59));
         assert_eq!(civil_from_unix(-100), (1970, 1, 1, 0, 0, 0)); // clamps to epoch
     }
 }

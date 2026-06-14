@@ -1035,6 +1035,45 @@ mod tests {
     }
 
     #[test]
+    fn header_parse_param_and_length_boundaries() {
+        // Build a 61-byte header with the given KDF params (no ciphertext needed:
+        // Header::parse validates magic/version/params/length only).
+        fn header_bytes(m: u32, t: u32, p: u32) -> [u8; HEADER_LEN] {
+            let mut b = [0u8; HEADER_LEN];
+            b[0..8].copy_from_slice(MAGIC);
+            b[8] = FORMAT_VERSION;
+            b[9..13].copy_from_slice(&m.to_le_bytes());
+            b[13..17].copy_from_slice(&t.to_le_bytes());
+            b[17..21].copy_from_slice(&p.to_le_bytes());
+            b
+        }
+        // Exactly at each bound: accepted (kills `< ` -> `<=`, `>` -> `>=`).
+        assert!(Header::parse(&header_bytes(8, 1, 1)).is_ok());
+        assert!(Header::parse(&header_bytes(MAX_M_COST, MAX_T_COST, MAX_P_COST)).is_ok());
+        // One step outside each bound: rejected (kills the `||` and comparison mutants).
+        for h in [
+            header_bytes(7, 1, 1),
+            header_bytes(MAX_M_COST + 1, 1, 1),
+            header_bytes(8, 0, 1),
+            header_bytes(8, MAX_T_COST + 1, 1),
+            header_bytes(8, 1, 0),
+            header_bytes(8, 1, MAX_P_COST + 1),
+        ] {
+            assert!(matches!(Header::parse(&h), Err(VaultError::BadParams)), "params should be rejected");
+        }
+        // Exactly HEADER_LEN bytes is NOT truncated; one byte short is (kills `<`->`<=`).
+        assert!(Header::parse(&header_bytes(8, 1, 1)[..]).is_ok());
+        assert!(matches!(Header::parse(&header_bytes(8, 1, 1)[..HEADER_LEN - 1]), Err(VaultError::Truncated)));
+        // Bad magic / unsupported version.
+        let mut bad_magic = header_bytes(8, 1, 1);
+        bad_magic[0] ^= 0xFF;
+        assert!(matches!(Header::parse(&bad_magic), Err(VaultError::BadMagic)));
+        let mut bad_version = header_bytes(8, 1, 1);
+        bad_version[8] = FORMAT_VERSION + 1;
+        assert!(matches!(Header::parse(&bad_version), Err(VaultError::BadVersion(_))));
+    }
+
+    #[test]
     fn header_tampering_is_detected() {
         let path = tmp_path("hdrtamper");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
