@@ -483,6 +483,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unix_now_is_a_realistic_timestamp() {
+        // Guards the clock source (and kills a "return a constant" mutation): the
+        // value must be after 2023-11-14 and before 2100.
+        let now = unix_now();
+        assert!(now > 1_700_000_000, "timestamp implausibly early: {now}");
+        assert!(now < 4_102_444_800, "timestamp implausibly late: {now}");
+    }
+
+    #[test]
     fn upsert_inserts_then_edits_with_history() {
         let mut list: Vec<Account> = Vec::new();
         let mut a = Account::new().unwrap();

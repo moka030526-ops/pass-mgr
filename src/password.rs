@@ -170,4 +170,27 @@ mod tests {
             assert!(uniform(7).unwrap() < 7);
         }
     }
+
+    #[test]
+    fn uniform_covers_the_whole_range() {
+        // Over many draws every index in 0..n must appear. This rejects a sampler
+        // that collapses to a constant (e.g. always 0 or 1) or grossly biases the
+        // output away from part of the range.
+        let n = 6;
+        let mut seen = [false; 6];
+        for _ in 0..3000 {
+            seen[uniform(n).unwrap()] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "uniform must reach every index in 0..n");
+    }
+
+    #[test]
+    fn generate_has_high_character_diversity() {
+        // A correct generator drawing from all four classes produces many distinct
+        // characters; a constant-index sampler would collapse to only a handful.
+        let opts = GenOptions { length: 64, ..Default::default() };
+        let pw = generate(&opts).unwrap();
+        let distinct: std::collections::BTreeSet<u8> = pw.bytes().collect();
+        assert!(distinct.len() >= 16, "expected diverse output, got {} distinct", distinct.len());
+    }
 }

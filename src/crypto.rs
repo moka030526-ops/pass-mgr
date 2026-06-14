@@ -100,6 +100,14 @@ impl Key {
 impl Drop for Key {
     fn drop(&mut self) {
         // Wipe before the lock guard drops (which unlocks the page).
+        //
+        // NOTE: mutation testing flags this `drop` body as an un-killed mutant
+        // (replacing it with a no-op still passes the suite). That is an inherent
+        // limit, not a gap: confirming a destructor wiped its bytes means reading
+        // memory after the value is gone, which is use-after-free — undefined
+        // behavior, and impossible here since the crate is `#![forbid(unsafe_code)]`.
+        // The behavior is exercised (keys are dropped throughout the tests) and the
+        // zeroize call is a well-reviewed one-liner; see DESIGN §9.6.
         self.bytes[..].zeroize();
     }
 }
