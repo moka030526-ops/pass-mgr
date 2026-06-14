@@ -1217,6 +1217,23 @@ mod tests {
     }
 
     #[test]
+    fn read_facilities_do_not_mutate_the_vault() {
+        // decrypt/manifest/extract are read-only: they must not bump the
+        // generation or otherwise change the on-disk vault.
+        let (path, _docs) = seed_multi_partition("nomutate", b"a", b"b");
+        let before = fs::read(&path).unwrap();
+        let gen_before = OpenVault::export(&path, b"a", b"b").unwrap().generation;
+        let _ = OpenVault::export(&path, b"a", b"b").unwrap();
+        let _ = OpenVault::export_manifests(&path, b"a", b"b", None).unwrap();
+        let _ = OpenVault::export_documents(&path, b"a", b"b", None).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(before, after, "the vault file is byte-identical after read facilities");
+        let gen_after = OpenVault::export(&path, b"a", b"b").unwrap().generation;
+        assert_eq!(gen_before, gen_after, "generation unchanged");
+        cleanup(&path);
+    }
+
+    #[test]
     fn set_volume_max_size_governs_future_placement() {
         let path = tmp_path("volcfg");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
@@ -1496,5 +1513,24 @@ mod tests {
         }
         assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
         cleanup(&path);
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        /// Virtual paths are always rooted, and `normalize_dir` is idempotent and
+        /// never yields empty ("//") segments — so the limit check and storage see
+        /// a single canonical form.
+        #[test]
+        fn prop_virtual_path_rooted_and_normalize_idempotent(
+            loc in "[ -~]{0,80}",
+            name in "[ -~]{1,40}",
+        ) {
+            let vp = virtual_path(&loc, &name);
+            prop_assert!(vp.starts_with('/'), "virtual path is rooted: {vp:?}");
+            let n1 = normalize_dir(&loc);
+            prop_assert_eq!(normalize_dir(&n1), n1.clone());
+            prop_assert!(!n1.contains("//"), "no empty segments: {n1:?}");
+            prop_assert!(n1.is_empty() || n1.starts_with('/'));
+        }
     }
 }

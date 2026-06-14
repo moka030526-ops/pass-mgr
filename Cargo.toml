@@ -20,6 +20,11 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
+[dev-dependencies]
+# Property-based testing for the parsers, the store invariants, and path
+# normalization (§13.4).
+proptest = "1"
+
 [profile.release]
 # Strip symbols and debug info from the release binary (smaller distributable).
 strip = true

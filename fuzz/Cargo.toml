@@ -23,8 +23,22 @@ doc = false
 bench = false
 
 [[bin]]
-name = "parse_archive"
-path = "fuzz_targets/parse_archive.rs"
+name = "parse_frame"
+path = "fuzz_targets/parse_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_manifest"
+path = "fuzz_targets/parse_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_volume"
+path = "fuzz_targets/scan_volume.rs"
 test = false
 doc = false
 bench = false

@@ -212,7 +212,9 @@ impl VolumeStore {
     pub fn read(&self, id: &str, key: &Key) -> Result<Zeroizing<Vec<u8>>, StorageError> {
         let loc = *self.index.get(id).ok_or_else(|| StorageError::NotFound(id.to_string()))?;
         let mut f = File::open(self.volume_path(loc.partition))?;
-        let (_id, _path, bytes) = read_frame_at(&mut f, loc.offset, loc.length, key, &self.aad(loc.partition))?;
+        let file_len = f.metadata()?.len();
+        let (_id, _path, bytes) =
+            read_frame_at(&mut f, file_len, loc.offset, loc.length, key, &self.aad(loc.partition))?;
         Ok(bytes)
     }
 
@@ -341,36 +343,45 @@ impl VolumeStore {
         let mut f = File::open(self.volume_path(part))?;
         let file_len = f.metadata()?.len();
         let aad = volume_aad(&self.vault_id, part);
-        let mut offset = 0u64;
-        // Last write wins for a repeated id (updates append a newer frame).
-        let mut latest: BTreeMap<String, ManifestEntry> = BTreeMap::new();
-        let mut order: Vec<String> = Vec::new();
-        while offset + FRAME_PREFIX_LEN <= file_len {
-            match read_frame_at(&mut f, offset, 0, key, &aad) {
-                Ok((id, path, bytes)) => {
-                    // read_frame_at(length=0) parsed the prefix to learn the size;
-                    // recover the on-disk frame length to advance.
-                    let frame_len = frame_total_len(&mut f, offset)?;
-                    let entry = ManifestEntry {
-                        id: id.clone(),
-                        path,
-                        size: bytes.len() as u64,
-                        offset,
-                        length: frame_len,
-                        uploaded_at: 0,
-                    };
-                    if latest.insert(id.clone(), entry).is_none() {
-                        order.push(id);
-                    }
-                    offset += frame_len;
-                }
-                // Torn/garbage/foreign frame → end of valid data.
-                Err(_) => break,
-            }
-        }
-        let entries: Vec<ManifestEntry> = order.into_iter().filter_map(|id| latest.remove(&id)).collect();
-        Ok(Manifest { seq: 1, end_offset: offset, entries })
+        Ok(scan_volume(&mut f, file_len, key, &aad))
     }
+}
+
+/// Scan a self-describing volume (any `Read + Seek`) from the start, decrypting
+/// frame after frame, and rebuild its manifest up to the last good frame. Any
+/// torn / garbage / foreign / undersized frame ends the scan, so this never
+/// fails — it returns whatever prefix is intact. Used by both the on-disk
+/// rebuild path and the fuzzer.
+fn scan_volume<R: Read + Seek>(f: &mut R, file_len: u64, key: &Key, aad: &[u8]) -> Manifest {
+    let mut offset = 0u64;
+    // Last write wins for a repeated id (updates append a newer frame).
+    let mut latest: BTreeMap<String, ManifestEntry> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    while offset + FRAME_PREFIX_LEN <= file_len {
+        match read_frame_at(f, file_len, offset, 0, key, aad) {
+            Ok((id, path, bytes)) => {
+                // read_frame_at(length=0) parsed the prefix to learn the size;
+                // recover the on-disk frame length to advance.
+                let Ok(frame_len) = frame_total_len(f, offset) else { break };
+                let entry = ManifestEntry {
+                    id: id.clone(),
+                    path,
+                    size: bytes.len() as u64,
+                    offset,
+                    length: frame_len,
+                    uploaded_at: 0,
+                };
+                if latest.insert(id.clone(), entry).is_none() {
+                    order.push(id);
+                }
+                offset += frame_len;
+            }
+            // Torn/garbage/foreign frame → end of valid data.
+            Err(_) => break,
+        }
+    }
+    let entries: Vec<ManifestEntry> = order.into_iter().filter_map(|id| latest.remove(&id)).collect();
+    Manifest { seq: 1, end_offset: offset, entries }
 }
 
 // --- Frame & AAD helpers -----------------------------------------------------
@@ -411,24 +422,25 @@ fn encode_frame(key: &Key, vault_id: &str, part: u32, id: &str, path: &str, byte
 
 /// Read the `[u32 frame_len]` at `offset` and return the total frame length
 /// (`4 + frame_len`), bounds-checked against the file.
-fn frame_total_len(f: &mut File, offset: u64) -> Result<u64, StorageError> {
+fn frame_total_len<R: Read + Seek>(f: &mut R, offset: u64) -> Result<u64, StorageError> {
     f.seek(SeekFrom::Start(offset))?;
     let mut lb = [0u8; 4];
     f.read_exact(&mut lb)?;
     Ok(FRAME_PREFIX_LEN + u32::from_le_bytes(lb) as u64)
 }
 
-/// Read and decrypt the frame at `offset`. If `expected_len` is non-zero it is a
-/// sanity check against the manifest. Returns `(id, path, doc_bytes)`. Every read
-/// is bounds-checked so a corrupt length can't over-read or over-allocate.
-fn read_frame_at(
-    f: &mut File,
+/// Read and decrypt the frame at `offset` within a reader of length `file_len`.
+/// If `expected_len` is non-zero it is a sanity check against the manifest.
+/// Returns `(id, path, doc_bytes)`. Every read is bounds-checked so a corrupt
+/// length can't over-read or over-allocate.
+fn read_frame_at<R: Read + Seek>(
+    f: &mut R,
+    file_len: u64,
     offset: u64,
     expected_len: u64,
     key: &Key,
     aad: &[u8],
 ) -> Result<(String, String, Zeroizing<Vec<u8>>), StorageError> {
-    let file_len = f.metadata()?.len();
     if offset + FRAME_PREFIX_LEN > file_len {
         return Err(StorageError::Corrupt("frame offset past EOF".into()));
     }
@@ -557,6 +569,46 @@ fn harden_dir(dir: &Path) {
 }
 #[cfg(not(unix))]
 fn harden_dir(_dir: &Path) {}
+
+/// Fuzz entry points: feed arbitrary bytes into the untrusted-input parsers.
+/// The invariant is strict — these must only ever return (`Ok`/`Err` internally),
+/// never panic, hang, or over-allocate, no matter the input.
+pub mod fuzz {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::OnceLock;
+
+    /// A cheap, process-wide key so fuzzing the scanner doesn't pay an Argon2
+    /// derivation per input (decryption fails on arbitrary bytes regardless; the
+    /// key value is irrelevant to the parse/bounds logic under test).
+    fn fuzz_key() -> &'static Key {
+        static KEY: OnceLock<Key> = OnceLock::new();
+        KEY.get_or_init(|| {
+            crypto::derive_key(b"fuzz", b"sixteen-byte-slt", &crypto::KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 })
+                .expect("fuzz key derivation")
+        })
+    }
+
+    /// The decrypted-manifest JSON parser (post-decrypt path).
+    pub fn manifest(buf: &[u8]) {
+        let _ = serde_json::from_slice::<Manifest>(buf);
+    }
+
+    /// The hand-rolled decrypted-frame plaintext parser
+    /// (`[u32 id_len][id][u32 path_len][path][bytes]`) — the highest-risk
+    /// length-prefixed surface for an out-of-bounds read or over-allocation.
+    pub fn frame(buf: &[u8]) {
+        let _ = parse_plaintext(buf);
+    }
+
+    /// The volume scan/rebuild path over arbitrary bytes: exercises the frame
+    /// length prefix, the bounds checks, and the seek/advance loop.
+    pub fn scan_volume(buf: &[u8]) {
+        let aad = volume_aad("fuzz", 0);
+        let mut cur = Cursor::new(buf);
+        let _ = super::scan_volume(&mut cur, buf.len() as u64, fuzz_key(), &aad);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -728,5 +780,215 @@ mod tests {
         let other = VolumeStore::open(&dir, &key, "vault-B", DEFAULT_VOLUME_MAX_SIZE).unwrap();
         assert!(!other.contains("a"), "documents are not readable under a foreign vault id");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Phase 7: parsers, AAD binding, bounds, nonce uniqueness, crash matrix --
+
+    /// Build a decrypted-frame plaintext `[u32 id_len][id][u32 path_len][path][body]`.
+    fn frame_plaintext(id: &str, path: &str, body: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        p.extend_from_slice(id.as_bytes());
+        p.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        p.extend_from_slice(path.as_bytes());
+        p.extend_from_slice(body);
+        p
+    }
+
+    #[test]
+    fn frame_plaintext_round_trips_and_rejects_malformed() {
+        let p = frame_plaintext("the-id", "/loc/file.pdf", b"body bytes");
+        let (id, path, body) = parse_plaintext(&p).unwrap();
+        assert_eq!(id, "the-id");
+        assert_eq!(path, "/loc/file.pdf");
+        assert_eq!(&body[..], b"body bytes");
+        // Too short for even the id-length prefix.
+        assert!(parse_plaintext(b"\x01\x00").is_err());
+        // id_len claims more bytes than are present.
+        let mut short = (99u32).to_le_bytes().to_vec();
+        short.extend_from_slice(b"abc");
+        assert!(matches!(parse_plaintext(&short), Err(StorageError::Corrupt(_))));
+        // id_len = u32::MAX must not wrap or over-allocate.
+        let mut huge = u32::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(b"x");
+        assert!(parse_plaintext(&huge).is_err());
+    }
+
+    #[test]
+    fn read_frame_at_bounds_and_per_blob_aad() {
+        let dir = tmp_dir("frame");
+        let key = fast_key();
+        let aad0 = volume_aad("v", 0);
+        let frame = encode_frame(&key, "v", 0, "id", "/p", b"payload").unwrap();
+        let vol = dir.join("vol");
+        append_frame(&vol, 0, &frame).unwrap();
+        let mut f = File::open(&vol).unwrap();
+        let len = f.metadata().unwrap().len();
+        // Correct read, including the expected-length sanity check.
+        let (id, path, body) = read_frame_at(&mut f, len, 0, len, &key, &aad0).unwrap();
+        assert_eq!((id.as_str(), path.as_str(), &body[..]), ("id", "/p", &b"payload"[..]));
+        // Per-blob AAD binding: a frame for partition 0 won't authenticate as 1.
+        assert!(read_frame_at(&mut f, len, 0, 0, &key, &volume_aad("v", 1)).is_err());
+        // Foreign vault-id AAD also fails.
+        assert!(read_frame_at(&mut f, len, 0, 0, &key, &volume_aad("other", 0)).is_err());
+        // An expected-length that disagrees with the manifest is rejected.
+        assert!(read_frame_at(&mut f, len, 0, len + 1, &key, &aad0).is_err());
+        // Offset past EOF.
+        assert!(read_frame_at(&mut f, len, len + 1, 0, &key, &aad0).is_err());
+        // A corrupt length prefix (u32::MAX) is rejected, not over-read.
+        {
+            let mut w = OpenOptions::new().write(true).open(&vol).unwrap();
+            w.write_all(&u32::MAX.to_le_bytes()).unwrap();
+            w.sync_all().unwrap();
+        }
+        let mut f2 = File::open(&vol).unwrap();
+        let len2 = f2.metadata().unwrap().len();
+        assert!(read_frame_at(&mut f2, len2, 0, 0, &key, &aad0).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn manifest_aad_binds_vault_id_and_partition() {
+        let dir = tmp_dir("maad");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "vault-A", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"data", 1, &key).unwrap();
+        let raw = std::fs::read(dir.join("manifest/manifest.0")).unwrap();
+        let (nonce, ct) = raw.split_at(NONCE_LEN);
+        // The right AAD decrypts; the wrong vault id or partition does not.
+        assert!(crypto::decrypt(&key, nonce, ct, &manifest_aad("vault-A", 0)).is_ok());
+        assert!(crypto::decrypt(&key, nonce, ct, &manifest_aad("vault-B", 0)).is_err());
+        assert!(crypto::decrypt(&key, nonce, ct, &manifest_aad("vault-A", 1)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frame_nonces_are_unique_across_writes() {
+        let dir = tmp_dir("nonce");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        for i in 0..50 {
+            s.put(&format!("id{i}"), "/p", b"identical body", i as i64, &key).unwrap();
+        }
+        let bytes = std::fs::read(dir.join("volume/vol.0")).unwrap();
+        let mut nonces = std::collections::BTreeSet::new();
+        let mut off = 0usize;
+        while off + 4 <= bytes.len() {
+            let flen = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+            let nstart = off + 4;
+            if nstart + NONCE_LEN > bytes.len() {
+                break;
+            }
+            nonces.insert(bytes[nstart..nstart + NONCE_LEN].to_vec());
+            off = nstart + flen;
+        }
+        assert_eq!(nonces.len(), 50, "every frame uses a distinct nonce");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrong_key_cannot_read_blob() {
+        let dir = tmp_dir("wrongkey");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"secret", 1, &key).unwrap();
+        let other =
+            derive_key(b"different", b"sixteen-byte-slt", &KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }).unwrap();
+        assert!(s.read("a", &other).is_err(), "a foreign key cannot decrypt the blob");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mid_file_corrupt_frame_stops_rebuild_at_last_good() {
+        let dir = tmp_dir("midcorrupt");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap();
+        let b_off = s.manifests[0].end_offset; // where b's frame will start
+        s.put("b", "/b", b"bravo", 2, &key).unwrap();
+        s.put("c", "/c", b"charlie", 3, &key).unwrap();
+        // Flip a byte inside b's ciphertext (just past its 4-byte len + nonce).
+        {
+            let mut w = OpenOptions::new().read(true).write(true).open(dir.join("volume/vol.0")).unwrap();
+            let pos = b_off + 4 + NONCE_LEN as u64;
+            w.seek(SeekFrom::Start(pos)).unwrap();
+            let mut byte = [0u8; 1];
+            w.read_exact(&mut byte).unwrap();
+            w.seek(SeekFrom::Start(pos)).unwrap();
+            w.write_all(&[byte[0] ^ 0xFF]).unwrap();
+            w.sync_all().unwrap();
+        }
+        // Clobber the manifest to force a rebuild by scanning the volume.
+        std::fs::write(dir.join("manifest/manifest.0"), b"x").unwrap();
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(s2.contains("a"), "frames before the corruption recover");
+        assert!(!s2.contains("b") && !s2.contains("c"), "the scan stops at the corrupt frame");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stray_temp_file_does_not_disturb_open() {
+        // A crash mid manifest temp-write leaves a hidden ".*.tmp" sibling; it must
+        // be ignored (only manifest.<N> is authoritative).
+        let dir = tmp_dir("tmp");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"data", 1, &key).unwrap();
+        std::fs::write(dir.join("manifest/.manifest.0.deadbeef.tmp"), b"garbage temp").unwrap();
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"data");
+        assert_eq!(s2.partition_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        /// Length-prefixed frames round-trip for arbitrary id/path/body, even with
+        /// separators or non-ASCII bytes embedded in the (authenticated) plaintext.
+        #[test]
+        fn prop_frame_plaintext_round_trips(
+            id in "[ -~]{0,40}",
+            path in "[ -~]{0,80}",
+            body in proptest::collection::vec(any::<u8>(), 0..200),
+        ) {
+            let p = frame_plaintext(&id, &path, &body);
+            let (rid, rpath, rbody) = parse_plaintext(&p).unwrap();
+            prop_assert_eq!(rid, id);
+            prop_assert_eq!(rpath, path);
+            prop_assert_eq!(&rbody[..], &body[..]);
+        }
+
+        /// The hand-rolled parser only ever returns Ok/Err on arbitrary bytes.
+        #[test]
+        fn prop_parse_plaintext_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = parse_plaintext(&bytes);
+        }
+
+        /// Manifests serialize/parse round-trip for arbitrary contents.
+        #[test]
+        fn prop_manifest_json_round_trips(seq in any::<u64>(), end in any::<u64>(), n in 0usize..6) {
+            let entries: Vec<ManifestEntry> = (0..n)
+                .map(|i| ManifestEntry {
+                    id: format!("id{i}"),
+                    path: format!("/p/{i}"),
+                    size: i as u64,
+                    offset: i as u64 * 10,
+                    length: 7,
+                    uploaded_at: i as i64,
+                })
+                .collect();
+            let m = Manifest { seq, end_offset: end, entries };
+            let back: Manifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+            prop_assert_eq!(m, back);
+        }
+
+        /// Scanning arbitrary bytes as a volume never panics/over-allocates.
+        #[test]
+        fn prop_scan_volume_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let key = fast_key();
+            let aad = volume_aad("v", 0);
+            let mut cur = std::io::Cursor::new(&bytes);
+            let _ = scan_volume(&mut cur, bytes.len() as u64, &key, &aad);
+        }
     }
 }

@@ -58,7 +58,7 @@ fn light_visuals() -> egui::Visuals {
     v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(248, 250, 253);
     v.widgets.hovered.bg_fill = egui::Color32::from_rgb(232, 240, 252);
     v.selection.bg_fill = egui::Color32::from_rgb(198, 222, 255);
-    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 90, 170));
+    v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 90, 170));
     v
 }
 
