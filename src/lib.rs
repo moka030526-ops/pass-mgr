@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod gui;
 pub mod password;
 pub mod records;
+pub mod storage;
 pub mod types;
 pub mod ui;
 pub mod vault;
