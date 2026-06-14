@@ -398,6 +398,25 @@ impl OpenVault {
         self.previous_generation
     }
 
+    /// The per-partition volume-size cap, in bytes.
+    pub fn volume_max_size(&self) -> u64 {
+        self.vault.settings.volume_max_size
+    }
+
+    /// Set the per-partition volume-size cap (bytes, clamped to >= 1). Updates the
+    /// saved settings and the live store so the change governs **future**
+    /// placement this session, then persists. Existing partitions are untouched.
+    pub fn set_volume_max_size(&mut self, bytes: u64) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        let bytes = bytes.max(1);
+        self.vault.settings.volume_max_size = bytes;
+        self.storage.set_max_size(bytes);
+        self.vault.audit.push(Change::new("volume_size_changed", bytes.to_string()));
+        self.save()
+    }
+
     // --- Documents (delegated to the partitioned store) ----------------------
 
     /// Add the file at `source` under virtual directory `location` with name
@@ -493,7 +512,9 @@ fn parent_dir(vault_file: &Path) -> PathBuf {
 }
 
 /// Normalize `location` and join `filename` into a virtual path "/a/b/file".
-fn virtual_path(location: &str, filename: &str) -> String {
+/// Exposed to the UIs so they can validate path length against
+/// [`storage::MAX_PATH_LEN`] with the exact string the core will store.
+pub(crate) fn virtual_path(location: &str, filename: &str) -> String {
     let loc = normalize_dir(location);
     if loc.is_empty() { format!("/{filename}") } else { format!("{loc}/{filename}") }
 }
@@ -1118,6 +1139,7 @@ mod tests {
         assert_eq!(ro.vault.accounts.len(), 1);
         assert!(matches!(ro.save(), Err(VaultError::ReadOnly)));
         assert!(matches!(ro.change_password(b"c", b"d"), Err(VaultError::ReadOnly)));
+        assert!(matches!(ro.set_volume_max_size(1024), Err(VaultError::ReadOnly)));
         assert!(matches!(ro.remove_document("x"), Err(VaultError::ReadOnly)));
         assert!(matches!(ro.add_asset_type("X"), Err(VaultError::ReadOnly)));
         let src = write_src("ro", b"x");
@@ -1192,6 +1214,32 @@ mod tests {
             Err(VaultError::NoSuchPartition(9))
         ));
         cleanup(&path);
+    }
+
+    #[test]
+    fn set_volume_max_size_governs_future_placement() {
+        let path = tmp_path("volcfg");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // Default cap is large: two small docs share partition 0.
+        let src = write_src("vc", &vec![7u8; 600]);
+        v.add_document("/a", "a.bin", &src).unwrap();
+        v.add_document("/b", "b.bin", &src).unwrap();
+        // Shrink the cap live; it persists and updates the running store.
+        v.set_volume_max_size(1024).unwrap();
+        assert_eq!(v.volume_max_size(), 1024);
+        // A further doc now rolls into a fresh partition.
+        v.add_document("/c", "c.bin", &src).unwrap();
+        drop(v);
+        // All three manifest entries survive; the third is in its own partition.
+        let p1 = OpenVault::export_manifests(&path, b"a", b"b", Some(1)).unwrap();
+        assert_eq!(p1.len(), 1, "the post-resize doc landed in partition 1");
+        let all = OpenVault::export_manifests(&path, b"a", b"b", None).unwrap();
+        assert_eq!(all.len(), 3);
+        // The persisted setting is read back on reopen.
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(reopened.volume_max_size(), 1024);
+        cleanup(&path);
+        fs::remove_file(&src).ok();
     }
 
     // ---- Phase 4: exhaustive rekey crash-injection -------------------------

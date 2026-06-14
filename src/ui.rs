@@ -229,6 +229,7 @@ struct App {
     cfg_account_type: String,
     cfg_subtype_type: String,
     cfg_subtype_name: String,
+    cfg_volume_size: String,
     cfg_backup_dest: String,
     status: String,
     clipboard_dirty: bool,
@@ -272,6 +273,7 @@ impl App {
             cfg_account_type: String::new(),
             cfg_subtype_type: String::new(),
             cfg_subtype_name: String::new(),
+            cfg_volume_size: String::new(),
             cfg_backup_dest: String::new(),
             status: String::new(),
             clipboard_dirty: false,
@@ -604,7 +606,7 @@ impl App {
     }
 
     fn handle_config_key(&mut self, key: KeyEvent) -> bool {
-        const CFG_FIELDS: usize = 5;
+        const CFG_FIELDS: usize = 6;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
@@ -627,15 +629,18 @@ impl App {
             1 => &mut self.cfg_account_type,
             2 => &mut self.cfg_subtype_type,
             3 => &mut self.cfg_subtype_name,
+            4 => &mut self.cfg_volume_size,
             _ => &mut self.cfg_backup_dest,
         }
     }
 
-    /// Perform the focused config action: add a type/subtype or run a backup.
+    /// Perform the focused config action: add a type/subtype, set the volume
+    /// size, or run a backup.
     fn submit_config(&mut self) {
-        // Backup (focus 4) is a read/copy and always allowed; the type/subtype
-        // adds (focus 0..3) write to config files and need --write.
-        if self.cfg_focus != 4 && !self.require_writable() {
+        // Backup (focus 5) is a read/copy and always allowed; the type/subtype
+        // adds and the volume-size change (focus 0..4) mutate the vault and need
+        // --write.
+        if self.cfg_focus != 5 && !self.require_writable() {
             return;
         }
         match self.cfg_focus {
@@ -678,6 +683,19 @@ impl App {
                     Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
+            4 => match self.cfg_volume_size.trim().parse::<u64>() {
+                Ok(mib) if mib >= 1 => {
+                    let bytes = mib.saturating_mul(1024 * 1024);
+                    match self.vault.as_mut().expect("vault open on config").set_volume_max_size(bytes) {
+                        Ok(()) => {
+                            self.status = format!("Volume size set to {mib} MiB (applies to future documents).");
+                            self.cfg_volume_size.clear();
+                        }
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    }
+                }
+                _ => self.status = "Enter a whole number of MiB (at least 1).".into(),
+            },
             _ => {
                 let dest = self.cfg_backup_dest.trim().to_string();
                 if dest.is_empty() {
@@ -979,6 +997,15 @@ impl App {
             self.edit = Some(es);
             return;
         }
+        // Reject an over-length virtual path up front (same limit the core
+        // enforces) so the upload key gives a clear message, not a generic error.
+        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        if vpath_len > crate::storage::MAX_PATH_LEN {
+            self.status =
+                format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
+            self.edit = Some(es);
+            return;
+        }
         let id = match self.vault.as_mut() {
             Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
                 Ok(id) => id,
@@ -1238,6 +1265,7 @@ impl App {
             ("New account type", &self.cfg_account_type),
             ("Subtype — account type", &self.cfg_subtype_type),
             ("Subtype — name", &self.cfg_subtype_name),
+            ("Volume size (MiB)", &self.cfg_volume_size),
             ("Backup destination dir", &self.cfg_backup_dest),
         ];
         let cats = self.vault_ref().categories();
@@ -1251,6 +1279,14 @@ impl App {
             let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
             lines.push(Line::from(Span::styled(format!("  {}: {subs}", t.name), Style::default().fg(Color::Gray))));
         }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Volume size: {} MiB (new documents roll into a fresh volume past this)",
+                self.vault_ref().volume_max_size() / (1024 * 1024)
+            ),
+            Style::default().fg(Color::Gray),
+        )));
         lines.push(Line::from(""));
         for (i, (label, value)) in inputs.iter().enumerate() {
             let focused = i == self.cfg_focus;
@@ -1777,6 +1813,60 @@ mod tests {
         assert!(
             !app.vault.as_ref().unwrap().categories().asset.contains(&"Annuity".to_string()),
             "type add blocked in read-only"
+        );
+        assert!(app.status.contains("Read-only"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn over_length_doc_path_is_rejected_in_tui() {
+        let (mut app, path) = app_unlocked("uipath");
+        app.tab = Tab::Assets;
+        app.start_edit(false); // builds the edit form, appending the doc fields
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let src = std::env::temp_dir().join(format!("passmgr-uipath-{nanos}.txt"));
+        std::fs::write(&src, b"x").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            let rc = es.record_fields;
+            es.fields[rc].value = "/d".into(); // location
+            es.fields[rc + 1].value = "f".repeat(crate::storage::MAX_PATH_LEN); // filename
+            es.fields[rc + 2].value = src.display().to_string(); // upload from
+        }
+        app.attach_document();
+        assert!(app.status.contains("too long"), "status was: {}", app.status);
+        assert!(app.edit.as_ref().unwrap().attached_file_id.is_none(), "nothing attached");
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn volume_size_config_sets_cap_in_tui() {
+        let (mut app, path) = app_unlocked("uivol");
+        app.cfg_focus = 4; // the volume-size field
+        app.cfg_volume_size = "8".into();
+        app.submit_config();
+        assert_eq!(app.vault.as_ref().unwrap().volume_max_size(), 8 * 1024 * 1024);
+        assert!(app.cfg_volume_size.is_empty(), "input cleared on success");
+        // A non-numeric value is rejected and leaves the cap unchanged.
+        app.cfg_volume_size = "abc".into();
+        app.submit_config();
+        assert_eq!(app.vault.as_ref().unwrap().volume_max_size(), 8 * 1024 * 1024);
+        assert!(app.status.contains("MiB"), "status was: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_config_blocks_volume_size() {
+        let (mut app, path) = app_read_only("rovol");
+        app.handle_key(key(KeyCode::Char('c'))); // Config
+        app.cfg_focus = 4;
+        app.cfg_volume_size = "8".into();
+        app.submit_config();
+        assert_eq!(
+            app.vault.as_ref().unwrap().volume_max_size(),
+            crate::storage::DEFAULT_VOLUME_MAX_SIZE,
+            "volume size change blocked in read-only"
         );
         assert!(app.status.contains("Read-only"));
         cleanup(&path);

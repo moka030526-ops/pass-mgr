@@ -200,6 +200,12 @@ impl VolumeStore {
         self.manifests.len()
     }
 
+    /// Update the per-partition size cap for **future** placement decisions
+    /// (existing partitions are untouched). Clamped to at least 1 byte.
+    pub fn set_max_size(&mut self, max_size: u64) {
+        self.max_size = max_size.max(1);
+    }
+
     // --- Reads (lazy: open the one volume, read one frame) -------------------
 
     /// Decrypt and return one stored document.

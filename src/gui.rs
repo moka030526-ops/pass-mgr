@@ -137,6 +137,8 @@ struct GuiApp {
     new_subtype_for: String,
     new_subtype_name: String,
     backup_dest: String,
+    // Volume-size config input (whole MiB).
+    cfg_volume_size: String,
     // Shared document-attach input buffers.
     doc_location: String,
     doc_filename: String,
@@ -194,6 +196,7 @@ impl GuiApp {
             new_subtype_for: String::new(),
             new_subtype_name: String::new(),
             backup_dest: String::new(),
+            cfg_volume_size: String::new(),
             doc_location: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
@@ -458,8 +461,10 @@ impl GuiApp {
         let mut add_account = false;
         let mut add_subtype = false;
         let mut do_backup = false;
-        // Snapshot the category lists (from the open vault) before the render
-        // closure borrows `self` mutably for the text inputs.
+        let mut set_volume = false;
+        // Snapshot the category lists + volume cap (from the open vault) before the
+        // render closure borrows `self` mutably for the text inputs.
+        let cur_volume_mib = self.vault_ref().volume_max_size() / (1024 * 1024);
         let cats = self.vault_ref().categories();
         let type_names = cats.account_type_names();
         let asset_list = cats.asset.join(" · ");
@@ -525,6 +530,26 @@ impl GuiApp {
                     do_backup = true;
                 }
             });
+
+            if self.writable {
+                ui.add_space(16.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Storage — volume size").strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "New documents roll into a fresh volume once a partition passes this size. \
+                         Current: {cur_volume_mib} MiB. Changing it affects only future placement."
+                    ))
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("New size (MiB):");
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg_volume_size).hint_text("e.g. 256").desired_width(140.0));
+                    if ui.button("Set volume size").clicked() {
+                        set_volume = true;
+                    }
+                });
+            }
         });
 
         // Deferred actions (kept out of the closures to keep borrows simple).
@@ -580,6 +605,21 @@ impl GuiApp {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
                     Err(e) => self.status = format!("Backup failed: {e}"),
                 }
+            }
+        }
+        if set_volume {
+            match self.cfg_volume_size.trim().parse::<u64>() {
+                Ok(mib) if mib >= 1 => {
+                    let bytes = mib.saturating_mul(1024 * 1024);
+                    match self.vault.as_mut().expect("vault open on config").set_volume_max_size(bytes) {
+                        Ok(()) => {
+                            self.status = format!("Volume size set to {mib} MiB (applies to future documents).");
+                            self.cfg_volume_size.clear();
+                        }
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    }
+                }
+                _ => self.status = "Enter a whole number of MiB (at least 1).".into(),
             }
         }
 
@@ -1069,6 +1109,15 @@ impl GuiApp {
                     self.status = "Filename and 'upload from' path are required.".into();
                     return;
                 }
+                let vpath = vault::virtual_path(&loc, &name);
+                if vpath.len() > crate::storage::MAX_PATH_LEN {
+                    self.status = format!(
+                        "Path too long: {} bytes (max {}). Shorten the location or filename.",
+                        vpath.len(),
+                        crate::storage::MAX_PATH_LEN
+                    );
+                    return;
+                }
                 let id = match self.vault.as_mut() {
                     Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
                         Ok(id) => id,
@@ -1384,7 +1433,17 @@ fn doc_section(
             ui.add(egui::TextEdit::singleline(source).hint_text("/path/on/disk/file.pdf").desired_width(300.0));
             ui.end_row();
         });
-        if ui.button("⬆ Attach (encrypt into volume)").clicked() {
+        // Validate the virtual path length live (same check the core enforces) so
+        // the limit is surfaced before attaching, and block the button if over.
+        let vpath_len = vault::virtual_path(location, filename).len();
+        let over_limit = vpath_len > crate::storage::MAX_PATH_LEN;
+        if over_limit {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xC0, 0x30, 0x30),
+                format!("Path too long: {vpath_len} / {} bytes — shorten the location or filename.", crate::storage::MAX_PATH_LEN),
+            );
+        }
+        if ui.add_enabled(!over_limit, egui::Button::new("⬆ Attach (encrypt into volume)")).clicked() {
             req = DocReq::Attach;
         }
     } else {
@@ -1519,6 +1578,23 @@ mod tests {
         assert!(app.edit_asset.as_ref().unwrap().statement.is_none());
         assert!(!app.vault.as_ref().unwrap().has_document(&id));
 
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn over_length_doc_path_is_rejected_in_gui() {
+        let (mut app, path) = app_unlocked("guipath");
+        let src = std::env::temp_dir().join(format!("passmgr-guipath-{}.txt", nanos()));
+        std::fs::write(&src, b"x").unwrap();
+        app.edit_asset = Some(AssetLiability::new().unwrap());
+        // A filename that alone pushes the virtual path past MAX_PATH_LEN bytes.
+        app.doc_location = "/d".into();
+        app.doc_filename = "f".repeat(crate::storage::MAX_PATH_LEN);
+        app.doc_source = src.display().to_string();
+        app.handle_doc(DocReq::Attach, DocTarget::Asset);
+        assert!(app.status.contains("too long"), "status was: {}", app.status);
+        assert!(app.edit_asset.as_ref().unwrap().statement.is_none(), "nothing attached");
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }
