@@ -69,6 +69,12 @@ the editable type lists travel with the encrypted vault (see §5).
 
 ## 3. File format & document volume (`vault.rs`)
 
+> **Being replaced (format v4).** The single-`.vol` document store below is
+> superseded by a partitioned, lazily-loaded, crash-safe volume + manifest engine
+> (new `storage.rs`), specified in [`PLAN.md`](PLAN.md) and summarized in
+> `DESIGN.md` §11. The description here is the current (v3) as-built until that
+> lands; the planned module changes are in §10 below.
+
 - **Vault file** (`vault.pmv`): a 61-byte plaintext header (magic `PMVAULT\0`,
   format version 3, Argon2 params, salt, nonce) followed by the
   XChaCha20-Poly1305 ciphertext of the JSON `Vault`. The **entire 61-byte header
@@ -191,7 +197,34 @@ GUI's deferred methods directly, and rendering every TUI screen to a ratatui
 | Key swap-lock | `mlock` | `VirtualLock` (both via `region`) |
 | Portable `.exe` | n/a | `.cargo/config.toml` static-CRT for MSVC |
 
-## 10. Definition of done
+## 10. Planned redesign — partitioned storage (format v4)
+
+Not yet built; authoritative spec in [`PLAN.md`](PLAN.md), design in `DESIGN.md`
+§11. Planned module changes:
+
+- **New `storage.rs`** — the partitioned engine: `Manifest`/`ManifestEntry`,
+  `VolumeStore`; frame encode/decode, atomic manifest writes, lazy open/read,
+  partition selection, the ordered crash-safe commit protocol, scan-rebuild, and
+  the rekey staging/roll-forward.
+- **`records.rs`** — drop the `Volume`/`volume` field from `Vault`; add
+  `settings { volume_max_size }`; records keep doc-id refs (the id→location map
+  moves to the manifests).
+- **`vault.rs`** — `OpenVault` orchestrates `vault.pmv` + `storage`; `open` loads
+  only manifests; document ops go through `storage`; `change_password` runs full
+  re-encryption (stage + `READY` + roll-forward); `FORMAT_VERSION = 4`; an
+  advisory single-writer lockfile; only harden dirs the app creates.
+- **`main.rs`** — directory-based path; remove `--vol`; `decrypt` (vault),
+  `manifest [--part N]` (one/all), `extract [--part N]` (one/all volumes); backup
+  the whole tree.
+- **`ui.rs`/`gui.rs`** — 256-byte path-limit enforcement, volume-size config,
+  lighter theme, and the §11-folded security-review UI fixes.
+
+Verification gate: the full §13 test catalog (incl. a fault-injection harness for
+crash-safety), fuzzing the new parsers, mutation testing, then **two max-depth
+multi-agent reviews** (bug hunt + security) with every confirmed finding fixed
+before this doc is updated to as-built.
+
+## 11. Definition of done
 
 - `cargo build`, `cargo test`, `cargo clippy` clean on Linux; Windows
   cross-compile checks pass.

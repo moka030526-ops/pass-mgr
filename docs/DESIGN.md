@@ -111,6 +111,11 @@ editable by the user. They are stored unencrypted (category names only).
 
 ### 4.3 Encrypted document volume
 
+> **⚠️ Being replaced (format v4).** The single-`<vault>.vol` store described
+> here is superseded by the **partitioned, lazily-loaded, crash-safe volume +
+> manifest** design in **§11** and specified in full in [`PLAN.md`](PLAN.md).
+> This section documents the current (v3) behavior until that lands.
+
 Statements, wills, and other documents are uploaded into a **single encrypted
 archive** file `<vault>.vol`, decrypted as one unit on unlock and re-encrypted
 as one unit on change (an "encrypted zip"):
@@ -508,3 +513,50 @@ Without that, a tampered download cannot be distinguished from a genuine one.
 
 These are deliberately excluded to keep the attack surface and the codebase
 small (req. 1, 13).
+
+## 11. Partitioned document storage (format v4 — target design)
+
+_Status: approved, pending implementation. Full execution spec, test plan, and
+review gates in [`PLAN.md`](PLAN.md)._
+
+The single-`.vol` store (§4.3) is replaced by a partitioned design so the
+document store can grow without bound, load lazily, and survive crashes.
+
+**Layout.** The user supplies only a directory `mypath`; all names are fixed:
+`mypath/vault.pmv`, `mypath/manifest/manifest.<N>`, `mypath/volume/vol.<N>`. The
+`--vol` flag is removed.
+
+**Volumes** are append-only logs of **individually-encrypted, self-describing
+frames** (`[len][nonce][ciphertext]`, with the doc-id and virtual path both inside
+the ciphertext and bound in the AAD). Per-blob encryption is what enables lazy,
+partial reads of large volumes. **Each partition has its own encrypted manifest**
+listing `{id, virtual_path, size, offset, len}` plus a `seq` and the committed
+`end_offset`; manifests are written atomically (temp → fsync → rename → dir fsync).
+
+**Crash-safety (the core).** A write commits in a fixed order — append+fsync the
+blob, then atomically swap the manifest (volume-layer commit), then atomically
+write the vault (final commit). The vault is authoritative; anything in a
+manifest/volume not referenced by the vault is reclaimable garbage; a torn
+trailing frame past `end_offset` is ignored. So **any crash/power loss recovers to
+at least the state prior to the last update, and no partial/corrupt state is ever
+visible.** A lost/corrupt manifest is **rebuilt by scanning** its self-describing
+volume.
+
+**Lazy load.** On open, only the (small) manifests are decrypted into an index;
+volumes are opened on demand and flushed/closed when idle.
+
+**Partitioning.** A configurable `volume_max_size` (default 256 MiB, stored in the
+vault) governs placement of *new* documents; exceeding it starts a new partition.
+Updates append to the **same** partition as the original. No compaction in v1
+(dead blobs accumulate as garbage; a future `compact` command reclaims them).
+
+**Password change** re-encrypts **everything** under a fresh key (full
+re-encryption, not a wrapped data-key), staged in `mypath/.rekey/` with a `READY`
+marker and committed by roll-forward, so a crash mid-rotation leaves either the
+old or the new tree fully working — never a mix. Rationale for full re-encryption
+over an envelope/data-key scheme (rotation must defend against a leaked *old*
+password) is in `PLAN.md` §7.
+
+**CLI** gains directory-based decryption facilities: `decrypt` (vault JSON),
+`manifest [--part N]` (one or all manifests), and `extract [--part N]` (decrypt one
+or all volumes' documents). See `PLAN.md` §8.
