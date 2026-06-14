@@ -190,6 +190,12 @@ impl VolumeStore {
         self.manifests.iter().flat_map(|m| m.entries.iter())
     }
 
+    /// Iterate the metadata of documents in a single partition (empty if that
+    /// partition does not exist).
+    pub fn partition_entries(&self, part: u32) -> impl Iterator<Item = &ManifestEntry> {
+        self.manifests.get(part as usize).into_iter().flat_map(|m| m.entries.iter())
+    }
+
     pub fn partition_count(&self) -> usize {
         self.manifests.len()
     }

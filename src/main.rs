@@ -8,12 +8,13 @@
 //!
 //! Usage:
 //! ```text
-//!   pass-mgr [VAULT]              launch the graphical UI (default vault if omitted)
-//!   pass-mgr --tui [VAULT]        launch the terminal UI instead
-//!   pass-mgr decrypt [VAULT]      decrypt the vault and print its JSON to stdout
-//!   pass-mgr extract [VAULT] DIR  decrypt all stored documents into DIR
-//!   pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
-//!   pass-mgr --help               show this help
+//!   pass-mgr [DIR]                    launch the graphical UI (default vault if omitted)
+//!   pass-mgr --tui [DIR]             launch the terminal UI instead
+//!   pass-mgr decrypt [DIR]           decrypt the vault and print its JSON to stdout
+//!   pass-mgr manifest [DIR] [--part N]  print the document manifest (one partition or all)
+//!   pass-mgr extract [DIR] OUT [--part N]  decrypt documents into OUT (one volume or all)
+//!   pass-mgr backup [DIR] DEST       copy the encrypted vault tree into DEST
+//!   pass-mgr --help                  show this help
 //! ```
 #![forbid(unsafe_code)]
 
@@ -43,22 +44,51 @@ DIR is the vault DIRECTORY (it holds vault.pmv, manifest/, and volume/).
 If omitted, the per-user default directory is used.
 
 USAGE:
-    pass-mgr [DIR]              Launch the graphical UI (read-only by default)
-    pass-mgr --write [DIR]      Launch writable (allow creating/editing/deleting)
-    pass-mgr --tui [DIR]        Launch the terminal UI instead (add --write to edit)
-    pass-mgr decrypt [DIR]      Decrypt the vault and print its JSON to stdout
-    pass-mgr manifest [DIR]     Decrypt and print the document manifest (index)
-    pass-mgr extract [DIR] OUT  Decrypt ALL documents (every volume) into OUT
-    pass-mgr backup [DIR] DEST  Copy the whole encrypted vault tree into DEST (timestamped)
-    pass-mgr --help             Show this help
+    pass-mgr [DIR]                  Launch the graphical UI (read-only by default)
+    pass-mgr --write [DIR]          Launch writable (allow creating/editing/deleting)
+    pass-mgr --tui [DIR]            Launch the terminal UI instead (add --write to edit)
+    pass-mgr decrypt [DIR]          Decrypt the vault and print its JSON to stdout
+    pass-mgr manifest [DIR] [--part N]
+                                    Decrypt the document manifest (index): one
+                                    partition N, or ALL partitions (default)
+    pass-mgr extract [DIR] OUT [--part N]
+                                    Decrypt documents into OUT: one volume/partition
+                                    N, or ALL volumes (default)
+    pass-mgr backup [DIR] DEST      Copy the whole encrypted vault tree into DEST (timestamped)
+    pass-mgr --help                 Show this help
 
 The vault is protected by two passwords entered in sequence. The interactive UI
-opens READ-ONLY unless --write is given. The category dropdown lists are stored
-inside the encrypted vault — there are no external configuration files.";
+opens READ-ONLY unless --write is given (a writable session takes a single-writer
+lock, so a second --write instance fails fast). The category dropdown lists are
+stored inside the encrypted vault — there are no external configuration files.";
 
 /// The vault file inside a user-supplied vault directory.
 fn vault_file(dir: &str) -> PathBuf {
     PathBuf::from(dir).join("vault.pmv")
+}
+
+/// Pull an optional `--part N` / `--part=N` flag out of the argument list,
+/// returning the parsed partition index plus the remaining arguments. Errors if
+/// the flag is present but its value is missing or not a non-negative integer.
+fn extract_part_flag(args: Vec<String>) -> anyhow::Result<(Option<u32>, Vec<String>)> {
+    let parse = |v: &str| {
+        v.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("--part value must be a non-negative integer, got {v:?}"))
+    };
+    let mut part = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--part" {
+            let v = it.next().ok_or_else(|| anyhow::anyhow!("--part requires a partition number"))?;
+            part = Some(parse(&v)?);
+        } else if let Some(v) = a.strip_prefix("--part=") {
+            part = Some(parse(v)?);
+        } else {
+            rest.push(a);
+        }
+    }
+    Ok((part, rest))
 }
 
 fn main() -> ExitCode {
@@ -69,8 +99,17 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Flags may appear anywhere. The interactive UI is read-only unless --write
-    // is given; --tui selects the terminal UI over the graphical one.
+    // Flags may appear anywhere. `--part N` (or `--part=N`) selects one
+    // partition for `manifest`/`extract`; extract it (and its value) first.
+    let (part, args) = match extract_part_flag(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pass-mgr error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The interactive UI is read-only unless --write is given; --tui selects the
+    // terminal UI over the graphical one.
     let writable = args.iter().any(|a| a == "--write");
     let tui = args.iter().any(|a| a == "--tui");
     let pos: Vec<String> =
@@ -79,14 +118,21 @@ fn main() -> ExitCode {
     // The (optional) positional vault DIRECTORY → its vault.pmv file.
     let vault_dir_arg = |i: usize| pos.get(i).map(|d| vault_file(d)).unwrap_or_else(default_vault_path);
 
-    let result = match pos.first().map(String::as_str) {
+    // `--part` only makes sense for the two partition-aware read commands.
+    let cmd = pos.first().map(String::as_str);
+    if part.is_some() && !matches!(cmd, Some("manifest") | Some("extract")) {
+        eprintln!("pass-mgr error: --part only applies to 'manifest' and 'extract'");
+        return ExitCode::FAILURE;
+    }
+
+    let result = match cmd {
         Some("decrypt" | "export") => cli_decrypt(vault_dir_arg(1)),
-        Some("manifest") => cli_manifest(vault_dir_arg(1)),
+        Some("manifest") => cli_manifest(vault_dir_arg(1), part),
         // `extract [DIR] OUT` — the output directory is always the LAST argument.
         Some("extract") => match pos.len() {
-            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1])),
-            3 => cli_extract(vault_file(&pos[1]), PathBuf::from(&pos[2])),
-            _ => Err(anyhow::anyhow!("usage: pass-mgr extract [DIR] <OUTPUT_DIR>")),
+            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1]), part),
+            3 => cli_extract(vault_file(&pos[1]), PathBuf::from(&pos[2]), part),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr extract [DIR] <OUTPUT_DIR> [--part N]")),
         },
         // `backup [DIR] DEST` — copies the encrypted tree; no passwords needed.
         Some("backup") => match pos.len() {
@@ -142,14 +188,15 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Decrypt and print the document manifest (the index of stored documents) as
-/// JSON. Prompts for both passwords; does not modify the vault.
-fn cli_manifest(path: PathBuf) -> anyhow::Result<()> {
+/// JSON. With `part = Some(n)` only partition `n`'s manifest is decrypted; with
+/// `None`, all of them. Prompts for both passwords; does not modify the vault.
+fn cli_manifest(path: PathBuf, part: Option<u32>) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
-    let entries = OpenVault::export_manifests(&path, pw1.as_bytes(), pw2.as_bytes())?;
+    let entries = OpenVault::export_manifests(&path, pw1.as_bytes(), pw2.as_bytes(), part)?;
     println!("{}", serde_json::to_string_pretty(&entries)?);
     Ok(())
 }
@@ -162,22 +209,23 @@ fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decrypt the whole document archive and write every stored document into
-/// `out_dir`, reconstructing the virtual directory tree. Prompts for both
-/// passwords. WARNING: this writes unencrypted copies of all documents to disk.
-fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
+/// Decrypt stored documents and write them into `out_dir`, reconstructing the
+/// virtual directory tree. With `part = Some(n)` only partition `n`'s volume is
+/// decrypted; with `None`, every partition. Prompts for both passwords.
+/// WARNING: this writes unencrypted copies of the documents to disk.
+fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
-    eprintln!(
-        "Extracting documents from {} into {} — these are UNENCRYPTED copies.",
-        path.display(),
-        out_dir.display()
-    );
+    let scope = match part {
+        Some(n) => format!("partition {n} of {}", path.display()),
+        None => path.display().to_string(),
+    };
+    eprintln!("Extracting documents from {scope} into {} — these are UNENCRYPTED copies.", out_dir.display());
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
 
-    let docs = OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes())?;
+    let docs = OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes(), part)?;
     if docs.is_empty() {
         eprintln!("No documents stored in this vault.");
         return Ok(());
@@ -426,5 +474,26 @@ mod tests {
     #[test]
     fn default_vault_path_ends_with_vault_pmv() {
         assert!(super::default_vault_path().ends_with("vault.pmv"));
+    }
+
+    #[test]
+    fn part_flag_is_parsed_and_stripped() {
+        let s = |v: &str| v.to_string();
+        // `--part N` form: value consumed, rest preserved in order.
+        let (p, rest) = super::extract_part_flag(vec![s("manifest"), s("--part"), s("2"), s("dir")]).unwrap();
+        assert_eq!(p, Some(2));
+        assert_eq!(rest, vec![s("manifest"), s("dir")]);
+        // `--part=N` form.
+        let (p, rest) = super::extract_part_flag(vec![s("--part=5"), s("x")]).unwrap();
+        assert_eq!(p, Some(5));
+        assert_eq!(rest, vec![s("x")]);
+        // Absent → None, args untouched.
+        let (p, rest) = super::extract_part_flag(vec![s("extract")]).unwrap();
+        assert_eq!(p, None);
+        assert_eq!(rest, vec![s("extract")]);
+        // Missing or non-numeric values are errors.
+        assert!(super::extract_part_flag(vec![s("--part")]).is_err());
+        assert!(super::extract_part_flag(vec![s("--part"), s("abc")]).is_err());
+        assert!(super::extract_part_flag(vec![s("--part=-1")]).is_err());
     }
 }

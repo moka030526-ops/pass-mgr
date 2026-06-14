@@ -53,6 +53,8 @@ const VAULT_FILE: &str = "vault.pmv";
 /// Staging directory used during a password-change re-encryption.
 const REKEY_DIR: &str = ".rekey";
 const REKEY_READY: &str = "READY";
+/// Single-writer advisory lock file inside the vault directory.
+const LOCK_FILE: &str = "pass-mgr.lock";
 
 // Sanity bounds for KDF parameters read from an untrusted file header, validated
 // *before* the (expensive, memory-hard) key derivation runs (DoS guard).
@@ -82,6 +84,10 @@ pub enum VaultError {
     RekeyPending,
     #[error("vault is open read-only (relaunch with --write to make changes)")]
     ReadOnly,
+    #[error("another writable session already has this vault open (close it, or open read-only)")]
+    Locked,
+    #[error("no such partition: {0}")]
+    NoSuchPartition(u32),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -159,6 +165,33 @@ pub struct OpenVault {
     previous_generation: u64,
     read_only: bool,
     storage: VolumeStore,
+    /// Held for a writable session: the OS advisory lock on `pass-mgr.lock`.
+    /// `None` for read-only opens. Released automatically when this `OpenVault`
+    /// drops (including on process crash), so the lock never goes stale.
+    _write_lock: Option<WriteLock>,
+}
+
+/// An OS advisory lock on `<dir>/pass-mgr.lock`, held for the lifetime of a
+/// writable [`OpenVault`]. The lock is taken on the open file handle, so the
+/// kernel releases it when the handle closes — no stale lock file to clean up.
+struct WriteLock {
+    _file: fs::File,
+}
+
+impl WriteLock {
+    /// Acquire the single-writer lock for `dir`. Errors with
+    /// [`VaultError::Locked`] if another writable session already holds it.
+    fn acquire(dir: &Path) -> Result<Self, VaultError> {
+        let path = dir.join(LOCK_FILE);
+        // The lock file carries no contents; never truncate it (avoids racing a
+        // concurrent holder's handle), just ensure it exists and is lockable.
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(WriteLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(VaultError::Locked),
+            Err(fs::TryLockError::Error(e)) => Err(VaultError::Io(e)),
+        }
+    }
 }
 
 impl OpenVault {
@@ -168,6 +201,11 @@ impl OpenVault {
         if path.exists() {
             return Err(VaultError::AlreadyExists(path));
         }
+        let dir = parent_dir(&path);
+        fs::create_dir_all(&dir)?;
+        harden_dir(&dir);
+        // Take the single-writer lock before writing anything into the directory.
+        let write_lock = Some(WriteLock::acquire(&dir)?);
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &params)?;
 
@@ -178,7 +216,6 @@ impl OpenVault {
         vault.categories = TypeLists::with_defaults();
         vault.audit.push(Change::new("vault_created", String::new()));
 
-        let dir = parent_dir(&path);
         let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
 
         let mut open = OpenVault {
@@ -191,6 +228,7 @@ impl OpenVault {
             previous_generation: 0,
             read_only: false,
             storage,
+            _write_lock: write_lock,
         };
         open.save()?;
         Ok(open)
@@ -214,6 +252,10 @@ impl OpenVault {
 
     fn open_inner(path: PathBuf, pw1: &[u8], pw2: &[u8], read_only: bool) -> Result<Self, VaultError> {
         let dir = parent_dir(&path);
+        // Single-writer: a writable open takes the advisory lock first, so a
+        // second writable instance fails fast and recovery/writes below are
+        // exclusive. Read-only opens never take it.
+        let write_lock = if read_only { None } else { Some(WriteLock::acquire(&dir)?) };
         // Finish/abort an interrupted password change before touching the vault.
         recover_pending_rekey(&dir, read_only)?;
 
@@ -240,6 +282,7 @@ impl OpenVault {
             previous_generation,
             read_only,
             storage,
+            _write_lock: write_lock,
         };
         // Best-effort refresh of last-opened; skipped entirely in read-only mode.
         if !read_only {
@@ -254,15 +297,21 @@ impl OpenVault {
         Ok(vault)
     }
 
-    /// Decrypt every document across **all** partitions without modifying any
-    /// file. Returns each document's manifest entry + plaintext (wiped on drop).
-    pub fn export_documents(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vec<DecryptedDoc>, VaultError> {
+    /// Decrypt documents without modifying any file. With `part = Some(n)` only
+    /// partition `n`'s volume is decrypted; with `None`, every partition.
+    /// Returns each document's manifest entry + plaintext (wiped on drop).
+    pub fn export_documents(
+        path: &Path,
+        pw1: &[u8],
+        pw2: &[u8],
+        part: Option<u32>,
+    ) -> Result<Vec<DecryptedDoc>, VaultError> {
         let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
         let dir = parent_dir(path);
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        // Collect entries first so the immutable borrow for reads is clean.
+        let entries: Vec<ManifestEntry> = selected_entries(&store, part)?;
         let mut out = Vec::new();
-        // Collect ids first so the immutable borrow for reads is clean.
-        let entries: Vec<ManifestEntry> = store.entries().cloned().collect();
         for e in entries {
             let bytes = store.read(&e.id, &key)?;
             out.push((e, bytes));
@@ -270,12 +319,18 @@ impl OpenVault {
         Ok(out)
     }
 
-    /// Decrypt and return all manifest entries (the document index).
-    pub fn export_manifests(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vec<ManifestEntry>, VaultError> {
+    /// Decrypt and return manifest entries (the document index). With
+    /// `part = Some(n)` only partition `n`'s manifest; with `None`, all of them.
+    pub fn export_manifests(
+        path: &Path,
+        pw1: &[u8],
+        pw2: &[u8],
+        part: Option<u32>,
+    ) -> Result<Vec<ManifestEntry>, VaultError> {
         let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
         let dir = parent_dir(path);
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
-        Ok(store.entries().cloned().collect())
+        selected_entries(&store, part)
     }
 
     /// Re-encrypt the vault and write it atomically, bumping the write-generation.
@@ -441,6 +496,21 @@ fn parent_dir(vault_file: &Path) -> PathBuf {
 fn virtual_path(location: &str, filename: &str) -> String {
     let loc = normalize_dir(location);
     if loc.is_empty() { format!("/{filename}") } else { format!("{loc}/{filename}") }
+}
+
+/// Manifest entries selected by an optional partition filter. `Some(n)` returns
+/// only partition `n`'s entries (erroring if `n` is out of range); `None`
+/// returns every partition's entries.
+fn selected_entries(store: &VolumeStore, part: Option<u32>) -> Result<Vec<ManifestEntry>, VaultError> {
+    match part {
+        Some(p) => {
+            if p as usize >= store.partition_count() {
+                return Err(VaultError::NoSuchPartition(p));
+            }
+            Ok(store.partition_entries(p).cloned().collect())
+        }
+        None => Ok(store.entries().cloned().collect()),
+    }
 }
 
 /// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
@@ -773,6 +843,7 @@ mod tests {
         let mut v = OpenVault::create(path.clone(), b"first", b"second", fast()).unwrap();
         records::upsert(&mut v.vault.accounts, sample_account("octocat", "hunter2"));
         v.save().unwrap();
+        drop(v); // release the single-writer lock before reopening
 
         let reopened = OpenVault::open(path.clone(), b"first", b"second").unwrap();
         assert_eq!(reopened.vault.accounts.len(), 1);
@@ -816,6 +887,7 @@ mod tests {
         tw.file = Some(id1.clone());
         records::upsert(&mut v.vault.trust_wills, tw);
         v.save().unwrap();
+        drop(v); // release the single-writer lock before reopening
 
         let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         assert_eq!(&*v2.read_document(&id1).unwrap(), b"statement contents");
@@ -853,6 +925,7 @@ mod tests {
         let src = write_src("rk", b"will body");
         let id = v.add_document("/wills", "will.txt", &src).unwrap();
         v.change_password(b"new1", b"new2").unwrap();
+        drop(v); // release the single-writer lock before reopening
 
         // Old passwords no longer work; new ones open and the doc still reads.
         assert!(OpenVault::open(path.clone(), b"old1", b"old2").is_err());
@@ -966,13 +1039,14 @@ mod tests {
         // Tiny volume cap so the two docs land in different partitions.
         v.vault.settings.volume_max_size = 1024;
         v.save().unwrap();
+        drop(v); // release the single-writer lock before reopening
         let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         let src = write_src("big", &vec![3u8; 600]);
         v.add_document("/a", "a.bin", &src).unwrap();
         v.add_document("/b", "b.bin", &src).unwrap();
         drop(v);
 
-        let docs = OpenVault::export_documents(&path, b"a", b"b").unwrap();
+        let docs = OpenVault::export_documents(&path, b"a", b"b", None).unwrap();
         assert_eq!(docs.len(), 2, "extract spans every partition");
         cleanup(&path);
         fs::remove_file(&src).ok();
@@ -1078,6 +1152,48 @@ mod tests {
         assert!(!compact_timestamp(records::unix_now()).contains([':', ' ', '/']));
     }
 
+    // ---- Phase 5: single-writer lock + partition-filtered export -----------
+
+    #[test]
+    fn single_writer_lock_blocks_second_writable_open() {
+        let path = tmp_path("lock");
+        let v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // A second writable open fails fast while the first session is held.
+        assert!(matches!(OpenVault::open(path.clone(), b"a", b"b"), Err(VaultError::Locked)));
+        // Read-only opens never take the lock, so they are always allowed.
+        assert!(OpenVault::open_read_only(path.clone(), b"a", b"b").is_ok());
+        drop(v); // releasing the writer frees the lock (no stale lock file)
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_filters_by_partition() {
+        // seed_multi_partition lands one document in each of three partitions.
+        let (path, docs) = seed_multi_partition("partfilter", b"a", b"b");
+        assert_eq!(docs.len(), 3);
+        // All manifests vs a single partition's manifest.
+        let all = OpenVault::export_manifests(&path, b"a", b"b", None).unwrap();
+        assert_eq!(all.len(), 3, "every partition's entries");
+        for p in 0..3u32 {
+            let one = OpenVault::export_manifests(&path, b"a", b"b", Some(p)).unwrap();
+            assert_eq!(one.len(), 1, "partition {p} holds exactly one doc");
+        }
+        // Documents filtered by partition decrypt only that one volume.
+        let d1 = OpenVault::export_documents(&path, b"a", b"b", Some(1)).unwrap();
+        assert_eq!(d1.len(), 1);
+        // Out-of-range partitions are rejected for both facilities.
+        assert!(matches!(
+            OpenVault::export_manifests(&path, b"a", b"b", Some(9)),
+            Err(VaultError::NoSuchPartition(9))
+        ));
+        assert!(matches!(
+            OpenVault::export_documents(&path, b"a", b"b", Some(9)),
+            Err(VaultError::NoSuchPartition(9))
+        ));
+        cleanup(&path);
+    }
+
     // ---- Phase 4: exhaustive rekey crash-injection -------------------------
     //
     // Protocol: stage a complete new-key tree under `.rekey/`, mark it `READY`,
@@ -1095,6 +1211,7 @@ mod tests {
         v.vault.settings.volume_max_size = 1024; // tiny cap → one doc per partition
         records::upsert(&mut v.vault.accounts, sample_account("user", "secret"));
         v.save().unwrap();
+        drop(v); // release the single-writer lock before reopening
         // Reopen so the store picks up the small cap before we add documents.
         let mut v = OpenVault::open(path.clone(), pw1, pw2).unwrap();
         let mut docs = Vec::new();

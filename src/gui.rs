@@ -1553,6 +1553,7 @@ mod tests {
         app.confirm2 = "d".into();
         app.submit_auth();
         assert!(app.screen == Screen::Main);
+        drop(app); // release the single-writer lock before reopening
         // Reopens only with the new passwords.
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_err());
         assert!(OpenVault::open(path.clone(), b"c", b"d").is_ok());
