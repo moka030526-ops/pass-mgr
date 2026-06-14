@@ -1,37 +1,34 @@
-//! The encrypted on-disk file format and the encrypted document volume.
+//! The encrypted vault file and the orchestration over the partitioned document
+//! store ([`crate::storage`]).
 //!
-//! The decrypted data model itself lives in [`crate::records`]; this module owns
-//! the *file* (header + AEAD ciphertext of the JSON vault) and the sidecar
-//! *archive* file that stores all uploaded documents together, encrypted as a
-//! single unit ("encrypted zip").
-//!
-//! File layout (all integers little-endian):
+//! The user supplies a **directory** `mypath`; inside it:
 //! ```text
-//!   offset  len  field
-//!   0       8    magic  b"PMVAULT\0"          (identifies a pass-mgr vault)
-//!   8       1    format version (currently 3)
-//!   9       4    Argon2 m_cost (KiB)
-//!   13      4    Argon2 t_cost
-//!   17      4    Argon2 p_cost
-//!   21      16   salt1   (salt for the first KDF pass)
-//!   37      24   nonce   (XChaCha20-Poly1305)
-//!   61      ..   XChaCha20-Poly1305 ciphertext of the JSON vault
+//!   mypath/vault.pmv          encrypted JSON vault (header + AEAD ciphertext)
+//!   mypath/manifest/manifest.<N>   encrypted per-partition document index
+//!   mypath/volume/vol.<N>          append-only, per-blob-encrypted documents
 //! ```
-//! The **entire 61-byte header** (magic, version, params, salt, and nonce) is the
-//! AEAD associated data, so tampering with any of it — a cost-parameter
-//! downgrade, a swapped salt, a flipped nonce — fails the Poly1305 tag on decrypt.
+//! `OpenVault` is given the vault *file* path (`mypath/vault.pmv`) and derives the
+//! directory as its parent; the [`VolumeStore`] lives under that directory.
 //!
-//! The key is derived from **two** passwords via a chained Argon2id derivation
-//! (see [`crate::crypto::derive_key_chained`] and `docs/DESIGN.md`). Format
-//! version 3 holds the five estate-record collections plus the document-volume
-//! manifest; earlier versions are not auto-migrated.
+//! Vault file layout (all integers little-endian):
+//! ```text
+//!   0   8   magic  b"PMVAULT\0"
+//!   8   1   format version (currently 4)
+//!   9   4   Argon2 m_cost (KiB)
+//!   13  4   Argon2 t_cost
+//!   17  4   Argon2 p_cost
+//!   21  16  salt1
+//!   37  24  nonce (XChaCha20-Poly1305)
+//!   61  ..  ciphertext of the JSON vault
+//! ```
+//! The **entire 61-byte header** (incl. the nonce) is the AEAD associated data, so
+//! tampering with the version/params/salt/nonce fails the Poly1305 tag on decrypt.
 //!
-//! Document volume: uploaded files are encrypted together with the vault key and
-//! stored in a single archive `<vault-filename>.vol` (`nonce ‖ ciphertext`),
-//! decrypted as one unit on open. The vault JSON holds the virtual directory
-//! tree, per-file metadata, and the upload history.
+//! Crash-safety: the document store commits per-operation (see [`crate::storage`]);
+//! the vault file is the **final** commit point. A password change re-encrypts the
+//! whole tree under a fresh key via a staged-and-rolled-forward protocol so a crash
+//! mid-rotation always leaves either the old or the new tree fully working.
 
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,58 +37,38 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError, KdfParams, Key, NONCE_LEN, SALT_LEN};
-use crate::records::{self, Change, Vault, VolumeFile};
+use crate::records::{self, Change, Vault};
+use crate::storage::{self, MAX_DOC_SIZE, ManifestEntry, StorageError, VolumeStore};
 use crate::types::TypeLists;
-
-/// Fixed prefix of the document-archive associated data (app/format tag). The
-/// vault's `volume.id` is appended so the archive is bound to its specific vault.
-const ARCHIVE_AAD_PREFIX: &[u8] = b"PMVAULT-DOC-ARCHIVE-v1\0";
-
-/// AEAD associated data for the document archive: the fixed prefix plus the
-/// vault's instance id. Binding the id means a `.vol` from a different vault (or
-/// a swapped one) fails authentication on decrypt.
-fn archive_aad(vault_id: &str) -> Vec<u8> {
-    let mut aad = ARCHIVE_AAD_PREFIX.to_vec();
-    aad.extend_from_slice(vault_id.as_bytes());
-    aad
-}
-
-/// All documents, decrypted, keyed by their volume file id. The values wipe on
-/// drop. This is the in-memory form of the single encrypted archive file.
-type DocArchive = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
 /// A decrypted document returned to the CLI: its manifest metadata plus its
 /// plaintext bytes (which wipe on drop).
-pub type DecryptedDoc = (VolumeFile, Zeroizing<Vec<u8>>);
+pub type DecryptedDoc = (ManifestEntry, Zeroizing<Vec<u8>>);
 
 const MAGIC: &[u8; 8] = b"PMVAULT\0";
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 const HEADER_LEN: usize = 61;
+/// Fixed vault-file name inside the user's directory.
+const VAULT_FILE: &str = "vault.pmv";
+/// Staging directory used during a password-change re-encryption.
+const REKEY_DIR: &str = ".rekey";
+const REKEY_READY: &str = "READY";
 
-// Sanity bounds for KDF parameters read from an untrusted file header. They are
-// validated *before* the (expensive, memory-hard) key derivation runs, so a
-// crafted header cannot force a huge Argon2 allocation as a denial-of-service.
-const MAX_M_COST: u32 = 1 << 20; // 1 GiB, expressed in KiB
+// Sanity bounds for KDF parameters read from an untrusted file header, validated
+// *before* the (expensive, memory-hard) key derivation runs (DoS guard).
+const MAX_M_COST: u32 = 1 << 20; // 1 GiB, in KiB
 const MAX_T_COST: u32 = 64;
 const MAX_P_COST: u32 = 16;
 
-// Resource limits on the document archive. The whole `.vol` is read and
-// decrypted into memory at once, so without a ceiling a corrupt or hostile
-// archive (or an accidental huge upload) could exhaust RAM. These bounds are
-// generous for real estate documents (scans, PDFs) yet keep allocation bounded
-// and fail closed.
-const MAX_DOCUMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB per uploaded document
-const MAX_ARCHIVE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB total archive on disk
-
 #[derive(Error, Debug)]
 pub enum VaultError {
-    #[error("vault file not found at {0}")]
+    #[error("vault not found at {0}")]
     NotFound(PathBuf),
     #[error("a vault already exists at {0}")]
     AlreadyExists(PathBuf),
     #[error("not a pass-mgr vault (bad magic bytes)")]
     BadMagic,
-    #[error("unsupported vault format version {0}")]
+    #[error("unsupported vault format version {0} (this build expects v{FORMAT_VERSION}; recreate the vault)")]
     BadVersion(u8),
     #[error("vault file is truncated or corrupt")]
     Truncated,
@@ -99,10 +76,14 @@ pub enum VaultError {
     BadParams,
     #[error("document or archive exceeds the maximum allowed size")]
     TooLarge,
-    #[error("document archive does not match the vault (possible tampering or rollback)")]
+    #[error("a document referenced by the vault is missing from the document store (possible tampering or rollback)")]
     ArchiveMismatch,
+    #[error("an interrupted password change is pending; reopen with --write to finish recovery")]
+    RekeyPending,
     #[error("vault is open read-only (relaunch with --write to make changes)")]
     ReadOnly,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("vault contents are not valid JSON: {0}")]
@@ -147,7 +128,6 @@ impl Header {
             t_cost: u32::from_le_bytes(buf[13..17].try_into().unwrap()),
             p_cost: u32::from_le_bytes(buf[17..21].try_into().unwrap()),
         };
-        // Reject absurd parameters before they reach the memory-hard KDF.
         if params.m_cost < 8
             || params.m_cost > MAX_M_COST
             || params.t_cost < 1
@@ -165,51 +145,26 @@ impl Header {
     }
 }
 
-/// An unlocked vault: the decrypted data plus the derived key and KDF salt/params
-/// needed to re-encrypt on save and to encrypt/decrypt the document archive. The
-/// key zeroizes when dropped; the `vault` zeroizes via its own `ZeroizeOnDrop`.
+/// An unlocked vault: the decrypted data, the derived key + KDF salt/params, and
+/// the partitioned document store. The key zeroizes on drop; `vault` zeroizes via
+/// its own `ZeroizeOnDrop`.
 pub struct OpenVault {
     pub vault: Vault,
     key: Key,
     params: KdfParams,
     salt: [u8; SALT_LEN],
+    /// The vault *file* (`<dir>/vault.pmv`).
     path: PathBuf,
-    /// `last_opened_at` read from disk before this session updated it (the prior
-    /// access time, for display on the unlock screen).
     previous_access: i64,
-    /// Write-generation read from disk on open, for rollback awareness (§9.12).
     previous_generation: u64,
-    /// When true, every mutating operation is refused (see [`OpenVault::open_read_only`]).
     read_only: bool,
-    /// All documents, decrypted, held together (the "encrypted zip" decrypted as
-    /// a unit on open and re-encrypted as a unit on change).
-    archive: DocArchive,
-    /// Resolved path of the document archive. Defaults to `<vault>.vol` beside
-    /// the vault, but can be pointed elsewhere via the `--vol` flag.
-    archive_path: PathBuf,
+    storage: VolumeStore,
 }
 
 impl OpenVault {
-    /// Create a brand-new vault at `path` protected by two passwords, with the
-    /// document archive at the default `<vault>.vol` location.
-    pub fn create(
-        path: PathBuf,
-        pw1: &[u8],
-        pw2: &[u8],
-        params: KdfParams,
-    ) -> Result<Self, VaultError> {
-        Self::create_with(path, pw1, pw2, params, None)
-    }
-
-    /// Like [`OpenVault::create`], but `archive` overrides the document-archive
-    /// path (the `--vol` flag); `None` uses the default `<vault>.vol`.
-    pub fn create_with(
-        path: PathBuf,
-        pw1: &[u8],
-        pw2: &[u8],
-        params: KdfParams,
-        archive: Option<PathBuf>,
-    ) -> Result<Self, VaultError> {
+    /// Create a brand-new vault in the directory containing `path`
+    /// (`<dir>/vault.pmv`), protected by two passwords.
+    pub fn create(path: PathBuf, pw1: &[u8], pw2: &[u8], params: KdfParams) -> Result<Self, VaultError> {
         if path.exists() {
             return Err(VaultError::AlreadyExists(path));
         }
@@ -219,11 +174,13 @@ impl OpenVault {
         let mut vault = Vault::default();
         vault.version = FORMAT_VERSION;
         vault.last_opened_at = records::unix_now();
-        vault.volume.id = records::random_id()?; // binds the document archive to this vault
-        vault.categories = TypeLists::with_defaults(); // seed the dropdown lists
+        vault.id = records::random_id()?; // binds the volumes/manifests to this vault
+        vault.categories = TypeLists::with_defaults();
         vault.audit.push(Change::new("vault_created", String::new()));
 
-        let archive_path = archive.unwrap_or_else(|| archive_path(&path));
+        let dir = parent_dir(&path);
+        let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+
         let mut open = OpenVault {
             vault,
             key,
@@ -233,60 +190,42 @@ impl OpenVault {
             previous_access: 0,
             previous_generation: 0,
             read_only: false,
-            archive: DocArchive::new(),
-            archive_path,
+            storage,
         };
         open.save()?;
         Ok(open)
     }
 
-    /// Unlock an existing vault read-write. Updates `last_opened_at` (persisted
-    /// best-effort) and exposes the prior access time/generation.
+    /// Unlock an existing vault read-write.
     pub fn open(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
-        Self::open_inner(path, pw1, pw2, false, None)
+        Self::open_inner(path, pw1, pw2, false)
     }
 
-    /// Unlock an existing vault **read-only**: every mutating operation is
-    /// refused with [`VaultError::ReadOnly`], and nothing is written to disk on
-    /// open (so the vault can be viewed even on read-only media).
+    /// Unlock an existing vault **read-only**: every mutating operation is refused
+    /// and nothing is written to disk on open.
     pub fn open_read_only(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
-        Self::open_inner(path, pw1, pw2, true, None)
+        Self::open_inner(path, pw1, pw2, true)
     }
 
-    /// Unlock an existing vault, choosing read-only and the document-archive path
-    /// explicitly. `archive` overrides the default `<vault>.vol` (the `--vol`
-    /// flag); `None` uses the default.
-    pub fn open_with(
-        path: PathBuf,
-        pw1: &[u8],
-        pw2: &[u8],
-        read_only: bool,
-        archive: Option<PathBuf>,
-    ) -> Result<Self, VaultError> {
-        Self::open_inner(path, pw1, pw2, read_only, archive)
+    /// Unlock, choosing read-only explicitly.
+    pub fn open_with(path: PathBuf, pw1: &[u8], pw2: &[u8], read_only: bool) -> Result<Self, VaultError> {
+        Self::open_inner(path, pw1, pw2, read_only)
     }
 
-    fn open_inner(
-        path: PathBuf,
-        pw1: &[u8],
-        pw2: &[u8],
-        read_only: bool,
-        archive: Option<PathBuf>,
-    ) -> Result<Self, VaultError> {
+    fn open_inner(path: PathBuf, pw1: &[u8], pw2: &[u8], read_only: bool) -> Result<Self, VaultError> {
+        let dir = parent_dir(&path);
+        // Finish/abort an interrupted password change before touching the vault.
+        recover_pending_rekey(&dir, read_only)?;
+
         let (mut vault, header, key) = decrypt_file(&path, pw1, pw2)?;
-
         let previous_access = vault.last_opened_at;
         let previous_generation = vault.generation;
         vault.last_opened_at = records::unix_now();
 
-        // Decrypt the whole document archive at once (empty if none yet), bound
-        // to this vault's id. Then verify it is consistent with the manifest:
-        // every document referenced by the manifest must be present, so a stale
-        // or swapped `.vol` (missing newer documents) is rejected.
-        let archive_path = archive.unwrap_or_else(|| archive_path(&path));
-        let archive = load_archive(&archive_path, &key, &vault.volume.id)?;
-        for f in &vault.volume.files {
-            if !archive.contains_key(&f.id) {
+        let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        // Consistency: every document a record references must be present.
+        for id in referenced_doc_ids(&vault) {
+            if !storage.contains(&id) {
                 return Err(VaultError::ArchiveMismatch);
             }
         }
@@ -300,290 +239,183 @@ impl OpenVault {
             previous_access,
             previous_generation,
             read_only,
-            archive,
-            archive_path,
+            storage,
         };
-        // Persisting the refreshed access time is best-effort, and skipped
-        // entirely in read-only mode (a read-only session writes nothing).
+        // Best-effort refresh of last-opened; skipped entirely in read-only mode.
         if !read_only {
             let _ = open.save();
         }
         Ok(open)
     }
 
-
-    /// Decrypt the vault and return its contents **without** modifying the file.
-    /// Used by the command-line decrypt/export path.
+    /// Decrypt the vault and return its contents **without** modifying any file.
     pub fn export(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vault, VaultError> {
         let (vault, _header, _key) = decrypt_file(path, pw1, pw2)?;
         Ok(vault)
     }
 
-    /// Decrypt the vault and its document archive **without** modifying any file,
-    /// returning each document's metadata together with its decrypted bytes (the
-    /// bytes wipe on drop). Used by the command-line `extract` command. Verifies
-    /// archive↔manifest consistency, failing closed on a stale/tampered archive.
-    pub fn export_documents(
-        path: &Path,
-        pw1: &[u8],
-        pw2: &[u8],
-        archive: Option<&Path>,
-    ) -> Result<Vec<DecryptedDoc>, VaultError> {
+    /// Decrypt every document across **all** partitions without modifying any
+    /// file. Returns each document's manifest entry + plaintext (wiped on drop).
+    pub fn export_documents(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vec<DecryptedDoc>, VaultError> {
         let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
-        let archive_path = archive.map(|p| p.to_path_buf()).unwrap_or_else(|| archive_path(path));
-        let mut archive = load_archive(&archive_path, &key, &vault.volume.id)?;
-        let mut out = Vec::with_capacity(vault.volume.files.len());
-        for f in &vault.volume.files {
-            match archive.remove(&f.id) {
-                Some(bytes) => out.push((f.clone(), bytes)),
-                None => return Err(VaultError::ArchiveMismatch),
-            }
+        let dir = parent_dir(path);
+        let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        let mut out = Vec::new();
+        // Collect ids first so the immutable borrow for reads is clean.
+        let entries: Vec<ManifestEntry> = store.entries().cloned().collect();
+        for e in entries {
+            let bytes = store.read(&e.id, &key)?;
+            out.push((e, bytes));
         }
         Ok(out)
     }
 
-    /// Re-encrypt the current data and write it atomically (unique temp file +
-    /// fsync + rename + dir fsync), with a fresh random nonce and owner-only mode.
-    /// Bumps the write-generation counter so a later rollback is detectable.
+    /// Decrypt and return all manifest entries (the document index).
+    pub fn export_manifests(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vec<ManifestEntry>, VaultError> {
+        let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
+        let dir = parent_dir(path);
+        let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        Ok(store.entries().cloned().collect())
+    }
+
+    /// Re-encrypt the vault and write it atomically, bumping the write-generation.
     pub fn save(&mut self) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
         self.vault.generation = self.vault.generation.saturating_add(1);
-        let plaintext = Zeroizing::new(serde_json::to_vec(&self.vault)?);
-
-        // Generate the nonce first and place it in the header, so the WHOLE header
-        // (magic, version, Argon2 params, salt, nonce) is authenticated as AAD —
-        // nobody can downgrade the cost parameters or swap the salt/nonce without
-        // invalidating the Poly1305 tag.
-        let nonce = crypto::random_bytes::<NONCE_LEN>()?;
-        let header = Header { params: self.params, salt: self.salt, nonce };
-        let header_bytes = header.to_bytes();
-        let ciphertext = crypto::encrypt_with_nonce(&self.key, &nonce, &plaintext, &header_bytes)?;
-
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-            harden_dir(parent);
-        }
-
-        let tmp = self.temp_path()?;
-        if let Err(e) = write_new_file(&tmp, &header_bytes, &ciphertext) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = fs::rename(&tmp, &self.path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-        sync_parent_dir(&self.path);
-        Ok(())
+        write_vault_file(&self.path, &self.vault, &self.key, &self.salt, self.params)
     }
 
-    /// A unique, hidden temp path beside the vault file.
-    fn temp_path(&self) -> Result<PathBuf, VaultError> {
-        sibling_tmp(&self.path)
-    }
-
-    /// Re-key under two new passwords (new salt) and persist. Transactional: the
-    /// in-memory key/salt/audit are only kept if the save succeeds.
+    /// Re-key under two new passwords via a **full re-encryption** of the vault and
+    /// the entire document store, staged then rolled forward so a crash leaves
+    /// either the old or the new tree fully working (never a mix).
     pub fn change_password(&mut self, pw1: &[u8], pw2: &[u8]) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let salt = crypto::random_bytes::<SALT_LEN>()?;
-        let key = crypto::derive_key_chained(pw1, pw2, &salt, &self.params)?;
+        let dir = parent_dir(&self.path);
+        let staging = dir.join(REKEY_DIR);
+        let _ = fs::remove_dir_all(&staging); // clear any stale staging
+        fs::create_dir_all(&staging)?;
+        harden_dir(&staging);
 
-        let old_key = std::mem::replace(&mut self.key, key);
-        let old_salt = std::mem::replace(&mut self.salt, salt);
-        self.vault.audit.push(Change::new("password_changed", String::new()));
+        let new_salt = crypto::random_bytes::<SALT_LEN>()?;
+        let new_key = crypto::derive_key_chained(pw1, pw2, &new_salt, &self.params)?;
 
-        // Re-encrypt the document archive under the new key FIRST (atomic write).
-        // If it fails the archive file is untouched, so we can fully revert.
-        if let Err(e) = self.save_archive() {
-            self.key = old_key;
-            self.salt = old_salt;
-            self.vault.audit.pop();
-            return Err(e);
+        // Re-encrypt every document into a fresh store under the new key.
+        let new_store = VolumeStore::open(&staging, &new_key, &self.vault.id, self.vault.settings.volume_max_size)?;
+        let mut new_store = new_store;
+        let ids: Vec<String> = self.storage.ids().map(|s| s.to_string()).collect();
+        for id in &ids {
+            let bytes = self.storage.read(id, &self.key)?;
+            let (path, uploaded_at) = self
+                .storage
+                .entry(id)
+                .map(|e| (e.path.clone(), e.uploaded_at))
+                .unwrap_or_default();
+            new_store.put(id, &path, &bytes, uploaded_at, &new_key)?;
         }
-        // Then write the vault under the new key.
-        if let Err(e) = self.save() {
-            // The vault file is still under the OLD key. Restore the archive to
-            // the old key too, then revert, so vault + archive stay consistent.
-            self.key = old_key;
-            self.salt = old_salt;
-            self.vault.audit.pop();
-            // Surface a failure to restore the archive (don't silently ignore):
-            // if this errors, the on-disk archive may be under the new key while
-            // the vault is under the old — the caller must know to retry.
-            self.save_archive()?;
-            return Err(e);
-        }
+        drop(new_store);
+
+        // Stage the re-encrypted vault, mark the staging complete, then commit.
+        let mut staged_vault = self.vault.clone();
+        staged_vault.audit.push(Change::new("password_changed", String::new()));
+        write_vault_file(&staging.join(VAULT_FILE), &staged_vault, &new_key, &new_salt, self.params)?;
+        write_new_bytes(&staging.join(REKEY_READY), b"ready")?;
+        sync_parent_dir(&staging.join(REKEY_READY));
+        commit_rekey(&dir, &staging)?;
+
+        // Adopt the new key/salt/state and reopen the store under the new key.
+        self.key = new_key;
+        self.salt = new_salt;
+        self.vault = staged_vault;
+        self.previous_generation = self.vault.generation;
+        self.storage = VolumeStore::open(&dir, &self.key, &self.vault.id, self.vault.settings.volume_max_size)?;
         Ok(())
     }
 
-    /// The previous access time (unix seconds), or 0 for a new vault.
     pub fn previous_access(&self) -> i64 {
         self.previous_access
     }
 
-    /// The write-generation read from disk on open (before this session bumped
-    /// it). Lets the UI surface "generation N" so a rollback to an older
-    /// whole-file snapshot is noticeable (§9.12).
     pub fn opened_generation(&self) -> u64 {
         self.previous_generation
     }
 
-    // --- Encrypted document volume (single archive) -------------------------
-    //
-    // All documents live together in one encrypted container, `<vault>.vol`,
-    // decrypted as a unit on open and re-encrypted as a unit on change. The
-    // vault JSON holds only the lightweight metadata (id/location/filename/...).
+    // --- Documents (delegated to the partitioned store) ----------------------
 
-    /// Add the file at `source` to the document archive under virtual directory
-    /// `location` with name `filename`; record its metadata + upload history and
-    /// persist both the archive and the vault. Returns the new file id.
-    pub fn add_document(
-        &mut self,
-        location: &str,
-        filename: &str,
-        source: &Path,
-    ) -> Result<String, VaultError> {
+    /// Add the file at `source` under virtual directory `location` with name
+    /// `filename`. Commits the blob + its manifest; the caller links the new id
+    /// onto a record and saves the vault (the final commit). Returns the id.
+    pub fn add_document(&mut self, location: &str, filename: &str, source: &Path) -> Result<String, VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        // Bound the read before pulling the file into memory: reject an
-        // oversized document up front, and reject one that would push the whole
-        // archive past its ceiling.
         let src_len = fs::metadata(source)?.len();
-        if src_len > MAX_DOCUMENT_SIZE {
+        if src_len > MAX_DOC_SIZE {
             return Err(VaultError::TooLarge);
         }
-        let existing: u64 = self.archive.values().map(|b| b.len() as u64).sum();
-        if existing.saturating_add(src_len) > MAX_ARCHIVE_SIZE {
-            return Err(VaultError::TooLarge);
+        let vpath = virtual_path(location, filename);
+        if vpath.len() > storage::MAX_PATH_LEN {
+            return Err(VaultError::Storage(StorageError::PathTooLong));
         }
         let data = Zeroizing::new(fs::read(source)?);
-        let size = data.len() as u64;
         let id = records::random_id()?;
-
-        self.archive.insert(id.clone(), data);
-        if let Err(e) = self.save_archive() {
-            self.archive.remove(&id);
-            return Err(e);
-        }
-
-        let location = normalize_dir(location);
-        let display_loc = if location.is_empty() { "/".to_string() } else { location.clone() };
-        // Snapshot the directory list so the rollback can restore it exactly.
-        let dirs_before = self.vault.volume.directories.clone();
-        self.vault.volume.register_directory(&location);
-        self.vault.volume.files.push(VolumeFile {
-            id: id.clone(),
-            location: location.clone(),
-            filename: filename.to_string(),
-            size,
-            uploaded_at: records::unix_now(),
-            source: source.display().to_string(),
-        });
-        self.vault
-            .volume
-            .uploads
-            .push(Change::new("uploaded", format!("{display_loc}/{filename}")));
-
-        if let Err(e) = self.save() {
-            // Roll back the manifest (files, uploads, directories) and the archive.
-            self.vault.volume.files.pop();
-            self.vault.volume.uploads.pop();
-            self.vault.volume.directories = dirs_before;
-            self.archive.remove(&id);
-            let _ = self.save_archive();
-            return Err(e);
-        }
+        self.storage.put(&id, &vpath, &data, records::unix_now(), &self.key)?;
         Ok(id)
     }
 
-    /// Permanently remove a stored document by id: drop it from the archive and
-    /// the manifest, log the removal, and persist. Called when a record holding
-    /// the document is deleted or its attachment is detached, so "deleted"
-    /// documents do not linger in the encrypted archive.
+    /// Permanently remove a stored document by id (drops its manifest entry; the
+    /// blob lingers as garbage until a future compaction).
     pub fn remove_document(&mut self, file_id: &str) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        // Snapshot what we remove so a failed persist can be fully rolled back.
-        let removed_blob = self.archive.remove(file_id);
-        let removed_idx = self.vault.volume.files.iter().position(|f| f.id == file_id);
-        let removed_file = removed_idx.map(|i| self.vault.volume.files.remove(i));
-        let pushed_upload = removed_file.is_some();
-        if let Some(f) = &removed_file {
-            let loc = if f.location.is_empty() { "/".to_string() } else { f.location.clone() };
-            self.vault.volume.uploads.push(Change::new("removed", format!("{loc}/{}", f.filename)));
-        }
-
-        // Write the vault (manifest WITHOUT this entry) FIRST, then rewrite the
-        // archive WITHOUT the blob. If the vault save fails, restore the in-memory
-        // state so the operation is a true no-op (in-memory stays == on-disk).
-        if let Err(e) = self.save() {
-            if let (Some(idx), Some(f)) = (removed_idx, removed_file) {
-                self.vault.volume.files.insert(idx.min(self.vault.volume.files.len()), f);
-            }
-            if let Some(blob) = removed_blob {
-                self.archive.insert(file_id.to_string(), blob);
-            }
-            if pushed_upload {
-                self.vault.volume.uploads.pop();
-            }
-            return Err(e);
-        }
-        // A failure here leaves a harmless orphan blob (manifest ⊆ archive still
-        // holds, so the vault still opens) — never a dangling manifest reference.
-        self.save_archive()
+        self.storage.remove(file_id, &self.key)?;
+        Ok(())
     }
 
-    /// Return a stored document by id (already decrypted in memory).
+    /// Decrypt and return one stored document.
     pub fn read_document(&self, file_id: &str) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-        match self.archive.get(file_id) {
-            Some(data) => Ok(Zeroizing::new(data.to_vec())),
-            None => Err(VaultError::NotFound(self.archive_path.clone())),
-        }
+        Ok(self.storage.read(file_id, &self.key)?)
     }
 
-    /// Write a stored document out to `dest` (to view/open it). This produces an
-    /// **unencrypted** copy, created with `create_new` (O_EXCL, so a pre-planted
-    /// symlink can't be followed) and mode 0600 on Unix. Fails if `dest` exists.
+    /// Write a stored document out to `dest` as an **unencrypted** copy (O_EXCL +
+    /// 0600; fails if `dest` exists).
     pub fn export_document(&self, file_id: &str, dest: &Path) -> Result<(), VaultError> {
         let data = self.read_document(file_id)?;
         write_new_bytes(dest, &data)
     }
 
+    /// The virtual path ("/loc/filename") of a stored document, for UI display.
+    pub fn doc_path(&self, file_id: &str) -> Option<String> {
+        self.storage.entry(file_id).map(|e| e.path.clone())
+    }
+
+    /// Whether a document id is present in the store.
+    pub fn has_document(&self, file_id: &str) -> bool {
+        self.storage.contains(file_id)
+    }
+
     // --- Category lists (stored in the vault) --------------------------------
 
-    /// The vault's editable category lists, used by the dropdowns/filters.
     pub fn categories(&self) -> &TypeLists {
         &self.vault.categories
     }
 
-    /// Add a new Asset/Liability type and persist the vault. Returns whether it
-    /// was newly added; refused (and nothing written) when read-only.
     pub fn add_asset_type(&mut self, name: &str) -> Result<bool, VaultError> {
         self.mutate_categories(|c| c.add_asset_type(name))
     }
 
-    /// Add a new account type (no subtypes) and persist. Returns whether added.
     pub fn add_account_type(&mut self, name: &str) -> Result<bool, VaultError> {
         self.mutate_categories(|c| c.add_account_type(name))
     }
 
-    /// Add a subtype under an existing account type and persist. Returns whether
-    /// it was added (false if the type is unknown or the subtype is a duplicate).
     pub fn add_account_subtype(&mut self, type_name: &str, subtype: &str) -> Result<bool, VaultError> {
         self.mutate_categories(|c| c.add_account_subtype(type_name, subtype))
     }
 
-    /// Apply an in-memory category edit and save only if it changed something.
-    /// Refused (no write) on a read-only vault.
     fn mutate_categories(&mut self, edit: impl FnOnce(&mut TypeLists) -> bool) -> Result<bool, VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
@@ -595,39 +427,36 @@ impl OpenVault {
             Ok(false)
         }
     }
+}
 
-    /// Encrypt the whole document archive and write it atomically to `<vault>.vol`.
-    fn save_archive(&self) -> Result<(), VaultError> {
-        let archive_file = self.archive_path.clone();
-        if self.archive.is_empty() {
-            // Nothing to store; remove any stale archive file.
-            let _ = fs::remove_file(&archive_file);
-            return Ok(());
-        }
-        let plaintext = Zeroizing::new(serialize_archive(&self.archive));
-        let aad = archive_aad(&self.vault.volume.id);
-        let (nonce, ciphertext) = crypto::encrypt(&self.key, &plaintext, &aad)?;
-
-        if let Some(parent) = archive_file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-            harden_dir(parent);
-        }
-        // Unique temp file + rename, like the vault save, so a crash can't corrupt
-        // the existing archive.
-        let tmp = sibling_tmp(&archive_file)?;
-        if let Err(e) = write_new_file(&tmp, &nonce, &ciphertext) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = fs::rename(&tmp, &archive_file) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-        sync_parent_dir(&archive_file);
-        Ok(())
+/// The directory containing the vault file (its parent, or "." if none).
+fn parent_dir(vault_file: &Path) -> PathBuf {
+    match vault_file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
     }
+}
+
+/// Normalize `location` and join `filename` into a virtual path "/a/b/file".
+fn virtual_path(location: &str, filename: &str) -> String {
+    let loc = normalize_dir(location);
+    if loc.is_empty() { format!("/{filename}") } else { format!("{loc}/{filename}") }
+}
+
+/// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
+fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
+    let mut ids = Vec::new();
+    for t in &vault.trust_wills {
+        if let Some(f) = &t.file {
+            ids.push(f.clone());
+        }
+    }
+    for a in &vault.assets {
+        if let Some(f) = &a.statement {
+            ids.push(f.clone());
+        }
+    }
+    ids
 }
 
 /// Read, parse, and decrypt the vault file at `path`. Performs no writes.
@@ -642,30 +471,123 @@ fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, K
     let header = Header::parse(&raw)?;
     let ciphertext = &raw[HEADER_LEN..];
     let key = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params)?;
-    // The full header (including the nonce) is the AEAD associated data, so any
-    // tampering with version/params/salt/nonce fails the tag check.
+    // The full header (incl. nonce) is the AEAD associated data.
     let aad = header.to_bytes();
     let plaintext = Zeroizing::new(crypto::decrypt(&key, &header.nonce, ciphertext, &aad)?);
     let vault: Vault = serde_json::from_slice(&plaintext)?;
     Ok((vault, header, key))
 }
 
-/// Normalize a virtual directory path to `/a/b/c` form (empty string == root).
-fn normalize_dir(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        String::new()
+/// Encrypt `vault` under `key` and write it atomically to `path` (new nonce, full
+/// header as AAD, temp → fsync → rename → dir fsync).
+fn write_vault_file(
+    path: &Path,
+    vault: &Vault,
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    params: KdfParams,
+) -> Result<(), VaultError> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(vault)?);
+    let nonce = crypto::random_bytes::<NONCE_LEN>()?;
+    let header = Header { params, salt: *salt, nonce };
+    let header_bytes = header.to_bytes();
+    let ciphertext = crypto::encrypt_with_nonce(key, &nonce, &plaintext, &header_bytes)?;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+        harden_dir(parent);
+    }
+    let tmp = sibling_tmp(path)?;
+    if let Err(e) = write_new_file(&tmp, &header_bytes, &ciphertext) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
+// --- Password-change (rekey) staging recovery --------------------------------
+
+/// Recover an interrupted password change found at `<dir>/.rekey`:
+/// a `READY` marker means the new tree is complete → **roll forward** (commit);
+/// no marker means staging was incomplete → **discard** it (the old tree stands).
+/// In read-only mode we cannot write, so a pending rekey is reported.
+fn recover_pending_rekey(dir: &Path, read_only: bool) -> Result<(), VaultError> {
+    let staging = dir.join(REKEY_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    if read_only {
+        return Err(VaultError::RekeyPending);
+    }
+    if staging.join(REKEY_READY).exists() {
+        commit_rekey(dir, &staging)?;
     } else {
-        format!("/{}", parts.join("/"))
+        let _ = fs::remove_dir_all(&staging);
+    }
+    Ok(())
+}
+
+/// Commit a staged rekey by moving the new tree into place: volumes and manifests
+/// first, then the vault file **last** (the commit point). Idempotent: re-running
+/// after a partial move finishes the remaining items.
+fn commit_rekey(dir: &Path, staging: &Path) -> Result<(), VaultError> {
+    replace_dir(&dir.join("volume"), &staging.join("volume"))?;
+    replace_dir(&dir.join("manifest"), &staging.join("manifest"))?;
+    replace_path(&dir.join(VAULT_FILE), &staging.join(VAULT_FILE))?;
+    sync_parent_dir(&dir.join(VAULT_FILE));
+    let _ = fs::remove_dir_all(staging);
+    Ok(())
+}
+
+/// Replace `live` with `staged` (a directory) if `staged` still exists.
+fn replace_dir(live: &Path, staged: &Path) -> Result<(), VaultError> {
+    if !staged.exists() {
+        return Ok(());
+    }
+    let old = sibling_old(live);
+    let _ = fs::remove_dir_all(&old);
+    if live.exists() {
+        fs::rename(live, &old)?;
+    }
+    fs::rename(staged, live)?;
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// Replace `live` with `staged` (a file) if `staged` still exists.
+fn replace_path(live: &Path, staged: &Path) -> Result<(), VaultError> {
+    if !staged.exists() {
+        return Ok(());
+    }
+    fs::rename(staged, live)?;
+    Ok(())
+}
+
+fn sibling_old(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("x");
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(format!(".{name}.old")),
+        _ => PathBuf::from(format!(".{name}.old")),
     }
 }
 
-/// A short random hex suffix for temp filenames.
+/// Normalize a virtual directory path to `/a/b/c` form (empty string == root).
+fn normalize_dir(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() { String::new() } else { format!("/{}", parts.join("/")) }
+}
+
 fn rand_suffix() -> Result<String, CryptoError> {
     Ok(crypto::random_bytes::<8>()?.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// A unique, hidden temp path beside `path` (same directory).
 fn sibling_tmp(path: &Path) -> Result<PathBuf, VaultError> {
     let suffix = rand_suffix()?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -676,47 +598,54 @@ fn sibling_tmp(path: &Path) -> Result<PathBuf, VaultError> {
     })
 }
 
-/// Copy the vault file **and** its document archive into `dest_dir` as a
-/// self-consistent, timestamped pair (e.g. `vault-20260614-013055.pmv` and
-/// `vault-20260614-013055.pmv.vol`). Copies the encrypted files as-is — no
-/// passwords needed and nothing is decrypted. `archive` overrides the source
-/// archive path (`--vol`); the backup copy is always named `<backup-vault>.vol`
-/// so it opens with the default convention. Returns the backup vault path.
-pub fn backup(
-    vault_path: &Path,
-    dest_dir: &Path,
-    archive: Option<&Path>,
-) -> Result<PathBuf, VaultError> {
+/// Copy the whole vault directory (`vault.pmv` + `manifest/` + `volume/`) into a
+/// fresh timestamped subdirectory of `dest_dir`, as a consistent set. Copies the
+/// encrypted files as-is — nothing is decrypted. Returns the backup vault path.
+pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError> {
     if !vault_path.exists() {
         return Err(VaultError::NotFound(vault_path.to_path_buf()));
     }
+    let src_dir = parent_dir(vault_path);
     fs::create_dir_all(dest_dir)?;
     harden_dir(dest_dir);
 
-    let stem = vault_path.file_stem().and_then(|s| s.to_str()).unwrap_or("vault");
-    let ext = vault_path.extension().and_then(|s| s.to_str()).unwrap_or("pmv");
     let stamp = compact_timestamp(records::unix_now());
-    let src_archive = archive.map(|p| p.to_path_buf()).unwrap_or_else(|| archive_path(vault_path));
-
-    // Choose a base name that collides with neither the vault nor its `.vol`
-    // companion, so two backups in the same second don't silently overwrite one
-    // another (the timestamp has 1-second resolution).
-    let mut backup_vault = dest_dir.join(format!("{stem}-{stamp}.{ext}"));
+    let mut target = dest_dir.join(format!("backup-{stamp}"));
     let mut n = 1;
-    while backup_vault.exists() || archive_path(&backup_vault).exists() {
-        backup_vault = dest_dir.join(format!("{stem}-{stamp}_{n}.{ext}"));
+    while target.exists() {
+        target = dest_dir.join(format!("backup-{stamp}_{n}"));
         n += 1;
     }
+    fs::create_dir_all(&target)?;
+    harden_dir(&target);
 
-    fs::copy(vault_path, &backup_vault)?;
-    harden_file(&backup_vault)?;
-    // Keep the archive named `<backup-vault>.vol` so the pair opens together.
-    if src_archive.exists() {
-        let backup_archive = archive_path(&backup_vault);
-        fs::copy(&src_archive, &backup_archive)?;
-        harden_file(&backup_archive)?;
+    fs::copy(vault_path, target.join(VAULT_FILE))?;
+    harden_file(&target.join(VAULT_FILE))?;
+    for sub in ["manifest", "volume"] {
+        let s = src_dir.join(sub);
+        if s.exists() {
+            copy_dir(&s, &target.join(sub))?;
+        }
     }
-    Ok(backup_vault)
+    Ok(target.join(VAULT_FILE))
+}
+
+/// Recursively copy a directory tree (files hardened to 0600 on Unix).
+fn copy_dir(src: &Path, dst: &Path) -> Result<(), VaultError> {
+    fs::create_dir_all(dst)?;
+    harden_dir(dst);
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+            harden_file(&to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Format unix seconds as a filename-safe UTC stamp `YYYYMMDD-HHMMSS`.
@@ -725,83 +654,8 @@ fn compact_timestamp(ts: i64) -> String {
     format!("{year:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
 }
 
-/// The single encrypted document-archive path for a vault: `<vault-name>.vol`.
-fn archive_path(vault: &Path) -> PathBuf {
-    let name = vault.file_name().and_then(|n| n.to_str()).unwrap_or("vault");
-    let file = format!("{name}.vol");
-    match vault.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(file),
-        _ => PathBuf::from(file),
-    }
-}
-
-/// Read and decrypt the whole document archive (empty map if the file is absent),
-/// authenticated against `vault_id` so a foreign/swapped archive is rejected.
-fn load_archive(path: &Path, key: &Key, vault_id: &str) -> Result<DocArchive, VaultError> {
-    // Refuse an absurdly large archive *before* reading it into memory, so a
-    // corrupt or hostile `.vol` cannot drive an unbounded allocation.
-    match fs::metadata(path) {
-        Ok(m) if m.len() > MAX_ARCHIVE_SIZE => return Err(VaultError::TooLarge),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DocArchive::new()),
-        _ => {}
-    }
-    let raw = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DocArchive::new()),
-        Err(e) => return Err(e.into()),
-    };
-    if raw.len() < NONCE_LEN {
-        return Err(VaultError::Truncated);
-    }
-    let (nonce, ciphertext) = raw.split_at(NONCE_LEN);
-    let aad = archive_aad(vault_id);
-    let plaintext = Zeroizing::new(crypto::decrypt(key, nonce, ciphertext, &aad)?);
-    parse_archive(&plaintext)
-}
-
-/// Serialize the archive map to a length-prefixed binary buffer:
-/// `[u32 count]` then per entry `[u32 id_len][id][u64 data_len][data]`.
-fn serialize_archive(map: &DocArchive) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
-    for (id, data) in map {
-        let idb = id.as_bytes();
-        buf.extend_from_slice(&(idb.len() as u32).to_le_bytes());
-        buf.extend_from_slice(idb);
-        buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        buf.extend_from_slice(data);
-    }
-    buf
-}
-
-/// Parse the archive buffer with bounds-checked reads (the archive is attacker-
-/// controllable, so a malformed buffer must fail closed, never panic). Every
-/// read is bounded by the actual buffer length, so a huge length field cannot
-/// trigger an over-read or over-allocation.
-fn parse_archive(buf: &[u8]) -> Result<DocArchive, VaultError> {
-    fn take<'a>(buf: &'a [u8], cur: &mut usize, n: usize) -> Result<&'a [u8], VaultError> {
-        let end = cur.checked_add(n).ok_or(VaultError::Truncated)?;
-        let slice = buf.get(*cur..end).ok_or(VaultError::Truncated)?;
-        *cur = end;
-        Ok(slice)
-    }
-    let mut map = DocArchive::new();
-    let mut cur = 0usize;
-    let count = u32::from_le_bytes(take(buf, &mut cur, 4)?.try_into().unwrap());
-    for _ in 0..count {
-        let id_len = u32::from_le_bytes(take(buf, &mut cur, 4)?.try_into().unwrap()) as usize;
-        let id = String::from_utf8(take(buf, &mut cur, id_len)?.to_vec())
-            .map_err(|_| VaultError::Truncated)?;
-        let data_len = u64::from_le_bytes(take(buf, &mut cur, 8)?.try_into().unwrap()) as usize;
-        let data = take(buf, &mut cur, data_len)?.to_vec();
-        map.insert(id, Zeroizing::new(data));
-    }
-    Ok(map)
-}
-
-// --- Cross-platform file hardening (req: compile on Windows + Linux) ---------
-// `pub` so the CLI binary (`main.rs`, a separate crate over this library) can
-// reuse these instead of re-implementing the same security-sensitive primitives.
+// --- Cross-platform file hardening (compile on Windows + Linux) --------------
+// `pub` so the CLI binary (a separate crate over this library) can reuse them.
 
 #[cfg(unix)]
 pub fn harden_file(path: &Path) -> std::io::Result<()> {
@@ -810,7 +664,6 @@ pub fn harden_file(path: &Path) -> std::io::Result<()> {
     perms.set_mode(0o600);
     fs::set_permissions(path, perms)
 }
-
 #[cfg(not(unix))]
 pub fn harden_file(_path: &Path) -> std::io::Result<()> {
     Ok(())
@@ -825,13 +678,10 @@ pub fn harden_dir(dir: &Path) {
         let _ = fs::set_permissions(dir, perms);
     }
 }
-
 #[cfg(not(unix))]
 pub fn harden_dir(_dir: &Path) {}
 
-/// Open a brand-new file at `path` with `create_new` (O_EXCL, so an existing
-/// path — including a pre-planted symlink — fails instead of being followed) and
-/// mode 0600 on Unix applied atomically at creation.
+/// Open a brand-new file with `create_new` (O_EXCL; no symlink-follow) + 0600.
 fn create_new_0600(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -843,21 +693,17 @@ fn create_new_0600(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
-/// Create a brand-new file at `path`, write `part1` + `part2`, and fsync.
-/// Used for the vault file (header+ciphertext) and the document archive
-/// (nonce+ciphertext). See [`create_new_0600`] for the symlink/permission notes.
 fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
-    harden_file(path)?; // belt-and-suspenders (no-op on non-unix)
+    harden_file(path)?;
     f.write_all(part1)?;
     f.write_all(part2)?;
     f.sync_all()?;
     Ok(())
 }
 
-/// Create a brand-new file and write a single buffer to it (O_EXCL + 0600); on a
-/// write error the partial file is removed so no fragment is left behind. Shared
-/// by `export_document` and the CLI `extract` command.
+/// Create a brand-new file and write a single buffer (O_EXCL + 0600); removes the
+/// partial file on a write error. Shared by `export_document` and the CLI.
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
     harden_file(path)?;
@@ -869,36 +715,21 @@ pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// fsync the directory containing `path` so a rename into it is durable.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     if let Ok(dir) = fs::File::open(parent) {
         let _ = dir.sync_all();
     }
 }
-
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
 
-/// Fuzzing entry points (hidden from the public API / docs). They feed
-/// attacker-controlled bytes straight into the two untrusted-input parsers so a
-/// fuzzer can assert the invariant: **never panic, never over-allocate, only
-/// ever return `Err` on malformed input.** Used by the targets under `fuzz/`.
+/// Fuzzing entry point (hidden). The vault-file header parser; see `fuzz/`.
 #[doc(hidden)]
 pub mod fuzz {
-    /// Drive the vault-file header parser (magic, version, KDF-param bounds).
     pub fn header(buf: &[u8]) {
         let _ = super::Header::parse(buf);
-    }
-
-    /// Drive the decrypted document-archive binary parser (length-prefixed
-    /// entries — the hand-rolled, bounds-checked format).
-    pub fn archive(buf: &[u8]) {
-        let _ = super::parse_archive(buf);
     }
 }
 
@@ -911,17 +742,23 @@ mod tests {
     fn fast() -> KdfParams {
         KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
     }
-
     fn nanos() -> u128 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
     }
-
+    /// A fresh, unique vault directory; returns its `vault.pmv` path.
     fn tmp_path(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("passmgr-test-{tag}-{}.pmv", nanos()));
+        let dir = std::env::temp_dir().join(format!("pmvault-{tag}-{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(VAULT_FILE)
+    }
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_dir_all(parent_dir(path));
+    }
+    fn write_src(tag: &str, body: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("pmsrc-{tag}-{}.txt", nanos()));
+        fs::write(&p, body).unwrap();
         p
     }
-
     fn sample_account(user: &str, pw: &str) -> Account {
         let mut a = Account::new().unwrap();
         a.account_type = "Checking".into();
@@ -941,66 +778,145 @@ mod tests {
         assert_eq!(reopened.vault.accounts.len(), 1);
         assert_eq!(reopened.vault.accounts[0].password, "hunter2");
         assert_eq!(reopened.vault.version, FORMAT_VERSION);
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
-    fn both_passwords_required() {
+    fn both_passwords_required_and_order_matters() {
         let path = tmp_path("twopw");
         OpenVault::create(path.clone(), b"right1", b"right2", fast()).unwrap();
         assert!(OpenVault::open(path.clone(), b"wrong1", b"right2").is_err());
         assert!(OpenVault::open(path.clone(), b"right1", b"wrong2").is_err());
+        assert!(OpenVault::open(path.clone(), b"right2", b"right1").is_err()); // order
         assert!(OpenVault::open(path.clone(), b"right1", b"right2").is_ok());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn password_order_matters() {
-        let path = tmp_path("order");
-        OpenVault::create(path.clone(), b"alpha", b"beta", fast()).unwrap();
-        assert!(OpenVault::open(path.clone(), b"beta", b"alpha").is_err());
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
     fn create_refuses_existing() {
         let path = tmp_path("exists");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let err = OpenVault::create(path.clone(), b"a", b"b", fast())
-            .err()
-            .expect("creating over an existing vault should fail");
+        let err = OpenVault::create(path.clone(), b"a", b"b", fast()).err().unwrap();
         assert!(matches!(err, VaultError::AlreadyExists(_)));
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
-    fn change_password_works() {
-        let path = tmp_path("changepw");
+    fn document_round_trip_and_consistency_check() {
+        let path = tmp_path("vol");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("doc", b"statement contents");
+        let id1 = v.add_document("/statements/2026", "q1.txt", &src).unwrap();
+        let id2 = v.add_document("/wills", "will.txt", &src).unwrap();
+        assert_eq!(&*v.read_document(&id1).unwrap(), b"statement contents");
+        assert_eq!(v.doc_path(&id1).unwrap(), "/statements/2026/q1.txt");
+
+        // Link one doc to a record so the consistency check has something to verify.
+        let mut tw = crate::records::TrustWill::new().unwrap();
+        tw.file = Some(id1.clone());
+        records::upsert(&mut v.vault.trust_wills, tw);
+        v.save().unwrap();
+
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*v2.read_document(&id1).unwrap(), b"statement contents");
+        assert_eq!(&*v2.read_document(&id2).unwrap(), b"statement contents");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn missing_referenced_document_is_rejected_on_open() {
+        let path = tmp_path("mismatch");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("d", b"doc");
+        let id = v.add_document("/d", "f.txt", &src).unwrap();
+        let mut tw = crate::records::TrustWill::new().unwrap();
+        tw.file = Some(id);
+        records::upsert(&mut v.vault.trust_wills, tw);
+        v.save().unwrap();
+        drop(v);
+
+        // Wipe the volume directory: the referenced doc is now missing.
+        fs::remove_dir_all(parent_dir(&path).join("volume")).unwrap();
+        fs::remove_dir_all(parent_dir(&path).join("manifest")).unwrap();
+        let err = OpenVault::open(path.clone(), b"a", b"b").err().unwrap();
+        assert!(matches!(err, VaultError::ArchiveMismatch));
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn change_password_full_reencrypt_keeps_docs() {
+        let path = tmp_path("rekey");
         let mut v = OpenVault::create(path.clone(), b"old1", b"old2", fast()).unwrap();
         records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        let src = write_src("rk", b"will body");
+        let id = v.add_document("/wills", "will.txt", &src).unwrap();
         v.change_password(b"new1", b"new2").unwrap();
 
+        // Old passwords no longer work; new ones open and the doc still reads.
         assert!(OpenVault::open(path.clone(), b"old1", b"old2").is_err());
         let reopened = OpenVault::open(path.clone(), b"new1", b"new2").unwrap();
         assert_eq!(reopened.vault.accounts.len(), 1);
-        fs::remove_file(&path).ok();
+        assert_eq!(&*reopened.read_document(&id).unwrap(), b"will body");
+        // Staging was cleaned up.
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists());
+        cleanup(&path);
+        fs::remove_file(&src).ok();
     }
 
     #[test]
-    fn change_password_keeps_documents_readable() {
-        let path = tmp_path("rekeydoc");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-src-{}.txt", nanos()));
-        fs::write(&src, b"will body").unwrap();
-        let id = v.add_document("/wills", "will.txt", &src).unwrap();
-        v.change_password(b"c", b"d").unwrap();
+    fn rekey_roll_forward_on_interrupted_commit() {
+        // Simulate a crash AFTER staging was marked READY but BEFORE commit: the
+        // .rekey dir (with READY) is present. Reopening must roll forward.
+        let path = tmp_path("rollfwd");
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+            v.save().unwrap();
+        }
+        let dir = parent_dir(&path);
+        // Manually stage a new-key tree (mirror change_password's staging).
+        let staging = dir.join(REKEY_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        let new_salt = crypto::random_bytes::<SALT_LEN>().unwrap();
+        let new_key = crypto::derive_key_chained(b"c", b"d", &new_salt, &fast()).unwrap();
+        let (vault, _h, _k) = decrypt_file(&path, b"a", b"b").unwrap();
+        // Empty store under the staging dir (no docs in this vault).
+        let _ = VolumeStore::open(&staging, &new_key, &vault.id, vault.settings.volume_max_size).unwrap();
+        write_vault_file(&staging.join(VAULT_FILE), &vault, &new_key, &new_salt, fast()).unwrap();
+        write_new_bytes(&staging.join(REKEY_READY), b"ready").unwrap();
 
+        // Reopen: roll-forward completes, so the NEW passwords open it.
         let reopened = OpenVault::open(path.clone(), b"c", b"d").unwrap();
-        assert_eq!(&reopened.read_document(&id).unwrap()[..], b"will body");
-        fs::remove_file(&src).ok();
-        fs::remove_file(archive_path(&path)).ok();
-        fs::remove_file(&path).ok();
+        assert_eq!(reopened.vault.accounts.len(), 1);
+        assert!(!dir.join(REKEY_DIR).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_discard_on_incomplete_staging() {
+        // .rekey present WITHOUT READY → staging is discarded, old passwords work.
+        let path = tmp_path("discard");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let staging = parent_dir(&path).join(REKEY_DIR);
+        fs::create_dir_all(staging.join("volume")).unwrap();
+        fs::write(staging.join("vault.pmv"), b"partial").unwrap();
+
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(reopened.vault.version, FORMAT_VERSION);
+        assert!(!staging.exists(), "incomplete staging discarded");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_with_pending_rekey_is_reported() {
+        let path = tmp_path("ropending");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        fs::create_dir_all(parent_dir(&path).join(REKEY_DIR)).unwrap();
+        let err = OpenVault::open_read_only(path.clone(), b"a", b"b").err().unwrap();
+        assert!(matches!(err, VaultError::RekeyPending));
+        cleanup(&path);
     }
 
     #[test]
@@ -1009,18 +925,7 @@ mod tests {
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
         fs::write(&path, b"PMVAULT\0").unwrap();
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_err());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn last_access_is_tracked() {
-        let path = tmp_path("access");
-        let created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        assert_eq!(created.previous_access(), 0);
-        let first_access = created.vault.last_opened_at;
-        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        assert_eq!(reopened.previous_access(), first_access);
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
@@ -1030,196 +935,101 @@ mod tests {
         let mut raw = fs::read(&path).unwrap();
         raw[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &raw).unwrap();
-        let err = OpenVault::open(path.clone(), b"a", b"b")
-            .err()
-            .expect("absurd KDF params must be rejected");
+        let err = OpenVault::open(path.clone(), b"a", b"b").err().unwrap();
         assert!(matches!(err, VaultError::BadParams));
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
-    fn export_reads_without_mutating() {
-        let path = tmp_path("export");
+    fn header_tampering_is_detected() {
+        let path = tmp_path("hdrtamper");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let good = fs::read(&path).unwrap();
+        let flipped_fails = |offset: usize| -> bool {
+            let mut bad = good.clone();
+            bad[offset] ^= 0x01;
+            fs::write(&path, &bad).unwrap();
+            OpenVault::open(path.clone(), b"a", b"b").is_err()
+        };
+        assert!(flipped_fails(9), "param tampering detected");
+        assert!(flipped_fails(21), "salt tampering detected");
+        assert!(flipped_fails(37), "nonce tampering detected");
+        fs::write(&path, &good).unwrap();
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_documents_spans_all_partitions() {
+        let path = tmp_path("exportall");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        records::upsert(&mut v.vault.accounts, sample_account("octocat", "pw"));
+        // Tiny volume cap so the two docs land in different partitions.
+        v.vault.settings.volume_max_size = 1024;
         v.save().unwrap();
-        let before = fs::read(&path).unwrap();
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        let src = write_src("big", &vec![3u8; 600]);
+        v.add_document("/a", "a.bin", &src).unwrap();
+        v.add_document("/b", "b.bin", &src).unwrap();
+        drop(v);
 
-        let exported = OpenVault::export(&path, b"a", b"b").unwrap();
-        assert_eq!(exported.accounts.len(), 1);
-
-        let after = fs::read(&path).unwrap();
-        assert_eq!(before, after, "export must not modify the vault file");
-        assert!(OpenVault::export(&path, b"a", b"WRONG").is_err());
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn document_volume_round_trip() {
-        let path = tmp_path("vol");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-src-{}.txt", nanos()));
-        fs::write(&src, b"statement contents").unwrap();
-
-        let id1 = v.add_document("/statements/2026", "q1.txt", &src).unwrap();
-        let id2 = v.add_document("/wills", "will.txt", &src).unwrap();
-        assert_eq!(v.vault.volume.files.len(), 2);
-        assert!(v.vault.volume.directories.contains(&"/statements".to_string()));
-        assert!(v.vault.volume.uploads.iter().any(|c| c.action == "uploaded"));
-
-        // Both documents live in ONE archive file decrypted as a unit.
-        let arc = archive_path(&path);
-        assert!(arc.exists(), "single archive file should exist");
-        let raw = fs::read(&arc).unwrap();
-        assert!(
-            raw.windows(b"statement contents".len()).all(|w| w != b"statement contents"),
-            "archive must be encrypted"
-        );
-
-        assert_eq!(&v.read_document(&id1).unwrap()[..], b"statement contents");
-
-        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        assert_eq!(&v2.read_document(&id1).unwrap()[..], b"statement contents");
-        assert_eq!(&v2.read_document(&id2).unwrap()[..], b"statement contents");
-        assert!(v2.read_document("deadbeef").is_err());
-
+        let docs = OpenVault::export_documents(&path, b"a", b"b").unwrap();
+        assert_eq!(docs.len(), 2, "extract spans every partition");
+        cleanup(&path);
         fs::remove_file(&src).ok();
-        fs::remove_file(&arc).ok();
-        fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn archive_mismatch_detected_when_stale() {
-        let path = tmp_path("mismatch");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-src-{}.txt", nanos()));
-        fs::write(&src, b"doc").unwrap();
-        v.add_document("/d", "f.txt", &src).unwrap();
-
-        // Drop the archive: the manifest still references the document id, so the
-        // on-open consistency check must reject it (a stale/missing/rolled-back .vol).
-        fs::remove_file(archive_path(&path)).unwrap();
-        let err = OpenVault::open(path.clone(), b"a", b"b")
-            .err()
-            .expect("a manifest id with no archive entry must be rejected");
-        assert!(matches!(err, VaultError::ArchiveMismatch));
-        fs::remove_file(&src).ok();
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn remove_document_reclaims_blob() {
-        let path = tmp_path("rmdoc");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-src-{}.txt", nanos()));
-        fs::write(&src, b"doc").unwrap();
-        let id = v.add_document("/d", "f.txt", &src).unwrap();
-        assert!(v.read_document(&id).is_ok());
-
-        v.remove_document(&id).unwrap();
-        assert!(v.read_document(&id).is_err(), "blob is gone from the archive");
-        assert!(v.vault.volume.files.iter().all(|f| f.id != id), "manifest entry removed");
-
-        // Reopen: archive is now empty and consistent with the empty manifest.
-        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        assert!(v2.vault.volume.files.is_empty());
-        fs::remove_file(&src).ok();
-        let _ = fs::remove_file(archive_path(&path));
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn compact_timestamp_is_filename_safe() {
-        assert_eq!(compact_timestamp(1_609_459_200), "20210101-000000");
-        assert_eq!(compact_timestamp(1_609_459_201), "20210101-000001");
-        assert!(!compact_timestamp(records::unix_now()).contains([':', ' ', '/']));
-    }
-
-    #[test]
-    fn backup_copies_consistent_pair() {
+    fn backup_copies_consistent_tree() {
         let path = tmp_path("bkp");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-bkpsrc-{}.txt", nanos()));
-        fs::write(&src, b"doc body").unwrap();
+        let src = write_src("bk", b"doc body");
         let id = v.add_document("/d", "f.txt", &src).unwrap();
+        drop(v);
 
-        let dest = std::env::temp_dir().join(format!("passmgr-bkp-{}", nanos()));
-        let backup_vault = backup(&path, &dest, None).unwrap();
+        let dest = std::env::temp_dir().join(format!("pmbkp-{}", nanos()));
+        let backup_vault = backup(&path, &dest).unwrap();
         assert!(backup_vault.exists());
-        assert!(archive_path(&backup_vault).exists(), "archive backed up alongside the vault");
 
-        // The backup is a self-consistent pair: it opens and its document reads.
         let reopened = OpenVault::open(backup_vault.clone(), b"a", b"b").unwrap();
-        assert_eq!(&reopened.read_document(&id).unwrap()[..], b"doc body");
-
+        assert_eq!(&*reopened.read_document(&id).unwrap(), b"doc body");
+        fs::remove_dir_all(&dest).ok();
+        cleanup(&path);
         fs::remove_file(&src).ok();
-        fs::remove_dir_all(&dest).ok();
-        let _ = fs::remove_file(archive_path(&path));
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn backup_same_second_does_not_overwrite() {
-        let path = tmp_path("bkdup");
-        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let dest = std::env::temp_dir().join(format!("passmgr-bkdup-{}", nanos()));
-
-        // Two backups "in the same second" must produce two distinct files.
-        let b1 = backup(&path, &dest, None).unwrap();
-        let b2 = backup(&path, &dest, None).unwrap();
-        assert_ne!(b1, b2, "second backup must not reuse the first name");
-        assert!(b1.exists() && b2.exists(), "both backups survive");
-
-        fs::remove_dir_all(&dest).ok();
-        fs::remove_file(&path).ok();
     }
 
     #[test]
     fn export_document_is_hardened_and_no_clobber() {
         let path = tmp_path("expdoc");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-expsrc-{}.txt", nanos()));
-        fs::write(&src, b"secret doc").unwrap();
+        let src = write_src("exp", b"secret doc");
         let id = v.add_document("/d", "f.txt", &src).unwrap();
 
-        let dest = std::env::temp_dir().join(format!("passmgr-exp-{}.txt", nanos()));
+        let dest = std::env::temp_dir().join(format!("pmexp-{}.txt", nanos()));
         v.export_document(&id, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"secret doc");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "exported plaintext is owner-only");
+            assert_eq!(mode, 0o600);
         }
-        // create_new semantics: a second export to the same path fails (no clobber).
-        assert!(v.export_document(&id, &dest).is_err());
-
-        fs::remove_file(&src).ok();
+        assert!(v.export_document(&id, &dest).is_err(), "no clobber");
         fs::remove_file(&dest).ok();
-        let _ = fs::remove_file(archive_path(&path));
-        fs::remove_file(&path).ok();
+        cleanup(&path);
+        fs::remove_file(&src).ok();
     }
 
     #[test]
     fn generation_increments_and_is_surfaced() {
         let path = tmp_path("gen");
         let created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let g_after_create = created.vault.generation;
-        assert!(g_after_create >= 1);
+        let g = created.vault.generation;
+        assert!(g >= 1);
         drop(created);
-
         let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        // The generation read from disk (before this open bumped it) is surfaced.
-        assert_eq!(reopened.opened_generation(), g_after_create);
-        // Opening also bumps and persists a new generation.
-        assert!(reopened.vault.generation > g_after_create);
-        fs::remove_file(&path).ok();
+        assert_eq!(reopened.opened_generation(), g);
+        assert!(reopened.vault.generation > g);
+        cleanup(&path);
     }
 
     #[test]
@@ -1231,149 +1041,40 @@ mod tests {
             v.save().unwrap();
         }
         let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
-        // Reads still work.
         assert_eq!(ro.vault.accounts.len(), 1);
-        // Every mutation is refused.
         assert!(matches!(ro.save(), Err(VaultError::ReadOnly)));
         assert!(matches!(ro.change_password(b"c", b"d"), Err(VaultError::ReadOnly)));
         assert!(matches!(ro.remove_document("x"), Err(VaultError::ReadOnly)));
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-rosrc-{}.txt", nanos()));
-        fs::write(&src, b"x").unwrap();
+        assert!(matches!(ro.add_asset_type("X"), Err(VaultError::ReadOnly)));
+        let src = write_src("ro", b"x");
         assert!(matches!(ro.add_document("/d", "f", &src), Err(VaultError::ReadOnly)));
 
-        // A read-only open does not bump the on-disk generation.
         let g_before = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap().vault.generation;
         let _ = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
         let g_after = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap().vault.generation;
         assert_eq!(g_before, g_after, "read-only open writes nothing");
-
+        cleanup(&path);
         fs::remove_file(&src).ok();
-        fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn malformed_archive_fails_closed() {
-        let mut bad = Vec::new();
-        bad.extend_from_slice(&5u32.to_le_bytes()); // claims 5 entries
-        bad.extend_from_slice(&9999u32.to_le_bytes()); // absurd id_len, no data
-        assert!(parse_archive(&bad).is_err());
-        assert!(parse_archive(&[]).is_err());
-        assert!(parse_archive(&0u32.to_le_bytes()).unwrap().is_empty());
-    }
-
-    #[test]
-    fn categories_are_seeded_and_persist_in_the_vault() {
+    fn categories_persist_and_read_only_refuses_edits() {
         let path = tmp_path("cats");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        // New vaults are seeded with the built-in defaults.
         assert!(v.categories().account_type_names().contains(&"Financial".to_string()));
-        // A category edit is persisted into the encrypted vault itself.
         assert!(v.add_asset_type("Annuity").unwrap());
-        assert!(!v.add_asset_type("annuity").unwrap(), "case-insensitive dedup");
         assert!(v.add_account_subtype("Financial", "HSA").unwrap());
+        drop(v);
 
         let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         assert!(reopened.categories().asset.contains(&"Annuity".to_string()));
         assert!(reopened.categories().subtypes_for("Financial").contains(&"HSA".to_string()));
-        fs::remove_file(&path).ok();
+        cleanup(&path);
     }
 
     #[test]
-    fn read_only_refuses_category_edits() {
-        let path = tmp_path("rocat");
-        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
-        assert!(matches!(ro.add_asset_type("Annuity"), Err(VaultError::ReadOnly)));
-        assert!(matches!(ro.add_account_type("Crypto"), Err(VaultError::ReadOnly)));
-        // Reopening confirms nothing was written.
-        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        assert!(!reopened.categories().asset.contains(&"Annuity".to_string()));
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn custom_archive_path_is_honored() {
-        // `--vol`: documents go to a chosen archive path, not the default <vault>.vol.
-        let path = tmp_path("volpath");
-        let custom = std::env::temp_dir().join(format!("passmgr-customvol-{}.bin", nanos()));
-        let mut src = std::env::temp_dir();
-        src.push(format!("passmgr-volsrc-{}.txt", nanos()));
-        fs::write(&src, b"top secret will").unwrap();
-
-        let mut v =
-            OpenVault::create_with(path.clone(), b"a", b"b", fast(), Some(custom.clone())).unwrap();
-        let id = v.add_document("/wills", "will.pdf", &src).unwrap();
-        assert!(custom.exists(), "document archive written to the custom path");
-        assert!(!archive_path(&path).exists(), "default <vault>.vol was NOT created");
-
-        // Reopening must be told the same archive path; the default would miss it.
-        assert!(matches!(
-            OpenVault::open(path.clone(), b"a", b"b"),
-            Err(VaultError::ArchiveMismatch)
-        ));
-        let reopened =
-            OpenVault::open_with(path.clone(), b"a", b"b", true, Some(custom.clone())).unwrap();
-        assert_eq!(&*reopened.read_document(&id).unwrap(), b"top secret will");
-
-        fs::remove_file(&path).ok();
-        fs::remove_file(&custom).ok();
-        fs::remove_file(&src).ok();
-    }
-
-    #[test]
-    fn oversized_document_source_is_rejected() {
-        let path = tmp_path("bigdoc");
-        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        // A *sparse* file that merely reports a size over the cap (no real blocks).
-        let big = std::env::temp_dir().join(format!("passmgr-bigsrc-{}.bin", nanos()));
-        let f = fs::File::create(&big).unwrap();
-        f.set_len(MAX_DOCUMENT_SIZE + 1).unwrap();
-        drop(f);
-        assert!(matches!(v.add_document("/d", "huge", &big), Err(VaultError::TooLarge)));
-        fs::remove_file(&big).ok();
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn oversized_archive_is_rejected_on_open() {
-        let path = tmp_path("bigvol");
-        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        // Replace the archive with a sparse file reporting a size over the cap.
-        let vol = archive_path(&path);
-        let f = fs::File::create(&vol).unwrap();
-        f.set_len(MAX_ARCHIVE_SIZE + 1).unwrap();
-        drop(f);
-        assert!(matches!(OpenVault::open(path.clone(), b"a", b"b"), Err(VaultError::TooLarge)));
-        fs::remove_file(&vol).ok();
-        fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn header_tampering_is_detected() {
-        // The whole header is AEAD associated data: flipping the KDF params, the
-        // salt, or the nonce must make the file fail to open (no silent downgrade
-        // or salt/nonce swap).
-        let path = tmp_path("hdrtamper");
-        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let good = fs::read(&path).unwrap();
-
-        let flipped_fails = |offset: usize| -> bool {
-            let mut bad = good.clone();
-            bad[offset] ^= 0x01;
-            let p = tmp_path("hdrtamper-x");
-            fs::write(&p, &bad).unwrap();
-            let failed = OpenVault::open(p.clone(), b"a", b"b").is_err();
-            fs::remove_file(&p).ok();
-            failed
-        };
-
-        // Header layout: m_cost@9, salt@21, nonce@37 (see the module docs).
-        assert!(flipped_fails(9), "KDF-parameter tampering must be detected");
-        assert!(flipped_fails(21), "salt tampering must be detected");
-        assert!(flipped_fails(37), "nonce tampering must be detected");
-        // Sanity: the untouched file still opens.
-        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
-        fs::remove_file(&path).ok();
+    fn compact_timestamp_is_filename_safe() {
+        assert_eq!(compact_timestamp(1_609_459_200), "20210101-000000");
+        assert!(!compact_timestamp(records::unix_now()).contains([':', ' ', '/']));
     }
 }

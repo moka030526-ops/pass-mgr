@@ -380,66 +380,20 @@ impl_record!(
     |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() }
 );
 
-// --- Encrypted document volume manifest --------------------------------------
+// --- Vault settings ----------------------------------------------------------
 
-/// A file stored in the encrypted volume. The on-disk blob is `<id>.bin` inside
-/// the volume directory; `location`/`filename` are the virtual path shown in the
-/// UI's directory structure.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
-pub struct VolumeFile {
-    pub id: String,
-    pub location: String,
-    pub filename: String,
-    pub size: u64,
-    pub uploaded_at: i64,
-    /// Filesystem path the file was originally uploaded from.
-    pub source: String,
+/// User-configurable vault settings, stored (encrypted) inside the vault.
+#[derive(Serialize, Deserialize, Clone, Debug, Zeroize, ZeroizeOnDrop)]
+pub struct VaultSettings {
+    /// Per-partition document-volume size cap (bytes). A new document that would
+    /// push the active partition past this rolls into a fresh partition.
+    pub volume_max_size: u64,
 }
 
-/// The manifest of the encrypted volume: the virtual directory structure, the
-/// stored files, and the append-only upload history (location / date / file).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
-pub struct Volume {
-    /// Stable random id binding the encrypted archive file to this vault (so a
-    /// `.vol` from another vault, or a swapped one, is rejected). Set on create.
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub directories: Vec<String>,
-    #[serde(default)]
-    pub files: Vec<VolumeFile>,
-    #[serde(default)]
-    pub uploads: Vec<Change>,
-}
-
-impl Volume {
-    /// Register a virtual directory path (and its ancestors) if not present.
-    pub fn register_directory(&mut self, path: &str) {
-        for dir in ancestor_dirs(path) {
-            if !self.directories.iter().any(|d| d == &dir) {
-                self.directories.push(dir);
-            }
-        }
-        self.directories.sort();
+impl Default for VaultSettings {
+    fn default() -> Self {
+        VaultSettings { volume_max_size: crate::storage::DEFAULT_VOLUME_MAX_SIZE }
     }
-
-    pub fn file(&self, id: &str) -> Option<&VolumeFile> {
-        self.files.iter().find(|f| f.id == id)
-    }
-}
-
-/// Normalize a virtual path and return it plus each ancestor, e.g.
-/// `/a/b/c` -> ["/a", "/a/b", "/a/b/c"]. Empty/`"/"` yields nothing.
-pub fn ancestor_dirs(path: &str) -> Vec<String> {
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    let mut out = Vec::new();
-    let mut acc = String::new();
-    for p in parts {
-        acc.push('/');
-        acc.push_str(p);
-        out.push(acc.clone());
-    }
-    out
 }
 
 /// The decrypted contents of a vault: all five record collections plus the
@@ -465,8 +419,12 @@ pub struct Vault {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub real_estate: Vec<RealEstate>,
+    /// Stable random id binding the document volumes/manifests to this vault (so a
+    /// foreign or swapped volume/manifest fails authentication). Set on create.
     #[serde(default)]
-    pub volume: Volume,
+    pub id: String,
+    #[serde(default)]
+    pub settings: VaultSettings,
     #[serde(default)]
     pub audit: Vec<Change>,
     /// The editable category lists for the dropdowns, stored in the vault itself
@@ -526,22 +484,6 @@ mod tests {
         assert!(remove(&mut list, &id, &mut audit, "Instruction"));
         assert!(audit.iter().any(|c| c.action == "deleted" && c.detail.contains("Read me")));
         assert!(!remove(&mut list, &id, &mut audit, "Instruction"));
-    }
-
-    #[test]
-    fn ancestor_dirs_builds_tree() {
-        assert_eq!(ancestor_dirs("/statements/2026/q1"), vec!["/statements", "/statements/2026", "/statements/2026/q1"]);
-        assert!(ancestor_dirs("/").is_empty());
-        assert!(ancestor_dirs("").is_empty());
-    }
-
-    #[test]
-    fn register_directory_dedups_and_adds_ancestors() {
-        let mut v = Volume::default();
-        v.register_directory("/statements/2026");
-        v.register_directory("/statements/2026"); // dup
-        v.register_directory("/wills");
-        assert_eq!(v.directories, vec!["/statements", "/statements/2026", "/wills"]);
     }
 
     #[test]

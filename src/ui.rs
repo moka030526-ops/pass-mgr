@@ -30,13 +30,8 @@ use crate::vault::{self, OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits. `writable` enables mutations;
 /// when false the vault is opened read-only and write keys are inert.
-pub fn run(
-    terminal: &mut DefaultTerminal,
-    path: PathBuf,
-    archive: Option<PathBuf>,
-    writable: bool,
-) -> anyhow::Result<()> {
-    let mut app = App::new(path, archive, writable);
+pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, writable: bool) -> anyhow::Result<()> {
+    let mut app = App::new(path, writable);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         // Poll rather than block so the clipboard auto-clear deadline fires even
@@ -213,8 +208,6 @@ impl EditState {
 
 struct App {
     path: PathBuf,
-    /// Document-archive override (`--vol`); `None` uses the default `<vault>.vol`.
-    archive: Option<PathBuf>,
     /// When false the vault is opened read-only and mutating keys are inert.
     writable: bool,
     screen: Screen,
@@ -258,11 +251,10 @@ impl Drop for App {
 }
 
 impl App {
-    fn new(path: PathBuf, archive: Option<PathBuf>, writable: bool) -> Self {
+    fn new(path: PathBuf, writable: bool) -> Self {
         let mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         App {
             path,
-            archive,
             writable,
             screen: Screen::Auth,
             auth: AuthState::new(mode),
@@ -480,17 +472,11 @@ impl App {
                     return;
                 }
             };
-            OpenVault::create_with(
-                self.path.clone(),
-                pw1.as_bytes(),
-                pw2.as_bytes(),
-                KdfParams::default(),
-                self.archive.clone(),
-            )
+            OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
         } else {
             let f = &self.auth.fields;
             let (p1, p2) = (f[0].value.as_bytes(), f[1].value.as_bytes());
-            OpenVault::open_with(self.path.clone(), p1, p2, !self.writable, self.archive.clone())
+            OpenVault::open_with(self.path.clone(), p1, p2, !self.writable)
         };
         match result {
             Ok(v) => {
@@ -697,7 +683,7 @@ impl App {
                 if dest.is_empty() {
                     self.status = "Enter a backup destination directory.".into();
                 } else {
-                    match vault::backup(&self.path, Path::new(&dest), self.archive.as_deref()) {
+                    match vault::backup(&self.path, Path::new(&dest)) {
                         Ok(p) => self.status = format!("Backed up to {}", p.display()),
                         Err(e) => self.status = format!("Backup failed: {e}"),
                     }
@@ -1414,11 +1400,7 @@ impl App {
             let attached = es
                 .attached_file_id
                 .as_ref()
-                .and_then(|id| self.vault_ref().vault.volume.file(id))
-                .map(|f| {
-                    let loc = if f.location.is_empty() { "/".into() } else { f.location.clone() };
-                    format!("{loc}/{}", f.filename)
-                })
+                .and_then(|id| self.vault_ref().doc_path(id))
                 .unwrap_or_else(|| "(none)".into());
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -1517,8 +1499,12 @@ mod tests {
     }
 
     fn tmp_vault(tag: &str) -> PathBuf {
+        // A unique per-test directory; the vault file name is fixed (vault.pmv),
+        // matching production where the user controls only the directory.
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("passmgr-ui-{tag}-{nanos}.pmv"))
+        let dir = std::env::temp_dir().join(format!("passmgr-ui-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("vault.pmv")
     }
 
     /// An `App` with a freshly-created, unlocked vault on the Browse screen — the
@@ -1526,7 +1512,7 @@ mod tests {
     fn app_unlocked(tag: &str) -> (App, PathBuf) {
         let path = tmp_vault(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = App::new(path.clone(), None, true);
+        let mut app = App::new(path.clone(), true);
         app.vault = Some(ov);
         app.screen = Screen::Browse;
         (app, path)
@@ -1542,17 +1528,15 @@ mod tests {
             ov.save().unwrap();
         }
         let ov = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
-        let mut app = App::new(path.clone(), None, false);
+        let mut app = App::new(path.clone(), false);
         app.vault = Some(ov);
         app.screen = Screen::Browse;
         (app, path)
     }
 
-    fn cleanup(path: &PathBuf) {
-        let _ = std::fs::remove_file(path);
-        // best-effort: remove a `.vol` companion if any test created documents
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            let _ = std::fs::remove_file(path.with_file_name(format!("{name}.vol")));
+    fn cleanup(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 
@@ -1811,7 +1795,7 @@ mod tests {
         // Auth screen, all three modes.
         let path = tmp_vault("render");
         for mode in [AuthMode::Create, AuthMode::Unlock, AuthMode::ChangePassword] {
-            let mut app = App::new(path.clone(), None, true);
+            let mut app = App::new(path.clone(), true);
             app.auth = AuthState::new(mode);
             app.auth.error = Some("err".into());
             render(&app);

@@ -39,22 +39,27 @@ fn default_vault_path() -> PathBuf {
 const HELP: &str = "\
 pass-mgr — standalone, offline, two-password encrypted estate vault
 
-USAGE:
-    pass-mgr [VAULT]              Launch the graphical UI (read-only by default)
-    pass-mgr --write [VAULT]      Launch writable (allow creating/editing/deleting)
-    pass-mgr --tui [VAULT]        Launch the terminal UI instead (add --write to edit)
-    pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
-    pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
-    pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
-    pass-mgr --help               Show this help
+DIR is the vault DIRECTORY (it holds vault.pmv, manifest/, and volume/).
+If omitted, the per-user default directory is used.
 
-OPTIONS:
-    --vol PATH   Use PATH as the encrypted document archive instead of the
-                 default <VAULT>.vol (works with the UI, extract, and backup).
+USAGE:
+    pass-mgr [DIR]              Launch the graphical UI (read-only by default)
+    pass-mgr --write [DIR]      Launch writable (allow creating/editing/deleting)
+    pass-mgr --tui [DIR]        Launch the terminal UI instead (add --write to edit)
+    pass-mgr decrypt [DIR]      Decrypt the vault and print its JSON to stdout
+    pass-mgr manifest [DIR]     Decrypt and print the document manifest (index)
+    pass-mgr extract [DIR] OUT  Decrypt ALL documents (every volume) into OUT
+    pass-mgr backup [DIR] DEST  Copy the whole encrypted vault tree into DEST (timestamped)
+    pass-mgr --help             Show this help
 
 The vault is protected by two passwords entered in sequence. The interactive UI
 opens READ-ONLY unless --write is given. The category dropdown lists are stored
 inside the encrypted vault — there are no external configuration files.";
+
+/// The vault file inside a user-supplied vault directory.
+fn vault_file(dir: &str) -> PathBuf {
+    PathBuf::from(dir).join("vault.pmv")
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -65,58 +70,38 @@ fn main() -> ExitCode {
     }
 
     // Flags may appear anywhere. The interactive UI is read-only unless --write
-    // is given; --tui selects the terminal UI over the graphical one; --vol PATH
-    // points the document archive somewhere other than the default <vault>.vol.
-    let mut writable = false;
-    let mut tui = false;
-    let mut archive: Option<PathBuf> = None;
-    let mut pos: Vec<String> = Vec::new();
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--write" => writable = true,
-            "--tui" => tui = true,
-            "--vol" | "--volume" => match it.next() {
-                Some(v) => archive = Some(PathBuf::from(v)),
-                None => {
-                    eprintln!("pass-mgr error: --vol requires a path argument");
-                    return ExitCode::FAILURE;
-                }
-            },
-            s if s.starts_with("--vol=") => archive = Some(PathBuf::from(&s["--vol=".len()..])),
-            s if s.starts_with("--volume=") => {
-                archive = Some(PathBuf::from(&s["--volume=".len()..]))
-            }
-            _ => pos.push(a),
-        }
-    }
+    // is given; --tui selects the terminal UI over the graphical one.
+    let writable = args.iter().any(|a| a == "--write");
+    let tui = args.iter().any(|a| a == "--tui");
+    let pos: Vec<String> =
+        args.into_iter().filter(|a| !matches!(a.as_str(), "--write" | "--tui")).collect();
+
+    // The (optional) positional vault DIRECTORY → its vault.pmv file.
+    let vault_dir_arg = |i: usize| pos.get(i).map(|d| vault_file(d)).unwrap_or_else(default_vault_path);
 
     let result = match pos.first().map(String::as_str) {
-        Some("decrypt" | "export") => {
-            let path = pos.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
-            cli_decrypt(path)
-        }
-        // `extract [VAULT] DIR` — the output directory is always the LAST argument.
+        Some("decrypt" | "export") => cli_decrypt(vault_dir_arg(1)),
+        Some("manifest") => cli_manifest(vault_dir_arg(1)),
+        // `extract [DIR] OUT` — the output directory is always the LAST argument.
         Some("extract") => match pos.len() {
-            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1]), archive),
-            3 => cli_extract(PathBuf::from(&pos[1]), PathBuf::from(&pos[2]), archive),
-            _ => Err(anyhow::anyhow!("usage: pass-mgr extract [VAULT] <OUTPUT_DIR>")),
+            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1])),
+            3 => cli_extract(vault_file(&pos[1]), PathBuf::from(&pos[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr extract [DIR] <OUTPUT_DIR>")),
         },
-        // `backup [VAULT] DIR` — copies the encrypted files; no passwords needed.
+        // `backup [DIR] DEST` — copies the encrypted tree; no passwords needed.
         Some("backup") => match pos.len() {
-            2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1]), archive),
-            3 => cli_backup(PathBuf::from(&pos[1]), PathBuf::from(&pos[2]), archive),
-            _ => Err(anyhow::anyhow!("usage: pass-mgr backup [VAULT] <DEST_DIR>")),
+            2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1])),
+            3 => cli_backup(vault_file(&pos[1]), PathBuf::from(&pos[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr backup [DIR] <DEST_DIR>")),
         },
-        // Otherwise the (optional) positional argument is the vault path for the
-        // interactive UI (graphical by default, terminal with --tui). The category
-        // lists live inside the vault, so there is nothing to load up front.
+        // Otherwise the (optional) positional argument is the vault directory for
+        // the interactive UI (graphical by default, terminal with --tui).
         _ => {
-            let path = pos.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
+            let path = vault_dir_arg(0);
             if tui {
-                run_ui(path, archive, writable)
+                run_ui(path, writable)
             } else {
-                gui::run(path, archive, writable)
+                gui::run(path, writable)
             }
         }
     };
@@ -128,12 +113,12 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_ui(path: PathBuf, archive: Option<PathBuf>, writable: bool) -> anyhow::Result<()> {
+fn run_ui(path: PathBuf, writable: bool) -> anyhow::Result<()> {
     // `ratatui::init` enters the alternate screen + raw mode and installs a
     // panic hook that restores the terminal before printing the panic, so a
     // crash never leaves the user's terminal in a broken state.
     let mut terminal = ratatui::init();
-    let result = ui::run(&mut terminal, path, archive, writable);
+    let result = ui::run(&mut terminal, path, writable);
     ratatui::restore();
     result
 }
@@ -156,10 +141,23 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Copy the encrypted vault + its document archive into `dest_dir` as a
-/// timestamped, self-consistent pair. No passwords needed (nothing is decrypted).
-fn cli_backup(path: PathBuf, dest_dir: PathBuf, archive: Option<PathBuf>) -> anyhow::Result<()> {
-    let backup = vault::backup(&path, &dest_dir, archive.as_deref())?;
+/// Decrypt and print the document manifest (the index of stored documents) as
+/// JSON. Prompts for both passwords; does not modify the vault.
+fn cli_manifest(path: PathBuf) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no vault found at {}", path.display());
+    }
+    let pw1 = read_password("Password 1: ")?;
+    let pw2 = read_password("Password 2: ")?;
+    let entries = OpenVault::export_manifests(&path, pw1.as_bytes(), pw2.as_bytes())?;
+    println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+/// Copy the whole encrypted vault tree into `dest_dir` as a timestamped,
+/// self-consistent set. No passwords needed (nothing is decrypted).
+fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
+    let backup = vault::backup(&path, &dest_dir)?;
     eprintln!("Backed up to {}", backup.display());
     Ok(())
 }
@@ -167,7 +165,7 @@ fn cli_backup(path: PathBuf, dest_dir: PathBuf, archive: Option<PathBuf>) -> any
 /// Decrypt the whole document archive and write every stored document into
 /// `out_dir`, reconstructing the virtual directory tree. Prompts for both
 /// passwords. WARNING: this writes unencrypted copies of all documents to disk.
-fn cli_extract(path: PathBuf, out_dir: PathBuf, archive: Option<PathBuf>) -> anyhow::Result<()> {
+fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
@@ -179,8 +177,7 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, archive: Option<PathBuf>) -> any
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
 
-    let docs =
-        OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes(), archive.as_deref())?;
+    let docs = OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes())?;
     if docs.is_empty() {
         eprintln!("No documents stored in this vault.");
         return Ok(());
@@ -190,9 +187,11 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, archive: Option<PathBuf>) -> any
     vault::harden_dir(&out_dir); // 0700 on unix (filenames/paths are sensitive)
     let mut written = 0usize;
     for (meta, bytes) in &docs {
-        // Build a SAFE relative path from the (decrypted) location/filename so a
-        // crafted manifest can never escape out_dir (no `..`, no absolute paths).
-        let rel = safe_relative_path(&meta.location, &meta.filename, &meta.id);
+        // The manifest stores one combined virtual path ("/loc/file"); split it
+        // back into directory + filename for the sanitizer. Build a SAFE relative
+        // path so a crafted manifest can never escape out_dir (no `..`/absolute).
+        let (location, filename) = meta.path.rsplit_once('/').unwrap_or(("", meta.path.as_str()));
+        let rel = safe_relative_path(location, filename, &meta.id);
         let dest = unique_path(out_dir.join(rel));
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -411,14 +410,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        // backup() copies the encrypted file as-is; a dummy file suffices here.
-        let vault = std::env::temp_dir().join(format!("passmgr-clibk-{nanos}.pmv"));
+        // backup() copies the whole vault tree as-is; a dummy file suffices here.
+        let vdir = std::env::temp_dir().join(format!("passmgr-clibk-{nanos}"));
+        std::fs::create_dir_all(&vdir).unwrap();
+        let vault = vdir.join("vault.pmv");
         std::fs::write(&vault, b"PMVAULT\0 fake").unwrap();
         let dest = std::env::temp_dir().join(format!("passmgr-clibk-dest-{nanos}"));
-        super::cli_backup(vault.clone(), dest.clone(), None).unwrap();
+        super::cli_backup(vault.clone(), dest.clone()).unwrap();
         let n = std::fs::read_dir(&dest).unwrap().count();
-        assert_eq!(n, 1, "one backup copy created");
-        let _ = std::fs::remove_file(&vault);
+        assert_eq!(n, 1, "one timestamped backup directory created");
+        let _ = std::fs::remove_dir_all(&vdir);
         let _ = std::fs::remove_dir_all(&dest);
     }
 

@@ -24,11 +24,7 @@ use crate::crypto::KdfParams;
 /// Launch the graphical app and block until the window is closed. `writable`
 /// enables mutations; when false the vault is opened read-only and write
 /// controls are hidden.
-pub fn run(
-    path: std::path::PathBuf,
-    archive: Option<std::path::PathBuf>,
-    writable: bool,
-) -> anyhow::Result<()> {
+pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
@@ -42,7 +38,7 @@ pub fn run(
         Box::new(move |cc| {
             // Lighter, higher-contrast theme.
             cc.egui_ctx.set_visuals(light_visuals());
-            Ok(Box::new(GuiApp::new(path, archive, writable)))
+            Ok(Box::new(GuiApp::new(path, writable)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
@@ -108,8 +104,6 @@ enum DocReq {
 
 struct GuiApp {
     path: std::path::PathBuf,
-    /// Document-archive override (`--vol`); `None` uses the default `<vault>.vol`.
-    archive: Option<std::path::PathBuf>,
     /// When false the vault is opened read-only and write controls are hidden.
     writable: bool,
     screen: Screen,
@@ -170,11 +164,10 @@ impl Drop for GuiApp {
 }
 
 impl GuiApp {
-    fn new(path: std::path::PathBuf, archive: Option<std::path::PathBuf>, writable: bool) -> Self {
+    fn new(path: std::path::PathBuf, writable: bool) -> Self {
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         GuiApp {
             path,
-            archive,
             writable,
             screen: Screen::Auth,
             auth_mode,
@@ -301,20 +294,13 @@ impl GuiApp {
                     return;
                 }
             };
-            OpenVault::create_with(
-                self.path.clone(),
-                pw1.as_bytes(),
-                pw2.as_bytes(),
-                KdfParams::default(),
-                self.archive.clone(),
-            )
+            OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
         } else {
             OpenVault::open_with(
                 self.path.clone(),
                 self.pw1.as_bytes(),
                 self.pw2.as_bytes(),
                 !self.writable,
-                self.archive.clone(),
             )
         };
 
@@ -590,7 +576,7 @@ impl GuiApp {
             if dest.is_empty() {
                 self.status = "Enter a backup destination directory.".into();
             } else {
-                match vault::backup(&self.path, Path::new(&dest), self.archive.as_deref()) {
+                match vault::backup(&self.path, Path::new(&dest)) {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
                     Err(e) => self.status = format!("Backup failed: {e}"),
                 }
@@ -1049,9 +1035,7 @@ impl GuiApp {
     /// Human-readable "location/filename" of an attached volume file id.
     fn attached_label(&self, file_id: Option<String>) -> Option<String> {
         let id = file_id?;
-        let f = self.vault_ref().vault.volume.file(&id)?;
-        let loc = if f.location.is_empty() { "/".to_string() } else { f.location.clone() };
-        Some(format!("{loc}/{}  ({} bytes)", f.filename, f.size))
+        self.vault_ref().doc_path(&id)
     }
 
     /// Upsert the current edit buffer for a document-bearing tab into the vault,
@@ -1457,13 +1441,16 @@ mod tests {
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("passmgr-gui-{tag}-{}.pmv", nanos()))
+        // Unique per-test directory; the vault file name is fixed (vault.pmv),
+        // matching production where the user controls only the directory.
+        let dir = std::env::temp_dir().join(format!("passmgr-gui-{tag}-{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("vault.pmv")
     }
 
-    fn cleanup(path: &std::path::PathBuf) {
-        let _ = std::fs::remove_file(path);
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            let _ = std::fs::remove_file(path.with_file_name(format!("{name}.vol")));
+    fn cleanup(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 
@@ -1471,7 +1458,7 @@ mod tests {
     fn app_unlocked(tag: &str) -> (GuiApp, std::path::PathBuf) {
         let path = tmp(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = GuiApp::new(path.clone(), None, true);
+        let mut app = GuiApp::new(path.clone(), true);
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
@@ -1480,7 +1467,7 @@ mod tests {
     #[test]
     fn create_flow_builds_vault() {
         let path = tmp("create");
-        let mut app = GuiApp::new(path.clone(), None, true);
+        let mut app = GuiApp::new(path.clone(), true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();
@@ -1496,7 +1483,7 @@ mod tests {
     #[test]
     fn mismatched_confirmation_is_rejected() {
         let path = tmp("mismatch");
-        let mut app = GuiApp::new(path.clone(), None, true);
+        let mut app = GuiApp::new(path.clone(), true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();
@@ -1524,13 +1511,13 @@ mod tests {
         assert!(id.is_some(), "statement linked to the uploaded doc");
         let id = id.unwrap();
         let ov = app.vault.as_ref().unwrap();
-        assert_eq!(ov.vault.volume.files.len(), 1);
+        assert!(ov.has_document(&id));
         assert_eq!(&ov.read_document(&id).unwrap()[..], b"will body");
 
         // Detach reclaims the blob and unlinks the record.
         app.handle_doc(DocReq::Remove, DocTarget::Asset);
         assert!(app.edit_asset.as_ref().unwrap().statement.is_none());
-        assert!(app.vault.as_ref().unwrap().vault.volume.files.is_empty());
+        assert!(!app.vault.as_ref().unwrap().has_document(&id));
 
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
