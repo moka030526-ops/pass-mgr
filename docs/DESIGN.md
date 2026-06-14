@@ -141,17 +141,18 @@ enforced in two layers:
 
 - **Core (authoritative):** `OpenVault::open_read_only` sets a `read_only` flag;
   every mutating method (`save`, `change_password`, `add_document`,
-  `remove_document`) returns `VaultError::ReadOnly`, and the open path writes
-  nothing to disk (not even the refreshed `last_opened_at`/generation). So a
-  read-only session is guaranteed not to modify `vault.pmv` or `.vol`.
+  `remove_document`, and the category mutators `add_asset_type` /
+  `add_account_type` / `add_account_subtype`) returns `VaultError::ReadOnly`, and
+  the open path writes nothing to disk (not even the refreshed
+  `last_opened_at`/generation). So a read-only session is guaranteed not to modify
+  `vault.pmv` or `.vol`.
 - **UI:** the front-ends hide write controls (New/Save/Delete/attach/detach/
   generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
   (browse, reveal, copy, export, backup) remain available.
 
-The guarantee extends past the vault files: `TypeLists::load(writable)` only
-seeds the default category JSON files (`types/*.json`) when writable, so a
-read-only launch writes **nothing** to disk — it reads any existing type files
-but falls back to in-memory defaults rather than creating them.
+Because the category lists now live **inside the vault** (not in external files),
+a read-only session writes **nothing** to disk at all — there are no auxiliary
+config files to seed.
 
 Creating a vault is itself a write, so first-run creation requires `--write`.
 
@@ -312,9 +313,11 @@ generic ("wrong password or corrupted vault").
 ### 9.3 Clipboard exposure
 See §7.1. Copying a password places it on the shared system clipboard. Other
 applications, clipboard managers, and OS-level cloud-clipboard sync can read it
-while it is there. Both front-ends now clear the clipboard on exit (best-effort),
-which bounds exposure to the session; a timed auto-clear is a possible future
-enhancement.
+while it is there. To bound the window, both front-ends now **auto-clear the
+clipboard 15 seconds after a copy** (the GUI schedules a repaint at the deadline;
+the TUI polls its event loop) **and again on exit** (best-effort). This shrinks
+but does not eliminate exposure: a clipboard manager or cloud-sync that captures
+the value within those 15 seconds keeps its own copy.
 
 ### 9.4 History stores old passwords
 By request, the per-entry history records the full before/after value of every
@@ -401,6 +404,35 @@ can prevent without an external trusted counter is an attacker restoring a
 **matched older pair** of `vault.pmv` + `vault.pmv.vol` (a full, self-consistent
 snapshot): that simply looks like the vault as it was at that time. This is the
 same inherent limitation that applies to the main vault file on its own.
+
+### 9.13 Archive resource limits
+The whole document archive is read and decrypted into memory at once. To stop a
+corrupt or hostile `.vol` (or an accidental huge upload) from exhausting RAM,
+uploads are capped at **64 MiB per document** and the **total archive at 1 GiB**;
+both are checked against the file's reported size *before* it is read, and exceed
+returns `VaultError::TooLarge`. These bounds are generous for estate documents
+(scans, PDFs) but keep allocation bounded. Adjust the constants in `vault.rs` if
+your use genuinely needs larger files.
+
+### 9.14 Trust boundary — host compromise is out of scope
+pass-mgr protects data **at rest** and assumes the machine is trustworthy *while
+the vault is open*. It does **not** defend against a compromised host: malware
+running as your user, a kernel keylogger, screen capture/scraping while records
+are revealed, a debugger attached to the process, or a cold-boot/DMA attack
+against RAM can all read secrets regardless of any in-process measure. The swap
+mitigation (§9.6), zeroize-on-drop, and read-only default reduce *incidental*
+leakage (to disk, to other local accounts via file modes, to accidental writes),
+not an attacker with code execution in your session. Keep the host patched, the
+disk full-disk-encrypted, and the vault closed when unattended.
+
+### 9.15 Distributing the binary — integrity is the user's responsibility
+The build is reproducible from source, but the project does not ship a signed
+binary. If you distribute `pass-mgr`/`pass-mgr.exe`, recipients should verify
+what they run: publish a SHA-256 checksum alongside the binary
+(`sha256sum target/release/pass-mgr` on Linux, `Get-FileHash` on Windows) and,
+ideally, **code-sign** the Windows `.exe` with your own Authenticode certificate
+(`signtool sign /fd SHA256 /a pass-mgr.exe`) so SmartScreen and AV trust it.
+Without that, a tampered download cannot be distinguished from a genuine one.
 
 ## 10. Non-goals
 

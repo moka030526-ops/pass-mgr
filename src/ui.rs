@@ -10,6 +10,7 @@
 //! (`start_edit` and `save_edit`) instead of throughout the key handler.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -25,7 +26,6 @@ use crate::password::{self, GenOptions};
 use crate::records::{
     self, Account, AssetLiability, Change, Instruction, RealEstate, Record, TrustWill,
 };
-use crate::types::TypeLists;
 use crate::vault::{self, OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits. `writable` enables mutations;
@@ -33,18 +33,22 @@ use crate::vault::{self, OpenVault, VaultError};
 pub fn run(
     terminal: &mut DefaultTerminal,
     path: PathBuf,
-    types: TypeLists,
+    archive: Option<PathBuf>,
     writable: bool,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(path, types, writable);
+    let mut app = App::new(path, archive, writable);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        if let Event::Key(key) = event::read()?
+        // Poll rather than block so the clipboard auto-clear deadline fires even
+        // when the user isn't pressing keys.
+        if event::poll(CLIPBOARD_POLL_INTERVAL)?
+            && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
             && app.handle_key(key)
         {
             break;
         }
+        app.tick_clipboard();
     }
     Ok(())
 }
@@ -209,7 +213,8 @@ impl EditState {
 
 struct App {
     path: PathBuf,
-    types: TypeLists,
+    /// Document-archive override (`--vol`); `None` uses the default `<vault>.vol`.
+    archive: Option<PathBuf>,
     /// When false the vault is opened read-only and mutating keys are inert.
     writable: bool,
     screen: Screen,
@@ -234,7 +239,15 @@ struct App {
     cfg_backup_dest: String,
     status: String,
     clipboard_dirty: bool,
+    // When set, the clipboard should be wiped at/after this instant (auto-clear
+    // a copied password so it doesn't linger for the whole session).
+    clipboard_clear_at: Option<Instant>,
 }
+
+/// How long a copied password stays on the clipboard before it is auto-cleared.
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(15);
+/// How often the event loop wakes (when idle) to check the auto-clear deadline.
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl Drop for App {
     fn drop(&mut self) {
@@ -245,11 +258,11 @@ impl Drop for App {
 }
 
 impl App {
-    fn new(path: PathBuf, types: TypeLists, writable: bool) -> Self {
+    fn new(path: PathBuf, archive: Option<PathBuf>, writable: bool) -> Self {
         let mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         App {
             path,
-            types,
+            archive,
             writable,
             screen: Screen::Auth,
             auth: AuthState::new(mode),
@@ -270,6 +283,20 @@ impl App {
             cfg_backup_dest: String::new(),
             status: String::new(),
             clipboard_dirty: false,
+            clipboard_clear_at: None,
+        }
+    }
+
+    /// Wipe the clipboard once the auto-clear deadline has passed. Called from the
+    /// event loop, so a copied password is cleared even with no further input.
+    fn tick_clipboard(&mut self) {
+        if let Some(deadline) = self.clipboard_clear_at
+            && Instant::now() >= deadline
+        {
+            clear_clipboard();
+            self.clipboard_dirty = false;
+            self.clipboard_clear_at = None;
+            self.status = "Clipboard cleared.".into();
         }
     }
 
@@ -441,15 +468,17 @@ impl App {
                     return;
                 }
             };
-            OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
+            OpenVault::create_with(
+                self.path.clone(),
+                pw1.as_bytes(),
+                pw2.as_bytes(),
+                KdfParams::default(),
+                self.archive.clone(),
+            )
         } else {
             let f = &self.auth.fields;
             let (p1, p2) = (f[0].value.as_bytes(), f[1].value.as_bytes());
-            if self.writable {
-                OpenVault::open(self.path.clone(), p1, p2)
-            } else {
-                OpenVault::open_read_only(self.path.clone(), p1, p2)
-            }
+            OpenVault::open_with(self.path.clone(), p1, p2, !self.writable, self.archive.clone())
         };
         match result {
             Ok(v) => {
@@ -528,7 +557,7 @@ impl App {
                 // otherwise cycle the subtypes present across all accounts.
                 let opts = match self.acct_filter_type.clone() {
                     Some(t) => {
-                        let mut opts = self.types.subtypes_for(&t);
+                        let mut opts = self.vault_ref().categories().subtypes_for(&t);
                         for a in &self.vault_ref().vault.accounts {
                             if a.account_type == t
                                 && !a.account_subtype.is_empty()
@@ -613,30 +642,41 @@ impl App {
         match self.cfg_focus {
             0 => {
                 let name = self.cfg_asset_type.trim().to_string();
-                if self.types.add_asset_type(&name) {
-                    self.status = format!("Added asset/liability type “{name}”.");
-                    self.cfg_asset_type.clear();
-                } else {
-                    self.status = "Type is empty or already exists.".into();
+                match self.vault.as_mut().expect("vault open on config").add_asset_type(&name) {
+                    Ok(true) => {
+                        self.status = format!("Added asset/liability type “{name}”.");
+                        self.cfg_asset_type.clear();
+                    }
+                    Ok(false) => self.status = "Type is empty or already exists.".into(),
+                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
             1 => {
                 let name = self.cfg_account_type.trim().to_string();
-                if self.types.add_account_type(&name) {
-                    self.status = format!("Added account type “{name}”.");
-                    self.cfg_account_type.clear();
-                } else {
-                    self.status = "Type is empty or already exists.".into();
+                match self.vault.as_mut().expect("vault open on config").add_account_type(&name) {
+                    Ok(true) => {
+                        self.status = format!("Added account type “{name}”.");
+                        self.cfg_account_type.clear();
+                    }
+                    Ok(false) => self.status = "Type is empty or already exists.".into(),
+                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
             2 | 3 => {
                 let ty = self.cfg_subtype_type.trim().to_string();
                 let sub = self.cfg_subtype_name.trim().to_string();
-                if self.types.add_account_subtype(&ty, &sub) {
-                    self.status = format!("Added subtype “{sub}” under “{ty}”.");
-                    self.cfg_subtype_name.clear();
-                } else {
-                    self.status = "Unknown type, or subtype empty/duplicate.".into();
+                match self
+                    .vault
+                    .as_mut()
+                    .expect("vault open on config")
+                    .add_account_subtype(&ty, &sub)
+                {
+                    Ok(true) => {
+                        self.status = format!("Added subtype “{sub}” under “{ty}”.");
+                        self.cfg_subtype_name.clear();
+                    }
+                    Ok(false) => self.status = "Unknown type, or subtype empty/duplicate.".into(),
+                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
             _ => {
@@ -644,7 +684,7 @@ impl App {
                 if dest.is_empty() {
                     self.status = "Enter a backup destination directory.".into();
                 } else {
-                    match vault::backup(&self.path, Path::new(&dest)) {
+                    match vault::backup(&self.path, Path::new(&dest), self.archive.as_deref()) {
                         Ok(p) => self.status = format!("Backed up to {}", p.display()),
                         Err(e) => self.status = format!("Backup failed: {e}"),
                     }
@@ -727,7 +767,11 @@ impl App {
                         Field::text("Approx. value", r.approx_value.clone()),
                         Field::text("As-of date", r.as_of_date.clone()),
                         Field::text("Institution", r.institution.clone()),
-                        Field::choice("Type", r.asset_type.clone(), self.types.asset.clone()),
+                        Field::choice(
+                            "Type",
+                            r.asset_type.clone(),
+                            self.vault_ref().categories().asset.clone(),
+                        ),
                         Field::text("URL", r.url.clone()),
                         Field::choice("Review", bool_choice(r.review), yes_no()),
                     ],
@@ -745,12 +789,16 @@ impl App {
                     id,
                     r.created_at,
                     vec![
-                        Field::choice("Account type", r.account_type.clone(), self.types.account_type_names()),
+                        Field::choice(
+                            "Account type",
+                            r.account_type.clone(),
+                            self.vault_ref().categories().account_type_names(),
+                        ),
                         // Subtype is a dependent dropdown of the chosen type's
                         // subtypes; the current value is kept selectable even if
                         // it is not in the configured list (e.g. legacy data).
                         Field::choice("Subtype", r.account_subtype.clone(), {
-                            let mut s = self.types.subtypes_for(&r.account_type);
+                            let mut s = self.vault_ref().categories().subtypes_for(&r.account_type);
                             if !r.account_subtype.is_empty()
                                 && !s.iter().any(|x| x == &r.account_subtype)
                             {
@@ -1142,7 +1190,8 @@ impl App {
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => {
                 self.clipboard_dirty = true;
-                self.status = "Copied (clipboard clears on exit).".into();
+                self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
+                self.status = "Copied (clipboard auto-clears in 15s, and on exit).".into();
             }
             Err(e) => self.status = format!("Clipboard unavailable: {e}"),
         }
@@ -1172,13 +1221,14 @@ impl App {
             ("Subtype — name", &self.cfg_subtype_name),
             ("Backup destination dir", &self.cfg_backup_dest),
         ];
+        let cats = self.vault_ref().categories();
         let mut lines = vec![
             Line::from(Span::styled("Asset/Liability types:", Style::default().add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled(self.types.asset.join(" · "), Style::default().fg(Color::Gray))),
+            Line::from(Span::styled(cats.asset.join(" · "), Style::default().fg(Color::Gray))),
             Line::from(""),
             Line::from(Span::styled("Account types (with subtypes):", Style::default().add_modifier(Modifier::BOLD))),
         ];
-        for t in &self.types.account {
+        for t in &cats.account {
             let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
             lines.push(Line::from(Span::styled(format!("  {}: {subs}", t.name), Style::default().fg(Color::Gray))));
         }
@@ -1427,7 +1477,6 @@ pub(crate) fn format_time(ts: i64) -> String {
 mod tests {
     use super::*;
     use crate::crypto::KdfParams;
-    use crate::types::TypeLists;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fast() -> KdfParams {
@@ -1444,7 +1493,7 @@ mod tests {
     fn app_unlocked(tag: &str) -> (App, PathBuf) {
         let path = tmp_vault(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = App::new(path.clone(), TypeLists::in_memory(), true);
+        let mut app = App::new(path.clone(), None, true);
         app.vault = Some(ov);
         app.screen = Screen::Browse;
         (app, path)
@@ -1460,7 +1509,7 @@ mod tests {
             ov.save().unwrap();
         }
         let ov = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
-        let mut app = App::new(path.clone(), TypeLists::in_memory(), false);
+        let mut app = App::new(path.clone(), None, false);
         app.vault = Some(ov);
         app.screen = Screen::Browse;
         (app, path)
@@ -1618,7 +1667,7 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.types.asset.contains(&"Annuity".to_string()));
+        assert!(app.vault.as_ref().unwrap().categories().asset.contains(&"Annuity".to_string()));
         // focus 2/3 = subtype type + name
         app.handle_key(key(KeyCode::Down)); // 0->1
         app.handle_key(key(KeyCode::Down)); // 1->2 subtype type
@@ -1630,7 +1679,14 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.types.subtypes_for("Financial").contains(&"HSA".to_string()));
+        assert!(
+            app.vault
+                .as_ref()
+                .unwrap()
+                .categories()
+                .subtypes_for("Financial")
+                .contains(&"HSA".to_string())
+        );
         cleanup(&path);
     }
 
@@ -1677,7 +1733,10 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter)); // focus 0 = add asset type
-        assert!(!app.types.asset.contains(&"Annuity".to_string()), "type add blocked in read-only");
+        assert!(
+            !app.vault.as_ref().unwrap().categories().asset.contains(&"Annuity".to_string()),
+            "type add blocked in read-only"
+        );
         assert!(app.status.contains("Read-only"));
         cleanup(&path);
     }
@@ -1695,7 +1754,7 @@ mod tests {
         // Auth screen, all three modes.
         let path = tmp_vault("render");
         for mode in [AuthMode::Create, AuthMode::Unlock, AuthMode::ChangePassword] {
-            let mut app = App::new(path.clone(), TypeLists::in_memory(), true);
+            let mut app = App::new(path.clone(), None, true);
             app.auth = AuthState::new(mode);
             app.auth.error = Some("err".into());
             render(&app);

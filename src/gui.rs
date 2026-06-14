@@ -10,13 +10,13 @@
 //! panel closures return, which keeps borrows of `self` disjoint and simple.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use zeroize::Zeroize;
 
 use crate::password::{self, GenOptions};
 use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TrustWill};
-use crate::types::TypeLists;
 use crate::ui::format_time;
 use crate::vault::{self, OpenVault, VaultError};
 use crate::crypto::KdfParams;
@@ -24,7 +24,11 @@ use crate::crypto::KdfParams;
 /// Launch the graphical app and block until the window is closed. `writable`
 /// enables mutations; when false the vault is opened read-only and write
 /// controls are hidden.
-pub fn run(path: std::path::PathBuf, types: TypeLists, writable: bool) -> anyhow::Result<()> {
+pub fn run(
+    path: std::path::PathBuf,
+    archive: Option<std::path::PathBuf>,
+    writable: bool,
+) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
@@ -38,7 +42,7 @@ pub fn run(path: std::path::PathBuf, types: TypeLists, writable: bool) -> anyhow
         Box::new(move |cc| {
             // Lighter, higher-contrast theme.
             cc.egui_ctx.set_visuals(light_visuals());
-            Ok(Box::new(GuiApp::new(path, types, writable)))
+            Ok(Box::new(GuiApp::new(path, archive, writable)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
@@ -97,7 +101,8 @@ enum DocReq {
 
 struct GuiApp {
     path: std::path::PathBuf,
-    types: TypeLists,
+    /// Document-archive override (`--vol`); `None` uses the default `<vault>.vol`.
+    archive: Option<std::path::PathBuf>,
     /// When false the vault is opened read-only and write controls are hidden.
     writable: bool,
     screen: Screen,
@@ -138,7 +143,12 @@ struct GuiApp {
     doc_dest: String,
     status: String,
     clipboard_dirty: bool,
+    // When set, the clipboard should be wiped at/after this instant.
+    clipboard_clear_at: Option<Instant>,
 }
+
+/// How long a copied password stays on the clipboard before it is auto-cleared.
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(15);
 
 impl Drop for GuiApp {
     fn drop(&mut self) {
@@ -153,11 +163,11 @@ impl Drop for GuiApp {
 }
 
 impl GuiApp {
-    fn new(path: std::path::PathBuf, types: TypeLists, writable: bool) -> Self {
+    fn new(path: std::path::PathBuf, archive: Option<std::path::PathBuf>, writable: bool) -> Self {
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         GuiApp {
             path,
-            types,
+            archive,
             writable,
             screen: Screen::Auth,
             auth_mode,
@@ -190,6 +200,23 @@ impl GuiApp {
             doc_dest: String::new(),
             status: String::new(),
             clipboard_dirty: false,
+            clipboard_clear_at: None,
+        }
+    }
+
+    /// Wipe the clipboard once the auto-clear deadline has passed; otherwise
+    /// schedule a repaint so the deadline fires even with no user interaction.
+    fn tick_clipboard(&mut self, ctx: &egui::Context) {
+        if let Some(deadline) = self.clipboard_clear_at {
+            let now = Instant::now();
+            if now >= deadline {
+                clear_clipboard();
+                self.clipboard_dirty = false;
+                self.clipboard_clear_at = None;
+                self.status = "Clipboard cleared.".into();
+            } else {
+                ctx.request_repaint_after(deadline - now);
+            }
         }
     }
 
@@ -266,11 +293,21 @@ impl GuiApp {
                     return;
                 }
             };
-            OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
-        } else if self.writable {
-            OpenVault::open(self.path.clone(), self.pw1.as_bytes(), self.pw2.as_bytes())
+            OpenVault::create_with(
+                self.path.clone(),
+                pw1.as_bytes(),
+                pw2.as_bytes(),
+                KdfParams::default(),
+                self.archive.clone(),
+            )
         } else {
-            OpenVault::open_read_only(self.path.clone(), self.pw1.as_bytes(), self.pw2.as_bytes())
+            OpenVault::open_with(
+                self.path.clone(),
+                self.pw1.as_bytes(),
+                self.pw2.as_bytes(),
+                !self.writable,
+                self.archive.clone(),
+            )
         };
 
         match result {
@@ -427,11 +464,23 @@ impl GuiApp {
         let mut add_account = false;
         let mut add_subtype = false;
         let mut do_backup = false;
-        let type_names = self.types.account_type_names();
+        // Snapshot the category lists (from the open vault) before the render
+        // closure borrows `self` mutably for the text inputs.
+        let cats = self.vault_ref().categories();
+        let type_names = cats.account_type_names();
+        let asset_list = cats.asset.join(" · ");
+        let account_list: Vec<(String, String)> = cats
+            .account
+            .iter()
+            .map(|t| {
+                let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
+                (t.name.clone(), subs)
+            })
+            .collect();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.label(egui::RichText::new("Asset / Liability types").strong());
-            ui.label(egui::RichText::new(self.types.asset.join(" · ")).weak());
+            ui.label(egui::RichText::new(asset_list).weak());
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0));
                 if self.writable && ui.button("Add type").clicked() {
@@ -441,9 +490,8 @@ impl GuiApp {
 
             ui.add_space(14.0);
             ui.label(egui::RichText::new("Account types & subtypes").strong());
-            for t in &self.types.account {
-                let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
-                ui.label(egui::RichText::new(format!("{}: {subs}", t.name)).weak());
+            for (name, subs) in &account_list {
+                ui.label(egui::RichText::new(format!("{name}: {subs}")).weak());
             }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_account_type).hint_text("New account type").desired_width(220.0));
@@ -488,20 +536,24 @@ impl GuiApp {
         // Deferred actions (kept out of the closures to keep borrows simple).
         if add_asset {
             let name = self.new_asset_type.trim().to_string();
-            if self.types.add_asset_type(&name) {
-                self.status = format!("Added asset/liability type “{name}”.");
-                self.new_asset_type.clear();
-            } else {
-                self.status = "Type is empty or already exists.".into();
+            match self.vault.as_mut().expect("vault open on config").add_asset_type(&name) {
+                Ok(true) => {
+                    self.status = format!("Added asset/liability type “{name}”.");
+                    self.new_asset_type.clear();
+                }
+                Ok(false) => self.status = "Type is empty or already exists.".into(),
+                Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
         if add_account {
             let name = self.new_account_type.trim().to_string();
-            if self.types.add_account_type(&name) {
-                self.status = format!("Added account type “{name}”.");
-                self.new_account_type.clear();
-            } else {
-                self.status = "Type is empty or already exists.".into();
+            match self.vault.as_mut().expect("vault open on config").add_account_type(&name) {
+                Ok(true) => {
+                    self.status = format!("Added account type “{name}”.");
+                    self.new_account_type.clear();
+                }
+                Ok(false) => self.status = "Type is empty or already exists.".into(),
+                Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
         if add_subtype {
@@ -509,11 +561,20 @@ impl GuiApp {
             let sub = self.new_subtype_name.trim().to_string();
             if ty.is_empty() {
                 self.status = "Choose an account type for the subtype.".into();
-            } else if self.types.add_account_subtype(&ty, &sub) {
-                self.status = format!("Added subtype “{sub}” under “{ty}”.");
-                self.new_subtype_name.clear();
             } else {
-                self.status = "Subtype is empty or already exists.".into();
+                match self
+                    .vault
+                    .as_mut()
+                    .expect("vault open on config")
+                    .add_account_subtype(&ty, &sub)
+                {
+                    Ok(true) => {
+                        self.status = format!("Added subtype “{sub}” under “{ty}”.");
+                        self.new_subtype_name.clear();
+                    }
+                    Ok(false) => self.status = "Subtype is empty or already exists.".into(),
+                    Err(e) => self.status = format!("Save failed: {e}"),
+                }
             }
         }
         if do_backup {
@@ -521,7 +582,7 @@ impl GuiApp {
             if dest.is_empty() {
                 self.status = "Enter a backup destination directory.".into();
             } else {
-                match vault::backup(&self.path, Path::new(&dest)) {
+                match vault::backup(&self.path, Path::new(&dest), self.archive.as_deref()) {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
                     Err(e) => self.status = format!("Backup failed: {e}"),
                 }
@@ -664,7 +725,7 @@ impl GuiApp {
             .collect();
         let cur = self.edit_asset.as_ref().map(|r| r.id.clone());
         let attached = self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone()));
-        let asset_types = self.types.asset.clone();
+        let asset_types = self.vault_ref().categories().asset.clone();
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
@@ -754,7 +815,7 @@ impl GuiApp {
     // --- Tab: Accounts -------------------------------------------------------
 
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
-        let type_names = self.types.account_type_names();
+        let type_names = self.vault_ref().categories().account_type_names();
         let owners_present =
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.owner.clone()));
         // When a type filter is chosen, only its connected subtypes are offered;
@@ -762,7 +823,7 @@ impl GuiApp {
         let subtype_opts: Vec<String> = if self.acct_filter_type.is_empty() {
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.account_subtype.clone()))
         } else {
-            self.types.subtypes_for(&self.acct_filter_type)
+            self.vault_ref().categories().subtypes_for(&self.acct_filter_type)
         };
 
         ui.horizontal_wrapped(|ui| {
@@ -808,12 +869,18 @@ impl GuiApp {
         let mut action = FormAction::None;
         let mut generate = false;
         let mut copy_pw: Option<String> = None;
+        // Subtypes for the record under edit, looked up from the vault's category
+        // lists before the mutable borrow of `edit_account` below.
+        let subtypes: Vec<String> = self
+            .edit_account
+            .as_ref()
+            .map(|r| self.vault_ref().categories().subtypes_for(&r.account_type))
+            .unwrap_or_default();
 
         ui.columns(2, |c| {
             (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
-                let subtypes = self.types.subtypes_for(&r.account_type);
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Account type");
                     let prev_type = r.account_type.clone();
@@ -1121,7 +1188,8 @@ impl GuiApp {
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             Ok(()) => {
                 self.clipboard_dirty = true;
-                self.status = "Copied (clipboard clears on exit).".into();
+                self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
+                self.status = "Copied (clipboard auto-clears in 15s, and on exit).".into();
             }
             Err(e) => self.status = format!("Clipboard unavailable: {e}"),
         }
@@ -1136,6 +1204,7 @@ enum DocTarget {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.tick_clipboard(ui.ctx());
         if self.screen == Screen::Auth {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_auth(ui));
             return;
@@ -1347,7 +1416,6 @@ mod tests {
     use super::*;
     use crate::crypto::KdfParams;
     use crate::records::AssetLiability;
-    use crate::types::TypeLists;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fast() -> KdfParams {
@@ -1373,7 +1441,7 @@ mod tests {
     fn app_unlocked(tag: &str) -> (GuiApp, std::path::PathBuf) {
         let path = tmp(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
+        let mut app = GuiApp::new(path.clone(), None, true);
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
@@ -1382,7 +1450,7 @@ mod tests {
     #[test]
     fn create_flow_builds_vault() {
         let path = tmp("create");
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
+        let mut app = GuiApp::new(path.clone(), None, true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();
@@ -1398,7 +1466,7 @@ mod tests {
     #[test]
     fn mismatched_confirmation_is_rejected() {
         let path = tmp("mismatch");
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
+        let mut app = GuiApp::new(path.clone(), None, true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();

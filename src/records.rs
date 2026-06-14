@@ -469,6 +469,13 @@ pub struct Vault {
     pub volume: Volume,
     #[serde(default)]
     pub audit: Vec<Change>,
+    /// The editable category lists for the dropdowns, stored in the vault itself
+    /// (not in external files). A vault that predates this field falls back to
+    /// the built-in defaults. Category names are not secrets, so they are skipped
+    /// by the zeroize-on-drop wipe.
+    #[serde(default = "crate::types::TypeLists::with_defaults")]
+    #[zeroize(skip)]
+    pub categories: crate::types::TypeLists,
 }
 
 #[cfg(test)]

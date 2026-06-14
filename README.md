@@ -14,7 +14,8 @@ network, no sync, no telemetry.
   encrypted container (`<vault>.vol`) decrypted as a unit.
 - Per-record **change history** with timestamps, **last-access** tracking, and a
   built-in **random password generator**.
-- Asset/Account category dropdowns from editable external JSON lists.
+- Asset/Account category dropdowns are stored **inside the encrypted vault** —
+  no external configuration files. Edit them on the Config screen.
 - Cross-platform: **Linux and Windows**.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture, crypto details, and
@@ -84,8 +85,17 @@ pass-mgr --tui [VAULT]        Launch the terminal UI instead (add --write to edi
 pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
 pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
 pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
+pass-mgr --vol PATH ...       Use PATH as the document archive instead of <VAULT>.vol
 pass-mgr --help               Show help
 ```
+
+**Where documents live.** Uploaded documents are encrypted into a single
+archive stored, by default, right next to the vault as `<VAULT>.vol` (e.g.
+`~/.local/share/pass-mgr/vault.pmv.vol`, or `%APPDATA%\pass-mgr\vault.pmv.vol`
+on Windows). Pass **`--vol PATH`** to put (and read) that archive somewhere else
+— e.g. on a removable drive: `pass-mgr --write --vol /mnt/usb/docs.vol`. The
+flag works with the interactive UI and with `extract` / `backup`. The archive is
+bound to its vault cryptographically, so a mismatched `.vol` is rejected.
 
 **Read-only by default.** The interactive GUI/TUI open the vault **read-only** —
 you can browse, reveal/copy passwords, export documents, and back up, but
@@ -139,7 +149,7 @@ screen, which needs both passwords in sequence (read-only unless `--write`).
 | Ctrl+S | save |
 | Ctrl+G | generate a random password |
 | Ctrl+R | reveal / hide password |
-| Ctrl+Y | copy password to clipboard |
+| Ctrl+Y | copy password to clipboard (auto-clears after 15s and on exit) |
 | Ctrl+U | upload document into the encrypted volume (Trust/Will, Assets) |
 | Ctrl+E | export the attached document to a path |
 | Ctrl+K | detach document from the record |
@@ -185,8 +195,9 @@ cargo clippy     # lints
   all records + document metadata).
 - `vault.pmv.vol` — the single encrypted **document archive**: every uploaded
   statement/will/document, encrypted together and decrypted as one unit. Created
-  only once you upload a document.
+  only once you upload a document. Relocatable with `--vol PATH`.
 
 Saves are atomic (write to a unique temp file, fsync, rename, then fsync the
 directory), so an interrupted write cannot corrupt an existing vault or archive.
-Type-list JSON files live (unencrypted) under the data dir's `types/`.
+The category dropdown lists are stored **inside the encrypted vault**, so there
+are no external (unencrypted) configuration files.

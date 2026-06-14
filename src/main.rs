@@ -1,10 +1,10 @@
-//! pass-mgr — a standalone, offline, two-password encrypted **estate vault**.
+//! pass-mgr — command-line entry point for the standalone, offline,
+//! two-password encrypted **estate vault**.
 //!
 //! `main` handles command-line dispatch, chooses the vault file path, and sets
-//! up / tears down the terminal. The five-tab data model and file format live in
-//! [`records`]/[`vault`]; all crypto in [`crypto`]; the graphical UI in [`gui`]
-//! and the terminal UI in [`ui`]; category lists in [`types`]; password
-//! generation in [`password`].
+//! up / tears down the terminal. The whole implementation (data model, file
+//! format, crypto, the two UIs, and the category lists) lives in the `pass_mgr`
+//! library crate (`src/lib.rs`); this binary is a thin wrapper over it.
 //!
 //! Usage:
 //! ```text
@@ -15,14 +15,7 @@
 //!   pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
 //!   pass-mgr --help               show this help
 //! ```
-
-mod crypto;
-mod gui;
-mod password;
-mod records;
-mod types;
-mod ui;
-mod vault;
+#![forbid(unsafe_code)]
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -31,7 +24,8 @@ use std::process::ExitCode;
 use directories::ProjectDirs;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::OpenVault;
+use pass_mgr::vault::OpenVault;
+use pass_mgr::{gui, ui, vault};
 
 /// Default vault location: the per-user data directory for this app
 /// (`~/.local/share/pass-mgr/` on Linux, `%APPDATA%\pass-mgr\` on Windows).
@@ -54,8 +48,13 @@ USAGE:
     pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
     pass-mgr --help               Show this help
 
+OPTIONS:
+    --vol PATH   Use PATH as the encrypted document archive instead of the
+                 default <VAULT>.vol (works with the UI, extract, and backup).
+
 The vault is protected by two passwords entered in sequence. The interactive UI
-opens READ-ONLY unless --write is given.";
+opens READ-ONLY unless --write is given. The category dropdown lists are stored
+inside the encrypted vault — there are no external configuration files.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -66,11 +65,31 @@ fn main() -> ExitCode {
     }
 
     // Flags may appear anywhere. The interactive UI is read-only unless --write
-    // is given; --tui selects the terminal UI over the graphical one.
-    let writable = args.iter().any(|a| a == "--write");
-    let tui = args.iter().any(|a| a == "--tui");
-    let pos: Vec<String> =
-        args.into_iter().filter(|a| !matches!(a.as_str(), "--write" | "--tui")).collect();
+    // is given; --tui selects the terminal UI over the graphical one; --vol PATH
+    // points the document archive somewhere other than the default <vault>.vol.
+    let mut writable = false;
+    let mut tui = false;
+    let mut archive: Option<PathBuf> = None;
+    let mut pos: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--write" => writable = true,
+            "--tui" => tui = true,
+            "--vol" | "--volume" => match it.next() {
+                Some(v) => archive = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("pass-mgr error: --vol requires a path argument");
+                    return ExitCode::FAILURE;
+                }
+            },
+            s if s.starts_with("--vol=") => archive = Some(PathBuf::from(&s["--vol=".len()..])),
+            s if s.starts_with("--volume=") => {
+                archive = Some(PathBuf::from(&s["--volume=".len()..]))
+            }
+            _ => pos.push(a),
+        }
+    }
 
     let result = match pos.first().map(String::as_str) {
         Some("decrypt" | "export") => {
@@ -79,27 +98,25 @@ fn main() -> ExitCode {
         }
         // `extract [VAULT] DIR` — the output directory is always the LAST argument.
         Some("extract") => match pos.len() {
-            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1])),
-            3 => cli_extract(PathBuf::from(&pos[1]), PathBuf::from(&pos[2])),
+            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1]), archive),
+            3 => cli_extract(PathBuf::from(&pos[1]), PathBuf::from(&pos[2]), archive),
             _ => Err(anyhow::anyhow!("usage: pass-mgr extract [VAULT] <OUTPUT_DIR>")),
         },
         // `backup [VAULT] DIR` — copies the encrypted files; no passwords needed.
         Some("backup") => match pos.len() {
-            2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1])),
-            3 => cli_backup(PathBuf::from(&pos[1]), PathBuf::from(&pos[2])),
+            2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1]), archive),
+            3 => cli_backup(PathBuf::from(&pos[1]), PathBuf::from(&pos[2]), archive),
             _ => Err(anyhow::anyhow!("usage: pass-mgr backup [VAULT] <DEST_DIR>")),
         },
         // Otherwise the (optional) positional argument is the vault path for the
-        // interactive UI (graphical by default, terminal with --tui).
+        // interactive UI (graphical by default, terminal with --tui). The category
+        // lists live inside the vault, so there is nothing to load up front.
         _ => {
             let path = pos.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
-            // Seed the default type-list files only in a writable session; a
-            // read-only launch uses the defaults in memory and writes nothing.
-            let types = types::TypeLists::load(writable);
             if tui {
-                run_ui(path, types, writable)
+                run_ui(path, archive, writable)
             } else {
-                gui::run(path, types, writable)
+                gui::run(path, archive, writable)
             }
         }
     };
@@ -111,12 +128,12 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_ui(path: PathBuf, types: types::TypeLists, writable: bool) -> anyhow::Result<()> {
+fn run_ui(path: PathBuf, archive: Option<PathBuf>, writable: bool) -> anyhow::Result<()> {
     // `ratatui::init` enters the alternate screen + raw mode and installs a
     // panic hook that restores the terminal before printing the panic, so a
     // crash never leaves the user's terminal in a broken state.
     let mut terminal = ratatui::init();
-    let result = ui::run(&mut terminal, path, types, writable);
+    let result = ui::run(&mut terminal, path, archive, writable);
     ratatui::restore();
     result
 }
@@ -141,8 +158,8 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
 
 /// Copy the encrypted vault + its document archive into `dest_dir` as a
 /// timestamped, self-consistent pair. No passwords needed (nothing is decrypted).
-fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
-    let backup = vault::backup(&path, &dest_dir)?;
+fn cli_backup(path: PathBuf, dest_dir: PathBuf, archive: Option<PathBuf>) -> anyhow::Result<()> {
+    let backup = vault::backup(&path, &dest_dir, archive.as_deref())?;
     eprintln!("Backed up to {}", backup.display());
     Ok(())
 }
@@ -150,7 +167,7 @@ fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
 /// Decrypt the whole document archive and write every stored document into
 /// `out_dir`, reconstructing the virtual directory tree. Prompts for both
 /// passwords. WARNING: this writes unencrypted copies of all documents to disk.
-fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
+fn cli_extract(path: PathBuf, out_dir: PathBuf, archive: Option<PathBuf>) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
@@ -162,7 +179,8 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
 
-    let docs = OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes())?;
+    let docs =
+        OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes(), archive.as_deref())?;
     if docs.is_empty() {
         eprintln!("No documents stored in this vault.");
         return Ok(());
@@ -365,7 +383,7 @@ mod tests {
         let vault = std::env::temp_dir().join(format!("passmgr-clibk-{nanos}.pmv"));
         std::fs::write(&vault, b"PMVAULT\0 fake").unwrap();
         let dest = std::env::temp_dir().join(format!("passmgr-clibk-dest-{nanos}"));
-        super::cli_backup(vault.clone(), dest.clone()).unwrap();
+        super::cli_backup(vault.clone(), dest.clone(), None).unwrap();
         let n = std::fs::read_dir(&dest).unwrap().count();
         assert_eq!(n, 1, "one backup copy created");
         let _ = std::fs::remove_file(&vault);

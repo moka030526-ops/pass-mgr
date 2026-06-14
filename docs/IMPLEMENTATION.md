@@ -9,26 +9,38 @@ is the "how" and the "where". No `unsafe`, no networking crates.
 
 ```
 src/
+├── lib.rs       Library crate root (`pass_mgr`): re-exports the modules below
+│                and sets `#![forbid(unsafe_code)]` crate-wide. The binary and
+│                the fuzz targets both build on this library.
 ├── crypto.rs    Argon2id chained two-password KDF + XChaCha20-Poly1305 AEAD;
 │                the derived Key lives in mlock'd heap pages (swap mitigation).
 ├── records.rs   The data model: 5 record types, Change/history, the Record
-│                trait + generic upsert/remove, the Volume manifest, the Vault.
+│                trait + generic upsert/remove, the Volume manifest, the Vault
+│                (which now also embeds the category lists).
 │                Shared helpers: unix_now, random_id, civil_from_unix.
 ├── vault.rs     On-disk file format (header + AEAD JSON) and the encrypted
 │                document archive (<vault>.vol); OpenVault open/create/save/
-│                export/change_password, document add/read/export/remove, backup.
-├── types.rs     External, editable category lists: flat Asset/Liability types
-│                and hierarchical Account types (AccountType{name, subtypes}).
+│                export/change_password, document add/read/export/remove, the
+│                in-vault category mutators, and backup.
+├── types.rs     The editable category lists (flat Asset/Liability types and
+│                hierarchical Account types, AccountType{name, subtypes}). Pure
+│                in-memory data; **persisted inside the vault**, not on disk.
 ├── password.rs  Bias-free random password generator (OS CSPRNG, rejection
 │                sampling, class guarantees, Fisher–Yates shuffle).
 ├── gui.rs       egui/eframe graphical UI (default). Tabs + Config screen.
 ├── ui.rs        ratatui terminal UI (`--tui`). Field-based edit forms.
-└── main.rs      CLI dispatch, vault-path selection, terminal setup/teardown,
-                 no-echo password reader; decrypt / extract / backup commands.
+└── main.rs      Binary crate: CLI dispatch (incl. the `--vol` flag), vault-path
+                 selection, terminal setup/teardown, no-echo password reader;
+                 decrypt / extract / backup commands.
 ```
 
-The security-critical core is `crypto.rs` + `vault.rs` + `records.rs`; both
-front-ends drive the **same** `OpenVault` API, so all crypto/data logic is shared.
+The crate is split into a **library** (`lib.rs` → `pass_mgr`) holding the whole
+implementation and a thin **binary** (`main.rs`). The split lets the fuzz targets
+under `fuzz/` link the parsers directly. The security-critical core is `crypto.rs`
++ `vault.rs` + `records.rs`; both front-ends drive the **same** `OpenVault` API,
+so all crypto/data logic is shared. There is no `unsafe` anywhere in the crate
+(`#![forbid(unsafe_code)]`); even the key page-locking uses the `region` crate's
+safe API.
 
 ## 2. Data model (`records.rs`)
 
@@ -42,6 +54,9 @@ Five record types, one per UI tab, each with `id` (128-bit hex), `created_at`,
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id) |
 | Accounts | `Account` | account_type, account_subtype, owner, username, password, url, description, review |
 | Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account |
+
+The `Vault` also embeds the `categories` (`TypeLists`) used by the dropdowns, so
+the editable type lists travel with the encrypted vault (see §5).
 
 - Shared insert/edit/history logic is the **`Record` trait** + generic
   `upsert`/`remove` (records.rs). Each type supplies only its field-level `diff`
@@ -61,12 +76,18 @@ Five record types, one per UI tab, each with `id` (128-bit hex), `created_at`,
   range-checked on parse (DoS guard). Saves are atomic: write a unique hidden
   temp file with `create_new`+0600, fsync, rename, fsync the directory; the write
   `generation` is bumped each save.
-- **Document archive** (`vault.pmv.vol`): a *single* encrypted container holding
-  all uploaded document bytes (`nonce ‖ ciphertext`), decrypted as a unit on
-  open. Bound to the vault via `volume.id` in the AEAD AAD; on open, every
-  manifest-referenced id must be present (rejects a stale/swapped `.vol`).
+- **Document archive** (`vault.pmv.vol` by default): a *single* encrypted
+  container holding all uploaded document bytes (`nonce ‖ ciphertext`), decrypted
+  as a unit on open. Bound to the vault via `volume.id` in the AEAD AAD; on open,
+  every manifest-referenced id must be present (rejects a stale/swapped `.vol`).
   `parse_archive` is fully bounds-checked. Deleting a record or detaching a
   document reclaims its blob; attaching persists the record→doc link immediately.
+  The archive path can be overridden (the `--vol` flag): `OpenVault` resolves and
+  stores it once (`archive_path`), defaulting to `<vault>.vol`.
+- **Resource limits:** the whole archive is read and decrypted in memory, so an
+  upload over 64 MiB, or a total archive over 1 GiB, is refused with
+  `VaultError::TooLarge` — checked against the file's reported size *before* it is
+  read, so a hostile/corrupt `.vol` can't drive an unbounded allocation.
 - **Backup** (`backup()`): copies the encrypted vault + `.vol` into a directory
   as a collision-safe, timestamped (`-YYYYMMDD-HHMMSS`) pair. No decryption.
 - Cross-platform file hardening (`harden_file`/`harden_dir`/`write_new_*`,
@@ -85,14 +106,19 @@ Five record types, one per UI tab, each with `id` (128-bit hex), `created_at`,
 
 ## 5. Type lists (`types.rs`)
 
-`TypeLists::load(writable)` reads `<data_dir>/types/{asset_types,account_types}.json`,
-seeding defaults when missing **only in a writable session** (a read-only launch
-uses the defaults in memory and writes nothing — honoring the §4.4 guarantee) and
-**never clobbering** a user-edited file.
-Account types are hierarchical (`AccountType { name, subtypes }`) and the loader
-accepts a legacy flat `["..."]` array for back-compat. `add_asset_type`,
-`add_account_type`, `add_account_subtype` mutate and persist; the Config screen
-drives these. The Account subtype dropdown/filter is dependent on the chosen type.
+`TypeLists` is pure in-memory data (a flat `asset: Vec<String>` and hierarchical
+`account: Vec<AccountType{name, subtypes}>`) **stored inside the vault** — it is a
+field of `Vault` (`#[serde(default = "TypeLists::with_defaults")]`, and
+`#[zeroize(skip)]` since category names are not secrets). A new vault is seeded
+with `with_defaults()`; a vault that predates the field falls back to those
+defaults on load. There are **no external files** — nothing to read at startup
+and nothing unencrypted to leak.
+
+The Config-screen edits go through `OpenVault::add_asset_type` /
+`add_account_type` / `add_account_subtype`, which mutate `vault.categories` and
+`save()` the encrypted vault (refused when read-only). The mutators in `types.rs`
+themselves only touch memory and report whether anything changed. The Account
+subtype dropdown/filter is dependent on the chosen type.
 
 ## 6. UIs
 
@@ -102,7 +128,8 @@ the render closures to keep `self` borrows disjoint). The TUI (`ui.rs`) builds
 each edit form as a flat `Vec<Field>` and rebuilds the typed record by field
 index in `commit_edit_record`. Selection resolves **by id** so filtered lists
 never edit the wrong record. Accounts filter by type/subtype/owner/review;
-Assets by review. Clipboard copies are cleared on exit; the write `generation`
+Assets by review. A copied password is auto-cleared from the clipboard after 15s
+(a deadline the event loop polls for) and again on exit; the write `generation`
 is shown on unlock so a rollback is noticeable.
 
 ## 7. CLI (`main.rs`)
@@ -111,10 +138,17 @@ is shown on unlock so a rollback is noticeable.
 pass-mgr [VAULT]              graphical UI (READ-ONLY by default)
 pass-mgr --write [VAULT]      writable (allow create/edit/delete/upload)
 pass-mgr --tui [VAULT]        terminal UI (add --write to edit)
+pass-mgr --vol PATH ...       use PATH as the document archive (default <vault>.vol)
 pass-mgr decrypt [VAULT]      print the decrypted vault JSON (secrets!) to stdout
 pass-mgr extract [VAULT] DIR  decrypt all documents into DIR (path-sanitized)
 pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
 ```
+
+`--vol`/`--volume` (with a following path, or `--vol=PATH`) is a position-
+independent flag threaded into `OpenVault::open_with` / `create_with` and into
+`export_documents` / `backup`. It overrides the default `<vault>.vol` archive
+location for the UI, `extract`, and `backup` (it is irrelevant to `decrypt`,
+which never touches the archive).
 
 `--write`/`--tui` are parsed as position-independent flags. **Read-only is the
 default** and is enforced authoritatively in `OpenVault` (`open_read_only` +
