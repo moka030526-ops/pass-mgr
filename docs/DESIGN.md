@@ -134,6 +134,22 @@ as one unit on change (an "encrypted zip"):
 - Whole archive is held decrypted in memory while the vault is open (acceptable
   for the standalone, single-user use case; see §9).
 
+### 4.4 Read-only by default
+
+Both UIs open the vault **read-only** unless `--write` is passed. Read-only is
+enforced in two layers:
+
+- **Core (authoritative):** `OpenVault::open_read_only` sets a `read_only` flag;
+  every mutating method (`save`, `change_password`, `add_document`,
+  `remove_document`) returns `VaultError::ReadOnly`, and the open path writes
+  nothing to disk (not even the refreshed `last_opened_at`/generation). So a
+  read-only session is guaranteed not to modify `vault.pmv` or `.vol`.
+- **UI:** the front-ends hide write controls (New/Save/Delete/attach/detach/
+  generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
+  (browse, reveal, copy, export, backup) remain available.
+
+Creating a vault is itself a write, so first-run creation requires `--write`.
+
 ## 5. Cryptography
 
 ### 5.1 Primitives

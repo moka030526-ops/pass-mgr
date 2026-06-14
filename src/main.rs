@@ -43,50 +43,62 @@ fn default_vault_path() -> PathBuf {
 }
 
 const HELP: &str = "\
-pass-mgr — standalone, offline, two-password encrypted password manager
+pass-mgr — standalone, offline, two-password encrypted estate vault
 
 USAGE:
-    pass-mgr [VAULT]              Launch the graphical UI (default vault if omitted)
-    pass-mgr --tui [VAULT]        Launch the terminal UI instead
+    pass-mgr [VAULT]              Launch the graphical UI (read-only by default)
+    pass-mgr --write [VAULT]      Launch writable (allow creating/editing/deleting)
+    pass-mgr --tui [VAULT]        Launch the terminal UI instead (add --write to edit)
     pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
     pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
     pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
     pass-mgr --help               Show this help
 
-The vault is protected by two passwords entered in sequence.";
+The vault is protected by two passwords entered in sequence. The interactive UI
+opens READ-ONLY unless --write is given.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let result = match args.first().map(String::as_str) {
-        Some("--help" | "-h") => {
-            println!("{HELP}");
-            return ExitCode::SUCCESS;
-        }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+
+    // Flags may appear anywhere. The interactive UI is read-only unless --write
+    // is given; --tui selects the terminal UI over the graphical one.
+    let writable = args.iter().any(|a| a == "--write");
+    let tui = args.iter().any(|a| a == "--tui");
+    let pos: Vec<String> =
+        args.into_iter().filter(|a| !matches!(a.as_str(), "--write" | "--tui")).collect();
+
+    let result = match pos.first().map(String::as_str) {
         Some("decrypt" | "export") => {
-            let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
+            let path = pos.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
             cli_decrypt(path)
         }
         // `extract [VAULT] DIR` — the output directory is always the LAST argument.
-        Some("extract") => match args.len() {
-            2 => cli_extract(default_vault_path(), PathBuf::from(&args[1])),
-            3 => cli_extract(PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+        Some("extract") => match pos.len() {
+            2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1])),
+            3 => cli_extract(PathBuf::from(&pos[1]), PathBuf::from(&pos[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr extract [VAULT] <OUTPUT_DIR>")),
         },
         // `backup [VAULT] DIR` — copies the encrypted files; no passwords needed.
-        Some("backup") => match args.len() {
-            2 => cli_backup(default_vault_path(), PathBuf::from(&args[1])),
-            3 => cli_backup(PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+        Some("backup") => match pos.len() {
+            2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1])),
+            3 => cli_backup(PathBuf::from(&pos[1]), PathBuf::from(&pos[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr backup [VAULT] <DEST_DIR>")),
         },
-        Some("--tui") => {
-            let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
-            run_ui(path, types::TypeLists::load())
-        }
-        // Otherwise the (optional) first argument is the vault path for the GUI.
+        // Otherwise the (optional) positional argument is the vault path for the
+        // interactive UI (graphical by default, terminal with --tui).
         _ => {
-            let path = args.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
-            gui::run(path, types::TypeLists::load())
+            let path = pos.first().map(PathBuf::from).unwrap_or_else(default_vault_path);
+            let types = types::TypeLists::load();
+            if tui {
+                run_ui(path, types, writable)
+            } else {
+                gui::run(path, types, writable)
+            }
         }
     };
 
@@ -97,12 +109,12 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_ui(path: PathBuf, types: types::TypeLists) -> anyhow::Result<()> {
+fn run_ui(path: PathBuf, types: types::TypeLists, writable: bool) -> anyhow::Result<()> {
     // `ratatui::init` enters the alternate screen + raw mode and installs a
     // panic hook that restores the terminal before printing the panic, so a
     // crash never leaves the user's terminal in a broken state.
     let mut terminal = ratatui::init();
-    let result = ui::run(&mut terminal, path, types);
+    let result = ui::run(&mut terminal, path, types, writable);
     ratatui::restore();
     result
 }

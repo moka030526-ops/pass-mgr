@@ -106,12 +106,19 @@ is shown on unlock so a rollback is noticeable.
 ## 7. CLI (`main.rs`)
 
 ```
-pass-mgr [VAULT]              graphical UI (default)
-pass-mgr --tui [VAULT]        terminal UI
+pass-mgr [VAULT]              graphical UI (READ-ONLY by default)
+pass-mgr --write [VAULT]      writable (allow create/edit/delete/upload)
+pass-mgr --tui [VAULT]        terminal UI (add --write to edit)
 pass-mgr decrypt [VAULT]      print the decrypted vault JSON (secrets!) to stdout
 pass-mgr extract [VAULT] DIR  decrypt all documents into DIR (path-sanitized)
 pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
 ```
+
+`--write`/`--tui` are parsed as position-independent flags. **Read-only is the
+default** and is enforced authoritatively in `OpenVault` (`open_read_only` +
+`read_only` guards on every mutator; nothing is written on a read-only open),
+with the UIs hiding write controls and showing a read-only badge (`DESIGN.md`
+§4.4). `decrypt`/`extract`/`backup` are read operations and ignore `--write`.
 
 `extract` sanitizes manifest paths (`safe_relative_path`: no `..`/absolute/drive/
 backslash) so it can't escape `DIR`, writes via the hardened `write_new_bytes`,

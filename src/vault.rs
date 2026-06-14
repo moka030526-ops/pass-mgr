@@ -92,6 +92,8 @@ pub enum VaultError {
     BadParams,
     #[error("document archive does not match the vault (possible tampering or rollback)")]
     ArchiveMismatch,
+    #[error("vault is open read-only (relaunch with --write to make changes)")]
+    ReadOnly,
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("vault contents are not valid JSON: {0}")]
@@ -168,6 +170,8 @@ pub struct OpenVault {
     previous_access: i64,
     /// Write-generation read from disk on open, for rollback awareness (§9.12).
     previous_generation: u64,
+    /// When true, every mutating operation is refused (see [`OpenVault::open_read_only`]).
+    read_only: bool,
     /// All documents, decrypted, held together (the "encrypted zip" decrypted as
     /// a unit on open and re-encrypted as a unit on change).
     archive: DocArchive,
@@ -201,15 +205,27 @@ impl OpenVault {
             path,
             previous_access: 0,
             previous_generation: 0,
+            read_only: false,
             archive: DocArchive::new(),
         };
         open.save()?;
         Ok(open)
     }
 
-    /// Unlock an existing vault with both passwords. Updates `last_opened_at`
-    /// (persisted best-effort) and exposes the prior access time/generation.
+    /// Unlock an existing vault read-write. Updates `last_opened_at` (persisted
+    /// best-effort) and exposes the prior access time/generation.
     pub fn open(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
+        Self::open_inner(path, pw1, pw2, false)
+    }
+
+    /// Unlock an existing vault **read-only**: every mutating operation is
+    /// refused with [`VaultError::ReadOnly`], and nothing is written to disk on
+    /// open (so the vault can be viewed even on read-only media).
+    pub fn open_read_only(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
+        Self::open_inner(path, pw1, pw2, true)
+    }
+
+    fn open_inner(path: PathBuf, pw1: &[u8], pw2: &[u8], read_only: bool) -> Result<Self, VaultError> {
         let (mut vault, header, key) = decrypt_file(&path, pw1, pw2)?;
 
         let previous_access = vault.last_opened_at;
@@ -235,13 +251,17 @@ impl OpenVault {
             path,
             previous_access,
             previous_generation,
+            read_only,
             archive,
         };
-        // Persisting the refreshed access time is best-effort: a read-only medium
-        // or full disk must not stop you from viewing an otherwise-valid vault.
-        let _ = open.save();
+        // Persisting the refreshed access time is best-effort, and skipped
+        // entirely in read-only mode (a read-only session writes nothing).
+        if !read_only {
+            let _ = open.save();
+        }
         Ok(open)
     }
+
 
     /// Decrypt the vault and return its contents **without** modifying the file.
     /// Used by the command-line decrypt/export path.
@@ -275,6 +295,9 @@ impl OpenVault {
     /// fsync + rename + dir fsync), with a fresh random nonce and owner-only mode.
     /// Bumps the write-generation counter so a later rollback is detectable.
     pub fn save(&mut self) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
         self.vault.generation = self.vault.generation.saturating_add(1);
         let plaintext = Zeroizing::new(serde_json::to_vec(&self.vault)?);
 
@@ -312,6 +335,9 @@ impl OpenVault {
     /// Re-key under two new passwords (new salt) and persist. Transactional: the
     /// in-memory key/salt/audit are only kept if the save succeeds.
     pub fn change_password(&mut self, pw1: &[u8], pw2: &[u8]) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &self.params)?;
 
@@ -370,6 +396,9 @@ impl OpenVault {
         filename: &str,
         source: &Path,
     ) -> Result<String, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
         let data = Zeroizing::new(fs::read(source)?);
         let size = data.len() as u64;
         let id = records::random_id()?;
@@ -415,6 +444,9 @@ impl OpenVault {
     /// the document is deleted or its attachment is detached, so "deleted"
     /// documents do not linger in the encrypted archive.
     pub fn remove_document(&mut self, file_id: &str) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
         // Snapshot what we remove so a failed persist can be fully rolled back.
         let removed_blob = self.archive.remove(file_id);
         let removed_idx = self.vault.volume.files.iter().position(|f| f.id == file_id);
@@ -1051,6 +1083,36 @@ mod tests {
         assert_eq!(reopened.opened_generation(), g_after_create);
         // Opening also bumps and persists a new generation.
         assert!(reopened.vault.generation > g_after_create);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_only_refuses_all_mutations() {
+        let path = tmp_path("ro");
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+            v.save().unwrap();
+        }
+        let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        // Reads still work.
+        assert_eq!(ro.vault.accounts.len(), 1);
+        // Every mutation is refused.
+        assert!(matches!(ro.save(), Err(VaultError::ReadOnly)));
+        assert!(matches!(ro.change_password(b"c", b"d"), Err(VaultError::ReadOnly)));
+        assert!(matches!(ro.remove_document("x"), Err(VaultError::ReadOnly)));
+        let mut src = std::env::temp_dir();
+        src.push(format!("passmgr-rosrc-{}.txt", nanos()));
+        fs::write(&src, b"x").unwrap();
+        assert!(matches!(ro.add_document("/d", "f", &src), Err(VaultError::ReadOnly)));
+
+        // A read-only open does not bump the on-disk generation.
+        let g_before = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap().vault.generation;
+        let _ = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        let g_after = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap().vault.generation;
+        assert_eq!(g_before, g_after, "read-only open writes nothing");
+
+        fs::remove_file(&src).ok();
         fs::remove_file(&path).ok();
     }
 

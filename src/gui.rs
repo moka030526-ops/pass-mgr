@@ -21,8 +21,10 @@ use crate::ui::format_time;
 use crate::vault::{self, OpenVault, VaultError};
 use crate::crypto::KdfParams;
 
-/// Launch the graphical app and block until the window is closed.
-pub fn run(path: std::path::PathBuf, types: TypeLists) -> anyhow::Result<()> {
+/// Launch the graphical app and block until the window is closed. `writable`
+/// enables mutations; when false the vault is opened read-only and write
+/// controls are hidden.
+pub fn run(path: std::path::PathBuf, types: TypeLists, writable: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
@@ -33,10 +35,10 @@ pub fn run(path: std::path::PathBuf, types: TypeLists) -> anyhow::Result<()> {
     eframe::run_native(
         "pass-mgr",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // Lighter, higher-contrast theme.
             cc.egui_ctx.set_visuals(light_visuals());
-            Ok(Box::new(GuiApp::new(path, types)))
+            Ok(Box::new(GuiApp::new(path, types, writable)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
@@ -96,6 +98,8 @@ enum DocReq {
 struct GuiApp {
     path: std::path::PathBuf,
     types: TypeLists,
+    /// When false the vault is opened read-only and write controls are hidden.
+    writable: bool,
     screen: Screen,
     // Auth.
     auth_mode: AuthMode,
@@ -149,11 +153,12 @@ impl Drop for GuiApp {
 }
 
 impl GuiApp {
-    fn new(path: std::path::PathBuf, types: TypeLists) -> Self {
+    fn new(path: std::path::PathBuf, types: TypeLists, writable: bool) -> Self {
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         GuiApp {
             path,
             types,
+            writable,
             screen: Screen::Auth,
             auth_mode,
             pw1: String::new(),
@@ -248,6 +253,11 @@ impl GuiApp {
 
     fn submit_open_or_create(&mut self) {
         let creating = self.auth_mode == AuthMode::Create;
+        if creating && !self.writable {
+            self.auth_error =
+                Some("No vault here, and this is read-only. Relaunch with --write to create one.".into());
+            return;
+        }
         let result = if creating {
             let (pw1, pw2) = match self.confirmed_passwords() {
                 Ok(p) => p,
@@ -257,8 +267,10 @@ impl GuiApp {
                 }
             };
             OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
-        } else {
+        } else if self.writable {
             OpenVault::open(self.path.clone(), self.pw1.as_bytes(), self.pw2.as_bytes())
+        } else {
+            OpenVault::open_read_only(self.path.clone(), self.pw1.as_bytes(), self.pw2.as_bytes())
         };
 
         match result {
@@ -368,7 +380,10 @@ impl GuiApp {
             tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
             tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
             ui.separator();
-            if ui.button("🔑 Passwords").clicked() {
+            // Change-password is a write; only offer it when writable.
+            if self.writable
+                && ui.button("🔑 Passwords").clicked()
+            {
                 self.auth_mode = AuthMode::ChangePassword;
                 self.auth_error = None;
                 self.wipe_passwords();
@@ -379,6 +394,14 @@ impl GuiApp {
             }
             if ui.button("Quit").clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if !self.writable {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("🔒 READ-ONLY")
+                        .strong()
+                        .color(egui::Color32::from_rgb(170, 90, 0)),
+                );
             }
         });
     }
@@ -393,6 +416,12 @@ impl GuiApp {
             }
         });
         ui.separator();
+        if !self.writable {
+            ui.label(
+                egui::RichText::new("Read-only: type editing is disabled (backup is still available).")
+                    .color(egui::Color32::from_rgb(170, 90, 0)),
+            );
+        }
 
         let mut add_asset = false;
         let mut add_account = false;
@@ -405,7 +434,7 @@ impl GuiApp {
             ui.label(egui::RichText::new(self.types.asset.join(" · ")).weak());
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0));
-                if ui.button("Add type").clicked() {
+                if self.writable && ui.button("Add type").clicked() {
                     add_asset = true;
                 }
             });
@@ -418,7 +447,7 @@ impl GuiApp {
             }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_account_type).hint_text("New account type").desired_width(220.0));
-                if ui.button("Add type").clicked() {
+                if self.writable && ui.button("Add type").clicked() {
                     add_account = true;
                 }
             });
@@ -432,7 +461,7 @@ impl GuiApp {
                     }
                 });
                 ui.add(egui::TextEdit::singleline(&mut self.new_subtype_name).hint_text("New subtype").desired_width(180.0));
-                if ui.button("Add subtype").clicked() {
+                if self.writable && ui.button("Add subtype").clicked() {
                     add_subtype = true;
                 }
             });
@@ -515,7 +544,7 @@ impl GuiApp {
         let mut action = FormAction::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref());
+            (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_instruction.as_mut() {
                 egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -525,7 +554,7 @@ impl GuiApp {
                 });
                 ui.label("Description");
                 ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(12).desired_width(f32::INFINITY));
-                action = form_buttons(ui);
+                action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select an instruction or click “New”.");
@@ -565,7 +594,7 @@ impl GuiApp {
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref());
+            (new, select) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -585,8 +614,9 @@ impl GuiApp {
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
+                    self.writable,
                 );
-                action = form_buttons(ui);
+                action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select a document or click “New”.");
@@ -641,7 +671,7 @@ impl GuiApp {
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref());
+            (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_asset.as_mut() {
                 egui::Grid::new("asset_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -685,8 +715,9 @@ impl GuiApp {
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
+                    self.writable,
                 );
-                action = form_buttons(ui);
+                action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select an asset/liability or click “New”.");
@@ -779,7 +810,7 @@ impl GuiApp {
         let mut copy_pw: Option<String> = None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref());
+            (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
                 let subtypes = self.types.subtypes_for(&r.account_type);
@@ -805,7 +836,8 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut r.password).password(!self.reveal_pw).desired_width(280.0));
                         ui.checkbox(&mut self.reveal_pw, "reveal");
-                        if ui.button("🎲").on_hover_text("Generate").clicked() {
+                        // Generate is only useful when you can save; copy is a read.
+                        if self.writable && ui.button("🎲").on_hover_text("Generate").clicked() {
                             generate = true;
                         }
                         if ui.button("📋").on_hover_text("Copy").clicked() {
@@ -822,7 +854,7 @@ impl GuiApp {
                 });
                 ui.label("Description");
                 ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY));
-                action = form_buttons(ui);
+                action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select an account or click “New”.");
@@ -877,7 +909,7 @@ impl GuiApp {
         let mut action = FormAction::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref());
+            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_realestate.as_mut() {
                 egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -889,7 +921,7 @@ impl GuiApp {
                     text_row(ui, "Financing account", &mut r.financing_account);
                     text_row(ui, "Payment account", &mut r.payment_account);
                 });
-                action = form_buttons(ui);
+                action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select a property or click “New”.");
@@ -1148,13 +1180,15 @@ fn list_panel(
     new_label: &str,
     labels: &[(String, String)],
     current_id: Option<&str>,
+    writable: bool,
 ) -> (bool, Option<usize>) {
     let mut new = false;
     let mut select = None;
     ui.horizontal(|ui| {
         ui.heading(title);
     });
-    if ui.button(new_label).clicked() {
+    // "New" is a write; only offered when writable.
+    if writable && ui.button(new_label).clicked() {
         new = true;
     }
     ui.separator();
@@ -1170,8 +1204,12 @@ fn list_panel(
     (new, select)
 }
 
-/// Save / Delete buttons; returns the chosen action.
-fn form_buttons(ui: &mut egui::Ui) -> FormAction {
+/// Save / Delete buttons; returns the chosen action. Renders nothing (and stays
+/// `None`) in read-only mode.
+fn form_buttons(ui: &mut egui::Ui, writable: bool) -> FormAction {
+    if !writable {
+        return FormAction::None;
+    }
     let mut action = FormAction::None;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1234,22 +1272,24 @@ fn doc_section(
     filename: &mut String,
     source: &mut String,
     dest: &mut String,
+    writable: bool,
 ) -> DocReq {
     let mut req = DocReq::None;
     ui.label(egui::RichText::new(format!("{label} (encrypted volume)")).strong());
     if attached_present {
         ui.label(format!("Attached: {}", attached_label.unwrap_or("(unknown)")));
         ui.horizontal(|ui| {
+            // Export is a read and is always allowed; Detach mutates the vault.
             ui.label("Export to:");
             ui.add(egui::TextEdit::singleline(dest).hint_text("/path/to/save/as").desired_width(300.0));
             if ui.button("Export").clicked() {
                 req = DocReq::Export;
             }
-            if ui.button("Detach").clicked() {
+            if writable && ui.button("Detach").clicked() {
                 req = DocReq::Remove;
             }
         });
-    } else {
+    } else if writable {
         egui::Grid::new(format!("doc_{label}")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Location");
             ui.add(egui::TextEdit::singleline(location).hint_text("/statements/2026").desired_width(300.0));
@@ -1264,6 +1304,8 @@ fn doc_section(
         if ui.button("⬆ Attach (encrypt into volume)").clicked() {
             req = DocReq::Attach;
         }
+    } else {
+        ui.label(egui::RichText::new("(no document attached)").weak());
     }
     req
 }
@@ -1331,7 +1373,7 @@ mod tests {
     fn app_unlocked(tag: &str) -> (GuiApp, std::path::PathBuf) {
         let path = tmp(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
@@ -1340,7 +1382,7 @@ mod tests {
     #[test]
     fn create_flow_builds_vault() {
         let path = tmp("create");
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();
@@ -1356,7 +1398,7 @@ mod tests {
     #[test]
     fn mismatched_confirmation_is_rejected() {
         let path = tmp("mismatch");
-        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory(), true);
         app.auth_mode = AuthMode::Create;
         app.pw1 = "a".into();
         app.confirm1 = "a".into();

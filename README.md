@@ -78,17 +78,26 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## Usage
 
 ```text
-pass-mgr [VAULT]              Launch the graphical UI (default vault if omitted)
-pass-mgr --tui [VAULT]        Launch the terminal UI instead
+pass-mgr [VAULT]              Launch the graphical UI (READ-ONLY by default)
+pass-mgr --write [VAULT]      Launch writable (create / edit / delete / upload)
+pass-mgr --tui [VAULT]        Launch the terminal UI instead (add --write to edit)
 pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
 pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
+pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
 pass-mgr --help               Show help
 ```
 
+**Read-only by default.** The interactive GUI/TUI open the vault **read-only** —
+you can browse, reveal/copy passwords, export documents, and back up, but
+nothing can be added to or changed in the vault. Pass **`--write`** to enable
+creating, editing, deleting, document upload, and changing master passwords. The
+UI shows a `🔒 READ-ONLY` badge and hides write controls when not writable. A
+read-only session never writes to disk (not even the last-opened time).
+
 Both UIs read and write the same vault and expose the same features across the
-five tabs (record list + edit form, document upload/export, history, random
-password generation, change master passwords). The graphical UI uses on-screen
-buttons; the terminal key bindings are below.
+five tabs (record list + edit form, document upload/export, history, type/subtype
++ review filters, random password generation, change master passwords). The
+graphical UI uses on-screen buttons; the terminal key bindings are below.
 
 The default vault location is per-user:
 
@@ -101,9 +110,10 @@ Pass a path to use a different file: `pass-mgr ./work-vault.pmv`.
 
 ### First run
 
+Creating a vault is a write, so launch with `--write` (e.g. `pass-mgr --write`).
 With no vault present you'll see the **Create** screen: choose two passwords,
 each entered twice to confirm. Afterwards every launch shows the **Unlock**
-screen, which needs both passwords in sequence.
+screen, which needs both passwords in sequence (read-only unless `--write`).
 
 ### Terminal key bindings
 

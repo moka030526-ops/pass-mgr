@@ -28,9 +28,15 @@ use crate::records::{
 use crate::types::TypeLists;
 use crate::vault::{self, OpenVault, VaultError};
 
-/// Run the UI event loop until the user quits.
-pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, types: TypeLists) -> anyhow::Result<()> {
-    let mut app = App::new(path, types);
+/// Run the UI event loop until the user quits. `writable` enables mutations;
+/// when false the vault is opened read-only and write keys are inert.
+pub fn run(
+    terminal: &mut DefaultTerminal,
+    path: PathBuf,
+    types: TypeLists,
+    writable: bool,
+) -> anyhow::Result<()> {
+    let mut app = App::new(path, types, writable);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         if let Event::Key(key) = event::read()?
@@ -204,6 +210,8 @@ impl EditState {
 struct App {
     path: PathBuf,
     types: TypeLists,
+    /// When false the vault is opened read-only and mutating keys are inert.
+    writable: bool,
     screen: Screen,
     auth: AuthState,
     vault: Option<OpenVault>,
@@ -237,11 +245,12 @@ impl Drop for App {
 }
 
 impl App {
-    fn new(path: PathBuf, types: TypeLists) -> Self {
+    fn new(path: PathBuf, types: TypeLists, writable: bool) -> Self {
         let mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         App {
             path,
             types,
+            writable,
             screen: Screen::Auth,
             auth: AuthState::new(mode),
             vault: None,
@@ -327,6 +336,15 @@ impl App {
         }
     }
 
+    /// Gate a mutating action: returns true if writable, else sets a status hint.
+    fn require_writable(&mut self) -> bool {
+        if self.writable {
+            return true;
+        }
+        self.status = "Read-only — relaunch with --write to make changes.".into();
+        false
+    }
+
     // --- Key handling: returns true to quit ---------------------------------
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -410,6 +428,11 @@ impl App {
 
     fn submit_open_or_create(&mut self) {
         let creating = self.auth.mode == AuthMode::Create;
+        if creating && !self.writable {
+            self.auth.error =
+                Some("No vault here, and this is read-only. Relaunch with --write to create one.".into());
+            return;
+        }
         let result = if creating {
             let (pw1, pw2) = match self.confirmed_passwords() {
                 Ok(p) => p,
@@ -421,7 +444,12 @@ impl App {
             OpenVault::create(self.path.clone(), pw1.as_bytes(), pw2.as_bytes(), KdfParams::default())
         } else {
             let f = &self.auth.fields;
-            OpenVault::open(self.path.clone(), f[0].value.as_bytes(), f[1].value.as_bytes())
+            let (p1, p2) = (f[0].value.as_bytes(), f[1].value.as_bytes());
+            if self.writable {
+                OpenVault::open(self.path.clone(), p1, p2)
+            } else {
+                OpenVault::open_read_only(self.path.clone(), p1, p2)
+            }
         };
         match result {
             Ok(v) => {
@@ -477,8 +505,16 @@ impl App {
                     self.start_edit(true);
                 }
             }
-            KeyCode::Char('n') => self.start_edit(false),
-            KeyCode::Char('d') => self.delete_selected(),
+            KeyCode::Char('n') => {
+                if self.require_writable() {
+                    self.start_edit(false);
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.require_writable() {
+                    self.delete_selected();
+                }
+            }
             // Accounts-only display filters: cycle by type / subtype / owner.
             KeyCode::Char('t') if self.tab == Tab::Accounts => {
                 let opts = self.account_values(|a| &a.account_type);
@@ -525,8 +561,10 @@ impl App {
                 self.selected = 0;
             }
             KeyCode::Char('p') => {
-                self.auth = AuthState::new(AuthMode::ChangePassword);
-                self.screen = Screen::Auth;
+                if self.require_writable() {
+                    self.auth = AuthState::new(AuthMode::ChangePassword);
+                    self.screen = Screen::Auth;
+                }
             }
             KeyCode::Char('c') => {
                 self.cfg_focus = 0;
@@ -567,6 +605,11 @@ impl App {
 
     /// Perform the focused config action: add a type/subtype or run a backup.
     fn submit_config(&mut self) {
+        // Backup (focus 4) is a read/copy and always allowed; the type/subtype
+        // adds (focus 0..3) write to config files and need --write.
+        if self.cfg_focus != 4 && !self.require_writable() {
+            return;
+        }
         match self.cfg_focus {
             0 => {
                 let name = self.cfg_asset_type.trim().to_string();
@@ -784,12 +827,21 @@ impl App {
                 self.edit = None;
                 self.screen = Screen::Browse;
             }
-            KeyCode::Char('s') if ctrl => self.save_edit(),
+            // Write actions are gated by --write; reads (reveal/copy/export) are not.
+            KeyCode::Char('s') if ctrl => {
+                if self.require_writable() {
+                    self.save_edit();
+                }
+            }
             KeyCode::Char('g') if ctrl => {
-                if let Some(f) = es.fields.iter_mut().find(|f| matches!(f.kind, FieldKind::Password)) {
+                if self.writable
+                    && let Some(f) = es.fields.iter_mut().find(|f| matches!(f.kind, FieldKind::Password))
+                {
                     f.value = password::generate(&GenOptions::default()).unwrap_or_default();
                     es.reveal = true;
                     self.status = "Generated a random password.".into();
+                } else if !self.writable {
+                    self.require_writable();
                 }
             }
             KeyCode::Char('r') if ctrl => es.reveal = !es.reveal,
@@ -799,9 +851,17 @@ impl App {
                     self.copy_to_clipboard(pw);
                 }
             }
-            KeyCode::Char('u') if ctrl => self.attach_document(),
+            KeyCode::Char('u') if ctrl => {
+                if self.require_writable() {
+                    self.attach_document();
+                }
+            }
             KeyCode::Char('e') if ctrl => self.export_document(),
-            KeyCode::Char('k') if ctrl => self.detach_document(),
+            KeyCode::Char('k') if ctrl => {
+                if self.require_writable() {
+                    self.detach_document();
+                }
+            }
             KeyCode::Tab | KeyCode::Down => {
                 es.focus = (es.focus + 1) % es.fields.len();
             }
@@ -1310,10 +1370,11 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect, hints: &str) {
+        let badge = if self.writable { "" } else { "🔒 READ-ONLY · " };
         let text = if self.status.is_empty() {
-            hints.to_string()
+            format!("{badge}{hints}")
         } else {
-            format!("{}  —  {hints}", self.status)
+            format!("{badge}{}  —  {hints}", self.status)
         };
         let footer = Paragraph::new(text)
             .style(Style::default().fg(Color::Gray))
@@ -1383,7 +1444,23 @@ mod tests {
     fn app_unlocked(tag: &str) -> (App, PathBuf) {
         let path = tmp_vault(tag);
         let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        let mut app = App::new(path.clone(), TypeLists::in_memory());
+        let mut app = App::new(path.clone(), TypeLists::in_memory(), true);
+        app.vault = Some(ov);
+        app.screen = Screen::Browse;
+        (app, path)
+    }
+
+    /// A read-only `App` unlocked over an existing vault that already has one
+    /// account, on the Browse screen.
+    fn app_read_only(tag: &str) -> (App, PathBuf) {
+        let path = tmp_vault(tag);
+        {
+            let mut ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            records::upsert(&mut ov.vault.accounts, Account::new().unwrap());
+            ov.save().unwrap();
+        }
+        let ov = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        let mut app = App::new(path.clone(), TypeLists::in_memory(), false);
         app.vault = Some(ov);
         app.screen = Screen::Browse;
         (app, path)
@@ -1569,6 +1646,42 @@ mod tests {
         cleanup(&path);
     }
 
+    #[test]
+    fn read_only_keys_are_inert_but_reads_work() {
+        let (mut app, path) = app_read_only("ro");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        assert_eq!(app.current_labels().len(), 1, "existing record is viewable");
+
+        // New / delete / change-password do nothing and report read-only.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.screen, Screen::Browse, "new is inert in read-only");
+        assert!(app.status.contains("Read-only"));
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.vault.as_ref().unwrap().vault.accounts.len(), 1, "delete is inert");
+
+        // Viewing (Enter -> Edit) is allowed; saving is not.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Edit);
+        app.handle_key(ctrl('s'));
+        assert!(app.status.contains("Read-only"), "save is inert in read-only");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_config_blocks_type_add() {
+        let (mut app, path) = app_read_only("rocfg");
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.screen, Screen::Config);
+        for c in "Annuity".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter)); // focus 0 = add asset type
+        assert!(!app.types.asset.contains(&"Annuity".to_string()), "type add blocked in read-only");
+        assert!(app.status.contains("Read-only"));
+        cleanup(&path);
+    }
+
     /// Render the current screen to an in-memory backend; asserts no panic.
     fn render(app: &App) {
         use ratatui::Terminal;
@@ -1582,7 +1695,7 @@ mod tests {
         // Auth screen, all three modes.
         let path = tmp_vault("render");
         for mode in [AuthMode::Create, AuthMode::Unlock, AuthMode::ChangePassword] {
-            let mut app = App::new(path.clone(), TypeLists::in_memory());
+            let mut app = App::new(path.clone(), TypeLists::in_memory(), true);
             app.auth = AuthState::new(mode);
             app.auth.error = Some("err".into());
             render(&app);
