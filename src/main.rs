@@ -222,7 +222,24 @@ fn safe_relative_path(location: &str, filename: &str, id: &str) -> PathBuf {
         if p.contains(['/', '\\', ':', '\0']) {
             return None;
         }
-        Some(p.to_string())
+        // Windows: strip trailing dots/spaces (they're silently dropped by the OS,
+        // which can alias names) and refuse reserved DOS device names (CON, PRN,
+        // AUX, NUL, COM1-9, LPT1-9), with or without an extension.
+        let trimmed = p.trim_end_matches(['.', ' ']);
+        if trimmed.is_empty() {
+            return None;
+        }
+        let stem = trimmed.split('.').next().unwrap_or(trimmed);
+        const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+        let upper = stem.to_ascii_uppercase();
+        let is_com_lpt = (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0';
+        if RESERVED.contains(&upper.as_str()) || is_com_lpt {
+            return None;
+        }
+        Some(trimmed.to_string())
     }
     let mut path = PathBuf::new();
     for part in location.split(['/', '\\']) {
@@ -351,6 +368,21 @@ mod tests {
         let p = safe_relative_path("C:", "x.txt", "id");
         assert!(contained(&p));
         assert_eq!(p, PathBuf::from("x.txt"));
+    }
+
+    #[test]
+    fn safe_path_rejects_windows_reserved_and_trailing() {
+        // Reserved DOS device names are dropped (filename falls back to the id).
+        assert_eq!(safe_relative_path("", "CON", "id1"), PathBuf::from("id1.bin"));
+        assert_eq!(safe_relative_path("", "nul.txt", "id2"), PathBuf::from("id2.bin"));
+        assert_eq!(safe_relative_path("", "COM1", "id3"), PathBuf::from("id3.bin"));
+        assert_eq!(safe_relative_path("", "LPT9", "id4"), PathBuf::from("id4.bin"));
+        // A reserved *directory* component is dropped, not used as a folder.
+        assert_eq!(safe_relative_path("CON/sub", "f.txt", "id5"), PathBuf::from("sub/f.txt"));
+        // Trailing dots/spaces are stripped (Windows aliases them away).
+        assert_eq!(safe_relative_path("", "report.pdf. .", "id6"), PathBuf::from("report.pdf"));
+        // COM0/LPT0 are NOT reserved.
+        assert_eq!(safe_relative_path("", "LPT0.log", "id7"), PathBuf::from("LPT0.log"));
     }
 
     #[test]

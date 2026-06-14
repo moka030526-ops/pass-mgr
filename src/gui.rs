@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::password::{self, GenOptions};
 use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TrustWill};
@@ -48,13 +48,20 @@ pub fn run(
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
-/// A light egui theme, a touch warmer/brighter than the default light visuals.
+/// A light egui theme — brighter than the default light visuals (panels and
+/// widget faces lifted toward white for a lighter overall feel).
 fn light_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::light();
-    v.panel_fill = egui::Color32::from_rgb(248, 249, 251);
-    v.window_fill = egui::Color32::from_rgb(252, 252, 253);
+    v.panel_fill = egui::Color32::from_rgb(252, 253, 255);
+    v.window_fill = egui::Color32::from_rgb(255, 255, 255);
     v.extreme_bg_color = egui::Color32::from_rgb(255, 255, 255);
-    v.selection.bg_fill = egui::Color32::from_rgb(180, 210, 255);
+    v.faint_bg_color = egui::Color32::from_rgb(248, 250, 253);
+    // Lift the widget backgrounds (inactive/hovered/active) so controls read lighter.
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(250, 251, 253);
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(244, 247, 251);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(248, 250, 253);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(232, 240, 252);
+    v.selection.bg_fill = egui::Color32::from_rgb(198, 222, 255);
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 90, 170));
     v
 }
@@ -242,14 +249,15 @@ impl GuiApp {
 
     // --- Auth ----------------------------------------------------------------
 
-    fn confirmed_passwords(&self) -> Result<(String, String), String> {
+    fn confirmed_passwords(&self) -> Result<(Zeroizing<String>, Zeroizing<String>), String> {
         if self.pw1.is_empty() || self.pw2.is_empty() {
             return Err("Both passwords are required.".into());
         }
         if self.pw1 != self.confirm1 || self.pw2 != self.confirm2 {
             return Err("Password confirmations do not match.".into());
         }
-        Ok((self.pw1.clone(), self.pw2.clone()))
+        // Zeroizing so these password copies are wiped from the heap when dropped.
+        Ok((Zeroizing::new(self.pw1.clone()), Zeroizing::new(self.pw2.clone())))
     }
 
     fn submit_auth(&mut self) {
@@ -818,12 +826,24 @@ impl GuiApp {
         let type_names = self.vault_ref().categories().account_type_names();
         let owners_present =
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.owner.clone()));
-        // When a type filter is chosen, only its connected subtypes are offered;
-        // otherwise offer the distinct subtypes present across all accounts.
+        // When a type filter is chosen, offer that type's configured subtypes
+        // UNION any free-text subtypes actually present on its accounts (so a
+        // hand-typed subtype is still selectable as a filter); otherwise offer the
+        // distinct subtypes present across all accounts.
         let subtype_opts: Vec<String> = if self.acct_filter_type.is_empty() {
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.account_subtype.clone()))
         } else {
-            self.vault_ref().categories().subtypes_for(&self.acct_filter_type)
+            let ft = self.acct_filter_type.clone();
+            let mut opts = self.vault_ref().categories().subtypes_for(&ft);
+            for a in &self.vault_ref().vault.accounts {
+                if a.account_type == ft
+                    && !a.account_subtype.is_empty()
+                    && !opts.contains(&a.account_subtype)
+                {
+                    opts.push(a.account_subtype.clone());
+                }
+            }
+            opts
         };
 
         ui.horizontal_wrapped(|ui| {
@@ -868,13 +888,21 @@ impl GuiApp {
         let mut select = None;
         let mut action = FormAction::None;
         let mut generate = false;
-        let mut copy_pw: Option<String> = None;
+        let mut copy_pw: Option<Zeroizing<String>> = None;
         // Subtypes for the record under edit, looked up from the vault's category
-        // lists before the mutable borrow of `edit_account` below.
+        // lists before the mutable borrow of `edit_account` below. The record's
+        // current subtype is kept selectable even if it is a free-text value not
+        // in the configured list (e.g. legacy/imported data).
         let subtypes: Vec<String> = self
             .edit_account
             .as_ref()
-            .map(|r| self.vault_ref().categories().subtypes_for(&r.account_type))
+            .map(|r| {
+                let mut s = self.vault_ref().categories().subtypes_for(&r.account_type);
+                if !r.account_subtype.is_empty() && !s.contains(&r.account_subtype) {
+                    s.insert(0, r.account_subtype.clone());
+                }
+                s
+            })
             .unwrap_or_default();
 
         ui.columns(2, |c| {
@@ -908,7 +936,7 @@ impl GuiApp {
                             generate = true;
                         }
                         if ui.button("📋").on_hover_text("Copy").clicked() {
-                            copy_pw = Some(r.password.clone());
+                            copy_pw = Some(Zeroizing::new(r.password.clone()));
                         }
                     });
                     ui.end_row();
@@ -1184,8 +1212,10 @@ impl GuiApp {
         self.status = "Deleted.".into();
     }
 
-    fn copy_to_clipboard(&mut self, text: String) {
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+    fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
+        // `text` is wiped on drop; arboard copies into the OS clipboard (cleared
+        // on the 15s timer and on exit).
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
             Ok(()) => {
                 self.clipboard_dirty = true;
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);

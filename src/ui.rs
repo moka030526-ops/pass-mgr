@@ -429,6 +429,17 @@ impl App {
         Ok((Zeroizing::new(pw1.clone()), Zeroizing::new(pw2.clone())))
     }
 
+    /// Wipe entered passwords from the auth fields once we leave the auth screen,
+    /// so they don't linger in memory for the rest of the session.
+    fn wipe_auth(&mut self) {
+        for f in &mut self.auth.fields {
+            f.value.zeroize();
+            f.value.clear();
+        }
+        self.auth.focus = 0;
+        self.auth.error = None;
+    }
+
     fn submit_auth(&mut self) {
         match self.auth.mode {
             AuthMode::ChangePassword => {
@@ -443,6 +454,7 @@ impl App {
                     match ov.change_password(pw1.as_bytes(), pw2.as_bytes()) {
                         Ok(()) => {
                             self.status = "Master passwords changed.".into();
+                            self.wipe_auth();
                             self.screen = Screen::Browse;
                         }
                         Err(e) => self.auth.error = Some(format!("{e}")),
@@ -494,6 +506,7 @@ impl App {
                     )
                 };
                 self.vault = Some(v);
+                self.wipe_auth();
                 self.screen = Screen::Browse;
             }
             Err(VaultError::Crypto(_)) => {
@@ -895,7 +908,7 @@ impl App {
             KeyCode::Char('r') if ctrl => es.reveal = !es.reveal,
             KeyCode::Char('y') if ctrl => {
                 if let Some(f) = es.fields.iter().find(|f| matches!(f.kind, FieldKind::Password)) {
-                    let pw = f.value.clone();
+                    let pw = Zeroizing::new(f.value.clone());
                     self.copy_to_clipboard(pw);
                 }
             }
@@ -917,8 +930,26 @@ impl App {
                 let n = es.fields.len();
                 es.focus = (es.focus + n - 1) % n;
             }
-            KeyCode::Left => es.fields[es.focus].cycle(-1),
-            KeyCode::Right => es.fields[es.focus].cycle(1),
+            KeyCode::Left | KeyCode::Right => {
+                let delta = if matches!(key.code, KeyCode::Left) { -1 } else { 1 };
+                es.fields[es.focus].cycle(delta);
+                // On the Accounts tab, cycling the account-type field reconstrains
+                // the dependent subtype field: rebuild its options for the new type
+                // and drop a value that no longer belongs to it.
+                if self.tab == Tab::Accounts && es.fields[es.focus].label.as_str() == "Account type" {
+                    let new_type = es.fields[es.focus].value.clone();
+                    if let Some(si) = es.fields.iter().position(|f| f.label.as_str() == "Subtype") {
+                        let opts = self
+                            .vault
+                            .as_ref()
+                            .map(|ov| ov.categories().subtypes_for(&new_type))
+                            .unwrap_or_default();
+                        let cur = es.fields[si].value.clone();
+                        let value = if opts.iter().any(|o| o == &cur) { cur } else { String::new() };
+                        es.fields[si] = Field::choice("Subtype", value, opts);
+                    }
+                }
+            }
             KeyCode::Char(c) if !ctrl => {
                 let f = &mut es.fields[es.focus];
                 if !matches!(f.kind, FieldKind::Choice(_)) {
@@ -1186,8 +1217,10 @@ impl App {
         self.status = "Deleted.".into();
     }
 
-    fn copy_to_clipboard(&mut self, text: String) {
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+    fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
+        // `text` wipes on drop; arboard copies into the OS clipboard (auto-cleared
+        // on the 15s timer and on exit).
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
             Ok(()) => {
                 self.clipboard_dirty = true;
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
@@ -1687,6 +1720,30 @@ mod tests {
                 .subtypes_for("Financial")
                 .contains(&"HSA".to_string())
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tui_subtype_reconstrains_on_type_change() {
+        let (mut app, path) = app_unlocked("subrecon");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('n'))); // new record -> Edit
+        assert_eq!(app.screen, Screen::Edit);
+        {
+            let es = app.edit.as_ref().unwrap();
+            assert_eq!(es.fields[0].label, "Account type");
+            assert_eq!(es.fields[1].label, "Subtype");
+        }
+        // Focus starts on the account-type field; cycling it must reconstrain the
+        // dependent subtype field's options to the newly-selected type.
+        app.handle_key(key(KeyCode::Right));
+        let es = app.edit.as_ref().unwrap();
+        let chosen_type = es.fields[0].value.clone();
+        let expected = app.vault.as_ref().unwrap().categories().subtypes_for(&chosen_type);
+        match &es.fields[1].kind {
+            FieldKind::Choice(opts) => assert_eq!(opts, &expected),
+            _ => panic!("subtype field is not a Choice"),
+        }
         cleanup(&path);
     }
 
