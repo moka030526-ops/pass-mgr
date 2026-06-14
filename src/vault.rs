@@ -190,6 +190,7 @@ impl WriteLock {
         // The lock file carries no contents; never truncate it (avoids racing a
         // concurrent holder's handle), just ensure it exists and is lockable.
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+        let _ = harden_file(&path); // 0600 for consistency with the other vault files
         match file.try_lock() {
             Ok(()) => Ok(WriteLock { _file: file }),
             Err(fs::TryLockError::WouldBlock) => Err(VaultError::Locked),
