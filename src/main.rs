@@ -7,10 +7,11 @@
 //!
 //! Usage:
 //! ```text
-//!   pass-mgr [VAULT]            launch the graphical UI (default vault if omitted)
-//!   pass-mgr --tui [VAULT]      launch the terminal UI instead
-//!   pass-mgr decrypt [VAULT]    decrypt the vault and print its JSON to stdout
-//!   pass-mgr --help             show this help
+//!   pass-mgr [VAULT]              launch the graphical UI (default vault if omitted)
+//!   pass-mgr --tui [VAULT]        launch the terminal UI instead
+//!   pass-mgr decrypt [VAULT]      decrypt the vault and print its JSON to stdout
+//!   pass-mgr extract [VAULT] DIR  decrypt all documents into DIR
+//!   pass-mgr --help               show this help
 //! ```
 
 mod crypto;
@@ -22,7 +23,7 @@ mod ui;
 mod vault;
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use directories::ProjectDirs;
@@ -43,10 +44,11 @@ const HELP: &str = "\
 pass-mgr — standalone, offline, two-password encrypted password manager
 
 USAGE:
-    pass-mgr [VAULT]            Launch the graphical UI (default vault if omitted)
-    pass-mgr --tui [VAULT]      Launch the terminal UI instead
-    pass-mgr decrypt [VAULT]    Decrypt the vault and print its JSON to stdout
-    pass-mgr --help             Show this help
+    pass-mgr [VAULT]              Launch the graphical UI (default vault if omitted)
+    pass-mgr --tui [VAULT]        Launch the terminal UI instead
+    pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
+    pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
+    pass-mgr --help               Show this help
 
 The vault is protected by two passwords entered in sequence.";
 
@@ -62,6 +64,12 @@ fn main() -> ExitCode {
             let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
             cli_decrypt(path)
         }
+        // `extract [VAULT] DIR` — the output directory is always the LAST argument.
+        Some("extract") => match args.len() {
+            2 => cli_extract(default_vault_path(), PathBuf::from(&args[1])),
+            3 => cli_extract(PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr extract [VAULT] <OUTPUT_DIR>")),
+        },
         Some("--tui") => {
             let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
             run_ui(path, types::TypeLists::load())
@@ -106,6 +114,157 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
     let json = Zeroizing::new(serde_json::to_string_pretty(&vault)?);
     println!("{}", json.as_str());
     Ok(())
+}
+
+/// Decrypt the whole document archive and write every stored document into
+/// `out_dir`, reconstructing the virtual directory tree. Prompts for both
+/// passwords. WARNING: this writes unencrypted copies of all documents to disk.
+fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no vault found at {}", path.display());
+    }
+    eprintln!(
+        "Extracting documents from {} into {} — these are UNENCRYPTED copies.",
+        path.display(),
+        out_dir.display()
+    );
+    let pw1 = read_password("Password 1: ")?;
+    let pw2 = read_password("Password 2: ")?;
+
+    let docs = OpenVault::export_documents(&path, pw1.as_bytes(), pw2.as_bytes())?;
+    if docs.is_empty() {
+        eprintln!("No documents stored in this vault.");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&out_dir)?;
+    let mut written = 0usize;
+    for (meta, bytes) in &docs {
+        // Build a SAFE relative path from the (decrypted) location/filename so a
+        // crafted manifest can never escape out_dir (no `..`, no absolute paths).
+        let rel = safe_relative_path(&meta.location, &meta.filename, &meta.id);
+        let dest = unique_path(out_dir.join(rel));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, bytes)?;
+        harden_path(&dest); // owner-only on unix (no-op elsewhere)
+        eprintln!("  {}", dest.display());
+        written += 1;
+    }
+    eprintln!("Extracted {written} document(s) to {}", out_dir.display());
+    Ok(())
+}
+
+/// Build a safe RELATIVE path under the output directory from an attacker-
+/// influenced virtual `location` + `filename`. Splits on both `/` and `\`, drops
+/// empty / `.` / `..` / drive-letter components, so the result can never escape
+/// the output directory. Falls back to the document id if no usable name remains.
+fn safe_relative_path(location: &str, filename: &str, id: &str) -> PathBuf {
+    fn clean(part: &str) -> Option<String> {
+        let p = part.trim();
+        if p.is_empty() || p == "." || p == ".." {
+            return None;
+        }
+        // Reject anything that still looks like a separator, drive, or NUL.
+        if p.contains(['/', '\\', ':', '\0']) {
+            return None;
+        }
+        Some(p.to_string())
+    }
+    let mut path = PathBuf::new();
+    for part in location.split(['/', '\\']) {
+        if let Some(c) = clean(part) {
+            path.push(c);
+        }
+    }
+    match filename.split(['/', '\\']).filter_map(clean).next_back() {
+        Some(name) => path.push(name),
+        None => path.push(format!("{id}.bin")),
+    }
+    path
+}
+
+/// Return `p` if it does not exist, otherwise a sibling with a `_N` suffix so an
+/// extraction never silently overwrites a just-written file.
+fn unique_path(p: PathBuf) -> PathBuf {
+    if !p.exists() {
+        return p;
+    }
+    let parent = p.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+    let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    for n in 1..10_000 {
+        let candidate = parent.join(format!("{stem}_{n}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    p
+}
+
+/// Tighten an extracted file to owner-only (0600) on Unix; no-op elsewhere.
+#[cfg(unix)]
+fn harden_path(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(p) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(p, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_path(_p: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_relative_path;
+    use std::path::{Component, PathBuf};
+
+    /// A path is "contained" if it is relative and has no `..`, root, or drive
+    /// component — i.e. it can never escape the directory it is joined to.
+    fn contained(p: &PathBuf) -> bool {
+        !p.is_absolute()
+            && p.components()
+                .all(|c| !matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+    }
+
+    #[test]
+    fn safe_path_normal_tree() {
+        let p = safe_relative_path("/statements/2026", "q1.pdf", "id");
+        assert_eq!(p, PathBuf::from("statements/2026/q1.pdf"));
+        assert!(contained(&p));
+    }
+
+    #[test]
+    fn safe_path_rejects_all_traversal() {
+        let cases = [
+            ("../../etc", "passwd"),
+            ("..\\..\\windows", "system32"),
+            ("a/../../b", "f"),
+            ("/abs/path", "/etc/shadow"),
+            ("C:\\Windows", "x.dll"),
+            ("....//....//", ".."),
+        ];
+        for (loc, name) in cases {
+            let p = safe_relative_path(loc, name, "fallbackid");
+            assert!(contained(&p), "must stay contained: {loc:?} {name:?} -> {p:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_empty_filename_uses_id() {
+        assert_eq!(safe_relative_path("/d", "", "abc123"), PathBuf::from("d/abc123.bin"));
+        assert_eq!(safe_relative_path("", "..", "abc123"), PathBuf::from("abc123.bin"));
+    }
+
+    #[test]
+    fn safe_path_drive_letter_dropped() {
+        let p = safe_relative_path("C:", "x.txt", "id");
+        assert!(contained(&p));
+        assert_eq!(p, PathBuf::from("x.txt"));
+    }
 }
 
 /// Prompt (on stderr) and read one password into a self-zeroizing buffer. When

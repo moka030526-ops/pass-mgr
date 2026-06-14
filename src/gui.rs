@@ -113,6 +113,9 @@ struct GuiApp {
     edit_account: Option<Account>,
     edit_realestate: Option<RealEstate>,
     reveal_pw: bool,
+    // Accounts-tab display filters ("" = no filter).
+    acct_filter_type: String,
+    acct_filter_owner: String,
     // Shared document-attach input buffers.
     doc_location: String,
     doc_filename: String,
@@ -155,6 +158,8 @@ impl GuiApp {
             edit_account: None,
             edit_realestate: None,
             reveal_pw: false,
+            acct_filter_type: String::new(),
+            acct_filter_owner: String::new(),
             doc_location: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
@@ -546,7 +551,39 @@ impl GuiApp {
     // --- Tab: Accounts -------------------------------------------------------
 
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
-        let labels = label_list(&self.vault_ref().vault.accounts);
+        // Distinct type/owner values present in the accounts, for the filter
+        // dropdowns. Computed before the filter row renders.
+        let (types_present, owners_present) = {
+            let accts = &self.vault_ref().vault.accounts;
+            (
+                distinct_values(accts.iter().map(|a| a.account_type.clone())),
+                distinct_values(accts.iter().map(|a| a.owner.clone())),
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.label("Filter — type:");
+            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &types_present);
+            ui.label("owner:");
+            filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &owners_present);
+            if ui.button("Clear").clicked() {
+                self.acct_filter_type.clear();
+                self.acct_filter_owner.clear();
+            }
+        });
+
+        // Filtered list (after the filter row, so a change applies this frame).
+        let labels: Vec<(String, String)> = {
+            let ft = self.acct_filter_type.clone();
+            let fo = self.acct_filter_owner.clone();
+            self.vault_ref()
+                .vault
+                .accounts
+                .iter()
+                .filter(|a| ft.is_empty() || a.account_type == ft)
+                .filter(|a| fo.is_empty() || a.owner == fo)
+                .map(|a| (a.id.clone(), a.label()))
+                .collect()
+        };
         let cur = self.edit_account.as_ref().map(|r| r.id.clone());
         let account_types = self.types.account.clone();
         let mut new = false;
@@ -945,6 +982,25 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
     ui.end_row();
+}
+
+/// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.
+fn distinct_values(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = values.filter(|s| !s.is_empty()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A filter dropdown: "All" (empty value) plus each option.
+fn filter_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {
+    let text = if value.is_empty() { "All".to_string() } else { value.clone() };
+    egui::ComboBox::from_id_salt(id).selected_text(text).show_ui(ui, |ui| {
+        ui.selectable_value(value, String::new(), "All");
+        for opt in options {
+            ui.selectable_value(value, opt.clone(), opt);
+        }
+    });
 }
 
 /// A dropdown restricted to `options`.

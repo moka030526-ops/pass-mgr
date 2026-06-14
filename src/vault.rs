@@ -58,6 +58,10 @@ fn archive_aad(vault_id: &str) -> Vec<u8> {
 /// drop. This is the in-memory form of the single encrypted archive file.
 type DocArchive = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
+/// A decrypted document returned to the CLI: its manifest metadata plus its
+/// plaintext bytes (which wipe on drop).
+pub type DecryptedDoc = (VolumeFile, Zeroizing<Vec<u8>>);
+
 const MAGIC: &[u8; 8] = b"PMVAULT\0";
 const FORMAT_VERSION: u8 = 3;
 const HEADER_LEN: usize = 61;
@@ -237,6 +241,27 @@ impl OpenVault {
     pub fn export(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vault, VaultError> {
         let (vault, _header, _key) = decrypt_file(path, pw1, pw2)?;
         Ok(vault)
+    }
+
+    /// Decrypt the vault and its document archive **without** modifying any file,
+    /// returning each document's metadata together with its decrypted bytes (the
+    /// bytes wipe on drop). Used by the command-line `extract` command. Verifies
+    /// archive↔manifest consistency, failing closed on a stale/tampered archive.
+    pub fn export_documents(
+        path: &Path,
+        pw1: &[u8],
+        pw2: &[u8],
+    ) -> Result<Vec<DecryptedDoc>, VaultError> {
+        let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
+        let mut archive = load_archive(&archive_path(path), &key, &vault.volume.id)?;
+        let mut out = Vec::with_capacity(vault.volume.files.len());
+        for f in &vault.volume.files {
+            match archive.remove(&f.id) {
+                Some(bytes) => out.push((f.clone(), bytes)),
+                None => return Err(VaultError::ArchiveMismatch),
+            }
+        }
+        Ok(out)
     }
 
     /// Re-encrypt the current data and write it atomically (unique temp file +

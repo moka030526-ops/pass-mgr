@@ -204,6 +204,9 @@ struct App {
     tab: Tab,
     selected: usize,
     edit: Option<EditState>,
+    // Accounts-tab display filters (None = no filter).
+    acct_filter_type: Option<String>,
+    acct_filter_owner: Option<String>,
     status: String,
     clipboard_dirty: bool,
 }
@@ -228,6 +231,8 @@ impl App {
             tab: Tab::Instructions,
             selected: 0,
             edit: None,
+            acct_filter_type: None,
+            acct_filter_owner: None,
             status: String::new(),
             clipboard_dirty: false,
         }
@@ -237,16 +242,38 @@ impl App {
         self.vault.as_ref().expect("vault open on browse/edit")
     }
 
-    /// `(id, label)` pairs for the current tab's records.
+    /// `(id, label)` pairs for the current tab's records. The Accounts tab is
+    /// additionally filtered by the active type/owner filters.
     fn current_labels(&self) -> Vec<(String, String)> {
         let v = &self.vault_ref().vault;
         match self.tab {
             Tab::Instructions => label_list(&v.instructions),
             Tab::TrustWill => label_list(&v.trust_wills),
             Tab::Assets => label_list(&v.assets),
-            Tab::Accounts => label_list(&v.accounts),
+            Tab::Accounts => v
+                .accounts
+                .iter()
+                .filter(|a| self.acct_filter_type.as_deref().is_none_or(|t| a.account_type == t))
+                .filter(|a| self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o))
+                .map(|a| (a.id.clone(), a.label()))
+                .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
         }
+    }
+
+    /// Distinct, sorted, non-empty values of an account field (for filter cycling).
+    fn account_values(&self, field: impl Fn(&Account) -> &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .vault_ref()
+            .vault
+            .accounts
+            .iter()
+            .map(|a| field(a).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
     }
 
     fn clamp_selection(&mut self) {
@@ -413,6 +440,17 @@ impl App {
             }
             KeyCode::Char('n') => self.start_edit(false),
             KeyCode::Char('d') => self.delete_selected(),
+            // Accounts-only display filters: cycle by type / owner.
+            KeyCode::Char('t') if self.tab == Tab::Accounts => {
+                let opts = self.account_values(|a| &a.account_type);
+                self.acct_filter_type = cycle_filter(&self.acct_filter_type, &opts);
+                self.selected = 0;
+            }
+            KeyCode::Char('o') if self.tab == Tab::Accounts => {
+                let opts = self.account_values(|a| &a.owner);
+                self.acct_filter_owner = cycle_filter(&self.acct_filter_owner, &opts);
+                self.selected = 0;
+            }
             KeyCode::Char('p') => {
                 self.auth = AuthState::new(AuthMode::ChangePassword);
                 self.screen = Screen::Auth;
@@ -909,8 +947,18 @@ impl App {
         let items: Vec<ListItem> =
             labels.iter().map(|(_, l)| ListItem::new(Line::from(l.clone()))).collect();
         let count = items.len();
+        // On the Accounts tab, show any active type/owner filters in the title.
+        let title = if self.tab == Tab::Accounts
+            && (self.acct_filter_type.is_some() || self.acct_filter_owner.is_some())
+        {
+            let t = self.acct_filter_type.as_deref().unwrap_or("any");
+            let o = self.acct_filter_owner.as_deref().unwrap_or("any");
+            format!(" Accounts ({count})  [type={t} · owner={o}] ")
+        } else {
+            format!(" {} ({count}) ", self.tab.title())
+        };
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ({count}) ", self.tab.title())))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
             .highlight_symbol("> ");
         let mut state = ListState::default();
@@ -919,7 +967,12 @@ impl App {
         }
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        self.draw_footer(frame, chunks[2], "↑↓ move · Enter edit · n new · d delete · ←/→ tab · p passwords · q quit");
+        let hints = if self.tab == Tab::Accounts {
+            "↑↓ move · Enter edit · n new · d delete · t/o filter type/owner · ←/→ tab · p passwords · q quit"
+        } else {
+            "↑↓ move · Enter edit · n new · d delete · ←/→ tab · p passwords · q quit"
+        };
+        self.draw_footer(frame, chunks[2], hints);
     }
 
     fn draw_edit(&self, frame: &mut Frame) {
@@ -1007,6 +1060,17 @@ fn label_list<R: Record>(list: &[R]) -> Vec<(String, String)> {
     list.iter().map(|r| (r.id().to_string(), r.label())).collect()
 }
 
+/// Advance a filter through: None → opts[0] → opts[1] → … → None (wrap to off).
+fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
+    match current {
+        None => opts.first().cloned(),
+        Some(cur) => match opts.iter().position(|o| o == cur) {
+            Some(i) if i + 1 < opts.len() => Some(opts[i + 1].clone()),
+            _ => None,
+        },
+    }
+}
+
 fn clear_clipboard() {
     let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(String::new()));
 }
@@ -1037,7 +1101,21 @@ pub(crate) fn format_time(ts: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_time;
+    use super::{cycle_filter, format_time};
+
+    #[test]
+    fn cycle_filter_wraps_through_none() {
+        let opts = vec!["a".to_string(), "b".to_string()];
+        let s = cycle_filter(&None, &opts);
+        assert_eq!(s.as_deref(), Some("a"));
+        let s = cycle_filter(&s, &opts);
+        assert_eq!(s.as_deref(), Some("b"));
+        let s = cycle_filter(&s, &opts);
+        assert_eq!(s, None); // wraps back to "no filter"
+        // A value no longer present, or empty options, resets to None.
+        assert_eq!(cycle_filter(&Some("gone".into()), &opts), None);
+        assert_eq!(cycle_filter(&None, &[]), None);
+    }
 
     #[test]
     fn formats_epoch_zero_as_never() {

@@ -78,10 +78,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## Usage
 
 ```text
-pass-mgr [VAULT]            Launch the graphical UI (default vault if omitted)
-pass-mgr --tui [VAULT]      Launch the terminal UI instead
-pass-mgr decrypt [VAULT]    Decrypt the vault and print its JSON to stdout
-pass-mgr --help             Show help
+pass-mgr [VAULT]              Launch the graphical UI (default vault if omitted)
+pass-mgr --tui [VAULT]        Launch the terminal UI instead
+pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
+pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
+pass-mgr --help               Show help
 ```
 
 Both UIs read and write the same vault and expose the same features across the
@@ -115,6 +116,7 @@ screen, which needs both passwords in sequence.
 | Enter | edit selected record |
 | n | new record |
 | d | delete selected |
+| t / o | (Accounts tab) filter by type / owner |
 | p | change master passwords |
 | q / Esc | quit |
 
@@ -145,6 +147,18 @@ printf 'pw1\npw2\n' | pass-mgr decrypt ./vault.pmv   # scripted (passwords via s
 
 > **Warning:** the output contains every password (and password history) in
 > plaintext. Treat it as highly sensitive — see `docs/DESIGN.md` §9.10.
+
+To get the **documents** out of the encrypted archive, use `extract`, which
+decrypts the whole `.vol` and writes every document into a directory,
+reconstructing its virtual folder tree:
+
+```bash
+pass-mgr extract ./vault.pmv ./out      # -> ./out/statements/2026/q1.pdf, ./out/wills/will.pdf, ...
+```
+
+> **Warning:** `extract` writes **unencrypted** copies of all documents to disk
+> (owner-only on Unix). Paths from the vault are sanitized so extraction can't
+> escape the output directory.
 
 ## Development
 
