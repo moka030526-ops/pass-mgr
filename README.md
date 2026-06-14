@@ -60,6 +60,12 @@ cargo run --release
 .\target\release\pass-mgr.exe
 ```
 
+The repo's `.cargo/config.toml` statically links the C runtime for the MSVC
+toolchain (the Windows default), so `target\release\pass-mgr.exe` is a
+self-contained single file — copy it to any **Windows 10 or 11 (x64)** machine
+and it runs with nothing to install. (An exe built on Windows 10 runs on Windows
+11; Windows is forward-compatible.)
+
 ### Cross-compiling a Windows `.exe` from Linux (optional)
 
 ```bash

@@ -1,0 +1,12 @@
+# Statically link the C runtime when building with the MSVC toolchain — the
+# default when compiling on Windows. The produced `pass-mgr.exe` is then a
+# self-contained, portable single file that runs on any Windows 10/11 (x64)
+# machine with no VC++ redistributable to install.
+#
+# This is target-scoped, so Linux builds are unaffected. The GNU cross-compile
+# target (x86_64-pc-windows-gnu) is intentionally left dynamic: static-CRT on the
+# GNU toolchain needs the full mingw-w64 binutils (e.g. dlltool); for a portable
+# GNU build, add `-C target-feature=+crt-static` once those tools are installed.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
