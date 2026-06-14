@@ -18,7 +18,7 @@ use crate::password::{self, GenOptions};
 use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TrustWill};
 use crate::types::TypeLists;
 use crate::ui::format_time;
-use crate::vault::{OpenVault, VaultError};
+use crate::vault::{self, OpenVault, VaultError};
 use crate::crypto::KdfParams;
 
 /// Launch the graphical app and block until the window is closed.
@@ -57,6 +57,7 @@ fn light_visuals() -> egui::Visuals {
 enum Screen {
     Auth,
     Main,
+    Config,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -115,7 +116,17 @@ struct GuiApp {
     reveal_pw: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
+    acct_filter_subtype: String,
     acct_filter_owner: String,
+    acct_filter_review: bool,
+    // Assets-tab "review only" filter.
+    asset_filter_review: bool,
+    // Config screen inputs.
+    new_asset_type: String,
+    new_account_type: String,
+    new_subtype_for: String,
+    new_subtype_name: String,
+    backup_dest: String,
     // Shared document-attach input buffers.
     doc_location: String,
     doc_filename: String,
@@ -159,7 +170,15 @@ impl GuiApp {
             edit_realestate: None,
             reveal_pw: false,
             acct_filter_type: String::new(),
+            acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
+            acct_filter_review: false,
+            asset_filter_review: false,
+            new_asset_type: String::new(),
+            new_account_type: String::new(),
+            new_subtype_for: String::new(),
+            new_subtype_name: String::new(),
+            backup_dest: String::new(),
             doc_location: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
@@ -175,7 +194,7 @@ impl GuiApp {
 
     /// Persist the in-memory vault, reporting any error to the status bar.
     fn persist(&mut self) {
-        if let Some(ov) = self.vault.as_ref()
+        if let Some(ov) = self.vault.as_mut()
             && let Err(e) = ov.save()
         {
             self.status = format!("Save failed: {e}");
@@ -249,7 +268,13 @@ impl GuiApp {
                 } else if v.previous_access() == 0 {
                     "Vault unlocked.".to_string()
                 } else {
-                    format!("Unlocked. Last opened: {}", format_time(v.previous_access()))
+                    // Show the write-generation so a rollback to an older snapshot
+                    // is noticeable (§9.12).
+                    format!(
+                        "Unlocked. Last opened: {} (generation {})",
+                        format_time(v.previous_access()),
+                        v.opened_generation()
+                    )
                 };
                 self.vault = Some(v);
                 self.auth_error = None;
@@ -349,10 +374,135 @@ impl GuiApp {
                 self.wipe_passwords();
                 self.screen = Screen::Auth;
             }
+            if ui.button("⚙ Config").clicked() {
+                self.screen = Screen::Config;
+            }
             if ui.button("Quit").clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+    }
+
+    // --- Config screen -------------------------------------------------------
+
+    fn ui_config(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Configuration");
+            if ui.button("⬅ Back").clicked() {
+                self.screen = Screen::Main;
+            }
+        });
+        ui.separator();
+
+        let mut add_asset = false;
+        let mut add_account = false;
+        let mut add_subtype = false;
+        let mut do_backup = false;
+        let type_names = self.types.account_type_names();
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(egui::RichText::new("Asset / Liability types").strong());
+            ui.label(egui::RichText::new(self.types.asset.join(" · ")).weak());
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0));
+                if ui.button("Add type").clicked() {
+                    add_asset = true;
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("Account types & subtypes").strong());
+            for t in &self.types.account {
+                let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
+                ui.label(egui::RichText::new(format!("{}: {subs}", t.name)).weak());
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.new_account_type).hint_text("New account type").desired_width(220.0));
+                if ui.button("Add type").clicked() {
+                    add_account = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Add subtype to:");
+                // Pick the type the subtype belongs to.
+                let cur = if self.new_subtype_for.is_empty() { "(choose type)".to_string() } else { self.new_subtype_for.clone() };
+                egui::ComboBox::from_id_salt("subtype_for").selected_text(cur).show_ui(ui, |ui| {
+                    for name in &type_names {
+                        ui.selectable_value(&mut self.new_subtype_for, name.clone(), name);
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut self.new_subtype_name).hint_text("New subtype").desired_width(180.0));
+                if ui.button("Add subtype").clicked() {
+                    add_subtype = true;
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Backup").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Copies the encrypted vault and its document archive into a directory, \
+                     timestamped to the second. Nothing is decrypted.",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Destination directory:");
+                ui.add(egui::TextEdit::singleline(&mut self.backup_dest).hint_text("/path/to/backups").desired_width(340.0));
+                if ui.button("Backup now").clicked() {
+                    do_backup = true;
+                }
+            });
+        });
+
+        // Deferred actions (kept out of the closures to keep borrows simple).
+        if add_asset {
+            let name = self.new_asset_type.trim().to_string();
+            if self.types.add_asset_type(&name) {
+                self.status = format!("Added asset/liability type “{name}”.");
+                self.new_asset_type.clear();
+            } else {
+                self.status = "Type is empty or already exists.".into();
+            }
+        }
+        if add_account {
+            let name = self.new_account_type.trim().to_string();
+            if self.types.add_account_type(&name) {
+                self.status = format!("Added account type “{name}”.");
+                self.new_account_type.clear();
+            } else {
+                self.status = "Type is empty or already exists.".into();
+            }
+        }
+        if add_subtype {
+            let ty = self.new_subtype_for.clone();
+            let sub = self.new_subtype_name.trim().to_string();
+            if ty.is_empty() {
+                self.status = "Choose an account type for the subtype.".into();
+            } else if self.types.add_account_subtype(&ty, &sub) {
+                self.status = format!("Added subtype “{sub}” under “{ty}”.");
+                self.new_subtype_name.clear();
+            } else {
+                self.status = "Subtype is empty or already exists.".into();
+            }
+        }
+        if do_backup {
+            let dest = self.backup_dest.trim().to_string();
+            if dest.is_empty() {
+                self.status = "Enter a backup destination directory.".into();
+            } else {
+                match vault::backup(&self.path, Path::new(&dest)) {
+                    Ok(p) => self.status = format!("Backed up to {}", p.display()),
+                    Err(e) => self.status = format!("Backup failed: {e}"),
+                }
+            }
+        }
+
+        if !self.status.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new(&self.status).weak());
+        }
     }
 
     // --- Tab: Instructions ---------------------------------------------------
@@ -470,7 +620,18 @@ impl GuiApp {
     // --- Tab: Assets and Liabilities ----------------------------------------
 
     fn tab_assets(&mut self, ui: &mut egui::Ui) {
-        let labels = label_list(&self.vault_ref().vault.assets);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.asset_filter_review, "Show only items flagged for review");
+        });
+        let fr = self.asset_filter_review;
+        let labels: Vec<(String, String)> = self
+            .vault_ref()
+            .vault
+            .assets
+            .iter()
+            .filter(|a| !fr || a.review)
+            .map(|a| (a.id.clone(), a.label()))
+            .collect();
         let cur = self.edit_asset.as_ref().map(|r| r.id.clone());
         let attached = self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone()));
         let asset_types = self.types.asset.clone();
@@ -487,11 +648,11 @@ impl GuiApp {
                     ui.label("Asset / Liability");
                     combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()]);
                     ui.end_row();
-                    ui.label("Description");
-                    ui.add(egui::TextEdit::singleline(&mut r.description).desired_width(420.0));
-                    ui.end_row();
                     ui.label("Owner");
                     ui.add(egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
+                    ui.end_row();
+                    ui.label("Beneficiary");
+                    ui.add(egui::TextEdit::singleline(&mut r.beneficiary).desired_width(420.0));
                     ui.end_row();
                     ui.label("Approximate value");
                     ui.add(egui::TextEdit::singleline(&mut r.approx_value).desired_width(420.0));
@@ -505,7 +666,15 @@ impl GuiApp {
                     ui.label("Type");
                     combo(ui, "asset_type", &mut r.asset_type, &asset_types);
                     ui.end_row();
+                    ui.label("URL");
+                    ui.add(egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
+                    ui.end_row();
+                    ui.label("Review");
+                    ui.checkbox(&mut r.review, "flag for review");
+                    ui.end_row();
                 });
+                ui.label("Description");
+                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY));
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -528,8 +697,11 @@ impl GuiApp {
             self.edit_asset = AssetLiability::new().ok();
             self.clear_doc_inputs();
         }
-        if let Some(i) = select {
-            self.edit_asset = self.vault_ref().vault.assets.get(i).cloned();
+        if let Some(i) = select
+            && let Some((id, _)) = labels.get(i)
+        {
+            // Resolve by id (the list may be filtered by the review flag).
+            self.edit_asset = self.vault_ref().vault.assets.iter().find(|a| &a.id == id).cloned();
             self.clear_doc_inputs();
         }
         self.handle_doc(docreq, DocTarget::Asset);
@@ -551,41 +723,55 @@ impl GuiApp {
     // --- Tab: Accounts -------------------------------------------------------
 
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
-        // Distinct type/owner values present in the accounts, for the filter
-        // dropdowns. Computed before the filter row renders.
-        let (types_present, owners_present) = {
-            let accts = &self.vault_ref().vault.accounts;
-            (
-                distinct_values(accts.iter().map(|a| a.account_type.clone())),
-                distinct_values(accts.iter().map(|a| a.owner.clone())),
-            )
+        let type_names = self.types.account_type_names();
+        let owners_present =
+            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.owner.clone()));
+        // When a type filter is chosen, only its connected subtypes are offered;
+        // otherwise offer the distinct subtypes present across all accounts.
+        let subtype_opts: Vec<String> = if self.acct_filter_type.is_empty() {
+            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.account_subtype.clone()))
+        } else {
+            self.types.subtypes_for(&self.acct_filter_type)
         };
-        ui.horizontal(|ui| {
+
+        ui.horizontal_wrapped(|ui| {
             ui.label("Filter — type:");
-            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &types_present);
+            let prev_type = self.acct_filter_type.clone();
+            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &type_names);
+            if self.acct_filter_type != prev_type {
+                self.acct_filter_subtype.clear(); // subtypes are type-specific
+            }
+            ui.label("subtype:");
+            filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &subtype_opts);
             ui.label("owner:");
             filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &owners_present);
+            ui.checkbox(&mut self.acct_filter_review, "review only");
             if ui.button("Clear").clicked() {
                 self.acct_filter_type.clear();
+                self.acct_filter_subtype.clear();
                 self.acct_filter_owner.clear();
+                self.acct_filter_review = false;
             }
         });
 
         // Filtered list (after the filter row, so a change applies this frame).
         let labels: Vec<(String, String)> = {
             let ft = self.acct_filter_type.clone();
+            let fs = self.acct_filter_subtype.clone();
             let fo = self.acct_filter_owner.clone();
+            let fr = self.acct_filter_review;
             self.vault_ref()
                 .vault
                 .accounts
                 .iter()
                 .filter(|a| ft.is_empty() || a.account_type == ft)
+                .filter(|a| fs.is_empty() || a.account_subtype == fs)
                 .filter(|a| fo.is_empty() || a.owner == fo)
+                .filter(|a| !fr || a.review)
                 .map(|a| (a.id.clone(), a.label()))
                 .collect()
         };
         let cur = self.edit_account.as_ref().map(|r| r.id.clone());
-        let account_types = self.types.account.clone();
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
@@ -596,9 +782,18 @@ impl GuiApp {
             (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref());
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
+                let subtypes = self.types.subtypes_for(&r.account_type);
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Account type");
-                    combo(ui, "acct_type", &mut r.account_type, &account_types);
+                    let prev_type = r.account_type.clone();
+                    combo(ui, "acct_type", &mut r.account_type, &type_names);
+                    if r.account_type != prev_type {
+                        // Subtypes are type-specific; drop a now-mismatched subtype.
+                        r.account_subtype.clear();
+                    }
+                    ui.end_row();
+                    ui.label("Subtype");
+                    combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes);
                     ui.end_row();
                     ui.label("Owner");
                     ui.add(egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
@@ -621,6 +816,9 @@ impl GuiApp {
                     ui.label("URL");
                     ui.add(egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
                     ui.end_row();
+                    ui.label("Review");
+                    ui.checkbox(&mut r.review, "flag for review");
+                    ui.end_row();
                 });
                 ui.label("Description");
                 ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY));
@@ -636,8 +834,14 @@ impl GuiApp {
             self.reveal_pw = false;
         }
         if let Some(i) = select {
-            self.edit_account = self.vault_ref().vault.accounts.get(i).cloned();
-            self.reveal_pw = false;
+            // `labels` is the FILTERED list, so resolve the clicked row to its id
+            // and look the account up by id (a positional index into the
+            // unfiltered vector would select the wrong record when filtering).
+            if let Some((id, _)) = labels.get(i) {
+                self.edit_account =
+                    self.vault_ref().vault.accounts.iter().find(|a| &a.id == id).cloned();
+                self.reveal_pw = false;
+            }
         }
         if generate
             && let Some(r) = self.edit_account.as_mut()
@@ -904,6 +1108,10 @@ impl eframe::App for GuiApp {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_auth(ui));
             return;
         }
+        if self.screen == Screen::Config {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.ui_config(ui));
+            return;
+        }
 
         egui::Panel::top("topbar").show_inside(ui, |ui| {
             ui.add_space(4.0);
@@ -1090,4 +1298,137 @@ fn label_list<R: Record>(list: &[R]) -> Vec<(String, String)> {
 /// Best-effort clearing of the system clipboard on exit.
 fn clear_clipboard() {
     let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(String::new()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KdfParams;
+    use crate::records::AssetLiability;
+    use crate::types::TypeLists;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fast() -> KdfParams {
+        KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
+    }
+
+    fn nanos() -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("passmgr-gui-{tag}-{}.pmv", nanos()))
+    }
+
+    fn cleanup(path: &std::path::PathBuf) {
+        let _ = std::fs::remove_file(path);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let _ = std::fs::remove_file(path.with_file_name(format!("{name}.vol")));
+        }
+    }
+
+    /// A GuiApp with a freshly-created, unlocked vault on the Main screen.
+    fn app_unlocked(tag: &str) -> (GuiApp, std::path::PathBuf) {
+        let path = tmp(tag);
+        let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        app.vault = Some(ov);
+        app.screen = Screen::Main;
+        (app, path)
+    }
+
+    #[test]
+    fn create_flow_builds_vault() {
+        let path = tmp("create");
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        app.auth_mode = AuthMode::Create;
+        app.pw1 = "a".into();
+        app.confirm1 = "a".into();
+        app.pw2 = "b".into();
+        app.confirm2 = "b".into();
+        app.submit_auth();
+        assert!(app.vault.is_some());
+        assert!(app.screen == Screen::Main);
+        assert!(app.pw1.is_empty(), "passwords wiped after submit");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mismatched_confirmation_is_rejected() {
+        let path = tmp("mismatch");
+        let mut app = GuiApp::new(path.clone(), TypeLists::in_memory());
+        app.auth_mode = AuthMode::Create;
+        app.pw1 = "a".into();
+        app.confirm1 = "a".into();
+        app.pw2 = "b".into();
+        app.confirm2 = "WRONG".into();
+        app.submit_auth();
+        assert!(app.vault.is_none());
+        assert!(app.auth_error.is_some());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attach_then_detach_document_round_trip() {
+        let (mut app, path) = app_unlocked("doc");
+        let src = std::env::temp_dir().join(format!("passmgr-guisrc-{}.txt", nanos()));
+        std::fs::write(&src, b"will body").unwrap();
+
+        app.edit_asset = Some(AssetLiability::new().unwrap());
+        app.doc_location = "/wills".into();
+        app.doc_filename = "will.txt".into();
+        app.doc_source = src.display().to_string();
+        app.handle_doc(DocReq::Attach, DocTarget::Asset);
+
+        let id = app.edit_asset.as_ref().unwrap().statement.clone();
+        assert!(id.is_some(), "statement linked to the uploaded doc");
+        let id = id.unwrap();
+        let ov = app.vault.as_ref().unwrap();
+        assert_eq!(ov.vault.volume.files.len(), 1);
+        assert_eq!(&ov.read_document(&id).unwrap()[..], b"will body");
+
+        // Detach reclaims the blob and unlinks the record.
+        app.handle_doc(DocReq::Remove, DocTarget::Asset);
+        assert!(app.edit_asset.as_ref().unwrap().statement.is_none());
+        assert!(app.vault.as_ref().unwrap().vault.volume.files.is_empty());
+
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_current_removes_record_and_reclaims_blob() {
+        let (mut app, path) = app_unlocked("del");
+        let src = std::env::temp_dir().join(format!("passmgr-guidel-{}.txt", nanos()));
+        std::fs::write(&src, b"stmt").unwrap();
+        // Build an asset with an attached statement, saved into the vault.
+        let id = app.vault.as_mut().unwrap().add_document("/s", "s.txt", std::path::Path::new(&src)).unwrap();
+        let mut a = AssetLiability::new().unwrap();
+        a.statement = Some(id.clone());
+        records::upsert(&mut app.vault.as_mut().unwrap().vault.assets, a.clone());
+        app.edit_asset = Some(a);
+
+        app.delete_current(Tab::Assets);
+        assert!(app.vault.as_ref().unwrap().vault.assets.is_empty());
+        assert!(app.vault.as_ref().unwrap().read_document(&id).is_err(), "blob reclaimed");
+
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn change_password_via_auth_rekeys() {
+        let (mut app, path) = app_unlocked("rekey");
+        app.auth_mode = AuthMode::ChangePassword;
+        app.pw1 = "c".into();
+        app.confirm1 = "c".into();
+        app.pw2 = "d".into();
+        app.confirm2 = "d".into();
+        app.submit_auth();
+        assert!(app.screen == Screen::Main);
+        // Reopens only with the new passwords.
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_err());
+        assert!(OpenVault::open(path.clone(), b"c", b"d").is_ok());
+        cleanup(&path);
+    }
 }

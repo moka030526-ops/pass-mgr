@@ -26,7 +26,7 @@ use crate::records::{
     self, Account, AssetLiability, Change, Instruction, RealEstate, Record, TrustWill,
 };
 use crate::types::TypeLists;
-use crate::vault::{OpenVault, VaultError};
+use crate::vault::{self, OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits.
 pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, types: TypeLists) -> anyhow::Result<()> {
@@ -43,14 +43,15 @@ pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, types: TypeLists) -> a
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 enum Screen {
     Auth,
     Browse,
     Edit,
+    Config,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Tab {
     Instructions,
     TrustWill,
@@ -189,9 +190,14 @@ struct EditState {
     history: Vec<Change>,
 }
 
+/// The tabs whose records can carry an attached document (single source of truth).
+fn tab_has_docs(tab: Tab) -> bool {
+    matches!(tab, Tab::TrustWill | Tab::Assets)
+}
+
 impl EditState {
     fn has_docs(&self) -> bool {
-        matches!(self.tab, Tab::TrustWill | Tab::Assets)
+        tab_has_docs(self.tab)
     }
 }
 
@@ -206,7 +212,18 @@ struct App {
     edit: Option<EditState>,
     // Accounts-tab display filters (None = no filter).
     acct_filter_type: Option<String>,
+    acct_filter_subtype: Option<String>,
     acct_filter_owner: Option<String>,
+    acct_filter_review: bool,
+    // Assets-tab "review only" filter.
+    asset_filter_review: bool,
+    // Config screen inputs.
+    cfg_focus: usize,
+    cfg_asset_type: String,
+    cfg_account_type: String,
+    cfg_subtype_type: String,
+    cfg_subtype_name: String,
+    cfg_backup_dest: String,
     status: String,
     clipboard_dirty: bool,
 }
@@ -232,7 +249,16 @@ impl App {
             selected: 0,
             edit: None,
             acct_filter_type: None,
+            acct_filter_subtype: None,
             acct_filter_owner: None,
+            acct_filter_review: false,
+            asset_filter_review: false,
+            cfg_focus: 0,
+            cfg_asset_type: String::new(),
+            cfg_account_type: String::new(),
+            cfg_subtype_type: String::new(),
+            cfg_subtype_name: String::new(),
+            cfg_backup_dest: String::new(),
             status: String::new(),
             clipboard_dirty: false,
         }
@@ -243,18 +269,26 @@ impl App {
     }
 
     /// `(id, label)` pairs for the current tab's records. The Accounts tab is
-    /// additionally filtered by the active type/owner filters.
+    /// additionally filtered by the active type/subtype/owner/review filters, and
+    /// the Assets tab by the review filter.
     fn current_labels(&self) -> Vec<(String, String)> {
         let v = &self.vault_ref().vault;
         match self.tab {
             Tab::Instructions => label_list(&v.instructions),
             Tab::TrustWill => label_list(&v.trust_wills),
-            Tab::Assets => label_list(&v.assets),
+            Tab::Assets => v
+                .assets
+                .iter()
+                .filter(|a| !self.asset_filter_review || a.review)
+                .map(|a| (a.id.clone(), a.label()))
+                .collect(),
             Tab::Accounts => v
                 .accounts
                 .iter()
                 .filter(|a| self.acct_filter_type.as_deref().is_none_or(|t| a.account_type == t))
+                .filter(|a| self.acct_filter_subtype.as_deref().is_none_or(|s| a.account_subtype == s))
                 .filter(|a| self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o))
+                .filter(|a| !self.acct_filter_review || a.review)
                 .map(|a| (a.id.clone(), a.label()))
                 .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
@@ -286,7 +320,7 @@ impl App {
     }
 
     fn persist(&mut self) {
-        if let Some(ov) = self.vault.as_ref()
+        if let Some(ov) = self.vault.as_mut()
             && let Err(e) = ov.save()
         {
             self.status = format!("Save failed: {e}");
@@ -300,6 +334,7 @@ impl App {
             Screen::Auth => self.handle_auth_key(key),
             Screen::Browse => self.handle_browse_key(key),
             Screen::Edit => self.handle_edit_key(key),
+            Screen::Config => self.handle_config_key(key),
         }
     }
 
@@ -395,7 +430,11 @@ impl App {
                 } else if v.previous_access() == 0 {
                     "Vault unlocked.".into()
                 } else {
-                    format!("Unlocked. Last opened: {}", format_time(v.previous_access()))
+                    format!(
+                        "Unlocked. Last opened: {} (generation {})",
+                        format_time(v.previous_access()),
+                        v.opened_generation()
+                    )
                 };
                 self.vault = Some(v);
                 self.screen = Screen::Browse;
@@ -440,10 +479,35 @@ impl App {
             }
             KeyCode::Char('n') => self.start_edit(false),
             KeyCode::Char('d') => self.delete_selected(),
-            // Accounts-only display filters: cycle by type / owner.
+            // Accounts-only display filters: cycle by type / subtype / owner.
             KeyCode::Char('t') if self.tab == Tab::Accounts => {
                 let opts = self.account_values(|a| &a.account_type);
                 self.acct_filter_type = cycle_filter(&self.acct_filter_type, &opts);
+                self.acct_filter_subtype = None; // subtypes are type-specific
+                self.selected = 0;
+            }
+            KeyCode::Char('s') if self.tab == Tab::Accounts => {
+                // When a type filter is set, offer that type's configured subtypes
+                // UNION any free-text subtypes actually present on its accounts;
+                // otherwise cycle the subtypes present across all accounts.
+                let opts = match self.acct_filter_type.clone() {
+                    Some(t) => {
+                        let mut opts = self.types.subtypes_for(&t);
+                        for a in &self.vault_ref().vault.accounts {
+                            if a.account_type == t
+                                && !a.account_subtype.is_empty()
+                                && !opts.contains(&a.account_subtype)
+                            {
+                                opts.push(a.account_subtype.clone());
+                            }
+                        }
+                        opts.sort();
+                        opts.dedup();
+                        opts
+                    }
+                    None => self.account_values(|a| &a.account_subtype),
+                };
+                self.acct_filter_subtype = cycle_filter(&self.acct_filter_subtype, &opts);
                 self.selected = 0;
             }
             KeyCode::Char('o') if self.tab == Tab::Accounts => {
@@ -451,13 +515,99 @@ impl App {
                 self.acct_filter_owner = cycle_filter(&self.acct_filter_owner, &opts);
                 self.selected = 0;
             }
+            // Review-only filter toggle (Accounts and Assets tabs).
+            KeyCode::Char('v') if self.tab == Tab::Accounts => {
+                self.acct_filter_review = !self.acct_filter_review;
+                self.selected = 0;
+            }
+            KeyCode::Char('v') if self.tab == Tab::Assets => {
+                self.asset_filter_review = !self.asset_filter_review;
+                self.selected = 0;
+            }
             KeyCode::Char('p') => {
                 self.auth = AuthState::new(AuthMode::ChangePassword);
                 self.screen = Screen::Auth;
             }
+            KeyCode::Char('c') => {
+                self.cfg_focus = 0;
+                self.screen = Screen::Config;
+            }
             _ => {}
         }
         false
+    }
+
+    fn handle_config_key(&mut self, key: KeyEvent) -> bool {
+        const CFG_FIELDS: usize = 5;
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Browse,
+            KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
+            KeyCode::BackTab | KeyCode::Up => self.cfg_focus = (self.cfg_focus + CFG_FIELDS - 1) % CFG_FIELDS,
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cfg_field_mut().push(c);
+            }
+            KeyCode::Backspace => {
+                self.cfg_field_mut().pop();
+            }
+            KeyCode::Enter => self.submit_config(),
+            _ => {}
+        }
+        false
+    }
+
+    fn cfg_field_mut(&mut self) -> &mut String {
+        match self.cfg_focus {
+            0 => &mut self.cfg_asset_type,
+            1 => &mut self.cfg_account_type,
+            2 => &mut self.cfg_subtype_type,
+            3 => &mut self.cfg_subtype_name,
+            _ => &mut self.cfg_backup_dest,
+        }
+    }
+
+    /// Perform the focused config action: add a type/subtype or run a backup.
+    fn submit_config(&mut self) {
+        match self.cfg_focus {
+            0 => {
+                let name = self.cfg_asset_type.trim().to_string();
+                if self.types.add_asset_type(&name) {
+                    self.status = format!("Added asset/liability type “{name}”.");
+                    self.cfg_asset_type.clear();
+                } else {
+                    self.status = "Type is empty or already exists.".into();
+                }
+            }
+            1 => {
+                let name = self.cfg_account_type.trim().to_string();
+                if self.types.add_account_type(&name) {
+                    self.status = format!("Added account type “{name}”.");
+                    self.cfg_account_type.clear();
+                } else {
+                    self.status = "Type is empty or already exists.".into();
+                }
+            }
+            2 | 3 => {
+                let ty = self.cfg_subtype_type.trim().to_string();
+                let sub = self.cfg_subtype_name.trim().to_string();
+                if self.types.add_account_subtype(&ty, &sub) {
+                    self.status = format!("Added subtype “{sub}” under “{ty}”.");
+                    self.cfg_subtype_name.clear();
+                } else {
+                    self.status = "Unknown type, or subtype empty/duplicate.".into();
+                }
+            }
+            _ => {
+                let dest = self.cfg_backup_dest.trim().to_string();
+                if dest.is_empty() {
+                    self.status = "Enter a backup destination directory.".into();
+                } else {
+                    match vault::backup(&self.path, Path::new(&dest)) {
+                        Ok(p) => self.status = format!("Backed up to {}", p.display()),
+                        Err(e) => self.status = format!("Backup failed: {e}"),
+                    }
+                }
+            }
+        }
     }
 
     // --- Editing -------------------------------------------------------------
@@ -466,7 +616,14 @@ impl App {
     /// (`existing = true`) or a fresh one.
     fn start_edit(&mut self, existing: bool) {
         let tab = self.tab;
-        let idx = self.selected;
+        // Resolve the selected record by id: the browse list may be filtered
+        // (Accounts), so a positional index must not be applied to the unfiltered
+        // vector. `sel` finds a record by that id in any record vector.
+        let sel_id: Option<String> = if existing {
+            self.current_labels().get(self.selected).map(|(id, _)| id.clone())
+        } else {
+            None
+        };
         let v = &self.vault_ref().vault;
 
         let (id, created_at, mut fields, attached, history): (
@@ -477,7 +634,9 @@ impl App {
             Vec<Change>,
         ) = match tab {
             Tab::Instructions => {
-                let r = if existing { v.instructions.get(idx).cloned() } else { None }
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.instructions.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| Instruction::new().unwrap_or_default());
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
@@ -492,7 +651,9 @@ impl App {
                 )
             }
             Tab::TrustWill => {
-                let r = if existing { v.trust_wills.get(idx).cloned() } else { None }
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.trust_wills.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| TrustWill::new().unwrap_or_default());
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
@@ -507,7 +668,9 @@ impl App {
                 )
             }
             Tab::Assets => {
-                let r = if existing { v.assets.get(idx).cloned() } else { None }
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.assets.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| AssetLiability::new().unwrap_or_default());
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
@@ -515,38 +678,58 @@ impl App {
                     r.created_at,
                     vec![
                         Field::choice("Asset/Liability", r.kind.clone(), vec!["Asset".into(), "Liability".into()]),
-                        Field::text("Description", r.description.clone()),
+                        Field::multiline("Description", r.description.clone()),
                         Field::text("Owner", r.owner.clone()),
+                        Field::text("Beneficiary", r.beneficiary.clone()),
                         Field::text("Approx. value", r.approx_value.clone()),
                         Field::text("As-of date", r.as_of_date.clone()),
                         Field::text("Institution", r.institution.clone()),
                         Field::choice("Type", r.asset_type.clone(), self.types.asset.clone()),
+                        Field::text("URL", r.url.clone()),
+                        Field::choice("Review", bool_choice(r.review), yes_no()),
                     ],
                     r.statement.clone(),
                     r.history.clone(),
                 )
             }
             Tab::Accounts => {
-                let r = if existing { v.accounts.get(idx).cloned() } else { None }
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.accounts.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| Account::new().unwrap_or_default());
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
                     id,
                     r.created_at,
                     vec![
-                        Field::choice("Account type", r.account_type.clone(), self.types.account.clone()),
+                        Field::choice("Account type", r.account_type.clone(), self.types.account_type_names()),
+                        // Subtype is a dependent dropdown of the chosen type's
+                        // subtypes; the current value is kept selectable even if
+                        // it is not in the configured list (e.g. legacy data).
+                        Field::choice("Subtype", r.account_subtype.clone(), {
+                            let mut s = self.types.subtypes_for(&r.account_type);
+                            if !r.account_subtype.is_empty()
+                                && !s.iter().any(|x| x == &r.account_subtype)
+                            {
+                                s.insert(0, r.account_subtype.clone());
+                            }
+                            s
+                        }),
                         Field::text("Owner", r.owner.clone()),
                         Field::text("Username", r.username.clone()),
                         Field::password("Password", r.password.clone()),
                         Field::text("URL", r.url.clone()),
                         Field::multiline("Description", r.description.clone()),
+                        Field::choice("Review", bool_choice(r.review), yes_no()),
                     ],
                     None,
                     r.history.clone(),
                 )
             }
             Tab::RealEstate => {
-                let r = if existing { v.real_estate.get(idx).cloned() } else { None }
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.real_estate.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| RealEstate::new().unwrap_or_default());
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
@@ -569,7 +752,7 @@ impl App {
 
         let record_fields = fields.len();
         // Append document-upload inputs for the doc-bearing tabs.
-        if matches!(tab, Tab::TrustWill | Tab::Assets) {
+        if tab_has_docs(tab) {
             fields.push(Field::text("Doc location", String::new()));
             fields.push(Field::text("Doc filename", String::new()));
             fields.push(Field::text("Upload from", String::new()));
@@ -685,7 +868,9 @@ impl App {
                 return;
             }
         };
-        es.attached_file_id = Some(id);
+        // Replacing an existing attachment: reclaim the previous blob so it does
+        // not become an orphan in the archive.
+        let previous = es.attached_file_id.replace(id);
         for i in rc..rc + 3 {
             es.fields[i].value.clear();
         }
@@ -695,6 +880,11 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
+        if let Some(old) = previous
+            && let Some(ov) = self.vault.as_mut()
+        {
+            let _ = ov.remove_document(&old);
+        }
         self.persist();
         self.status = "Document uploaded to the encrypted volume.".into();
         self.edit = Some(es);
@@ -704,6 +894,12 @@ impl App {
     /// persist (so a "removed" document does not linger in the archive).
     fn detach_document(&mut self) {
         let Some(mut es) = self.edit.take() else { return };
+        // Only the document-bearing tabs have anything to detach; on others this
+        // is a no-op (don't commit/persist or show a misleading status).
+        if !es.has_docs() {
+            self.edit = Some(es);
+            return;
+        }
         let id = es.attached_file_id.take();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
@@ -711,13 +907,19 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
+        let mut cleanup_err = None;
         if let Some(id) = id
             && let Some(ov) = self.vault.as_mut()
+            && let Err(e) = ov.remove_document(&id)
         {
-            let _ = ov.remove_document(&id);
+            cleanup_err = Some(e);
         }
         self.persist();
-        self.status = "Removed document from the vault.".into();
+        // Surface a failed blob reclaim instead of silently reporting success.
+        self.status = match cleanup_err {
+            Some(e) => format!("Unlinked, but blob cleanup failed: {e}"),
+            None => "Removed document from the vault.".into(),
+        };
         self.edit = Some(es);
     }
 
@@ -776,10 +978,13 @@ impl App {
                 r.kind = f(0);
                 r.description = f(1);
                 r.owner = f(2);
-                r.approx_value = f(3);
-                r.as_of_date = f(4);
-                r.institution = f(5);
-                r.asset_type = f(6);
+                r.beneficiary = f(3);
+                r.approx_value = f(4);
+                r.as_of_date = f(5);
+                r.institution = f(6);
+                r.asset_type = f(7);
+                r.url = f(8);
+                r.review = f(9) == "Yes";
                 r.statement = es.attached_file_id.clone();
                 records::upsert(&mut v.assets, r);
             }
@@ -788,11 +993,13 @@ impl App {
                 r.id = id;
                 r.created_at = es.created_at;
                 r.account_type = f(0);
-                r.owner = f(1);
-                r.username = f(2);
-                r.password = f(3);
-                r.url = f(4);
-                r.description = f(5);
+                r.account_subtype = f(1);
+                r.owner = f(2);
+                r.username = f(3);
+                r.password = f(4);
+                r.url = f(5);
+                r.description = f(6);
+                r.review = f(7) == "Yes";
                 records::upsert(&mut v.accounts, r);
             }
             Tab::RealEstate => {
@@ -888,7 +1095,59 @@ impl App {
             Screen::Auth => self.draw_auth(frame),
             Screen::Browse => self.draw_browse(frame),
             Screen::Edit => self.draw_edit(frame),
+            Screen::Config => self.draw_config(frame),
         }
+    }
+
+    fn draw_config(&self, frame: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(frame.area());
+
+        let inputs = [
+            ("New asset/liability type", &self.cfg_asset_type),
+            ("New account type", &self.cfg_account_type),
+            ("Subtype — account type", &self.cfg_subtype_type),
+            ("Subtype — name", &self.cfg_subtype_name),
+            ("Backup destination dir", &self.cfg_backup_dest),
+        ];
+        let mut lines = vec![
+            Line::from(Span::styled("Asset/Liability types:", Style::default().add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(self.types.asset.join(" · "), Style::default().fg(Color::Gray))),
+            Line::from(""),
+            Line::from(Span::styled("Account types (with subtypes):", Style::default().add_modifier(Modifier::BOLD))),
+        ];
+        for t in &self.types.account {
+            let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
+            lines.push(Line::from(Span::styled(format!("  {}: {subs}", t.name), Style::default().fg(Color::Gray))));
+        }
+        lines.push(Line::from(""));
+        for (i, (label, value)) in inputs.iter().enumerate() {
+            let focused = i == self.cfg_focus;
+            let marker = if focused { "> " } else { "  " };
+            let style = if focused {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{label:<26}"), style),
+                Span::raw((*value).clone()),
+            ]));
+        }
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" Configuration "))
+                .wrap(Wrap { trim: true }),
+            chunks[0],
+        );
+        self.draw_footer(
+            frame,
+            chunks[1],
+            "Tab/↑↓ field · type to edit · Enter = add type / backup · Esc back",
+        );
     }
 
     fn draw_auth(&self, frame: &mut Frame) {
@@ -947,13 +1206,20 @@ impl App {
         let items: Vec<ListItem> =
             labels.iter().map(|(_, l)| ListItem::new(Line::from(l.clone()))).collect();
         let count = items.len();
-        // On the Accounts tab, show any active type/owner filters in the title.
+        // Show any active filters in the title.
         let title = if self.tab == Tab::Accounts
-            && (self.acct_filter_type.is_some() || self.acct_filter_owner.is_some())
+            && (self.acct_filter_type.is_some()
+                || self.acct_filter_subtype.is_some()
+                || self.acct_filter_owner.is_some()
+                || self.acct_filter_review)
         {
             let t = self.acct_filter_type.as_deref().unwrap_or("any");
+            let s = self.acct_filter_subtype.as_deref().unwrap_or("any");
             let o = self.acct_filter_owner.as_deref().unwrap_or("any");
-            format!(" Accounts ({count})  [type={t} · owner={o}] ")
+            let r = if self.acct_filter_review { " · review" } else { "" };
+            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o}{r}] ")
+        } else if self.tab == Tab::Assets && self.asset_filter_review {
+            format!(" Assets & Liabilities ({count})  [review only] ")
         } else {
             format!(" {} ({count}) ", self.tab.title())
         };
@@ -967,10 +1233,10 @@ impl App {
         }
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        let hints = if self.tab == Tab::Accounts {
-            "↑↓ move · Enter edit · n new · d delete · t/o filter type/owner · ←/→ tab · p passwords · q quit"
-        } else {
-            "↑↓ move · Enter edit · n new · d delete · ←/→ tab · p passwords · q quit"
+        let hints = match self.tab {
+            Tab::Accounts => "↑↓ · Enter edit · n new · d del · t/s/o filter · v review · ←→ tab · c config · p pw · q quit",
+            Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
+            _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
         };
         self.draw_footer(frame, chunks[2], hints);
     }
@@ -1060,6 +1326,16 @@ fn label_list<R: Record>(list: &[R]) -> Vec<(String, String)> {
     list.iter().map(|r| (r.id().to_string(), r.label())).collect()
 }
 
+/// Options for a yes/no choice field.
+fn yes_no() -> Vec<String> {
+    vec!["No".to_string(), "Yes".to_string()]
+}
+
+/// The yes/no choice value for a boolean.
+fn bool_choice(b: bool) -> String {
+    if b { "Yes" } else { "No" }.to_string()
+}
+
 /// Advance a filter through: None → opts[0] → opts[1] → … → None (wrap to off).
 fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
     match current {
@@ -1076,32 +1352,57 @@ fn clear_clipboard() {
 }
 
 /// Format a unix-seconds timestamp as `YYYY-MM-DD HH:MM:SS UTC` (no date crate).
-/// Returns "never" for a zero/negative timestamp. Shared with the GUI.
+/// Returns "never" for a zero/negative timestamp. Shared with the GUI; the
+/// calendar math lives once in [`crate::records::civil_from_unix`].
 pub(crate) fn format_time(ts: i64) -> String {
     if ts <= 0 {
         return "never".to_string();
     }
-    let days = ts.div_euclid(86_400);
-    let secs_of_day = ts.rem_euclid(86_400);
-    let (h, m, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
-
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+    let (year, mo, d, h, m, s) = records::civil_from_unix(ts);
+    format!("{year:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cycle_filter, format_time};
+    use super::*;
+    use crate::crypto::KdfParams;
+    use crate::types::TypeLists;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fast() -> KdfParams {
+        KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
+    }
+
+    fn tmp_vault(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("passmgr-ui-{tag}-{nanos}.pmv"))
+    }
+
+    /// An `App` with a freshly-created, unlocked vault on the Browse screen — the
+    /// state a user reaches after a successful create/unlock, without rendering.
+    fn app_unlocked(tag: &str) -> (App, PathBuf) {
+        let path = tmp_vault(tag);
+        let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut app = App::new(path.clone(), TypeLists::in_memory());
+        app.vault = Some(ov);
+        app.screen = Screen::Browse;
+        (app, path)
+    }
+
+    fn cleanup(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        // best-effort: remove a `.vol` companion if any test created documents
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let _ = std::fs::remove_file(path.with_file_name(format!("{name}.vol")));
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
 
     #[test]
     fn cycle_filter_wraps_through_none() {
@@ -1112,20 +1413,221 @@ mod tests {
         assert_eq!(s.as_deref(), Some("b"));
         let s = cycle_filter(&s, &opts);
         assert_eq!(s, None); // wraps back to "no filter"
-        // A value no longer present, or empty options, resets to None.
         assert_eq!(cycle_filter(&Some("gone".into()), &opts), None);
         assert_eq!(cycle_filter(&None, &[]), None);
     }
 
     #[test]
-    fn formats_epoch_zero_as_never() {
-        assert_eq!(format_time(0), "never");
-        assert_eq!(format_time(-5), "never");
+    fn bool_choice_round_trips() {
+        assert_eq!(bool_choice(true), "Yes");
+        assert_eq!(bool_choice(false), "No");
+        assert_eq!(yes_no(), vec!["No".to_string(), "Yes".to_string()]);
     }
 
     #[test]
-    fn formats_known_timestamp() {
+    fn formats_timestamps() {
+        assert_eq!(format_time(0), "never");
+        assert_eq!(format_time(-5), "never");
         assert_eq!(format_time(1_609_459_200), "2021-01-01 00:00:00 UTC");
         assert_eq!(format_time(1_609_459_201), "2021-01-01 00:00:01 UTC");
+    }
+
+    #[test]
+    fn tabs_cycle_and_number_select() {
+        let (mut app, path) = app_unlocked("tabs");
+        assert_eq!(app.tab, Tab::Instructions);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.tab, Tab::TrustWill);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.tab, Tab::Instructions);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Accounts);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_account_via_keys_persists_fields_in_order() {
+        let (mut app, path) = app_unlocked("acct");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('n'))); // new -> Edit screen
+        assert_eq!(app.screen, Screen::Edit);
+
+        // Field order: 0 type(choice) 1 subtype(choice) 2 owner 3 username
+        // 4 password 5 url 6 description 7 review(choice).
+        let typ = |app: &mut App, c: char| app.handle_key(key(KeyCode::Char(c)));
+        // owner (focus 2)
+        app.handle_key(key(KeyCode::Down)); // 0->1
+        app.handle_key(key(KeyCode::Down)); // 1->2 owner
+        for c in "Jane".chars() { typ(&mut app, c); }
+        app.handle_key(key(KeyCode::Down)); // username
+        for c in "jane".chars() { typ(&mut app, c); }
+        app.handle_key(key(KeyCode::Down)); // password
+        for c in "pw".chars() { typ(&mut app, c); }
+        app.handle_key(ctrl('s')); // save
+
+        assert_eq!(app.screen, Screen::Browse);
+        let v = &app.vault.as_ref().unwrap().vault;
+        assert_eq!(v.accounts.len(), 1);
+        // Verify field-index mapping: owner/username/password landed correctly.
+        assert_eq!(v.accounts[0].owner, "Jane");
+        assert_eq!(v.accounts[0].username, "jane");
+        assert_eq!(v.accounts[0].password, "pw");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn review_choice_maps_to_bool_on_save() {
+        let (mut app, path) = app_unlocked("review");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('n')));
+        // focus 7 = review choice; cycle to "Yes".
+        for _ in 0..7 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Right)); // cycle choice No -> Yes
+        app.handle_key(ctrl('s'));
+        assert!(app.vault.as_ref().unwrap().vault.accounts[0].review);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn edit_existing_resolves_by_id_under_filter() {
+        let (mut app, path) = app_unlocked("filteredit");
+        // Two accounts: one flagged for review, one not.
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a1 = Account::new().unwrap();
+            a1.owner = "Plain".into();
+            let mut a2 = Account::new().unwrap();
+            a2.owner = "Flagged".into();
+            a2.review = true;
+            records::upsert(&mut v.accounts, a1);
+            records::upsert(&mut v.accounts, a2);
+        }
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('v'))); // review-only filter
+        assert!(app.acct_filter_review);
+        assert_eq!(app.current_labels().len(), 1); // only the flagged one
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Enter)); // edit selected (filtered index 0)
+        assert_eq!(app.screen, Screen::Edit);
+        // The edit buffer must be the *flagged* account, not accounts[0].
+        let es = app.edit.as_ref().unwrap();
+        assert_eq!(es.id.as_deref(), Some(app.vault.as_ref().unwrap().vault.accounts.iter().find(|a| a.review).unwrap().id.as_str()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_via_key_removes_record() {
+        let (mut app, path) = app_unlocked("del");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.instructions, Instruction::new().unwrap());
+        }
+        assert_eq!(app.current_labels().len(), 1);
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.vault.as_ref().unwrap().vault.instructions.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn config_screen_adds_type_and_subtype() {
+        let (mut app, path) = app_unlocked("cfg");
+        app.handle_key(key(KeyCode::Char('c'))); // open Config
+        assert_eq!(app.screen, Screen::Config);
+        // focus 0 = new asset type
+        for c in "Annuity".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.types.asset.contains(&"Annuity".to_string()));
+        // focus 2/3 = subtype type + name
+        app.handle_key(key(KeyCode::Down)); // 0->1
+        app.handle_key(key(KeyCode::Down)); // 1->2 subtype type
+        for c in "Financial".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Down)); // 2->3 subtype name
+        for c in "HSA".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.types.subtypes_for("Financial").contains(&"HSA".to_string()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn detach_on_non_doc_tab_is_noop() {
+        let (mut app, path) = app_unlocked("detachnoop");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts (no docs)
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(ctrl('k')); // detach — should be a harmless no-op
+        // Still on the edit screen with an intact buffer; no account created yet.
+        assert_eq!(app.screen, Screen::Edit);
+        assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty());
+        cleanup(&path);
+    }
+
+    /// Render the current screen to an in-memory backend; asserts no panic.
+    fn render(app: &App) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+    }
+
+    #[test]
+    fn renders_every_screen_without_panicking() {
+        // Auth screen, all three modes.
+        let path = tmp_vault("render");
+        for mode in [AuthMode::Create, AuthMode::Unlock, AuthMode::ChangePassword] {
+            let mut app = App::new(path.clone(), TypeLists::in_memory());
+            app.auth = AuthState::new(mode);
+            app.auth.error = Some("err".into());
+            render(&app);
+        }
+
+        let (mut app, _p) = app_unlocked("render2");
+        // Populate one record per tab so list/label rendering is exercised.
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.instructions, Instruction::new().unwrap());
+            records::upsert(&mut v.trust_wills, TrustWill::new().unwrap());
+            records::upsert(&mut v.assets, AssetLiability::new().unwrap());
+            let mut acc = Account::new().unwrap();
+            acc.account_type = "Financial".into();
+            acc.review = true;
+            records::upsert(&mut v.accounts, acc);
+            records::upsert(&mut v.real_estate, RealEstate::new().unwrap());
+        }
+        // Browse each tab.
+        for t in Tab::ALL {
+            app.tab = t;
+            app.selected = 0;
+            render(&app);
+        }
+        // Browse with Accounts filters active (exercises the filter title).
+        app.tab = Tab::Accounts;
+        app.acct_filter_type = Some("Financial".into());
+        app.acct_filter_review = true;
+        render(&app);
+        app.tab = Tab::Assets;
+        app.asset_filter_review = true;
+        render(&app);
+
+        // Edit screen for a doc-bearing tab (history + attached-doc lines) and a
+        // plain tab; plus the config screen.
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        render(&app);
+        app.screen = Screen::Browse;
+        app.tab = Tab::Accounts;
+        app.start_edit(false);
+        render(&app);
+        app.screen = Screen::Config;
+        render(&app);
+        cleanup(&path);
     }
 }

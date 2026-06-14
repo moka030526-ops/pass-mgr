@@ -1,16 +1,18 @@
-//! pass-mgr — a standalone, offline, two-password encrypted password manager.
+//! pass-mgr — a standalone, offline, two-password encrypted **estate vault**.
 //!
 //! `main` handles command-line dispatch, chooses the vault file path, and sets
-//! up / tears down the terminal. All UI logic lives in [`ui`]; all crypto in
-//! [`crypto`]; the data model and file format in [`vault`]; password generation
-//! in [`password`].
+//! up / tears down the terminal. The five-tab data model and file format live in
+//! [`records`]/[`vault`]; all crypto in [`crypto`]; the graphical UI in [`gui`]
+//! and the terminal UI in [`ui`]; category lists in [`types`]; password
+//! generation in [`password`].
 //!
 //! Usage:
 //! ```text
 //!   pass-mgr [VAULT]              launch the graphical UI (default vault if omitted)
 //!   pass-mgr --tui [VAULT]        launch the terminal UI instead
 //!   pass-mgr decrypt [VAULT]      decrypt the vault and print its JSON to stdout
-//!   pass-mgr extract [VAULT] DIR  decrypt all documents into DIR
+//!   pass-mgr extract [VAULT] DIR  decrypt all stored documents into DIR
+//!   pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
 //!   pass-mgr --help               show this help
 //! ```
 
@@ -23,7 +25,7 @@ mod ui;
 mod vault;
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use directories::ProjectDirs;
@@ -48,6 +50,7 @@ USAGE:
     pass-mgr --tui [VAULT]        Launch the terminal UI instead
     pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
     pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
+    pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
     pass-mgr --help               Show this help
 
 The vault is protected by two passwords entered in sequence.";
@@ -69,6 +72,12 @@ fn main() -> ExitCode {
             2 => cli_extract(default_vault_path(), PathBuf::from(&args[1])),
             3 => cli_extract(PathBuf::from(&args[1]), PathBuf::from(&args[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr extract [VAULT] <OUTPUT_DIR>")),
+        },
+        // `backup [VAULT] DIR` — copies the encrypted files; no passwords needed.
+        Some("backup") => match args.len() {
+            2 => cli_backup(default_vault_path(), PathBuf::from(&args[1])),
+            3 => cli_backup(PathBuf::from(&args[1]), PathBuf::from(&args[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr backup [VAULT] <DEST_DIR>")),
         },
         Some("--tui") => {
             let path = args.get(1).map(PathBuf::from).unwrap_or_else(default_vault_path);
@@ -116,6 +125,14 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Copy the encrypted vault + its document archive into `dest_dir` as a
+/// timestamped, self-consistent pair. No passwords needed (nothing is decrypted).
+fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
+    let backup = vault::backup(&path, &dest_dir)?;
+    eprintln!("Backed up to {}", backup.display());
+    Ok(())
+}
+
 /// Decrypt the whole document archive and write every stored document into
 /// `out_dir`, reconstructing the virtual directory tree. Prompts for both
 /// passwords. WARNING: this writes unencrypted copies of all documents to disk.
@@ -138,6 +155,7 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     }
 
     std::fs::create_dir_all(&out_dir)?;
+    vault::harden_dir(&out_dir); // 0700 on unix (filenames/paths are sensitive)
     let mut written = 0usize;
     for (meta, bytes) in &docs {
         // Build a SAFE relative path from the (decrypted) location/filename so a
@@ -146,9 +164,11 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
         let dest = unique_path(out_dir.join(rel));
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
+            vault::harden_dir(parent);
         }
-        std::fs::write(&dest, bytes)?;
-        harden_path(&dest); // owner-only on unix (no-op elsewhere)
+        // Reuse the vault's hardened writer: create_new (O_EXCL, no symlink
+        // follow) + 0600, removing any partial fragment on a write error.
+        vault::write_new_bytes(&dest, bytes)?;
         eprintln!("  {}", dest.display());
         written += 1;
     }
@@ -203,70 +223,6 @@ fn unique_path(p: PathBuf) -> PathBuf {
     p
 }
 
-/// Tighten an extracted file to owner-only (0600) on Unix; no-op elsewhere.
-#[cfg(unix)]
-fn harden_path(p: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(p) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600);
-        let _ = std::fs::set_permissions(p, perms);
-    }
-}
-
-#[cfg(not(unix))]
-fn harden_path(_p: &Path) {}
-
-#[cfg(test)]
-mod tests {
-    use super::safe_relative_path;
-    use std::path::{Component, PathBuf};
-
-    /// A path is "contained" if it is relative and has no `..`, root, or drive
-    /// component — i.e. it can never escape the directory it is joined to.
-    fn contained(p: &PathBuf) -> bool {
-        !p.is_absolute()
-            && p.components()
-                .all(|c| !matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
-    }
-
-    #[test]
-    fn safe_path_normal_tree() {
-        let p = safe_relative_path("/statements/2026", "q1.pdf", "id");
-        assert_eq!(p, PathBuf::from("statements/2026/q1.pdf"));
-        assert!(contained(&p));
-    }
-
-    #[test]
-    fn safe_path_rejects_all_traversal() {
-        let cases = [
-            ("../../etc", "passwd"),
-            ("..\\..\\windows", "system32"),
-            ("a/../../b", "f"),
-            ("/abs/path", "/etc/shadow"),
-            ("C:\\Windows", "x.dll"),
-            ("....//....//", ".."),
-        ];
-        for (loc, name) in cases {
-            let p = safe_relative_path(loc, name, "fallbackid");
-            assert!(contained(&p), "must stay contained: {loc:?} {name:?} -> {p:?}");
-        }
-    }
-
-    #[test]
-    fn safe_path_empty_filename_uses_id() {
-        assert_eq!(safe_relative_path("/d", "", "abc123"), PathBuf::from("d/abc123.bin"));
-        assert_eq!(safe_relative_path("", "..", "abc123"), PathBuf::from("abc123.bin"));
-    }
-
-    #[test]
-    fn safe_path_drive_letter_dropped() {
-        let p = safe_relative_path("C:", "x.txt", "id");
-        assert!(contained(&p));
-        assert_eq!(p, PathBuf::from("x.txt"));
-    }
-}
-
 /// Prompt (on stderr) and read one password into a self-zeroizing buffer. When
 /// stdin is an interactive terminal the input is read without echo; when piped,
 /// a line is read from stdin (so `printf 'pw1\npw2\n' | pass-mgr decrypt` works).
@@ -314,4 +270,96 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     eprintln!();
     outcome?;
     Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_relative_path;
+    use std::path::{Component, Path, PathBuf};
+
+    /// A path is "contained" if it is relative and has no `..`, root, or drive
+    /// component — i.e. it can never escape the directory it is joined to.
+    fn contained(p: &Path) -> bool {
+        !p.is_absolute()
+            && p.components()
+                .all(|c| !matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+    }
+
+    #[test]
+    fn safe_path_normal_tree() {
+        let p = safe_relative_path("/statements/2026", "q1.pdf", "id");
+        assert_eq!(p, PathBuf::from("statements/2026/q1.pdf"));
+        assert!(contained(&p));
+    }
+
+    #[test]
+    fn safe_path_rejects_all_traversal() {
+        let cases = [
+            ("../../etc", "passwd"),
+            ("..\\..\\windows", "system32"),
+            ("a/../../b", "f"),
+            ("/abs/path", "/etc/shadow"),
+            ("C:\\Windows", "x.dll"),
+            ("....//....//", ".."),
+        ];
+        for (loc, name) in cases {
+            let p = safe_relative_path(loc, name, "fallbackid");
+            assert!(contained(&p), "must stay contained: {loc:?} {name:?} -> {p:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_empty_filename_uses_id() {
+        assert_eq!(safe_relative_path("/d", "", "abc123"), PathBuf::from("d/abc123.bin"));
+        assert_eq!(safe_relative_path("", "..", "abc123"), PathBuf::from("abc123.bin"));
+    }
+
+    #[test]
+    fn safe_path_drive_letter_dropped() {
+        let p = safe_relative_path("C:", "x.txt", "id");
+        assert!(contained(&p));
+        assert_eq!(p, PathBuf::from("x.txt"));
+    }
+
+    #[test]
+    fn unique_path_avoids_existing() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("passmgr-uniq-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("doc.txt");
+        // Non-existing path is returned as-is.
+        assert_eq!(super::unique_path(p.clone()), p);
+        std::fs::write(&p, b"x").unwrap();
+        // Existing path gets a `_N` suffix that doesn't yet exist.
+        let u = super::unique_path(p.clone());
+        assert_ne!(u, p);
+        assert!(!u.exists());
+        assert_eq!(u.file_name().unwrap().to_str().unwrap(), "doc_1.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_backup_copies_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // backup() copies the encrypted file as-is; a dummy file suffices here.
+        let vault = std::env::temp_dir().join(format!("passmgr-clibk-{nanos}.pmv"));
+        std::fs::write(&vault, b"PMVAULT\0 fake").unwrap();
+        let dest = std::env::temp_dir().join(format!("passmgr-clibk-dest-{nanos}"));
+        super::cli_backup(vault.clone(), dest.clone()).unwrap();
+        let n = std::fs::read_dir(&dest).unwrap().count();
+        assert_eq!(n, 1, "one backup copy created");
+        let _ = std::fs::remove_file(&vault);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn default_vault_path_ends_with_vault_pmv() {
+        assert!(super::default_vault_path().ends_with("vault.pmv"));
+    }
 }

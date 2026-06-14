@@ -15,7 +15,7 @@ use chacha20poly1305::{
     Key as ChaChaKey, XChaCha20Poly1305, XNonce,
 };
 use thiserror::Error;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 24;
@@ -61,13 +61,28 @@ impl Default for KdfParams {
     }
 }
 
-/// A derived symmetric key. Wipes its bytes from memory on drop.
-#[derive(ZeroizeOnDrop)]
-pub struct Key([u8; KEY_LEN]);
+/// A derived symmetric key. The key bytes live on the heap and their page(s)
+/// are **memory-locked** (`mlock` on Unix, `VirtualLock` on Windows) so the OS
+/// will not page them to swap, where a plaintext copy could survive on disk
+/// (see `docs/DESIGN.md` §9.6). The bytes are wiped, then unlocked, on drop.
+pub struct Key {
+    bytes: Box<[u8; KEY_LEN]>,
+    /// Held for its lifetime; unlocks the page(s) when dropped. `None` if the OS
+    /// refused the lock (then the key is still usable, just not swap-protected).
+    _lock: Option<region::LockGuard>,
+}
 
 impl Key {
+    fn new(bytes: [u8; KEY_LEN]) -> Key {
+        let boxed = Box::new(bytes);
+        // Pin the page(s) holding the key. Best-effort: a failure (e.g. a tight
+        // RLIMIT_MEMLOCK) leaves the key working but unprotected from swap.
+        let lock = region::lock(boxed.as_ref().as_ptr(), KEY_LEN).ok();
+        Key { bytes: boxed, _lock: lock }
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
-        let key = ChaChaKey::from_slice(&self.0);
+        let key = ChaChaKey::from_slice(self.bytes.as_ref());
         XChaCha20Poly1305::new(key)
     }
 
@@ -75,7 +90,14 @@ impl Key {
     /// the chained two-password derivation (see [`derive_key_chained`]). `k1`
     /// itself is zeroized when dropped at the end of that function.
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.bytes.as_ref()
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        // Wipe before the lock guard drops (which unlocks the page).
+        self.bytes[..].zeroize();
     }
 }
 
@@ -102,9 +124,9 @@ pub fn derive_key(
     argon
         .hash_password_into(password, salt, &mut key)
         .map_err(|_| CryptoError::KdfDerive)?;
-    // `key` is `Copy`, so moving it into `Key` leaves the secret in this local
+    // `key` is `Copy`, so the bytes copied into `Key` leave a copy in this local
     // buffer too; wipe it explicitly (the copy inside `Key` is what we return).
-    let derived = Key(key);
+    let derived = Key::new(key);
     key.zeroize();
     Ok(derived)
 }
@@ -214,7 +236,7 @@ mod tests {
     fn derivation_is_deterministic() {
         let a = derive_key(b"pw", b"sixteen-byte-slt", &fast()).unwrap();
         let b = derive_key(b"pw", b"sixteen-byte-slt", &fast()).unwrap();
-        assert_eq!(a.0, b.0);
+        assert_eq!(a.as_bytes(), b.as_bytes());
     }
 
     #[test]

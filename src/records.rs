@@ -28,6 +28,29 @@ pub fn random_id() -> Result<String, CryptoError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
+/// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
+/// to the epoch. Shared by the human and filename timestamp formatters so the
+/// (fiddly) calendar math lives in exactly one place.
+pub(crate) fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let ts = ts.max(0);
+    let days = ts.div_euclid(86_400);
+    let sod = ts.rem_euclid(86_400);
+    let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, h, m, s)
+}
+
 /// A single timestamped audit record. Pushed onto a record's history on every
 /// edit, or onto the vault-level audit / volume upload log.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
@@ -51,6 +74,13 @@ fn track(out: &mut Vec<Change>, at: i64, name: &str, old: &str, new: &str) {
             action: "updated".into(),
             detail: format!("{name}: {old:?} -> {new:?}"),
         });
+    }
+}
+
+/// Append a boolean field change to `out` if it changed.
+fn track_bool(out: &mut Vec<Change>, at: i64, name: &str, old: bool, new: bool) {
+    if old != new {
+        out.push(Change { at, action: "updated".into(), detail: format!("{name}: {old} -> {new}") });
     }
 }
 
@@ -141,6 +171,14 @@ pub struct AssetLiability {
     pub institution: String,
     /// Category taken from the external asset-types list.
     pub asset_type: String,
+    #[serde(default)]
+    pub url: String,
+    /// Beneficiary (chiefly for liabilities, but stored for any entry).
+    #[serde(default)]
+    pub beneficiary: String,
+    /// Flagged for review.
+    #[serde(default)]
+    pub review: bool,
     /// Volume file id of the attached statement, if any.
     pub statement: Option<String>,
     pub created_at: i64,
@@ -154,11 +192,17 @@ pub struct Account {
     pub id: String,
     /// Category taken from the external account-types list.
     pub account_type: String,
+    /// Subtype connected to the account type (e.g. type "Financial" -> "IRA").
+    #[serde(default)]
+    pub account_subtype: String,
     pub owner: String,
     pub username: String,
     pub password: String,
     pub description: String,
     pub url: String,
+    /// Flagged for review.
+    #[serde(default)]
+    pub review: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub history: Vec<Change>,
@@ -288,6 +332,9 @@ impl_record!(
         track(out, at, "as_of_date", &s.as_of_date, &n.as_of_date);
         track(out, at, "institution", &s.institution, &n.institution);
         track(out, at, "type", &s.asset_type, &n.asset_type);
+        track(out, at, "url", &s.url, &n.url);
+        track(out, at, "beneficiary", &s.beneficiary, &n.beneficiary);
+        track_bool(out, at, "review", s.review, n.review);
         if s.statement != n.statement {
             out.push(Change { at, action: "updated".into(), detail: "statement document changed".into() });
         }
@@ -302,12 +349,14 @@ impl_record!(
     Account,
     |s: &Account, n: &Account, at: i64, out: &mut Vec<Change>| {
         track(out, at, "type", &s.account_type, &n.account_type);
+        track(out, at, "subtype", &s.account_subtype, &n.account_subtype);
         track(out, at, "owner", &s.owner, &n.owner);
         track(out, at, "username", &s.username, &n.username);
         // Full before/after of the password is recorded (accepted decision).
         track(out, at, "password", &s.password, &n.password);
         track(out, at, "description", &s.description, &n.description);
         track(out, at, "url", &s.url, &n.url);
+        track_bool(out, at, "review", s.review, n.review);
     },
     |l: &Account| {
         let who = if l.username.is_empty() { l.owner.clone() } else { l.username.clone() };
@@ -399,6 +448,11 @@ pub fn ancestor_dirs(path: &str) -> Vec<String> {
 pub struct Vault {
     #[serde(default)]
     pub version: u8,
+    /// Monotonically increasing write counter, bumped on every successful save.
+    /// Surfaced on unlock so a user can notice a whole-file rollback to an older
+    /// snapshot (see `docs/DESIGN.md` §9.12).
+    #[serde(default)]
+    pub generation: u64,
     #[serde(default)]
     pub last_opened_at: i64,
     #[serde(default)]
@@ -472,5 +526,73 @@ mod tests {
         v.register_directory("/statements/2026"); // dup
         v.register_directory("/wills");
         assert_eq!(v.directories, vec!["/statements", "/statements/2026", "/wills"]);
+    }
+
+    #[test]
+    fn account_diff_tracks_subtype_and_review() {
+        let mut old = Account::new().unwrap();
+        old.account_type = "Financial".into();
+        let mut new = old.clone();
+        new.account_subtype = "IRA".into();
+        new.review = true;
+        let now = unix_now();
+        let changes = old.diff(&new, now);
+        assert!(changes.iter().any(|c| c.detail.contains("subtype") && c.detail.contains("IRA")));
+        assert!(changes.iter().any(|c| c.detail.contains("review") && c.detail.contains("true")));
+        // Unchanged record yields no changes.
+        assert!(old.diff(&old.clone(), now).is_empty());
+    }
+
+    #[test]
+    fn asset_diff_tracks_new_fields() {
+        let old = AssetLiability::new().unwrap();
+        let mut new = old.clone();
+        new.url = "https://x".into();
+        new.beneficiary = "Spouse".into();
+        new.review = true;
+        new.statement = Some("blob1".into());
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("url")));
+        assert!(c.iter().any(|x| x.detail.contains("beneficiary")));
+        assert!(c.iter().any(|x| x.detail.contains("review")));
+        assert!(c.iter().any(|x| x.detail.contains("statement document changed")));
+    }
+
+    #[test]
+    fn labels_are_meaningful_per_type() {
+        let mut acc = Account::new().unwrap();
+        acc.account_type = "Financial".into();
+        acc.username = "jane".into();
+        assert_eq!(acc.label(), "Financial: jane");
+
+        let mut al = AssetLiability::new().unwrap();
+        al.kind = "Liability".into();
+        al.description = "Mortgage".into();
+        assert_eq!(al.label(), "[Liability] Mortgage");
+
+        let re = RealEstate::new().unwrap();
+        assert_eq!(re.label(), "(no address)");
+        let tw = TrustWill::new().unwrap();
+        assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn new_records_have_distinct_ids_and_timestamps() {
+        let a = Account::new().unwrap();
+        let b = Account::new().unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.id.len(), 32); // 128-bit hex
+        assert!(a.created_at > 0 && a.created_at == a.updated_at);
+        assert_eq!(AssetLiability::new().unwrap().kind, "Asset"); // default kind
+    }
+
+    #[test]
+    fn civil_from_unix_known_dates() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(civil_from_unix(1_609_459_200), (2021, 1, 1, 0, 0, 0));
+        // A leap day: 2024-02-29 12:34:56 UTC = 1709209? compute precisely.
+        // 2024-02-29T00:00:00Z = 1709164800.
+        assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
+        assert_eq!(civil_from_unix(-100), (1970, 1, 1, 0, 0, 0)); // clamps to epoch
     }
 }

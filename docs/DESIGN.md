@@ -313,12 +313,24 @@ one-shot migration tool can be added if needed.
 ### 9.6 Memory-safety of secrets is best-effort
 Secrets are zeroized on drop throughout: the derived keys and the intermediate
 KDF key (`crypto.rs`), the decrypted plaintext buffers (`Zeroizing`), the whole
-decrypted data model (`Entry`/`Change`/`Vault` are `ZeroizeOnDrop`), and the
-password-input buffers in the TUI, GUI, and CLI. Residual risk remains: Rust may
-move `String`/`Vec` contents during reallocation (leaving un-wiped copies of an
-in-progress buffer), and the OS may swap memory to disk. Zeroization reduces but
-does not eliminate residual-secret risk, and none of it defends a compromised
-host (out of scope, §8).
+decrypted data model (records/`Change`/`Vault` are `ZeroizeOnDrop`, and the
+in-memory document archive holds `Zeroizing` bytes), and the password-input
+buffers in the TUI, GUI, and CLI.
+
+**Swap mitigation.** The derived encryption key — the highest-value secret, since
+it decrypts the whole vault — is held in heap pages that are **memory-locked**
+(`mlock` on Unix, `VirtualLock` on Windows, via the `region` crate), so the OS
+will not page it out to swap where a plaintext copy could persist on disk across
+reboots. The lock is released and the bytes wiped on drop.
+
+Residual risk remains and is *not* fully mitigated: the decrypted records, the
+document archive, and password-input buffers are **not** page-locked (a blanket
+`mlockall(MCL_FUTURE)` would cover them but makes later allocations fail under
+the default `RLIMIT_MEMLOCK` and would destabilize the GUI). Those can still be
+swapped. Rust may also move `String`/`Vec` contents during reallocation, leaving
+un-wiped copies. For full protection of all secrets at rest in swap, use an
+**encrypted swap device/file** (or disable swap). None of this defends a
+compromised host (out of scope, §8).
 
 ### 9.7 No rate limiting / lockout
 The app does not lock out after repeated failed unlocks (it is a local file; an
