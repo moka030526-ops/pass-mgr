@@ -15,13 +15,21 @@ src/
 ├── crypto.rs    Argon2id chained two-password KDF + XChaCha20-Poly1305 AEAD;
 │                the derived Key lives in mlock'd heap pages (swap mitigation).
 ├── records.rs   The data model: 5 record types, Change/history, the Record
-│                trait + generic upsert/remove, the Volume manifest, the Vault
-│                (which now also embeds the category lists).
+│                trait + generic upsert/remove, the Vault (which embeds the
+│                category lists and a `settings` block; the id→location map lives
+│                in the manifests, not here).
 │                Shared helpers: unix_now, random_id, civil_from_unix.
-├── vault.rs     On-disk file format (header + AEAD JSON) and the encrypted
-│                document archive (<vault>.vol); OpenVault open/create/save/
-│                export/change_password, document add/read/export/remove, the
-│                in-vault category mutators, and backup.
+├── storage.rs   The partitioned document engine (format v4): Manifest/
+│                ManifestEntry/VolumeStore; frame encode/decode + bounds-checked
+│                parsers, atomic manifest commits, lazy open/read, partition
+│                selection, the ordered crash-safe commit protocol, and
+│                scan-rebuild of a lost manifest. `pub mod fuzz` exposes the
+│                parsers to the fuzz targets.
+├── vault.rs     The vault file (header + AEAD JSON) and orchestration over
+│                `storage`: OpenVault open/create/save/export/change_password
+│                (staged full re-encryption), document add/read/export/remove,
+│                the single-writer lockfile, the in-vault category + volume-size
+│                mutators, and backup.
 ├── types.rs     The editable category lists (flat Asset/Liability types and
 │                hierarchical Account types, AccountType{name, subtypes}). Pure
 │                in-memory data; **persisted inside the vault**, not on disk.
@@ -29,15 +37,15 @@ src/
 │                sampling, class guarantees, Fisher–Yates shuffle).
 ├── gui.rs       egui/eframe graphical UI (default). Tabs + Config screen.
 ├── ui.rs        ratatui terminal UI (`--tui`). Field-based edit forms.
-└── main.rs      Binary crate: CLI dispatch (incl. the `--vol` flag), vault-path
-                 selection, terminal setup/teardown, no-echo password reader;
-                 decrypt / extract / backup commands.
+└── main.rs      Binary crate: CLI dispatch (`--write`/`--tui`/`--part`), vault-
+                 directory selection, terminal setup/teardown, no-echo password
+                 reader; decrypt / manifest / extract / backup commands.
 ```
 
 The crate is split into a **library** (`lib.rs` → `pass_mgr`) holding the whole
 implementation and a thin **binary** (`main.rs`). The split lets the fuzz targets
 under `fuzz/` link the parsers directly. The security-critical core is `crypto.rs`
-+ `vault.rs` + `records.rs`; both front-ends drive the **same** `OpenVault` API,
++ `storage.rs` + `vault.rs` + `records.rs`; both front-ends drive the **same** `OpenVault` API,
 so all crypto/data logic is shared. There is no `unsafe` anywhere in the crate
 (`#![forbid(unsafe_code)]`); even the key page-locking uses the `region` crate's
 safe API.
@@ -64,54 +72,67 @@ the editable type lists travel with the encrypted vault (see §5).
   history; `remove` logs a deletion to the vault audit log.
 - All types derive `Zeroize`/`ZeroizeOnDrop`, so decrypted secrets (incl. the
   password history and document bytes held in memory) are wiped on drop.
-- `Vault` owns the five `Vec`s plus a `Volume` manifest, `version`, a write
-  `generation` counter, `last_opened_at`, and the vault-level `audit` log.
+- `Vault` owns the five `Vec`s plus `categories` (`TypeLists`), a `settings`
+  block (`volume_max_size`), an `id` (binds the volumes/manifests to this vault),
+  `version`, a write `generation` counter, `last_opened_at`, and the vault-level
+  `audit` log. The document index is **not** here — it lives in the per-partition
+  manifests; records hold only doc-id references.
 
-## 3. File format & document volume (`vault.rs`)
+## 3. File format & document store (`vault.rs` + `storage.rs`)
 
-> **Being replaced (format v4).** The single-`.vol` document store below is
-> superseded by a partitioned, lazily-loaded, crash-safe volume + manifest engine
-> (new `storage.rs`), specified in [`PLAN.md`](PLAN.md) and summarized in
-> `DESIGN.md` §11. The description here is the current (v3) as-built until that
-> lands; the planned module changes are in §10 below.
+The vault is a **directory** (`mypath/vault.pmv` + `manifest/` + `volume/` +
+`pass-mgr.lock`); see `DESIGN.md` §6 for the byte layouts.
 
 - **Vault file** (`vault.pmv`): a 61-byte plaintext header (magic `PMVAULT\0`,
-  format version 3, Argon2 params, salt, nonce) followed by the
+  format version 4, Argon2 params, salt, nonce) followed by the
   XChaCha20-Poly1305 ciphertext of the JSON `Vault`. The **entire 61-byte header
   — including the nonce — is the AEAD associated data**: `save` generates the
   nonce first, writes it into the header, and passes the whole header to
   `crypto::encrypt_with_nonce`, so a downgrade of the Argon2 params or a swap of
   the salt/nonce can't go undetected (verified by `header_tampering_is_detected`).
-  KDF params are range-checked on parse (DoS guard). Saves are atomic: write a
-  unique hidden temp file with `create_new`+0600, fsync, rename, fsync the
-  directory; the write `generation` is bumped each save.
-- **Document archive** (`vault.pmv.vol` by default): a *single* encrypted
-  container holding all uploaded document bytes (`nonce ‖ ciphertext`), decrypted
-  as a unit on open. Bound to the vault via `volume.id` in the AEAD AAD; on open,
-  every manifest-referenced id must be present (rejects a stale/swapped `.vol`).
-  `parse_archive` is fully bounds-checked. Deleting a record or detaching a
-  document reclaims its blob; attaching persists the record→doc link immediately.
-  The archive path can be overridden (the `--vol` flag): `OpenVault` resolves and
-  stores it once (`archive_path`), defaulting to `<vault>.vol`.
-- **Resource limits:** the whole archive is read and decrypted in memory, so an
-  upload over 64 MiB, or a total archive over 1 GiB, is refused with
-  `VaultError::TooLarge` — checked against the file's reported size *before* it is
-  read, so a hostile/corrupt `.vol` can't drive an unbounded allocation.
-- **Backup** (`backup()`): copies the encrypted vault + `.vol` into a directory
-  as a collision-safe, timestamped (`-YYYYMMDD-HHMMSS`) pair. No decryption.
-- Cross-platform file hardening (`harden_file`/`harden_dir`/`write_new_*`,
-  `pub(crate)` and reused by `main.rs`): 0600/0700 on Unix; on Windows it relies
-  on the inherited per-user `%APPDATA%` ACL.
+  KDF params are range-checked, and `vault.pmv` is size-capped, on parse (DoS
+  guard). Saves are atomic: write a unique hidden temp file with `create_new`+0600,
+  fsync, rename, fsync the directory; the write `generation` is bumped each save.
+- **Document store** (`storage.rs`): per-partition `volume/vol.<N>` of append-only
+  frames `[u32 len][nonce][ct]` (ct over `[id_len][id][path_len][path][bytes]`,
+  AAD = `vault_id ‖ partition`), indexed by encrypted `manifest/manifest.<N>`.
+  - **Commit protocol** (`put`): append+fsync the frame, fsync the volume dir,
+    then atomically swap the manifest (temp→fsync→rename→fsync dir) — the storage
+    commit point. The manifest `end_offset` is authoritative, so a torn trailing
+    frame is ignored. A lost/corrupt manifest is rebuilt by scanning its volume.
+  - **Lazy + bounded:** `open` decrypts only the manifests; `read` opens one
+    volume and one frame, verifying the frame's authenticated id/path against the
+    manifest (rejects a relocated/substituted frame). All length fields are
+    bounds-checked; per-doc/per-manifest sizes are capped.
+  - **Partitioning:** `volume_max_size` (vault `settings`, default 256 MiB)
+    governs placement of new docs; updates stay in the original partition. No
+    compaction in v1 (reclaimed blobs linger as garbage).
+  - **Lifecycle:** attaching persists the record→doc link immediately; remove/
+    detach/delete persist the unlinked vault **first**, then reclaim the blob, so
+    a crash leaves at most a harmless orphan, never a dangling reference.
+- **Password change** (`change_password`): full re-encryption under a fresh
+  key+salt, staged in `.rekey/` (`vault.pmv` + `manifest/` + `volume/` + `READY`),
+  committed by roll-forward (volumes, then manifests, then `vault.pmv` last), and
+  recovered on the next open if interrupted. Poisons the live handle if a partial
+  commit fails.
+- **Single-writer lock:** a writable open/create takes an OS advisory lock on
+  `pass-mgr.lock` (`File::try_lock`, released on process exit); a second writable
+  instance gets `VaultError::Locked`. Read-only opens skip it.
+- **Backup** (`backup()`): copies the whole encrypted tree into a collision-safe,
+  timestamped subdir (refuses a half-committed rekey). No decryption.
+- Cross-platform file hardening (`harden_file`/`harden_dir`/`write_new_*`):
+  0600/0700 on Unix; on Windows it relies on the inherited per-user `%APPDATA%` ACL.
 
 ## 4. Cryptography (`crypto.rs`)
 
 - **KDF:** Argon2id, 64 MiB / 3 / 1 defaults. Two passwords are chained:
   `k1 = Argon2id(pw1, salt1)`, `key = Argon2id(pw2, k1)`. Both required; order
   matters; neither verifiable independently.
-- **AEAD:** XChaCha20-Poly1305, fresh 24-byte random nonce per write. The vault
-  path uses `encrypt_with_nonce` so the nonce can be placed in the header and the
-  **whole header authenticated as associated data** (`encrypt` — which picks its
-  own nonce — is kept for the document archive, whose AAD is the `volume.id`).
+- **AEAD:** XChaCha20-Poly1305, fresh 24-byte random nonce per write. Every path
+  uses `encrypt_with_nonce` with an explicit nonce and explicit associated data:
+  the vault binds its **whole 61-byte header**, each volume frame and each
+  manifest bind `PREFIX ‖ vault_id ‖ partition`. The 24-byte XChaCha nonce space
+  makes random-nonce collision negligible (tested for uniqueness across writes).
 - **Key memory:** the derived `Key` is a boxed `[u8;32]` whose page(s) are
   `mlock`/`VirtualLock`'d (the `region` crate) so the key is not paged to swap;
   wiped then unlocked on drop. Transient stack copies are zeroized.
@@ -142,51 +163,76 @@ index in `commit_edit_record`. Selection resolves **by id** so filtered lists
 never edit the wrong record. Accounts filter by type/subtype/owner/review;
 Assets by review. A copied password is auto-cleared from the clipboard after 15s
 (a deadline the event loop polls for) and again on exit; the write `generation`
-is shown on unlock so a rollback is noticeable.
+is shown on unlock so a rollback is noticeable. Both UIs validate a document's
+virtual path against `storage::MAX_PATH_LEN` (256 bytes) before attaching — the
+GUI disables the Attach button with an inline error, the TUI rejects the upload
+key — and the Config screen (write mode only) edits the volume-size setting via
+`OpenVault::set_volume_max_size` (which updates the live store cap and persists).
+Change-password runs through the Auth screen into `OpenVault::change_password`.
 
 ## 7. CLI (`main.rs`)
 
+The positional argument is the vault **directory** (default per-user data dir).
+
 ```
-pass-mgr [VAULT]              graphical UI (READ-ONLY by default)
-pass-mgr --write [VAULT]      writable (allow create/edit/delete/upload)
-pass-mgr --tui [VAULT]        terminal UI (add --write to edit)
-pass-mgr --vol PATH ...       use PATH as the document archive (default <vault>.vol)
-pass-mgr decrypt [VAULT]      print the decrypted vault JSON (secrets!) to stdout
-pass-mgr extract [VAULT] DIR  decrypt all documents into DIR (path-sanitized)
-pass-mgr backup [VAULT] DIR   copy the encrypted vault + archive into DIR
+pass-mgr [DIR]                    graphical UI (READ-ONLY by default)
+pass-mgr --write [DIR]            writable (allow create/edit/delete/upload)
+pass-mgr --tui [DIR]             terminal UI (add --write to edit)
+pass-mgr decrypt [DIR]           print the decrypted vault JSON (secrets!) to stdout
+pass-mgr manifest [DIR] [--part N]   print the document index: one partition or all
+pass-mgr extract [DIR] OUT [--part N]   decrypt documents into OUT: one volume or all
+pass-mgr backup [DIR] DEST       copy the whole encrypted vault tree into DEST
 ```
 
-`--vol`/`--volume` (with a following path, or `--vol=PATH`) is a position-
-independent flag threaded into `OpenVault::open_with` / `create_with` and into
-`export_documents` / `backup`. It overrides the default `<vault>.vol` archive
-location for the UI, `extract`, and `backup` (it is irrelevant to `decrypt`,
-which never touches the archive).
-
-`--write`/`--tui` are parsed as position-independent flags. **Read-only is the
-default** and is enforced authoritatively in `OpenVault` (`open_read_only` +
-`read_only` guards on every mutator; nothing is written on a read-only open),
+`--write`/`--tui` are position-independent flags. **Read-only is the default**,
+enforced authoritatively in `OpenVault` (`open_read_only` + `read_only` guards on
+every mutator; nothing is written, and no lock is taken, on a read-only open),
 with the UIs hiding write controls and showing a read-only badge (`DESIGN.md`
-§4.4). `decrypt`/`extract`/`backup` are read operations and ignore `--write`.
+§4.4). A writable open takes the single-writer lock; a second writable instance
+fails fast with `VaultError::Locked`.
 
-`extract` sanitizes manifest paths (`safe_relative_path`: no `..`/absolute/drive/
-backslash) so it can't escape `DIR`, writes via the hardened `write_new_bytes`,
-and creates dirs 0700. The no-echo password reader uses crossterm raw mode on a
-TTY and falls back to a piped line otherwise.
+`--part N` / `--part=N` (parsed by `extract_part_flag`) selects one partition for
+`manifest`/`extract`; it is rejected on other commands. `extract` sanitizes the
+manifest paths (`safe_relative_path`: no `..`/absolute/drive/backslash, drops
+Windows reserved names + trailing dots) so it can't escape `OUT`, writes via the
+hardened `write_new_bytes` (0600), and creates dirs 0700. `decrypt`/`manifest`/
+`extract`/`backup` are read operations (refuse a half-committed rekey). The
+no-echo password reader uses crossterm raw mode on a TTY and falls back to a piped
+line otherwise.
 
 ## 8. Build, test, coverage
 
 ```bash
 cargo build --release                         # GUI default; --tui for terminal
-cargo test                                    # unit + integration tests
-cargo clippy                                  # lints (kept clean)
+cargo test                                    # unit + property tests (proptest)
+cargo clippy --all-targets -- -D warnings     # lints (kept clean)
 cargo check --target x86_64-pc-windows-gnu    # Windows portability
-cargo llvm-cov --summary-only                 # coverage (if cargo-llvm-cov installed)
+cargo +nightly fuzz build                     # build the fuzz targets
+cargo +nightly fuzz run parse_frame           # fuzz a parser (also parse_manifest/
+                                              #   scan_volume/parse_header)
+cargo mutants --file src/storage.rs ...       # mutation testing (see below)
 ```
 
-Tests cover the core thoroughly (crypto, records, vault, types, password) plus
-the front-end logic by driving the TUI state machine through key events and the
-GUI's deferred methods directly, and rendering every TUI screen to a ratatui
-`TestBackend`. The egui rendering itself is not unit-tested (needs a GUI harness).
+Tests cover the core thoroughly (crypto, storage, vault, records, types,
+password): per-operation crash-injection and the full rekey roll-forward matrix,
+per-blob/per-manifest AAD binding and frame-substitution rejection, nonce
+uniqueness, the partition/`end_offset` arithmetic, and `proptest` suites for the
+parsers and path normalization. Front-end logic is driven through the TUI key
+handler and the GUI's deferred methods directly, with every TUI screen rendered to
+a ratatui `TestBackend`; egui rendering itself is not unit-tested (needs a GUI
+harness). The untrusted-input parsers (`parse_header`, `parse_frame`,
+`parse_manifest`, `scan_volume`) have `cargo-fuzz` targets.
+
+**Mutation testing (§13.6).** `cargo mutants` over the security-critical files is
+run periodically; surviving mutants are triaged. Killed: the `Header::parse`
+bounds, the partition-scan recovery, the frame plausibility checks, and the date
+math. Documented surviving classes (a killing test would be tautological, flaky,
+or impossible): `Key::drop`'s zeroize (not observable without UB-adjacent memory
+inspection); `password::uniform`'s rejection-zone arithmetic (bias-only — output
+range/coverage are preserved; the genuinely-broken variants are caught via
+*timeout*); the DoS-guard size *constants* (value not behavior); and the
+fsync/fuzz-wrapper helpers (durability isn't in-process observable; fuzz wrappers
+are exercised by the fuzz binaries, which discard the parsed result).
 
 ## 9. Cross-platform notes
 
@@ -197,32 +243,23 @@ GUI's deferred methods directly, and rendering every TUI screen to a ratatui
 | Key swap-lock | `mlock` | `VirtualLock` (both via `region`) |
 | Portable `.exe` | n/a | `.cargo/config.toml` static-CRT for MSVC |
 
-## 10. Planned redesign — partitioned storage (format v4)
+## 10. Format-v4 redesign — as built
 
-Not yet built; authoritative spec in [`PLAN.md`](PLAN.md), design in `DESIGN.md`
-§11. Planned module changes:
-
-- **New `storage.rs`** — the partitioned engine: `Manifest`/`ManifestEntry`,
-  `VolumeStore`; frame encode/decode, atomic manifest writes, lazy open/read,
-  partition selection, the ordered crash-safe commit protocol, scan-rebuild, and
-  the rekey staging/roll-forward.
-- **`records.rs`** — drop the `Volume`/`volume` field from `Vault`; add
-  `settings { volume_max_size }`; records keep doc-id refs (the id→location map
-  moves to the manifests).
-- **`vault.rs`** — `OpenVault` orchestrates `vault.pmv` + `storage`; `open` loads
-  only manifests; document ops go through `storage`; `change_password` runs full
-  re-encryption (stage + `READY` + roll-forward); `FORMAT_VERSION = 4`; an
-  advisory single-writer lockfile; only harden dirs the app creates.
-- **`main.rs`** — directory-based path; remove `--vol`; `decrypt` (vault),
-  `manifest [--part N]` (one/all), `extract [--part N]` (one/all volumes); backup
-  the whole tree.
-- **`ui.rs`/`gui.rs`** — 256-byte path-limit enforcement, volume-size config,
-  lighter theme, and the §11-folded security-review UI fixes.
-
-Verification gate: the full §13 test catalog (incl. a fault-injection harness for
-crash-safety), fuzzing the new parsers, mutation testing, then **two max-depth
-multi-agent reviews** (bug hunt + security) with every confirmed finding fixed
-before this doc is updated to as-built.
+The partitioned store (§3) replaced the earlier single-`.vol` archive. The work
+landed in phases (see `git log` and `PLAN.md` "Execution progress"): the storage
+engine (`storage.rs`) and its wiring into `vault.rs` (directory layout,
+`FORMAT_VERSION = 4`, staged `change_password`); the exhaustive rekey
+crash-injection tests; the CLI `--part` selectivity and the single-writer
+lockfile; the UI path-limit enforcement and volume-size config; the verification
+pass (refreshed fuzz targets, `proptest`, storage AAD/bounds/nonce/corruption
+tests, mutation triage); and finally two **max-depth multi-agent reviews** (a
+bug-hunt and a security review, each *find → adversarial-verify → critic →
+synthesize*) whose every confirmed finding was fixed and re-verified before this
+doc was updated. The notable review fixes: per-frame id/path verification on read,
+the volume-dir fsync ordering, persist-before-reclaim in the delete/detach paths,
+the `vault.pmv` size cap, and the `append_frame` symlink refusal. The residual
+limitations (at-rest rollback, the Argon2-cost open DoS, single-active-session
+concurrency) are documented in `DESIGN.md` §9.12/§9.13/§9.16.
 
 ## 11. Definition of done
 

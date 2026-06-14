@@ -1,34 +1,35 @@
 # pass-mgr — Execution Plan: Partitioned Volumes + Manifests (format v4)
 
-_Status: IN PROGRESS. Authoritative spec for the storage-layer redesign.
-Author/owner: Michael. Created 2026-06-14._
+_Status: COMPLETE (all phases landed on `main`). Authoritative spec + execution
+history for the storage-layer redesign. Author/owner: Michael. Created 2026-06-14._
 
-## ▶ Execution progress (resume here)
+## ▶ Execution progress
 
 - ✅ **Phase 1** — quick wins (commit `d587200`): Zeroizing passwords, arboard
   slimming, Windows path hardening, UI subtype fixes, lighter theme.
 - ✅ **Phase 2** — storage engine `storage.rs` (commit `b146296`): partitioned,
-  crash-safe, lazy; 9 tests incl. crash-injection.
+  crash-safe, lazy; tests incl. crash-injection.
 - ✅ **Phase 3** — vault integration (commit `0a09000`): FORMAT v4, directory
   layout, lazy open + consistency check, staged full-re-encryption rekey, tree
   backup, CLI (`decrypt`/`manifest`/`extract`/`backup`), UIs repointed.
-  86 tests pass; clippy clean; Windows cross-check OK. All pushed to origin/main.
-- ⏭ **NEXT: Phase 4** — rekey crash-injection tests (the stage+READY+roll-forward
-  machinery is built in `vault.rs::change_password`/`recover_pending_rekey`; this
-  phase adds the exhaustive fault-injection tests for it).
-- ⬜ **Phase 5** — CLI `--part` selectivity + single-writer lockfile (both
-  deferred from Phase 3).
-- ⬜ **Phase 6** — UI: 256-byte path-limit enforcement in GUI/TUI + volume-size
-  config control.
-- ⬜ **Phase 7** — full test catalog (§13): fault-injection harness, property
-  tests, refresh `fuzz/` targets (the old `parse_archive` target references the
-  now-removed `vault::fuzz::archive` — point it at the storage frame/manifest
-  parsers), mutation testing.
-- ⬜ **Phase 8** — the two max-depth review workflows (§14), fix findings, then
-  update DESIGN/IMPLEMENTATION from "target" to "as-built".
+- ✅ **Phase 4** — exhaustive rekey crash-injection tests (commit `5dcb9cd`):
+  every commit sub-step, both mid-swap windows, idempotency, READY-absent discard,
+  read-only handling, across multiple partitions.
+- ✅ **Phase 5** — CLI `--part` selectivity + single-writer lockfile (commit
+  `adc1ced`): `partition_entries` accessor, `export_*` partition filter +
+  `NoSuchPartition`, `File::try_lock` lock (`VaultError::Locked`).
+- ✅ **Phase 6** — UI (commit `db0d554`): 256-byte path-limit enforced/surfaced in
+  GUI + TUI, volume-size config on both Config screens, `set_volume_max_size`.
+- ✅ **Phase 7** — verification (commits `3176bae`, `2512d80`): fixed/expanded
+  fuzz targets (`parse_frame`/`parse_manifest`/`scan_volume`), `proptest` suites,
+  storage AAD/bounds/nonce/corruption tests, mutation hardening + triage.
+- ✅ **Phase 8** — two max-depth multi-agent reviews (§14, bug-hunt + security),
+  every confirmed finding fixed and re-verified (commits `98e3ff1`, `0d260d9`),
+  then DESIGN/IMPLEMENTATION updated to as-built. Residual limitations are
+  documented in `DESIGN.md` §9.12/§9.13/§9.16.
 
-Other carried-forward notes: a few INFO security-review items (§11) still to fold
-in during the relevant phases.
+Final state: 120 lib tests pass, clippy clean, Windows cross-check clean, fuzz
+targets build + smoke-run clean.
 
 This plan supersedes the single-`<vault>.vol` document store with a partitioned,
 lazily-loaded, crash-safe volume + manifest design. It is written so it can be

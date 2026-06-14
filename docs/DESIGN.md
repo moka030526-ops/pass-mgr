@@ -63,21 +63,19 @@ is the `Record` trait + generic `upsert`/`remove`.
 
 ```text
 Vault
-├── version: u8                  // schema version (currently 3)
+├── version: u8                  // schema version (currently 4)
+├── id: String                   // random; binds this vault's manifests + volumes
 ├── last_opened_at: i64          // set on each successful unlock (req. 6)
+├── generation: u64              // monotonic write counter (rollback hint, §9.12)
 ├── instructions:  Vec<Instruction>   // Tab 1: title, description
 ├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
 │                                     //         institution, type, statement (doc id)
 ├── accounts:      Vec<Account>       // Tab 4: account_type, owner, username, password, url, description
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account
-├── volume: Volume               // document-archive manifest (metadata only)
+├── categories: TypeLists        // the editable dropdown lists (in-vault, §5/§4.2)
+├── settings: VaultSettings      // { volume_max_size }  (Config screen, §4.3)
 └── audit: Vec<Change>           // vault-level log: created, password changed, deletions, uploads
-
-Volume                            // metadata for the encrypted document archive
-├── directories: Vec<String>     // virtual directory tree (e.g. "/statements/2026")
-├── files: Vec<VolumeFile>       // {id, location, filename, size, uploaded_at, source}
-└── uploads: Vec<Change>         // upload history: location / date / file (req)
 
 Change
 ├── at: i64                      // unix-seconds timestamp
@@ -85,9 +83,11 @@ Change
 └── detail: String               // human-readable summary, e.g. "username: alice -> bob"
 ```
 
-The `kind`/`asset_type`/`account_type` dropdown values come from external,
-editable JSON lists in the data dir (`types/asset_types.json`,
-`types/account_types.json`), auto-created with defaults (req. 2).
+The document index (`{id, path, size, offset, length}` per blob) is **not** in the
+vault JSON — it lives in the per-partition manifests (§4.3, §11); records hold
+only the doc-id references. The `kind`/`asset_type`/`account_type` dropdown values
+come from `categories`, which is stored **inside the encrypted vault** (§4.2,
+§5) — there are no external configuration files.
 
 ### 4.1 History semantics (req. 4 & 5)
 
@@ -105,39 +105,39 @@ editable JSON lists in the data dir (`types/asset_types.json`,
 ### 4.2 Category types (req. 2)
 
 The Asset/Liability "type" and the Account "account type" are chosen from
-dropdowns populated by external JSON lists (`types/asset_types.json`,
-`types/account_types.json`) created with sensible defaults on first run and
-editable by the user. They are stored unencrypted (category names only).
+dropdowns populated by the vault's `categories` (`TypeLists`), seeded with
+sensible defaults on creation and editable from the Config screen. They live
+**inside the encrypted vault** (not in external files), so they travel with it
+and leak nothing at rest (§5, §4.4).
 
-### 4.3 Encrypted document volume
+### 4.3 Encrypted document store (partitioned, format v4)
 
-> **⚠️ Being replaced (format v4).** The single-`<vault>.vol` store described
-> here is superseded by the **partitioned, lazily-loaded, crash-safe volume +
-> manifest** design in **§11** and specified in full in [`PLAN.md`](PLAN.md).
-> This section documents the current (v3) behavior until that lands.
+Statements, wills, and other documents live in a **partitioned, lazily-loaded,
+crash-safe** store under the vault directory — `mypath/volume/vol.<N>` (the blob
+data) indexed by `mypath/manifest/manifest.<N>` (the encrypted index). The full
+design is in **§11**; the essentials:
 
-Statements, wills, and other documents are uploaded into a **single encrypted
-archive** file `<vault>.vol`, decrypted as one unit on unlock and re-encrypted
-as one unit on change (an "encrypted zip"):
-
-- The archive holds the document bytes keyed by a random file id, encrypted with
-  the same vault key (XChaCha20-Poly1305, fresh random nonce per write). On disk:
-  `nonce ‖ ciphertext`.
-- **Identity binding:** the AEAD associated data is a fixed tag plus the vault's
-  random `volume.id`, so a `.vol` from a different vault (or a swapped one) fails
-  authentication. On open, a **consistency check** also requires every document
-  referenced by the manifest to be present in the archive, rejecting a stale or
-  rolled-back `.vol` that is missing newer documents.
-- **Lifecycle:** deleting a record or detaching a document **reclaims** its blob
-  from the archive (and logs the removal), so "deleted" documents do not linger.
-  Attaching immediately persists the record→document link, so no orphan is left.
-- The vault JSON's `Volume` holds only metadata (vault id, virtual location,
-  filename, size, upload time/source) and the upload/removal history.
-- The archive plaintext is a length-prefixed binary frame
-  (`[count][id_len][id][data_len][data]…`); parsing is fully bounds-checked so a
-  crafted/corrupted archive fails closed rather than panicking or over-allocating.
-- Whole archive is held decrypted in memory while the vault is open (acceptable
-  for the standalone, single-user use case; see §9).
+- **Per-blob encryption.** Each document is one **self-describing frame**
+  `[u32 len][nonce(24)][ciphertext]` appended to a volume, where the ciphertext
+  covers `[id_len][id][path_len][path][bytes]` and the AEAD associated data is
+  `PREFIX ‖ vault_id ‖ partition`. Per-blob encryption (vs one big archive) is
+  what lets the store grow without bound and read one document without decrypting
+  the rest.
+- **Identity binding.** A frame authenticates only under its vault's id and its
+  partition, so a volume/manifest from another vault (or a wrong partition) fails
+  the tag. The id and path *inside* the authenticated plaintext are verified
+  against the manifest entry on every read, so a relocated/substituted (but
+  individually authentic) frame from the same partition cannot be served under the
+  wrong identity. An open-time check additionally requires every document a record
+  references to be present (rejects a store missing referenced docs).
+- **Lifecycle.** Attaching persists the record→document link immediately.
+  Removing/detaching/deleting **persists the unlinked vault first, then** reclaims
+  the blob (drops its manifest entry), so a crash in between leaves at most a
+  harmless orphan, never a dangling reference. There is no compaction in v1, so a
+  reclaimed blob's bytes linger in the volume as garbage until a future `compact`.
+- **In-memory footprint.** Only the (small) manifests are decrypted on open;
+  volume bytes are read on demand, one frame at a time — the whole document set is
+  never held in memory at once.
 
 ### 4.4 Read-only by default
 
@@ -149,8 +149,8 @@ enforced in two layers:
   `remove_document`, and the category mutators `add_asset_type` /
   `add_account_type` / `add_account_subtype`) returns `VaultError::ReadOnly`, and
   the open path writes nothing to disk (not even the refreshed
-  `last_opened_at`/generation). So a read-only session is guaranteed not to modify
-  `vault.pmv` or `.vol`.
+  `last_opened_at`/generation) and takes no single-writer lock. So a read-only
+  session is guaranteed not to modify `vault.pmv` or the document store.
 - **UI:** the front-ends hide write controls (New/Save/Delete/attach/detach/
   generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
   (browse, reveal, copy, export, backup) remain available.
@@ -220,7 +220,8 @@ Putting §5.1–§5.3 together, this is exactly what happens to your data.
 
 **Creating / saving the vault**
 
-1. On create, generate a random 16-byte `salt1` and a random `volume.id`.
+1. On create, generate a random 16-byte `salt1` and a random vault `id` (which
+   binds this vault's manifests and volume frames in their AAD).
 2. Derive the key from the two passwords (chained Argon2id, §5.2):
    `k1 = Argon2id(pw1, salt1)`, `key = Argon2id(pw2, salt = k1)`.
 3. Serialize the whole vault (records, history, document manifest, **and the
@@ -240,10 +241,12 @@ Putting §5.1–§5.3 together, this is exactly what happens to your data.
    wrong password, a corrupted body, or **any** altered header field fails here —
    there is no separate password check, so the tag is the single source of truth.
 
-**Documents** are encrypted separately into `<vault>.vol` with the same `key`
-(`nonce ‖ ciphertext`), with the vault's `volume.id` as associated data so a
-foreign or swapped archive is rejected, and an open-time manifest⊆archive check
-rejects a stale archive that drops newer documents (§9.12).
+**Documents** are encrypted per-blob into the partitioned store (`volume/vol.<N>`,
+indexed by `manifest/manifest.<N>`) under the same `key`, each frame's AAD binding
+`vault_id ‖ partition` so a foreign/swapped/cross-partition frame or manifest is
+rejected; the authenticated id/path inside each frame are checked against the
+manifest on read, and an open-time referenced⊆stored check rejects a store missing
+referenced documents (§4.3, §11, §9.12).
 
 **Methodology / rationale.** Standard, well-reviewed primitives only (Argon2id,
 XChaCha20-Poly1305) from audited Rust crates; no home-grown crypto and no
@@ -265,13 +268,25 @@ breaking old vaults. Secrets are memory-locked (§9.6) and zeroized on drop.
 - **At-rest only.** Once unlocked, the key and plaintext live in process memory;
   a compromised host (malware, keylogger, debugger, cold-boot) defeats every
   in-process measure (§9.14). Memory zeroization/locking is best-effort (§9.6).
-- **Rollback of a full matched pair** (`vault.pmv` + `.vol`) can't be detected at
-  rest without an external trusted counter (§9.12).
+- **Rollback of a matched older tree** (`vault.pmv` + `manifest/` + `volume/`, or
+  an individual partition) can't be detected at rest without an external trusted
+  counter (§9.12).
 - **Nonce reuse** would be catastrophic for any stream cipher; here nonces are
   random per write, and the 24-byte XChaCha nonce space makes collision
   negligible — but this relies on the OS CSPRNG being sound.
 
 ## 6. On-disk file format (req. 8, 11)
+
+The vault is a **directory** `mypath/` holding three things:
+
+```text
+mypath/vault.pmv          encrypted JSON vault (header + AEAD ciphertext)
+mypath/manifest/manifest.<N>  encrypted per-partition document index
+mypath/volume/vol.<N>         append-only, per-blob-encrypted document frames
+mypath/pass-mgr.lock          single-writer advisory lock (empty; writable opens only)
+```
+
+### 6.1 `vault.pmv`
 
 All integers little-endian. The header is plaintext (so the file is
 self-identifying and self-describing); the body is ciphertext.
@@ -279,7 +294,7 @@ self-identifying and self-describing); the body is ciphertext.
 ```text
 offset  len  field
 0       8    magic            b"PMVAULT\0"            (req. 11 — identifiable)
-8       1    format version   currently 3
+8       1    format version   currently 4
 9       4    Argon2 m_cost (KiB)
 13      4    Argon2 t_cost
 17      4    Argon2 p_cost
@@ -287,6 +302,19 @@ offset  len  field
 37      24   nonce            (XChaCha20-Poly1305)
 61      ..   ciphertext       AEAD(JSON vault), full 61-byte header as assoc. data
 ```
+
+### 6.2 Manifests and volumes
+
+- A **volume** `vol.<N>` is a sequence of frames `[u32 frame_len][nonce(24)][ct]`
+  where `ct = AEAD(key, nonce, plaintext, aad = "PMVAULT-VOLUME-v1\0" ‖ vault_id ‖
+  N)` and `plaintext = [u32 id_len][id][u32 path_len][path][doc_bytes]`. Frames are
+  append-only; the manifest's `end_offset` is the authoritative end of valid data,
+  so a torn trailing frame from a crash is ignored and overwritten.
+- A **manifest** `manifest.<N>` is `nonce(24) ‖ ct` where `ct = AEAD(key, nonce,
+  JSON, aad = "PMVAULT-MANIFEST-v1\0" ‖ vault_id ‖ N)` and the JSON is
+  `{seq, end_offset, entries: [{id, path, size, offset, length, uploaded_at}]}`.
+  Manifests are written atomically (temp → fsync → rename → dir fsync). A
+  lost/corrupt manifest is rebuilt by scanning its self-describing volume.
 
 - The **entire 61-byte header** (magic, version, params, salt, nonce) is the AEAD
   associated data, so every field is authenticated under the Poly1305 tag even
@@ -298,18 +326,21 @@ offset  len  field
   the real file; the parent directory is then `fsync`'d so the rename is durable.
   A crash mid-write cannot corrupt an existing vault, and a failed write removes
   the temp file.
-- **File permissions:** on Unix the temp file is created with mode `0600`
-  *atomically* (no world-readable window) and the parent directory is `0700`.
+- **File permissions:** on Unix every vault file (`vault.pmv`, manifests,
+  volumes, and the lock file) is `0600` and the directories `0700`; temp files are
+  created `0600` *atomically* (no world-readable window). Volume appends additionally
+  refuse to write through a symlink at the volume path.
 - **Untrusted-input bounds:** KDF parameters read from the file header are
-  range-checked before the memory-hard derivation runs, so a crafted header
-  cannot force a huge Argon2 allocation (DoS).
+  range-checked before the memory-hard derivation runs, and `vault.pmv`, each
+  manifest, and each document are size-capped before being read, so a crafted file
+  cannot force a huge allocation (DoS) — see §9.13.
 
-> Note: the current format is **version 3** (the estate-vault schema with the
-> embedded document manifest and category lists). Earlier prototype versions are
-> not auto-migrated; an unsupported version is reported rather than risk a lossy
-> migration (see §9.5). The byte layout above is unchanged from v3's introduction;
-> the AAD now covers the full header (it previously covered the first 37 bytes),
-> a binding tightened deliberately — older test vaults must be recreated.
+> Note: the current format is **version 4** (the partitioned document store of
+> §4.3/§11, with the category lists and a `settings` block embedded in the vault
+> JSON). Earlier versions are not auto-migrated; an unsupported version is reported
+> rather than risk a lossy migration (see §9.5). The full 61-byte header is the
+> vault AAD; manifests and volume frames each bind `vault_id ‖ partition` in their
+> own AAD.
 
 ## 7. User interface (req. 10)
 
@@ -465,24 +496,58 @@ fsync a hard power loss could still lose the last save (never corrupt the file).
 Any truncated/garbled file is additionally caught by the AEAD tag on open (fails
 closed). See §6.
 
-### 9.12 Whole-snapshot rollback is out of scope
-The document archive is bound to its vault (`volume.id` in the AEAD AAD) and an
-on-open check rejects a `.vol` that is *inconsistent* with the vault manifest
-(missing referenced documents) — so an attacker can't swap in another vault's
-archive or a stale archive that drops newer documents. What no at-rest scheme
-can prevent without an external trusted counter is an attacker restoring a
-**matched older pair** of `vault.pmv` + `vault.pmv.vol` (a full, self-consistent
-snapshot): that simply looks like the vault as it was at that time. This is the
-same inherent limitation that applies to the main vault file on its own.
+### 9.12 Rollback of authentic at-rest state is out of scope
+Every encrypted unit is authenticated and bound to its vault and partition: the
+vault to its header, each manifest and each volume frame to `vault_id ‖ partition`
+(and each frame's id/path are checked against the manifest on read, §4.3). So an
+attacker holding the files cannot **forge** content, swap in another vault's
+files, move a frame across partitions, or relabel a document — all fail the tag
+or the id/path check.
 
-### 9.13 Archive resource limits
-The whole document archive is read and decrypted into memory at once. To stop a
-corrupt or hostile `.vol` (or an accidental huge upload) from exhausting RAM,
-uploads are capped at **64 MiB per document** and the **total archive at 1 GiB**;
-both are checked against the file's reported size *before* it is read, and exceed
-returns `VaultError::TooLarge`. These bounds are generous for estate documents
-(scans, PDFs) but keep allocation bounded. Adjust the constants in `vault.rs` if
-your use genuinely needs larger files.
+What no purely-at-rest scheme can prevent **without an external trusted counter**
+is an attacker restoring older-but-authentic state that the user once wrote:
+
+- Replacing the whole tree (`vault.pmv` + `manifest/` + `volume/`), or a single
+  partition's matched `manifest.<N>` + `vol.<N>`, with an earlier self-consistent
+  version — it simply looks like the vault as it was then.
+- Deleting a `manifest.<N>`: it is rebuilt by scanning `vol.<N>` (recovery for a
+  genuinely lost manifest), which also re-indexes documents that had been
+  *deleted* (a delete drops only the manifest entry; the blob lingers because
+  there is no compaction in v1, §4.3), effectively undoing those deletes.
+- Truncating a `vol.<N>` to an earlier `end_offset` to drop recently-appended
+  frames.
+
+The open-time consistency check is one-directional (every *referenced* document
+must be *present*); it deliberately permits unreferenced/garbage blobs, so it does
+not detect a dropped record pointer or a rolled-back unreferenced document. The
+write-generation counter (bumped on every save, including a rekey) lets a user who
+records it out-of-band notice a rollback, but the format itself does not enforce
+monotonicity. This is the same inherent limitation that applies to any single
+encrypted file at rest; defending it requires an external trusted store
+(a TPM counter, a remote witness) which is out of scope for an offline vault.
+
+### 9.13 Resource limits (DoS guards)
+A crafted or corrupt file must not be able to exhaust memory before it is
+authenticated. Sizes are checked against the file's reported length *before* the
+read, and an exceed returns `VaultError::TooLarge` / `StorageError::TooLarge`:
+
+- **Per document:** 64 MiB (`MAX_DOC_SIZE`).
+- **Per manifest:** 256 MiB (`MAX_MANIFEST_SIZE`) — generous; manifests are a
+  small index.
+- **`vault.pmv`:** 256 MiB (`MAX_VAULT_SIZE`) before the wholesale read+decrypt.
+- **Volume frames:** the frame-length prefix is range-checked (`>= nonce`, `<=
+  MAX_DOC_SIZE + overhead`) and bounds-checked against the file before any
+  allocation, so a corrupt length can neither over-read nor over-allocate.
+
+Documents and volumes are read one frame at a time, so the whole document set is
+never held in memory at once. One bounded cost remains by design: the Argon2id
+parameters live in the (authenticated-but-not-secret) header and must run *before*
+any password check (§9.2), so opening an attacker-supplied vault with a maxed-out
+cost header (`m_cost` up to 1 GiB, `t_cost`/`p_cost` at their ceilings, run twice
+for the chained derivation, §5.2) can burn memory/CPU. The parameters are bounded
+(`MAX_M_COST`/`MAX_T_COST`/`MAX_P_COST` in `vault.rs`) so the cost is finite, and
+the user chooses which vault to open; lower the ceilings if you only ever open
+your own vaults. Adjust any of these constants for genuinely larger needs.
 
 ### 9.14 Trust boundary — host compromise is out of scope
 pass-mgr protects data **at rest** and assumes the machine is trustworthy *while
@@ -504,6 +569,20 @@ ideally, **code-sign** the Windows `.exe` with your own Authenticode certificate
 (`signtool sign /fd SHA256 /a pass-mgr.exe`) so SmartScreen and AV trust it.
 Without that, a tampered download cannot be distinguished from a genuine one.
 
+### 9.16 Concurrency is single-writer, best-effort for readers
+A writable open takes an OS advisory lock on `mypath/pass-mgr.lock` (via
+`File::try_lock`, released automatically when the process exits — no stale lock to
+clear), so a second writable instance fails fast with `VaultError::Locked`.
+Read-only opens and the CLI read facilities (`decrypt`/`manifest`/`extract`) do
+**not** take the lock — multiple readers are fine — but they are therefore **not
+isolated** from a writer running *concurrently in the same instant*: a backup or
+extract taken while another session is mid-write can observe a per-operation
+in-between state. The read paths and `backup` do refuse a half-committed password
+change (`RekeyPending`), and each individual write is atomic, so the exposure is a
+narrow same-moment race, not corruption. The intended model is single-user,
+single-active-session; don't back up or extract while actively editing in another
+window.
+
 ## 10. Non-goals
 
 - Browser integration / autofill.
@@ -514,13 +593,14 @@ Without that, a tampered download cannot be distinguished from a genuine one.
 These are deliberately excluded to keep the attack surface and the codebase
 small (req. 1, 13).
 
-## 11. Partitioned document storage (format v4 — target design)
+## 11. Partitioned document storage (format v4 — as built)
 
-_Status: approved, pending implementation. Full execution spec, test plan, and
-review gates in [`PLAN.md`](PLAN.md)._
+_Status: **implemented** (`src/storage.rs` + `src/vault.rs`). The single-`.vol`
+store of earlier prototypes is replaced by this partitioned design. Execution
+history, the full test plan, and the review gates are in [`PLAN.md`](PLAN.md)._
 
-The single-`.vol` store (§4.3) is replaced by a partitioned design so the
-document store can grow without bound, load lazily, and survive crashes.
+The document store is partitioned so it can grow without bound, load lazily, and
+survive crashes.
 
 **Layout.** The user supplies only a directory `mypath`; all names are fixed:
 `mypath/vault.pmv`, `mypath/manifest/manifest.<N>`, `mypath/volume/vol.<N>`. The
