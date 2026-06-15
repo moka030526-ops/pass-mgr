@@ -248,7 +248,9 @@ parsers and path normalization. Front-end logic is driven through the TUI key
 handler and the GUI's deferred methods directly, with every TUI screen rendered to
 a ratatui `TestBackend`; egui rendering itself is not unit-tested (needs a GUI
 harness). The untrusted-input parsers (`parse_header`, `parse_frame`,
-`parse_manifest`, `scan_volume`) have `cargo-fuzz` targets.
+`parse_manifest`, `scan_volume`) have `cargo-fuzz` targets with a committed seed
+corpus (`fuzz/seeds/`) and a CI budget documented in `fuzz/README.md`; a 60 s ×
+4-target campaign runs clean (~62M executions, zero crashes).
 
 **Mutation testing (§13.6).** `cargo mutants` over the security-critical files is
 run periodically; surviving mutants are triaged. Killed: the `Header::parse`

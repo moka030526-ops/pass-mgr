@@ -598,22 +598,29 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
     let dir = pos.get(2).cloned().ok_or_else(|| anyhow::anyhow!("crashop: missing DIR"))?;
     let path = vault_file(&dir);
     let src = PathBuf::from(&dir).join("__crashop_src.bin");
+    // 600-byte doc bodies + a tiny volume cap so documents land in SEPARATE
+    // partitions — the crash tests then exercise new-volume creation, not just
+    // appends to an existing volume. Distinct first bytes identify each doc.
+    let body = |marker: u8| vec![marker; 600];
     match scenario {
-        // Create a vault (fast KDF) with one committed, record-referenced document.
+        // Create a vault (fast KDF), shrink the volume cap, and add one committed,
+        // record-referenced document (doc-one == 0xA1 x600) in partition 0.
         "setup" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             let mut v = OpenVault::create(path, b"a", b"b", params)?;
-            std::fs::write(&src, b"doc-one")?;
+            v.set_volume_max_size(1024)?;
+            std::fs::write(&src, body(0xA1))?;
             let id = v.add_document("/w", "d1.txt", &src)?;
             let mut tw = records::TrustWill::new()?;
             tw.file = Some(id);
             records::upsert(&mut v.vault.trust_wills, tw);
             v.save()?;
         }
-        // Add a second document + link it + save. Crash points put.*/vault.* fire.
+        // Add a second document (0xB2 x600) — rolls into a NEW partition (vol.1)
+        // given the tiny cap — link it + save. Crash points put.*/vault.* fire.
         "adddoc" => {
             let mut v = OpenVault::open(path, b"a", b"b")?;
-            std::fs::write(&src, b"doc-two")?;
+            std::fs::write(&src, body(0xB2))?;
             let id = v.add_document("/w", "d2.txt", &src)?;
             let mut tw = records::TrustWill::new()?;
             tw.file = Some(id);
@@ -624,6 +631,11 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         "rekey" => {
             let mut v = OpenVault::open(path, b"a", b"b")?;
             v.change_password(b"c", b"d")?;
+        }
+        // Just open under the NEW passwords — triggers recover_pending_rekey, so a
+        // crash point can abort recovery itself (testing idempotent re-recovery).
+        "open" => {
+            let _ = OpenVault::open(path, b"c", b"d")?;
         }
         other => anyhow::bail!("crashop: unknown scenario {other:?}"),
     }

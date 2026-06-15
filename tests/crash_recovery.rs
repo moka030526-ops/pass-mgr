@@ -47,6 +47,28 @@ fn run_crashop(dir: &Path, scenario: &str, crash_at: Option<&str>) -> bool {
     cmd.status().expect("spawn __crashop").success()
 }
 
+/// The content `setup` stores as the referenced document (doc-one == 0xA1 x600).
+fn doc_one() -> Vec<u8> {
+    vec![0xA1u8; 600]
+}
+/// The content the clean `adddoc` stores (doc-two == 0xB2 x600).
+fn doc_two() -> Vec<u8> {
+    vec![0xB2u8; 600]
+}
+
+/// Bytes of every record-referenced document, sorted, for multi-doc assertions.
+fn all_referenced_docs(v: &OpenVault) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = v
+        .vault
+        .trust_wills
+        .iter()
+        .filter_map(|t| t.file.as_ref())
+        .map(|id| v.read_document(id).unwrap()[..].to_vec())
+        .collect();
+    out.sort();
+    out
+}
+
 /// The bytes of the single record-referenced document (doc-one from `setup`).
 fn referenced_doc(v: &OpenVault) -> Vec<u8> {
     let tw = v.vault.trust_wills.iter().find(|t| t.file.is_some()).expect("a trust/will with a doc");
@@ -63,11 +85,14 @@ fn setup(dir: &Path) {
 fn force_kill_after_volume_append_recovers() {
     let dir = tmp_dir("vol");
     setup(&dir);
-    // Add a 2nd doc; abort right after its volume frame is durable but before the
-    // manifest commit. The frame is a tail past end_offset, invisible on reopen.
+    // Add a 2nd doc; with the tiny cap it rolls into a NEW partition (vol.1), and we
+    // abort right after its volume frame is durable but before the manifest commit.
+    // On reopen vol.1 is rebuilt from its volume, recovering the frame as an
+    // UNREFERENCED orphan (the record link + save never happened) — harmless; the
+    // vault stays consistent and openable.
     assert!(!run_crashop(&dir, "adddoc", Some("put.after_append")), "child must abort");
     let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("vault recovers + lock released");
-    assert_eq!(referenced_doc(&v), b"doc-one", "committed doc intact");
+    assert_eq!(referenced_doc(&v), doc_one(), "committed doc intact");
     drop(v);
     // The store is consistent enough that a fresh add still works.
     assert!(run_crashop(&dir, "adddoc", None), "subsequent add succeeds");
@@ -84,7 +109,7 @@ fn force_kill_after_manifest_commit_recovers() {
     // doc is a harmless orphan (unreferenced); the vault stays openable.
     assert!(!run_crashop(&dir, "adddoc", Some("put.after_commit")), "child must abort");
     let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("vault recovers");
-    assert_eq!(referenced_doc(&v), b"doc-one");
+    assert_eq!(referenced_doc(&v), doc_one());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -95,7 +120,7 @@ fn force_kill_during_vault_save_recovers() {
     // Abort at the vault.pmv rename during the post-add save: the old vault stands.
     assert!(!run_crashop(&dir, "adddoc", Some("vault.rename")), "child must abort");
     let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("old vault intact");
-    assert_eq!(referenced_doc(&v), b"doc-one");
+    assert_eq!(referenced_doc(&v), doc_one());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -109,7 +134,7 @@ fn force_kill_mid_rekey_rolls_forward() {
     assert!(!run_crashop(&dir, "rekey", Some("rekey.after_volume")), "child must abort");
     assert!(OpenVault::open(vault_pmv(&dir), b"a", b"b").is_err(), "old passwords no longer open it");
     let v = OpenVault::open(vault_pmv(&dir), b"c", b"d").expect("rolled forward to the new passwords");
-    assert_eq!(referenced_doc(&v), b"doc-one", "document survives the rekey");
+    assert_eq!(referenced_doc(&v), doc_one(), "document survives the rekey");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -121,6 +146,57 @@ fn force_kill_mid_rekey_after_manifest_rolls_forward() {
     assert!(!run_crashop(&dir, "rekey", Some("rekey.after_manifest")), "child must abort");
     assert!(OpenVault::open(vault_pmv(&dir), b"a", b"b").is_err());
     let v = OpenVault::open(vault_pmv(&dir), b"c", b"d").expect("rolled forward");
-    assert_eq!(referenced_doc(&v), b"doc-one");
+    assert_eq!(referenced_doc(&v), doc_one());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_mid_rekey_after_vault_rolls_forward() {
+    let dir = tmp_dir("rekey3");
+    setup(&dir);
+    // The last commit step: volume + manifest + vault.pmv all swapped, but `.rekey`
+    // not yet removed. The next open re-runs the (idempotent) commit and finishes.
+    assert!(!run_crashop(&dir, "rekey", Some("rekey.after_vault")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"c", b"d").expect("rolled forward (cleanup re-run)");
+    assert_eq!(referenced_doc(&v), doc_one());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_during_vault_write_recovers() {
+    let dir = tmp_dir("vwrite");
+    setup(&dir);
+    // Abort before the post-add vault temp-write even begins: the old vault stands.
+    assert!(!run_crashop(&dir, "adddoc", Some("vault.write")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("old vault intact");
+    assert_eq!(referenced_doc(&v), doc_one());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn multi_partition_rekey_force_kill_rolls_forward() {
+    let dir = tmp_dir("multirekey");
+    setup(&dir); // doc-one in partition 0
+    assert!(run_crashop(&dir, "adddoc", None), "clean add of doc-two -> partition 1");
+    // Rekey re-encrypts BOTH documents across BOTH partitions; abort mid-commit.
+    assert!(!run_crashop(&dir, "rekey", Some("rekey.after_manifest")), "child must abort");
+    assert!(OpenVault::open(vault_pmv(&dir), b"a", b"b").is_err(), "old passwords gone");
+    let v = OpenVault::open(vault_pmv(&dir), b"c", b"d").expect("rolled forward to new passwords");
+    assert_eq!(all_referenced_docs(&v), vec![doc_one(), doc_two()], "both docs survive across partitions");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_during_recovery_is_idempotent() {
+    let dir = tmp_dir("recrash");
+    setup(&dir);
+    // 1) Abort mid-rekey -> a pending `.rekey` (with READY) is left on disk.
+    assert!(!run_crashop(&dir, "rekey", Some("rekey.after_volume")), "rekey aborts");
+    // 2) Re-open (which runs recover_pending_rekey) but abort DURING the
+    //    roll-forward at a LATER step — a crash while recovering from a crash.
+    assert!(!run_crashop(&dir, "open", Some("rekey.after_manifest")), "recovery aborts");
+    // 3) A clean open completes the idempotent roll-forward; new passwords work.
+    let v = OpenVault::open(vault_pmv(&dir), b"c", b"d").expect("idempotent recovery completes");
+    assert_eq!(referenced_doc(&v), doc_one());
     std::fs::remove_dir_all(&dir).ok();
 }

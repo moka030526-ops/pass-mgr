@@ -2131,6 +2131,30 @@ mod tests {
         fs::remove_file(&src).ok();
     }
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_at_rekey_manifest_commit_discards_staging() {
+        // Same as above but the disk fills at the staged MANIFEST commit (after the
+        // staged volume append) rather than the volume write — still no READY, so
+        // the staging is discarded and the old vault stands intact.
+        let path = tmp_path("enospc-rekey2");
+        let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+        let src = write_src("rk2", b"trust body");
+        let id = v.add_document("/t", "t.txt", &src).unwrap();
+        v.save().unwrap();
+        crate::fault::fail_at("atomic.write", 1);
+        let err = v.change_password(b"n1", b"n2").unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, VaultError::Storage(_)), "got {err:?}");
+        drop(v);
+        assert!(OpenVault::open(path.clone(), b"n1", b"n2").is_err());
+        let re = OpenVault::open(path.clone(), b"o1", b"o2").unwrap();
+        assert_eq!(&*re.read_document(&id).unwrap(), b"trust body");
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists(), "staging discarded");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
     use proptest::prelude::*;
     proptest! {
         /// Virtual paths are always rooted, and `normalize_dir` is idempotent and
