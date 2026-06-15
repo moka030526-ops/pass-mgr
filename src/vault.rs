@@ -481,8 +481,9 @@ impl OpenVault {
         if dest.exists() {
             return Err(VaultError::AlreadyExists(dest.to_path_buf()));
         }
-        // Read + validate the mirror's vault JSON (wipe the buffer after parsing).
-        let vault_json = Zeroizing::new(fs::read(src.join("vault.json"))?);
+        // Read + validate the mirror's vault JSON (size-capped, symlink-rejected;
+        // wipe the buffer after parsing). The mirror is untrusted input.
+        let vault_json = Zeroizing::new(read_capped(&src.join("vault.json"), MAX_VAULT_SIZE)?);
         let vault: Vault = serde_json::from_slice(&vault_json)?;
         if vault.version != FORMAT_VERSION {
             return Err(VaultError::BadVersion(vault.version));
@@ -505,7 +506,7 @@ impl OpenVault {
             if !man_path.exists() {
                 break; // partitions are contiguous from 0
             }
-            let entries: Vec<ManifestEntry> = serde_json::from_slice(&fs::read(&man_path)?)?;
+            let entries: Vec<ManifestEntry> = serde_json::from_slice(&read_capped(&man_path, storage::MAX_MANIFEST_SIZE)?)?;
             let vol_dir = vol_root.join(format!("vol.{p}"));
             for e in &entries {
                 // The mirror is untrusted input: the blob is read from
@@ -514,7 +515,9 @@ impl OpenVault {
                 if !is_safe_blob_id(&e.id) {
                     return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document id in mirror: {:?}", e.id))));
                 }
-                let bytes = Zeroizing::new(fs::read(vol_dir.join(&e.id))?);
+                // Size-capped + symlink-rejected read (no OOM, no /dev/zero or
+                // arbitrary-file read through a planted symlink).
+                let bytes = Zeroizing::new(read_capped(&vol_dir.join(&e.id), MAX_DOC_SIZE)?);
                 store.put(&e.id, &e.path, &bytes, e.uploaded_at, &key)?;
             }
             p += 1;
@@ -804,6 +807,22 @@ fn selected_entries(store: &VolumeStore, part: Option<u32>) -> Result<Vec<Manife
 /// genuine export — it only stops a crafted mirror from escaping its directory.
 fn is_safe_blob_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
+}
+
+/// Read a file from an UNTRUSTED import mirror with a size ceiling, rejecting a
+/// symlink at the path. Mirrors the stat-before-read discipline used everywhere
+/// else (load_manifest, decrypt_file, add_document) so a crafted mirror cannot
+/// OOM the import (a multi-GB manifest/blob) or redirect a read through a symlink
+/// (e.g. to `/dev/zero` or an arbitrary file).
+fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(VaultError::Storage(StorageError::Corrupt(format!("mirror entry is a symlink: {}", path.display()))));
+    }
+    if meta.len() > max {
+        return Err(VaultError::TooLarge);
+    }
+    Ok(fs::read(path)?)
 }
 
 /// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
@@ -1676,6 +1695,49 @@ mod tests {
 
         std::fs::remove_dir_all(&mirror).ok();
         std::fs::remove_dir_all(&dest_dir).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_tree_rejects_oversized_manifest() {
+        // A crafted mirror with an oversized manifest must be rejected before the
+        // wholesale read (no OOM), like every other manifest-ingest path.
+        let (path, _docs) = seed_multi_partition("impbig", b"o1", b"o2");
+        let mirror = std::env::temp_dir().join(format!("pmbig-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        {
+            // Sparse-extend manifest.0.json past the cap (no real bytes written).
+            let f = OpenOptions::new().write(true).open(mirror.join("manifest/manifest.0.json")).unwrap();
+            f.set_len(storage::MAX_MANIFEST_SIZE + 1).unwrap();
+        }
+        let dest = std::env::temp_dir().join(format!("pmbigd-{}", nanos())).join(VAULT_FILE);
+        assert!(matches!(
+            OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()),
+            Err(VaultError::TooLarge)
+        ));
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(parent_dir(&dest)).ok();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_tree_rejects_symlink_blob() {
+        // A blob replaced by a symlink (e.g. -> /dev/zero or an arbitrary file) is
+        // rejected rather than followed.
+        let (path, docs) = seed_multi_partition("impsym", b"o1", b"o2");
+        let mirror = std::env::temp_dir().join(format!("pmsym-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        let blob = mirror.join("volume/vol.0").join(&docs[0].0);
+        std::fs::remove_file(&blob).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &blob).unwrap();
+        let dest = std::env::temp_dir().join(format!("pmsymd-{}", nanos())).join(VAULT_FILE);
+        assert!(matches!(
+            OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()),
+            Err(VaultError::Storage(_))
+        ));
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(parent_dir(&dest)).ok();
         cleanup(&path);
     }
 

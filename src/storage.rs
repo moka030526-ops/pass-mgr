@@ -60,8 +60,8 @@ pub const MAX_DOC_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 pub const MAX_PATH_LEN: usize = 256;
 /// Default partition size cap; new documents roll to a fresh partition past this.
 pub const DEFAULT_VOLUME_MAX_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
-/// Hard ceiling on a single decrypted manifest (DoS guard).
-const MAX_MANIFEST_SIZE: u64 = 256 * 1024 * 1024;
+/// Hard ceiling on a single manifest file (DoS guard).
+pub const MAX_MANIFEST_SIZE: u64 = 256 * 1024 * 1024;
 
 const FRAME_PREFIX_LEN: u64 = 4; // the `[u32 frame_len]`
 /// Worst-case per-frame on-disk overhead (prefix + nonce + tag + the two length
