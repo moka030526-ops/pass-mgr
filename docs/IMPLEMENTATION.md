@@ -35,6 +35,10 @@ src/
 │                in-memory data; **persisted inside the vault**, not on disk.
 ├── password.rs  Bias-free random password generator (OS CSPRNG, rejection
 │                sampling, class guarantees, Fisher–Yates shuffle).
+├── fault.rs     Crash-safety fault-injection hook (`point`). A zero-cost no-op
+│                unless the `fault-injection` feature is on; then it can return
+│                ENOSPC (full-disk tests) or abort (force-kill tests) at a named
+│                commit step. Compiled out of release builds.
 ├── gui.rs       egui/eframe graphical UI (default). Tabs + Config screen.
 ├── ui.rs        ratatui terminal UI (`--tui`). Field-based edit forms.
 └── main.rs      Binary crate: CLI dispatch (`--write`/`--tui`/`--part`), vault-
@@ -120,6 +124,14 @@ The vault is a **directory** (`mypath/vault.pmv` + `manifest/` + `volume/` +
   instance gets `VaultError::Locked`. Read-only opens skip it.
 - **Backup** (`backup()`): copies the whole encrypted tree into a collision-safe,
   timestamped subdir (refuses a half-committed rekey). No decryption.
+- **Plaintext round-trip** (`export_tree`/`import_tree`, DESIGN.md §6.3):
+  `export_tree` decrypts the whole vault into `out/vault.json` +
+  `manifest/manifest.<N>.json` + `volume/vol.<N>/<id>` (reusing the decrypt +
+  store-read paths; 0600/`create_new`; refuses a pending rekey). `import_tree`
+  rebuilds a new encrypted vault from such a mirror under new passwords, reusing
+  `VolumeStore::put` + `write_vault_file` then the normal open path; it treats the
+  mirror as untrusted (validates the version and rejects a blob id that isn't a
+  safe filename — `is_safe_blob_id` — so a crafted mirror can't traverse out).
 - Cross-platform file hardening (`harden_file`/`harden_dir`/`write_new_*`):
   0600/0700 on Unix; on Windows it relies on the inherited per-user `%APPDATA%` ACL.
 
@@ -182,6 +194,8 @@ pass-mgr decrypt [DIR]           print the decrypted vault JSON (secrets!) to st
 pass-mgr manifest [DIR] [--part N]   print the document index: one partition or all
 pass-mgr extract [DIR] OUT [--part N]   decrypt documents into OUT: one volume or all
 pass-mgr backup [DIR] DEST       copy the whole encrypted vault tree into DEST
+pass-mgr export-tree [DIR] OUT   decrypt the whole vault into a plaintext mirror
+pass-mgr import-tree SRC [DIR]   build a new encrypted vault from a plaintext mirror
 ```
 
 `--write`/`--tui` are position-independent flags. **Read-only is the default**,
@@ -207,11 +221,24 @@ cargo build --release                         # GUI default; --tui for terminal
 cargo test                                    # unit + property tests (proptest)
 cargo clippy --all-targets -- -D warnings     # lints (kept clean)
 cargo check --target x86_64-pc-windows-gnu    # Windows portability
+cargo test --features fault-injection         # + the crash / full-disk tests
 cargo +nightly fuzz build                     # build the fuzz targets
 cargo +nightly fuzz run parse_frame           # fuzz a parser (also parse_manifest/
                                               #   scan_volume/parse_header)
 cargo mutants --file src/storage.rs ...       # mutation testing (see below)
 ```
+
+**Crash-safety / fault injection (`--features fault-injection`).** The `fault`
+module instruments every commit step (volume append, manifest write+rename, vault
+write+rename, the rekey roll-forward). Two test layers exercise it: *in-process*
+ENOSPC injection asserts that a full disk at any step fails cleanly and leaves the
+prior state intact and recoverable (the failed op vanishes; a torn tail past
+`end_offset` is ignored; a half-staged rekey is discarded); and `tests/
+crash_recovery.rs` *spawns the real binary* (the hidden `__crashop` subcommand)
+and aborts it (`std::process::abort` — no `Drop`/flush, like SIGKILL/power-loss)
+after the volume append, after the manifest commit, during the vault save, and
+mid-rekey, then reopens and asserts recovery (document intact, lock released,
+rekey rolled forward). See DESIGN.md §12 for the matrix.
 
 Tests cover the core thoroughly (crypto, storage, vault, records, types,
 password): per-operation crash-injection and the full rekey roll-forward matrix,
