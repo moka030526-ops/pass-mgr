@@ -8,11 +8,28 @@
 //! egui is immediate-mode, so all vault-mutating side effects (save, delete,
 //! attach, …) are recorded as flags while rendering and applied *after* the
 //! panel closures return, which keeps borrows of `self` disjoint and simple.
+//!
+//! Rust orientation for non-Rust readers of this file:
+//! - `&T` is a *shared* (read-only) borrow of a value; `&mut T` is an
+//!   *exclusive* (read/write) borrow. Rust allows many `&T` xor one `&mut T` at
+//!   a time, which is why this file defers writes (see above).
+//! - `String` is an owned, growable, heap-allocated UTF-8 string; `&str` is a
+//!   borrowed string slice (a view into a `String` or a literal).
+//! - `Option<T>` is "maybe a T": `Some(x)` or `None`. `Result<T, E>` is
+//!   "success `Ok(x)` or failure `Err(e)`". The `?` operator early-returns the
+//!   error/`None` from the enclosing function. `.unwrap()`/`.expect("msg")`
+//!   extract the inner value but *panic* (abort) if it is absent.
+//! - "Closures" are inline anonymous functions written `|args| body`; egui's
+//!   `.show(ui, |ui| { ... })` calls our closure to draw a panel's contents.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+// `use` brings names into scope (like an import). `eframe`/`egui` are the
+// GUI framework; `zeroize` provides helpers that wipe secrets from memory.
 use eframe::egui;
+// `Zeroize` is a trait giving values a `.zeroize()` method (overwrite with
+// zeros); `Zeroizing<T>` is a wrapper that auto-zeroes its contents on drop.
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::password::{self, GenOptions};
@@ -24,6 +41,11 @@ use crate::crypto::KdfParams;
 /// Launch the graphical app and block until the window is closed. `writable`
 /// enables mutations; when false the vault is opened read-only and write
 /// controls are hidden.
+///
+/// `pub` makes this callable from outside this module. `PathBuf` is an owned,
+/// heap-allocated filesystem path (the borrowed view is `&Path`). The return
+/// type `anyhow::Result<()>` means "succeeds with the empty value `()` or fails
+/// with a boxed error".
 pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -35,18 +57,25 @@ pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
     eframe::run_native(
         "pass-mgr",
         options,
+        // `Box::new(...)` heap-allocates; `Box<T>` is an owning pointer to a
+        // heap value. `move |cc| ...` is a closure that *takes ownership* of the
+        // captured `path`/`writable` (the `move` keyword) so they outlive `run`.
         Box::new(move |cc| {
             // Lighter, higher-contrast theme.
             cc.egui_ctx.set_visuals(light_visuals());
             Ok(Box::new(GuiApp::new(path, writable)))
         }),
     )
+    // `.map_err(|e| ...)` transforms only the error case of a `Result`; here it
+    // wraps eframe's error into an `anyhow` error with context.
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
 }
 
 /// A light egui theme — brighter than the default light visuals (panels and
 /// widget faces lifted toward white for a lighter overall feel).
 fn light_visuals() -> egui::Visuals {
+    // `let mut v` declares a mutable local; without `mut`, bindings are
+    // read-only in Rust. We tweak fields of the default light theme below.
     let mut v = egui::Visuals::light();
     v.panel_fill = egui::Color32::from_rgb(252, 253, 255);
     v.window_fill = egui::Color32::from_rgb(255, 255, 255);
@@ -62,6 +91,10 @@ fn light_visuals() -> egui::Visuals {
     v
 }
 
+// `enum` is a closed set of named alternatives (a tagged union). `#[derive(...)]`
+// auto-generates trait implementations: `PartialEq`/`Eq` enable `==`/`!=`
+// comparisons; `Clone` enables explicit `.clone()`; `Copy` makes the value
+// trivially duplicated on assignment (so passing it around does not "move" it).
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Screen {
     Auth,
@@ -102,6 +135,10 @@ enum DocReq {
     Remove,
 }
 
+// `struct` is a record of named fields — the whole application state lives here.
+// Field types tell you the shape of each piece: `String` (owned text),
+// `bool` (flag), `Option<T>` (maybe present). egui calls our `ui()` method each
+// frame with `&mut GuiApp`, so every field is freely readable/writable there.
 struct GuiApp {
     path: std::path::PathBuf,
     /// When false the vault is opened read-only and write controls are hidden.
@@ -114,9 +151,12 @@ struct GuiApp {
     pw2: String,
     confirm2: String,
     auth_error: Option<String>,
-    // Unlocked vault.
+    // Unlocked vault. `Option<OpenVault>` is `None` until the user authenticates,
+    // then `Some(vault)`; this is how Rust models "may or may not be present"
+    // without null pointers.
     vault: Option<OpenVault>,
-    // Tabs + per-tab working edit buffer.
+    // Tabs + per-tab working edit buffer. Each `edit_*` is the record currently
+    // being edited on that tab, or `None` when nothing is selected.
     tab: Tab,
     edit_instruction: Option<Instruction>,
     edit_trustwill: Option<TrustWill>,
@@ -147,13 +187,20 @@ struct GuiApp {
     status: String,
     clipboard_dirty: bool,
     // When set, the clipboard should be wiped at/after this instant.
+    // `Option<Instant>`: `None` = no pending wipe, `Some(t)` = wipe at time `t`.
     clipboard_clear_at: Option<Instant>,
 }
 
 /// How long a copied password stays on the clipboard before it is auto-cleared.
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(15);
 
+// `impl Trait for Type` provides a trait's methods for a type (like implementing
+// an interface). `Drop` runs `drop()` automatically when a `GuiApp` goes out of
+// scope (e.g. on quit) — used here to wipe the in-memory password buffers and
+// clear the OS clipboard so secrets do not linger after exit.
 impl Drop for GuiApp {
+    // `&mut self` is an exclusive borrow of the value being dropped, so we can
+    // overwrite its fields. `.zeroize()` overwrites the heap bytes with zeros.
     fn drop(&mut self) {
         self.pw1.zeroize();
         self.confirm1.zeroize();
@@ -165,8 +212,14 @@ impl Drop for GuiApp {
     }
 }
 
+// Inherent methods of `GuiApp` (its own functions, not from a trait). `Self`
+// inside this block is shorthand for the type `GuiApp`.
 impl GuiApp {
+    // A constructor by convention; `-> Self` returns a new `GuiApp`. There is no
+    // `new` keyword in Rust — this is just a regular function.
     fn new(path: std::path::PathBuf, writable: bool) -> Self {
+        // `if ... { } else { }` is an expression here: its value initializes
+        // `auth_mode` (unlock an existing vault file, else offer to create one).
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         GuiApp {
             path,
@@ -210,6 +263,9 @@ impl GuiApp {
     /// Wipe the clipboard once the auto-clear deadline has passed; otherwise
     /// schedule a repaint so the deadline fires even with no user interaction.
     fn tick_clipboard(&mut self, ctx: &egui::Context) {
+        // `if let Some(x) = opt { ... }` runs the block only when `opt` is
+        // `Some`, binding its inner value to `x`. Here: only act if a wipe
+        // deadline has been scheduled. `&egui::Context` is a shared borrow.
         if let Some(deadline) = self.clipboard_clear_at {
             let now = Instant::now();
             if now >= deadline {
@@ -223,12 +279,21 @@ impl GuiApp {
         }
     }
 
+    // Returns a shared borrow (`&OpenVault`) of the open vault. `.as_ref()` turns
+    // `&Option<T>` into `Option<&T>` (borrow without taking ownership);
+    // `.expect("…")` then unwraps it, panicking with this message if `None` —
+    // safe here because this is only called on the Main screen where the vault
+    // is guaranteed open.
     fn vault_ref(&self) -> &OpenVault {
         self.vault.as_ref().expect("vault is open on the main screen")
     }
 
     /// Persist the in-memory vault, reporting any error to the status bar.
     fn persist(&mut self) {
+        // A "let-chain": both conditions must hold to enter the block. First
+        // `.as_mut()` borrows the vault mutably if present (binding `ov`); then
+        // `ov.save()` runs and we match its `Err(e)` case. `&&` short-circuits,
+        // so save is only attempted when the vault exists.
         if let Some(ov) = self.vault.as_mut()
             && let Err(e) = ov.save()
         {
@@ -245,6 +310,10 @@ impl GuiApp {
 
     // --- Auth ----------------------------------------------------------------
 
+    // Returns either `Ok((pw1, pw2))` (a 2-tuple of zeroizing strings) or
+    // `Err(message)`. `&self` is a read-only borrow — this validates without
+    // mutating. `.into()` converts the string literal `&str` into an owned
+    // `String` to match the `Err` type.
     fn confirmed_passwords(&self) -> Result<(Zeroizing<String>, Zeroizing<String>), String> {
         if self.pw1.is_empty() || self.pw2.is_empty() {
             return Err("Both passwords are required.".into());
@@ -252,13 +321,18 @@ impl GuiApp {
         if self.pw1 != self.confirm1 || self.pw2 != self.confirm2 {
             return Err("Password confirmations do not match.".into());
         }
-        // Zeroizing so these password copies are wiped from the heap when dropped.
+        // `.clone()` makes owned copies of the password strings; wrapping them in
+        // `Zeroizing` means those copies are wiped from the heap when dropped.
         Ok((Zeroizing::new(self.pw1.clone()), Zeroizing::new(self.pw2.clone())))
     }
 
     fn submit_auth(&mut self) {
+        // `match` dispatches on the value, like a switch but exhaustive: every
+        // variant must be handled. Each `Variant => { ... }` is an arm.
         match self.auth_mode {
             AuthMode::ChangePassword => {
+                // Destructure the success tuple into `pw1`/`pw2`; on `Err`, record
+                // the message and `return` early from the whole method.
                 let (pw1, pw2) = match self.confirmed_passwords() {
                     Ok(p) => p,
                     Err(m) => {
@@ -267,6 +341,8 @@ impl GuiApp {
                     }
                 };
                 if let Some(ov) = self.vault.as_mut() {
+                    // `.as_bytes()` views the string as a read-only byte slice
+                    // (`&[u8]`), which the crypto layer expects.
                     match ov.change_password(pw1.as_bytes(), pw2.as_bytes()) {
                         Ok(()) => {
                             self.status = "Master passwords changed.".into();
@@ -278,6 +354,7 @@ impl GuiApp {
                     }
                 }
             }
+            // `A | B =>` matches either variant with one arm.
             AuthMode::Create | AuthMode::Unlock => self.submit_open_or_create(),
         }
     }
@@ -289,6 +366,9 @@ impl GuiApp {
                 Some("No vault here, and this is read-only. Relaunch with --write to create one.".into());
             return;
         }
+        // `result` is assigned from an `if/else` expression: create a new vault
+        // or open an existing one. `self.path.clone()` hands an owned copy of the
+        // path to the call (the original stays in `self`).
         let result = if creating {
             let (pw1, pw2) = match self.confirmed_passwords() {
                 Ok(p) => p,
@@ -327,9 +407,12 @@ impl GuiApp {
                 self.wipe_passwords();
                 self.screen = Screen::Main;
             }
+            // Match a specific error variant; `(_)` ignores its inner payload so
+            // the wrong-password case is reported generically (no detail leak).
             Err(VaultError::Crypto(_)) => {
                 self.auth_error = Some("Wrong password(s) or corrupted vault.".into());
             }
+            // `Err(e)` catches every other error variant.
             Err(e) => self.auth_error = Some(format!("{e}")),
         }
     }
@@ -341,7 +424,11 @@ impl GuiApp {
         self.confirm2.zeroize();
     }
 
+    // `&mut egui::Ui` is the drawing surface, borrowed mutably so widgets can be
+    // added to it. egui is immediate-mode: this method re-runs every frame.
     fn ui_auth(&mut self, ui: &mut egui::Ui) {
+        // `match` used as an expression: it yields a `(heading, help)` pair which
+        // we immediately destructure into two named bindings.
         let (heading, help) = match self.auth_mode {
             AuthMode::Create => ("Create vault", "Choose two passwords. Both are required to open this vault."),
             AuthMode::Unlock => ("Unlock vault", "Enter both passwords to unlock."),
@@ -350,6 +437,8 @@ impl GuiApp {
         let confirm = self.auth_mode != AuthMode::Unlock;
 
         ui.add_space(28.0);
+        // `|ui| { ... }` is a closure (anonymous function). egui passes a child
+        // `ui` into it so everything inside is laid out vertically and centered.
         ui.vertical_centered(|ui| {
             ui.heading(heading);
             ui.label(egui::RichText::new(format!("Vault: {}", self.path.display())).weak());
@@ -357,9 +446,12 @@ impl GuiApp {
         });
         ui.add_space(16.0);
 
+        // Track whether the user requested submission; `|=` ORs in `true` if any
+        // password field had Enter pressed (see `password_field`'s return value).
         let mut submit = false;
         egui::Grid::new("auth_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label("Password 1");
+            // `&mut self.pw1` lends the field to the widget so typing updates it.
             submit |= password_field(ui, &mut self.pw1);
             ui.end_row();
             if confirm {
@@ -378,6 +470,8 @@ impl GuiApp {
         });
 
         ui.add_space(8.0);
+        // `&self.auth_error` borrows the Option so we can read the message
+        // without moving it out; show it only when an error is present.
         if let Some(err) = &self.auth_error {
             ui.colored_label(egui::Color32::from_rgb(190, 50, 50), err);
             ui.add_space(4.0);
@@ -415,6 +509,8 @@ impl GuiApp {
             tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
             ui.separator();
             // Change-password is a write; only offer it when writable.
+            // `&&` short-circuits: the button is only drawn/evaluated when
+            // `self.writable` is true, so read-only mode hides it entirely.
             if self.writable
                 && ui.button("🔑 Passwords").clicked()
             {
@@ -457,6 +553,10 @@ impl GuiApp {
             );
         }
 
+        // These `bool` flags are the deferred-action pattern: rendering only
+        // *sets* them; the actual vault mutations happen after the closures below
+        // return, so we never hold a render-time borrow of `self` and a write
+        // borrow at the same time.
         let mut add_asset = false;
         let mut add_account = false;
         let mut add_subtype = false;
@@ -468,11 +568,17 @@ impl GuiApp {
         let cats = self.vault_ref().categories();
         let type_names = cats.account_type_names();
         let asset_list = cats.asset.join(" · ");
+        // Iterator pipeline: `.iter()` walks the account types by reference;
+        // `.map(|t| ...)` transforms each into an `(name, subtypes)` tuple via a
+        // closure; `.collect()` gathers them into a `Vec` (growable array). The
+        // type annotation `Vec<(String, String)>` tells `collect` what to build.
         let account_list: Vec<(String, String)> = cats
             .account
             .iter()
             .map(|t| {
                 let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
+                // `.clone()` because the snapshot must own its strings (the
+                // borrow of `cats` ends when this function's closures run).
                 (t.name.clone(), subs)
             })
             .collect();
@@ -489,6 +595,8 @@ impl GuiApp {
 
             ui.add_space(14.0);
             ui.label(egui::RichText::new("Account types & subtypes").strong());
+            // `for (name, subs) in &account_list` iterates by reference and
+            // destructures each tuple into its two parts.
             for (name, subs) in &account_list {
                 ui.label(egui::RichText::new(format!("{name}: {subs}")).weak());
             }
@@ -554,7 +662,11 @@ impl GuiApp {
 
         // Deferred actions (kept out of the closures to keep borrows simple).
         if add_asset {
+            // `.trim()` returns a trimmed `&str`; `.to_string()` makes it owned.
             let name = self.new_asset_type.trim().to_string();
+            // `.expect(...)` unwraps the open vault (safe on the config screen).
+            // The call returns `Result<bool, _>`: `Ok(true)` = added,
+            // `Ok(false)` = no-op (duplicate/empty), `Err` = save failure.
             match self.vault.as_mut().expect("vault open on config").add_asset_type(&name) {
                 Ok(true) => {
                     self.status = format!("Added asset/liability type “{name}”.");
@@ -601,6 +713,7 @@ impl GuiApp {
             if dest.is_empty() {
                 self.status = "Enter a backup destination directory.".into();
             } else {
+                // `Path::new(&dest)` makes a borrowed `&Path` view of the string.
                 match vault::backup(&self.path, Path::new(&dest)) {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
                     Err(e) => self.status = format!("Backup failed: {e}"),
@@ -608,8 +721,13 @@ impl GuiApp {
             }
         }
         if set_volume {
+            // `.parse::<u64>()` parses text into an unsigned 64-bit integer,
+            // returning a `Result` (`Err` if the text is not a number).
             match self.cfg_volume_size.trim().parse::<u64>() {
+                // A "match guard": this arm matches `Ok(mib)` only if `mib >= 1`.
                 Ok(mib) if mib >= 1 => {
+                    // `.saturating_mul` multiplies but clamps at the max instead
+                    // of overflowing/panicking.
                     let bytes = mib.saturating_mul(1024 * 1024);
                     match self.vault.as_mut().expect("vault open on config").set_volume_max_size(bytes) {
                         Ok(()) => {
@@ -619,6 +737,7 @@ impl GuiApp {
                         Err(e) => self.status = format!("Save failed: {e}"),
                     }
                 }
+                // `_` is the catch-all arm: any other case (parse error, or 0).
                 _ => self.status = "Enter a whole number of MiB (at least 1).".into(),
             }
         }
@@ -632,15 +751,28 @@ impl GuiApp {
     // --- Tab: Instructions ---------------------------------------------------
 
     fn tab_instructions(&mut self, ui: &mut egui::Ui) {
+        // Build the left-hand list (id+label pairs) from the vault's records.
         let labels = label_list(&self.vault_ref().vault.instructions);
+        // `cur` = id of the record being edited, if any. `.as_ref()` borrows the
+        // Option's contents; `.map(|r| r.id.clone())` runs the closure only when
+        // `Some`, producing `Option<String>` (an owned copy of the id).
         let cur = self.edit_instruction.as_ref().map(|r| r.id.clone());
+        // Deferred-action flags (filled during rendering, acted on afterwards).
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
 
+        // `ui.columns(2, |c| ...)`: `c` is a slice of two child UIs (left/right).
         ui.columns(2, |c| {
+            // Destructuring assignment into the outer `new`/`select` vars.
+            // `cur.as_deref()` turns `Option<String>` into `Option<&str>` (a
+            // borrowed view) without consuming `cur`.
             (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable);
+            // Shadow `ui` with a mutable borrow of the right column. "Shadowing"
+            // reuses the name `ui` for a new binding within this block.
             let ui = &mut c[1];
+            // `.as_mut()` borrows the edited record mutably so the form widgets
+            // below can write directly into its fields.
             if let Some(r) = self.edit_instruction.as_mut() {
                 egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
@@ -656,14 +788,21 @@ impl GuiApp {
             }
         });
 
+        // Now apply the deferred actions outside the render closure.
         if new {
+            // `Instruction::new()` returns a `Result`; `.ok()` discards any error
+            // and yields `Option<Instruction>` (Some on success, None on error).
             self.edit_instruction = Instruction::new().ok();
         }
         if let Some(i) = select {
+            // `.get(i)` returns `Option<&Instruction>` (None if out of range);
+            // `.cloned()` turns that into an owned `Option<Instruction>`.
             self.edit_instruction = self.vault_ref().vault.instructions.get(i).cloned();
         }
         match action {
             FormAction::Save => {
+                // Let-chain: take an owned clone of the edited record AND a mutable
+                // borrow of the vault, then upsert (insert-or-update) into it.
                 if let Some(r) = self.edit_instruction.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -673,6 +812,7 @@ impl GuiApp {
                 self.status = "Saved.".into();
             }
             FormAction::Delete => self.delete_current(Tab::Instructions),
+            // `_ => {}` handles the remaining `FormAction::None` with a no-op.
             _ => {}
         }
     }
@@ -682,6 +822,10 @@ impl GuiApp {
     fn tab_trustwill(&mut self, ui: &mut egui::Ui) {
         let labels = label_list(&self.vault_ref().vault.trust_wills);
         let cur = self.edit_trustwill.as_ref().map(|r| r.id.clone());
+        // `.and_then(|r| r.file.clone())` chains two Options: only if a record is
+        // being edited AND it has an attached `file` do we get `Some(id)`. (Using
+        // `.map` here would give a nested `Option<Option<…>>`; `and_then`
+        // flattens it.)
         let attached = self.attached_label(self.edit_trustwill.as_ref().and_then(|r| r.file.clone()));
         let mut new = false;
         let mut select = None;
@@ -749,6 +893,9 @@ impl GuiApp {
             ui.checkbox(&mut self.asset_filter_review, "Show only items flagged for review");
         });
         let fr = self.asset_filter_review;
+        // Iterator pipeline: walk assets by reference, keep only those passing the
+        // filter closure (`!fr` = filter off, or the item is flagged), turn each
+        // into an `(id, label)` tuple, and collect into a `Vec`.
         let labels: Vec<(String, String)> = self
             .vault_ref()
             .vault
@@ -826,7 +973,10 @@ impl GuiApp {
         if let Some(i) = select
             && let Some((id, _)) = labels.get(i)
         {
-            // Resolve by id (the list may be filtered by the review flag).
+            // Resolve by id (the list may be filtered by the review flag). The
+            // `(id, _)` pattern keeps the id and ignores the label. `.find(|a|
+            // ...)` returns the first matching element (`&a.id == id` compares the
+            // borrowed ids); `.cloned()` makes an owned copy for the edit buffer.
             self.edit_asset = self.vault_ref().vault.assets.iter().find(|a| &a.id == id).cloned();
             self.clear_doc_inputs();
         }
@@ -860,6 +1010,7 @@ impl GuiApp {
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.account_subtype.clone()))
         } else {
             let ft = self.acct_filter_type.clone();
+            // `&ft` passes a shared borrow; the callee reads but does not own it.
             let mut opts = self.vault_ref().categories().subtypes_for(&ft);
             for a in &self.vault_ref().vault.accounts {
                 if a.account_type == ft
@@ -914,11 +1065,15 @@ impl GuiApp {
         let mut select = None;
         let mut action = FormAction::None;
         let mut generate = false;
+        // Deferred password-copy: `None` unless the user clicks copy, in which
+        // case it holds the secret in a self-wiping `Zeroizing<String>`.
         let mut copy_pw: Option<Zeroizing<String>> = None;
         // Subtypes for the record under edit, looked up from the vault's category
         // lists before the mutable borrow of `edit_account` below. The record's
         // current subtype is kept selectable even if it is a free-text value not
         // in the configured list (e.g. legacy/imported data).
+        // `.map(|r| { ... last expr is the value })` builds the list when a record
+        // is being edited; `.unwrap_or_default()` yields an empty `Vec` otherwise.
         let subtypes: Vec<String> = self
             .edit_account
             .as_ref()
@@ -962,6 +1117,7 @@ impl GuiApp {
                             generate = true;
                         }
                         if ui.button("📋").on_hover_text("Copy").clicked() {
+                            // Stash a self-wiping copy to act on after rendering.
                             copy_pw = Some(Zeroizing::new(r.password.clone()));
                         }
                     });
@@ -999,10 +1155,13 @@ impl GuiApp {
         if generate
             && let Some(r) = self.edit_account.as_mut()
         {
+            // `.unwrap_or_default()` yields the generated password on success or
+            // an empty string on the (unexpected) error case, avoiding a panic.
             r.password = password::generate(&GenOptions::default()).unwrap_or_default();
             self.reveal_pw = true;
         }
         if let Some(pw) = copy_pw {
+            // `pw` is moved into the call and wiped when it drops there.
             self.copy_to_clipboard(pw);
         }
         match action {
@@ -1074,6 +1233,8 @@ impl GuiApp {
 
     /// Human-readable "location/filename" of an attached volume file id.
     fn attached_label(&self, file_id: Option<String>) -> Option<String> {
+        // `file_id?` is the `?` operator on an Option: if `None`, return `None`
+        // from this function immediately; otherwise unwrap to `id` and continue.
         let id = file_id?;
         self.vault_ref().doc_path(&id)
     }
@@ -1099,10 +1260,13 @@ impl GuiApp {
         }
     }
 
+    // Performs the document attach/export/detach requested during rendering.
+    // Split out so the vault is borrowed mutably *here*, not while drawing.
     fn handle_doc(&mut self, req: DocReq, target: DocTarget) {
         match req {
             DocReq::None => {}
             DocReq::Attach => {
+                // Clone the three input strings into a tuple, then destructure.
                 let (loc, name, src) =
                     (self.doc_location.clone(), self.doc_filename.clone(), self.doc_source.clone());
                 if name.trim().is_empty() || src.trim().is_empty() {
@@ -1118,6 +1282,8 @@ impl GuiApp {
                     );
                     return;
                 }
+                // Nested match: get the vault (mut), then attempt the upload. Each
+                // branch either yields the new document `id` or returns early.
                 let id = match self.vault.as_mut() {
                     Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
                         Ok(id) => id,
@@ -1154,6 +1320,8 @@ impl GuiApp {
                 if let Some(old) = previous
                     && let Some(ov) = self.vault.as_mut()
                 {
+                    // `let _ = ...` deliberately discards the `Result`: a failure
+                    // here only orphans a blob (harmless), so it is not reported.
                     let _ = ov.remove_document(&old);
                 }
                 self.clear_doc_inputs();
@@ -1169,6 +1337,8 @@ impl GuiApp {
                     self.status = "Enter an 'export to' path first.".into();
                     return;
                 }
+                // Tuple pattern: this block runs only if BOTH a file id exists
+                // and the vault is open (both elements are `Some`).
                 if let (Some(id), Some(ov)) = (file_id, self.vault.as_ref()) {
                     match ov.export_document(&id, Path::new(&dest)) {
                         Ok(()) => self.status = format!("Exported to {dest}"),
@@ -1201,6 +1371,8 @@ impl GuiApp {
                 // entry is already gone (ArchiveMismatch -> unopenable). An
                 // orphaned blob is harmless (it lingers until a future compaction).
                 self.persist();
+                // Three-part let-chain: there is an id, the vault is open, and the
+                // blob removal failed — only then report the cleanup error.
                 if let Some(id) = id
                     && let Some(ov) = self.vault.as_mut()
                     && let Err(e) = ov.remove_document(&id)
@@ -1217,9 +1389,14 @@ impl GuiApp {
         // Collect any attached document ids to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
         if let Some(ov) = self.vault.as_mut() {
+            // `&mut ov.vault` is an exclusive borrow of the in-memory vault data,
+            // reused below as `v` to keep the match arms terse.
             let v = &mut ov.vault;
             match tab {
                 Tab::Instructions => {
+                    // `.take()` moves the edited record out of the Option, leaving
+                    // `None` behind (so the form clears after deletion) and giving
+                    // us owned `r` to read its id.
                     if let Some(r) = self.edit_instruction.take() {
                         records::remove(&mut v.instructions, &r.id, &mut v.audit, "Instruction");
                     }
@@ -1266,6 +1443,9 @@ impl GuiApp {
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
         // `text` is wiped on drop; arboard copies into the OS clipboard (cleared
         // on the 15s timer and on exit).
+        // `.and_then(|mut c| ...)` on a `Result` runs the closure only if opening
+        // the clipboard succeeded; `mut c` is a mutable clipboard handle, and
+        // `text.as_str()` borrows the secret as `&str` to write it.
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
             Ok(()) => {
                 self.clipboard_dirty = true;
@@ -1277,13 +1457,17 @@ impl GuiApp {
     }
 }
 
+// Identifies which document-bearing tab a deferred doc action applies to.
 #[derive(Clone, Copy)]
 enum DocTarget {
     TrustWill,
     Asset,
 }
 
+// Implement eframe's `App` trait so `GuiApp` can be driven by the framework.
+// eframe calls `ui()` on every frame to (re)draw the whole window.
 impl eframe::App for GuiApp {
+    // The leading `_` in `_frame` marks the parameter as intentionally unused.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick_clipboard(ui.ctx());
         if self.screen == Screen::Auth {
@@ -1305,6 +1489,8 @@ impl eframe::App for GuiApp {
                 ui.label(egui::RichText::new(&self.status).weak());
             });
         }
+        // Draw the active tab. The closure body is a `match` selecting which
+        // tab-rendering method to call based on the current `self.tab`.
         egui::CentralPanel::default().show_inside(ui, |ui| match self.tab {
             Tab::Instructions => self.tab_instructions(ui),
             Tab::TrustWill => self.tab_trustwill(ui),
@@ -1317,6 +1503,9 @@ impl eframe::App for GuiApp {
 
 // --- Free helper widgets -----------------------------------------------------
 
+// `current` is borrowed mutably so the click can change it. `*current` is a
+// *dereference*: it reads/writes the value behind the `&mut` reference (compare
+// `*current == tab`, assign `*current = tab`).
 fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
     if ui.selectable_label(*current == tab, label).clicked() {
         *current = tab;
@@ -1324,6 +1513,10 @@ fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
 }
 
 /// Render the left list panel; return `(new_clicked, selected_index)`.
+// `labels: &[(String, String)]` is a borrowed *slice* — a read-only view of a
+// contiguous run of `(id, label)` tuples (no ownership taken). `Option<&str>`
+// is a maybe-present borrowed string. Returning a tuple lets one call report two
+// outcomes at once.
 fn list_panel(
     ui: &mut egui::Ui,
     title: &str,
@@ -1344,7 +1537,11 @@ fn list_panel(
     ui.separator();
     ui.label(egui::RichText::new(format!("{} item(s)", labels.len())).weak());
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // `.enumerate()` pairs each item with its index `i`; the `(i, (id, label))`
+        // pattern destructures the index and the inner tuple together.
         for (i, (id, label)) in labels.iter().enumerate() {
+            // `id.as_str()` borrows the `String` as `&str` to compare with the
+            // currently-selected id.
             let selected = current_id == Some(id.as_str());
             if ui.selectable_label(selected, label).clicked() {
                 select = Some(i);
@@ -1374,6 +1571,8 @@ fn form_buttons(ui: &mut egui::Ui, writable: bool) -> FormAction {
 }
 
 /// A two-column "label + single-line edit" row inside a Grid.
+// `value: &mut String` lets the text widget write the user's edits straight back
+// into the caller's field.
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
@@ -1381,6 +1580,9 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
 }
 
 /// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.
+// `impl Iterator<Item = String>` is a generic parameter: accept *any* iterator
+// yielding `String`s (the caller decides the concrete type). `.dedup()` removes
+// *consecutive* duplicates, which is why it follows `.sort()`.
 fn distinct_values(values: impl Iterator<Item = String>) -> Vec<String> {
     let mut v: Vec<String> = values.filter(|s| !s.is_empty()).collect();
     v.sort();
@@ -1412,6 +1614,9 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {
 /// The document attach / export / detach section. Returns the requested action;
 /// the caller performs the actual volume operation (to keep `self` borrows
 /// disjoint). `attached_present` reflects whether the record currently has a file.
+// `#[allow(...)]` silences a specific lint (here: the linter's "too many
+// arguments" warning) — it does not change behavior. The `&mut String` inputs
+// are the caller's text buffers, edited in place by the widgets below.
 #[allow(clippy::too_many_arguments)]
 fn doc_section(
     ui: &mut egui::Ui,
@@ -1427,6 +1632,8 @@ fn doc_section(
     let mut req = DocReq::None;
     ui.label(egui::RichText::new(format!("{label} (encrypted volume)")).strong());
     if attached_present {
+        // `.unwrap_or("(unknown)")` yields the label if present, else a fallback
+        // string — never panics.
         ui.label(format!("Attached: {}", attached_label.unwrap_or("(unknown)")));
         ui.horizontal(|ui| {
             // Export is a read and is always allowed; Detach mutates the vault.
@@ -1471,6 +1678,7 @@ fn doc_section(
 }
 
 /// A collapsing, timestamped history view for a record.
+// `&[records::Change]` is a read-only slice of change entries.
 fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
     ui.add_space(8.0);
     egui::CollapsingHeader::new("History").default_open(false).show(ui, |ui| {
@@ -1478,6 +1686,7 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
             ui.label(egui::RichText::new("(no changes recorded)").weak());
         }
         egui::ScrollArea::vertical().max_height(180.0).id_salt("hist").show(ui, |ui| {
+            // `.iter().rev()` walks the entries newest-first (reverse order).
             for c in history.iter().rev() {
                 let detail = if c.detail.is_empty() { c.action.clone() } else { c.detail.clone() };
                 ui.label(format!("{}  —  {detail}", format_time(c.at)));
@@ -1489,19 +1698,31 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
 /// A masked single-line password field; returns true if Enter was pressed.
 fn password_field(ui: &mut egui::Ui, value: &mut String) -> bool {
     let resp = ui.add(egui::TextEdit::singleline(value).password(true).desired_width(280.0));
+    // The final expression (no `;`) is the return value. `ui.input(|i| ...)`
+    // passes a closure that inspects the frame's input state; this returns true
+    // when the field just lost focus AND Enter was pressed.
     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
 /// Build `(id, label)` pairs for a record list.
+// `<R: Record>` is a generic: this works for any type `R` that implements the
+// `Record` trait (i.e. exposes `.id()` and `.label()`). `&[R]` is a slice of
+// such records. `.to_string()` makes an owned `String` from the borrowed id.
 fn label_list<R: Record>(list: &[R]) -> Vec<(String, String)> {
     list.iter().map(|r| (r.id().to_string(), r.label())).collect()
 }
 
 /// Best-effort clearing of the system clipboard on exit.
 fn clear_clipboard() {
+    // `let _ = ...` ignores the `Result`: if the clipboard is unavailable there
+    // is nothing useful to do. Setting it to an empty `String` overwrites any
+    // copied secret.
     let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(String::new()));
 }
 
+// `#[cfg(test)]` is conditional compilation: this module is compiled ONLY when
+// running tests, so it adds nothing to the shipped binary. `use super::*` pulls
+// in everything from the parent module (this file) for the tests to exercise.
 #[cfg(test)]
 mod tests {
     use super::*;

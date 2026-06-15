@@ -7,24 +7,56 @@
 //! [`upsert`]/[`remove`] helpers, so each type only describes its own fields and
 //! field-level diff. All types wipe their contents on drop (they hold secrets
 //! such as passwords).
+//!
+//! Rust orientation for non-Rust readers (concepts used throughout this file):
+//! - `//!` starts a *module*-level doc comment (this whole block describes the
+//!   file); `///` documents the item right below it; `//` is an ordinary comment.
+//! - `&T` is a *shared (read-only) borrow* of a value, `&mut T` an *exclusive
+//!   (read/write) borrow*. Passing `&x` lends access without giving up ownership;
+//!   `clone()` makes an independent copy when a value would otherwise be moved.
+//! - `Result<T, E>` is "either an `Ok(T)` or an `Err(E)`"; `Option<T>` is "either
+//!   `Some(T)` or `None`". The `?` operator means "if this is an error/None,
+//!   return it from the current function early; otherwise unwrap the value".
+//! - `Vec<T>` is a growable array; `String` is an owned text buffer; `&str` is a
+//!   borrowed view of text. `derive(...)` auto-generates trait implementations.
 
+// `use` brings names into scope (like imports).
+// serde = serialization framework; Deserialize/Serialize let these structs be
+// converted to/from bytes (used for encrypting the vault to disk).
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+// zeroize = securely wipe memory. `Zeroize` exposes a wipe method; `ZeroizeOnDrop`
+// makes a value wipe itself automatically when it goes out of scope (req: secrets
+// must not linger in RAM).
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+// `crate::crypto` is the sibling `crypto` module of this same crate (binary).
+// `self` here also imports the `crypto` module name itself, so both `crypto::...`
+// and `CryptoError` are usable below.
 use crate::crypto::{self, CryptoError};
 
 /// Unix-seconds "now" (0 if the clock is before the epoch).
+// `pub fn` = public function; `-> i64` = returns a 64-bit signed integer.
 pub fn unix_now() -> i64 {
     SystemTime::now()
+        // `duration_since` returns a `Result`: Ok(duration) if now >= epoch, else Err.
         .duration_since(UNIX_EPOCH)
+        // `.map(|d| ...)` transforms the Ok value with a *closure* (an inline
+        // anonymous function `|d| body`). `as i64` is a numeric cast.
         .map(|d| d.as_secs() as i64)
+        // `.unwrap_or(0)` yields the inner value, or 0 if it was an Err.
         .unwrap_or(0)
 }
 
 /// A random 128-bit hex id, used for records and volume blobs.
+// Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
+    // `::<16>` is a const generic argument: ask for exactly 16 random bytes.
+    // The trailing `?` propagates an error: if `random_bytes` returns Err, this
+    // function returns that Err immediately; otherwise `bytes` is the 16 bytes.
     let bytes = crypto::random_bytes::<16>()?;
+    // Iterate the bytes, format each as 2 lowercase hex digits, and `.collect()`
+    // the resulting chars into one `String`. `Ok(...)` wraps it as the success case.
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -32,7 +64,11 @@ pub fn random_id() -> Result<String, CryptoError> {
 /// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
 /// to the epoch. Shared by the human and filename timestamp formatters so the
 /// (fiddly) calendar math lives in exactly one place.
+// `pub(crate)` = visible anywhere in this crate but not to outside users.
+// The return type `(i64, i64, ...)` is a *tuple*: several values bundled together.
 pub(crate) fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
+    // `let ts = ...` here *shadows* the parameter `ts`: a new binding reusing the
+    // name. `.max(0)` clamps negatives to 0 (so pre-epoch times become the epoch).
     let ts = ts.max(0);
     let days = ts.div_euclid(86_400);
     let sod = ts.rem_euclid(86_400);
@@ -53,25 +89,42 @@ pub(crate) fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
 
 /// A single timestamped audit record. Pushed onto a record's history on every
 /// edit, or onto the vault-level audit / volume upload log.
+// `#[derive(...)]` auto-implements these traits for the struct below:
+//   Serialize/Deserialize -> can be encoded to/from disk bytes,
+//   Clone -> can be deep-copied, Debug -> printable for debugging,
+//   Default -> has a zero/empty default value,
+//   Zeroize/ZeroizeOnDrop -> wipes its memory (and does so automatically on drop).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
 pub struct Change {
-    pub at: i64,
-    pub action: String,
-    pub detail: String,
+    pub at: i64,        // unix-seconds timestamp of the change
+    pub action: String, // e.g. "created", "updated", "deleted"
+    pub detail: String, // human-readable description
 }
 
+// An `impl` block attaches methods/associated functions to a type (like adding
+// methods to a class).
 impl Change {
+    // `&str` is a borrowed string slice (caller keeps ownership of its text);
+    // `detail: String` is taken by value (an owned string moved in). `-> Self`
+    // means it returns a `Change`.
     pub fn new(action: &str, detail: String) -> Self {
+        // `action.to_string()` copies the borrowed text into a new owned String.
         Change { at: unix_now(), action: action.to_string(), detail }
     }
 }
 
 /// Append a field change to `out` if `old != new` (full before/after values).
+// `out: &mut Vec<Change>` is an *exclusive borrow* of the caller's vector, so this
+// function can push into the caller's list without copying or owning it. Plain
+// `fn` (no `pub`) means this helper is private to the module.
 fn track(out: &mut Vec<Change>, at: i64, name: &str, old: &str, new: &str) {
     if old != new {
         out.push(Change {
             at,
+            // `.into()` converts the "updated" `&str` literal into an owned
+            // `String` (the field's type) via the trait-driven `Into` conversion.
             action: "updated".into(),
+            // `{old:?}`/`{new:?}` use the Debug format (quotes the strings).
             detail: format!("{name}: {old:?} -> {new:?}"),
         });
     }
@@ -85,13 +138,22 @@ fn track_bool(out: &mut Vec<Change>, at: i64, name: &str, old: bool, new: bool) 
 }
 
 /// Shared behaviour for the five record types so insert/edit/history is generic.
+// A `trait` is like an interface: it lists methods a type must provide. `: Clone`
+// is a *supertrait bound* — anything implementing `Record` must also be cloneable.
+// These are method *signatures* only; each record type fills in the bodies later.
 pub trait Record: Clone {
+    // `&self` borrows the value read-only (a getter). `-> &str` returns a borrowed
+    // view of the id, tied to the lifetime of `self` (no copy).
     fn id(&self) -> &str;
     fn created_at(&self) -> i64;
+    // `&mut self` borrows exclusively so the method may mutate the value (a setter).
     fn set_created_at(&mut self, at: i64);
     fn set_updated_at(&mut self, at: i64);
+    // Returns an exclusive borrow of the history vector so callers can push to it.
     fn history_mut(&mut self) -> &mut Vec<Change>;
     /// Field-level diff describing the change from `self` to `new`.
+    // `Self` (capital S) means "the implementing type itself", so `new: &Self`
+    // borrows another value of the same record type.
     fn diff(&self, new: &Self, at: i64) -> Vec<Change>;
     /// Short label for list display.
     fn label(&self) -> String;
@@ -99,18 +161,31 @@ pub trait Record: Clone {
 
 /// Insert `rec` or, if a record with the same id exists, replace it — appending
 /// the field-level diff to history and preserving the original creation time.
+// `<R: Record>` is a *generic* parameter: this one function works for any type `R`
+// that implements the `Record` trait. `list: &mut Vec<R>` borrows the caller's
+// vector exclusively; `mut rec: R` takes ownership of the record (moved in) and
+// `mut` lets us modify it locally.
 pub fn upsert<R: Record>(list: &mut Vec<R>, mut rec: R) {
     let now = unix_now();
     rec.set_updated_at(now);
+    // `match` is pattern-matching (like a powerful switch). `.position(..)` finds
+    // the index of the first element matching the closure `|e| ...`, returning
+    // `Some(index)` or `None`.
     match list.iter().position(|e| e.id() == rec.id()) {
+        // Existing record at index `i`: this is an edit.
         Some(i) => {
+            // `&rec` lends the new record to `diff` (which only needs to read it).
             let changes = list[i].diff(&rec, now);
-            rec.set_created_at(list[i].created_at());
+            rec.set_created_at(list[i].created_at()); // keep original creation time
+            // `.clone()` copies the old history out so we can rebuild it.
             let mut history = list[i].history_mut().clone();
-            history.extend(changes);
+            history.extend(changes); // old history + the new diffs
+            // `*rec.history_mut() = history` writes through the mutable borrow,
+            // replacing the record's history with the combined list.
             *rec.history_mut() = history;
-            list[i] = rec;
+            list[i] = rec; // replace the slot (the old record is dropped & wiped)
         }
+        // No match: this is a fresh insert.
         None => {
             let label = rec.label();
             rec.history_mut().push(Change::new("created", label));
@@ -120,6 +195,7 @@ pub fn upsert<R: Record>(list: &mut Vec<R>, mut rec: R) {
 }
 
 /// Remove a record by id, logging a timestamped deletion in `audit`.
+// Generic over any `Record` type. Returns `bool`: true if something was removed.
 pub fn remove<R: Record>(list: &mut Vec<R>, id: &str, audit: &mut Vec<Change>, kind: &str) -> bool {
     match list.iter().position(|e| e.id() == id) {
         Some(i) => {
@@ -133,6 +209,9 @@ pub fn remove<R: Record>(list: &mut Vec<R>, id: &str, audit: &mut Vec<Change>, k
 }
 
 // --- The five record types ---------------------------------------------------
+// Each struct below is one record kind. They share the same derives as `Change`
+// (see that note): Serialize/Deserialize for disk, Clone/Debug/Default, and
+// Zeroize/ZeroizeOnDrop so every field (including secrets) is wiped on drop.
 
 /// Tab 1 — free-form instruction note.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
@@ -142,7 +221,7 @@ pub struct Instruction {
     pub description: String,
     pub created_at: i64,
     pub updated_at: i64,
-    pub history: Vec<Change>,
+    pub history: Vec<Change>, // append-only audit trail for this record
 }
 
 /// Tab 2 — a trust/will document with a usage note and an attached file.
@@ -152,6 +231,7 @@ pub struct TrustWill {
     pub document: String,
     pub usage: String,
     /// Volume file id of the attached document, if any.
+    // `Option<String>` = either `Some(id)` (a file is attached) or `None` (no file).
     pub file: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -171,6 +251,9 @@ pub struct AssetLiability {
     pub institution: String,
     /// Category taken from the external asset-types list.
     pub asset_type: String,
+    // `#[serde(default)]` on a field: if an older saved vault lacks this field,
+    // deserialization fills it with the type's default ("" for String, false for
+    // bool) instead of failing. This keeps newly-added fields backward-compatible.
     #[serde(default)]
     pub url: String,
     /// Beneficiary (chiefly for liabilities, but stored for any entry).
@@ -225,17 +308,28 @@ pub struct RealEstate {
 }
 
 /// Stamp a freshly-built record with an id and creation/update timestamps.
+// `macro_rules!` defines a compile-time code template (a macro), expanded inline
+// wherever it's invoked — used here to avoid repeating identical constructor code
+// for all five types. `$ty:ident` is a parameter that captures a type name.
+// Note: the macro body uses `?`, so it only compiles inside a function that
+// returns a `Result` (the `new()` methods below). The double `{{ }}` makes the
+// expansion a block expression whose last value `r` is the result.
 macro_rules! new_record {
     ($ty:ident) => {{
         let now = unix_now();
+        // `mut r` so we can assign fields; `$ty::default()` builds an all-defaults
+        // value of the named type (from the derived `Default`).
         let mut r = $ty::default();
-        r.id = random_id()?;
+        r.id = random_id()?; // `?` bubbles up an RNG error to the caller
         r.created_at = now;
         r.updated_at = now;
-        r
+        r // last expression of the block = the value the macro produces
     }};
 }
 
+// One `impl` block per type providing a `new()` constructor. Each returns
+// `Result<Self, CryptoError>` because id generation can fail; `Ok(...)` wraps the
+// success value.
 impl Instruction {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(Instruction))
@@ -248,6 +342,8 @@ impl TrustWill {
 }
 impl AssetLiability {
     pub fn new() -> Result<Self, CryptoError> {
+        // This type defaults to an "Asset" (vs "Liability"), so it overrides the
+        // field after the macro builds the base record.
         let mut r = new_record!(AssetLiability);
         r.kind = "Asset".to_string();
         Ok(r)
@@ -269,8 +365,12 @@ impl RealEstate {
 /// Generate the boilerplate `Record` impl. The id/timestamp/history accessors
 /// are identical across types; the per-type `diff` and `label` are passed as
 /// non-capturing closures (which coerce to `fn` pointers).
+// `$ty:ty` captures a type, `$diff:expr`/`$label:expr` capture expressions (the
+// two closures supplied at each call site below). The macro stamps out a full
+// `impl Record for <type>` so we don't hand-write the same accessors five times.
 macro_rules! impl_record {
     ($ty:ty, $diff:expr, $label:expr) => {
+        // `impl Record for $ty` = "this type provides the Record interface".
         impl Record for $ty {
             fn id(&self) -> &str {
                 &self.id
@@ -288,10 +388,14 @@ macro_rules! impl_record {
                 &mut self.history
             }
             fn diff(&self, new: &Self, at: i64) -> Vec<Change> {
-                let mut out = Vec::new();
+                let mut out = Vec::new(); // empty, growable list to fill with diffs
+                // Bind the supplied closure to a function-pointer-typed variable
+                // (`fn(...)` is a plain function pointer). A closure that captures
+                // nothing coerces to this. Then call it, passing `&mut out` so it
+                // can append changes into our local vector.
                 let f: fn(&$ty, &$ty, i64, &mut Vec<Change>) = $diff;
                 f(self, new, at, &mut out);
-                out
+                out // return the collected changes
             }
             fn label(&self) -> String {
                 let f: fn(&$ty) -> String = $label;
@@ -301,12 +405,18 @@ macro_rules! impl_record {
     };
 }
 
+// Each call below passes: the type, a diff closure, and a label closure.
+// Diff closure args: `s` = self (old), `n` = new, `at` = timestamp, `out` = the
+// vector to append changes to. `&s.title` lends the field to `track` (read-only).
 impl_record!(
     Instruction,
     |s: &Instruction, n: &Instruction, at: i64, out: &mut Vec<Change>| {
         track(out, at, "title", &s.title, &n.title);
         track(out, at, "description", &s.description, &n.description);
     },
+    // Label closure: `l` is the record. `if/else` is an expression here (it yields
+    // a value). Uses a literal placeholder when empty, else `.clone()`s the title
+    // into a new owned String (the trait requires returning an owned `String`).
     |l: &Instruction| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() }
 );
 
@@ -315,6 +425,8 @@ impl_record!(
     |s: &TrustWill, n: &TrustWill, at: i64, out: &mut Vec<Change>| {
         track(out, at, "document", &s.document, &n.document);
         track(out, at, "usage", &s.usage, &n.usage);
+        // `file` is an `Option`, not a string, so it's compared directly (rather
+        // than via `track`) and logged without exposing the file id.
         if s.file != n.file {
             out.push(Change { at, action: "updated".into(), detail: "attached file changed".into() });
         }
@@ -340,6 +452,8 @@ impl_record!(
         }
     },
     |l: &AssetLiability| {
+        // `.as_str()` borrows the String as a `&str` so both arms have the same
+        // type (the literal is already a `&str`); no allocation happens here.
         let d = if l.description.is_empty() { "(no description)" } else { l.description.as_str() };
         format!("[{}] {d}", l.kind)
     }
@@ -359,9 +473,12 @@ impl_record!(
         track_bool(out, at, "review", s.review, n.review);
     },
     |l: &Account| {
+        // Prefer username, fall back to owner; `.clone()` makes an owned String
+        // either way so `who` owns its text.
         let who = if l.username.is_empty() { l.owner.clone() } else { l.username.clone() };
         let label =
             if l.account_type.is_empty() { who } else { format!("{}: {who}", l.account_type) };
+        // `.trim()` strips surrounding whitespace just for the emptiness check.
         if label.trim().is_empty() { "(account)".to_string() } else { label }
     }
 );
@@ -383,13 +500,18 @@ impl_record!(
 // --- Vault settings ----------------------------------------------------------
 
 /// User-configurable vault settings, stored (encrypted) inside the vault.
+// Note: no `Default` in the derive list — a custom one is written by hand below
+// because the default cap isn't the numeric zero.
 #[derive(Serialize, Deserialize, Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct VaultSettings {
     /// Per-partition document-volume size cap (bytes). A new document that would
     /// push the active partition past this rolls into a fresh partition.
-    pub volume_max_size: u64,
+    pub volume_max_size: u64, // u64 = unsigned 64-bit integer
 }
 
+// Hand-written `Default` implementation (the `Default` trait's one method).
+// Returning `Self` here means a `VaultSettings` whose cap is the project-wide
+// constant rather than 0.
 impl Default for VaultSettings {
     fn default() -> Self {
         VaultSettings { volume_max_size: crate::storage::DEFAULT_VOLUME_MAX_SIZE }
@@ -398,10 +520,14 @@ impl Default for VaultSettings {
 
 /// The decrypted contents of a vault: all five record collections plus the
 /// volume manifest, access time, and vault-level audit log. Wipes on drop.
+// This is the top-level in-memory object; `ZeroizeOnDrop` means the entire vault
+// (and every record inside it) is securely erased when it leaves scope.
+// `#[serde(default)]` on each field keeps older saved vaults loadable when new
+// fields are added (missing fields take their type default).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
 pub struct Vault {
     #[serde(default)]
-    pub version: u8,
+    pub version: u8, // u8 = unsigned 8-bit integer (0..=255)
     /// Monotonically increasing write counter, bumped on every successful save.
     /// Surfaced on unlock so a user can notice a whole-file rollback to an older
     /// snapshot (see `docs/DESIGN.md` §9.12).
@@ -431,11 +557,22 @@ pub struct Vault {
     /// (not in external files). A vault that predates this field falls back to
     /// the built-in defaults. Category names are not secrets, so they are skipped
     /// by the zeroize-on-drop wipe.
+    // `#[serde(default = "path::to::fn")]` names a function to call for the default
+    // when the field is missing (here, the built-in category lists) — used instead
+    // of the plain `#[serde(default)]` because the desired default isn't "empty".
     #[serde(default = "crate::types::TypeLists::with_defaults")]
+    // `#[zeroize(skip)]` excludes this one field from the secret-wiping on drop
+    // (category names aren't sensitive, and `TypeLists` may not be zeroize-able).
     #[zeroize(skip)]
     pub categories: crate::types::TypeLists,
 }
 
+// `#[cfg(test)]` is *conditional compilation*: this whole module is compiled only
+// when running tests, never in the shipped binary. `use super::*` pulls in
+// everything from the parent module (this file). Each `#[test]` fn is run by the
+// test harness; `assert!`/`assert_eq!` panic (fail the test) if their condition
+// is false. `.unwrap()` extracts the value from a Result/Option and panics if it's
+// Err/None — acceptable in tests, where a panic simply marks the test failed.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,13 +29,17 @@
 //! whole tree under a fresh key via a staged-and-rolled-forward protocol so a crash
 //! mid-rotation always leaves either the old or the new tree fully working.
 
+// `use` brings names into scope (like `import` elsewhere). `std::fs::{self, ..}`
+// imports the `fs` module itself AND the listed items from it.
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::Write; // a *trait* (interface); brought in so `.write_all()` is callable
+use std::path::{Path, PathBuf}; // `Path` = borrowed path (like `&str`); `PathBuf` = owned (like `String`)
 
-use thiserror::Error;
-use zeroize::Zeroizing;
+use thiserror::Error; // a derive macro that auto-generates the std `Error` impl for our enum
+use zeroize::Zeroizing; // wrapper that overwrites (zeroes) its contents on drop — for secrets
 
+// `crate::` = this crate's own modules. `{self, ..}` again pulls in the module
+// name plus the listed types/constants from it.
 use crate::crypto::{self, CryptoError, KdfParams, Key, NONCE_LEN, SALT_LEN};
 use crate::records::{self, Change, Vault};
 use crate::storage::{self, MAX_DOC_SIZE, ManifestEntry, StorageError, VolumeStore};
@@ -43,8 +47,15 @@ use crate::types::TypeLists;
 
 /// A decrypted document returned to the CLI: its manifest metadata plus its
 /// plaintext bytes (which wipe on drop).
+// `type` is an alias (a nickname for a longer type). A tuple `(A, B)` pairs two
+// values. `Vec<u8>` is a growable byte array; wrapping it in `Zeroizing` means the
+// plaintext bytes are scrubbed from memory when this value goes out of scope.
 pub type DecryptedDoc = (ManifestEntry, Zeroizing<Vec<u8>>);
 
+// `const` = compile-time constant. `&[u8; 8]` is a shared reference (`&`, a
+// read-only borrow) to a fixed-size array of 8 bytes. `b"..."` is a byte-string
+// literal; `\0` is a NUL byte. `u8` = unsigned 8-bit int; `usize` = pointer-sized
+// unsigned int (used for lengths/indices).
 const MAGIC: &[u8; 8] = b"PMVAULT\0";
 const FORMAT_VERSION: u8 = 4;
 const HEADER_LEN: usize = 61;
@@ -66,6 +77,12 @@ const MAX_M_COST: u32 = 1 << 20; // 1 GiB, in KiB
 const MAX_T_COST: u32 = 64;
 const MAX_P_COST: u32 = 16;
 
+// An `enum` is a tagged union: a value is exactly ONE of the listed variants,
+// some of which carry data (e.g. `NotFound(PathBuf)`). This is the single error
+// type every fallible function here returns.
+// `#[derive(...)]` auto-generates trait impls: `Error` (from thiserror, using the
+// `#[error("...")]` strings as the human-readable message) and `Debug` (a
+// developer-facing dump). `{0}` in those strings interpolates the variant's data.
 #[derive(Error, Debug)]
 pub enum VaultError {
     #[error("vault not found at {0}")]
@@ -92,6 +109,10 @@ pub enum VaultError {
     Locked,
     #[error("no such partition: {0}")]
     NoSuchPartition(u32),
+    // `#[from]` generates a conversion so a `StorageError` (etc.) automatically
+    // becomes a `VaultError` — this is what lets the `?` operator (used below)
+    // bubble up errors of other types without manual wrapping. `transparent`
+    // means this variant just forwards the inner error's message unchanged.
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -103,6 +124,9 @@ pub enum VaultError {
 }
 
 /// Self-describing header parsed from / written to the vault file.
+// A `struct` groups named fields (like a record/object). `#[derive(Clone)]` lets
+// callers make an independent copy with `.clone()`; `Debug` enables `{:?}` dumps.
+// `[u8; SALT_LEN]` is a fixed-length byte array whose length is the constant.
 #[derive(Debug, Clone)]
 struct Header {
     params: KdfParams,
@@ -110,9 +134,16 @@ struct Header {
     nonce: [u8; NONCE_LEN],
 }
 
+// `impl Header { ... }` attaches methods to the `Header` type (like defining the
+// methods of a class). Methods taking `&self` borrow the value read-only.
 impl Header {
+    // Serialize this header to its fixed 61-byte on-disk form. `&self` = read-only
+    // borrow of the header; the return type is an owned 61-byte array.
     fn to_bytes(&self) -> [u8; HEADER_LEN] {
-        let mut b = [0u8; HEADER_LEN];
+        let mut b = [0u8; HEADER_LEN]; // `mut` = mutable; an array of 61 zero bytes
+        // `b[0..8]` is a slice (a view) of bytes 0..7; `copy_from_slice` fills it.
+        // `&self.params...` takes a borrow of each field. `to_le_bytes()` encodes an
+        // integer as little-endian bytes (matching the on-disk format).
         b[0..8].copy_from_slice(MAGIC);
         b[8] = FORMAT_VERSION;
         b[9..13].copy_from_slice(&self.params.m_cost.to_le_bytes());
@@ -120,12 +151,15 @@ impl Header {
         b[17..21].copy_from_slice(&self.params.p_cost.to_le_bytes());
         b[21..37].copy_from_slice(&self.salt);
         b[37..61].copy_from_slice(&self.nonce);
-        b
+        b // last expression with no `;` is the return value (no `return` needed)
     }
 
+    // Parse a header out of untrusted file bytes. `buf: &[u8]` is a read-only byte
+    // slice. The return type `Result<Header, VaultError>` is "either an `Ok(Header)`
+    // on success, or an `Err(VaultError)` on failure" — Rust's checked-error type.
     fn parse(buf: &[u8]) -> Result<Header, VaultError> {
         if buf.len() < HEADER_LEN {
-            return Err(VaultError::Truncated);
+            return Err(VaultError::Truncated); // early-return an error variant
         }
         if &buf[0..8] != MAGIC {
             return Err(VaultError::BadMagic);
@@ -133,6 +167,11 @@ impl Header {
         if buf[8] != FORMAT_VERSION {
             return Err(VaultError::BadVersion(buf[8]));
         }
+        // `from_le_bytes` rebuilds a u32 from 4 little-endian bytes. `try_into()`
+        // converts the variable-length slice into the fixed `[u8; 4]` it needs and
+        // returns a `Result`; `.unwrap()` takes the `Ok` value or panics. It is
+        // safe here because the length was already checked to be >= HEADER_LEN, so
+        // these fixed sub-ranges always exist.
         let params = KdfParams {
             m_cost: u32::from_le_bytes(buf[9..13].try_into().unwrap()),
             t_cost: u32::from_le_bytes(buf[13..17].try_into().unwrap()),
@@ -151,6 +190,8 @@ impl Header {
         salt.copy_from_slice(&buf[21..37]);
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&buf[37..61]);
+        // Build and return the header. `Header { params, salt, nonce }` is field
+        // shorthand: each field is set from the like-named local variable.
         Ok(Header { params, salt, nonce })
     }
 }
@@ -158,9 +199,12 @@ impl Header {
 /// An unlocked vault: the decrypted data, the derived key + KDF salt/params, and
 /// the partitioned document store. The key zeroizes on drop; `vault` zeroizes via
 /// its own `ZeroizeOnDrop`.
+// Fields are private by default (encapsulated); only `vault` is marked `pub`, so
+// callers can read/edit records directly but everything security-sensitive (the
+// key, the lock) is reachable only through this module's methods.
 pub struct OpenVault {
     pub vault: Vault,
-    key: Key,
+    key: Key, // the symmetric encryption key derived from the passwords
     params: KdfParams,
     salt: [u8; SALT_LEN],
     /// The vault *file* (`<dir>/vault.pmv`).
@@ -172,6 +216,9 @@ pub struct OpenVault {
     /// Held for a writable session: the OS advisory lock on `pass-mgr.lock`.
     /// `None` for read-only opens. Released automatically when this `OpenVault`
     /// drops (including on process crash), so the lock never goes stale.
+    // `Option<T>` is "either `Some(value)` or `None`" — Rust's null-free optional.
+    // The leading `_` says "stored only to keep it alive, not read"; when this
+    // struct is dropped the `WriteLock` is dropped too, which releases the lock.
     _write_lock: Option<WriteLock>,
 }
 
@@ -185,36 +232,47 @@ struct WriteLock {
 impl WriteLock {
     /// Acquire the single-writer lock for `dir`. Errors with
     /// [`VaultError::Locked`] if another writable session already holds it.
+    // `Self` is shorthand for the type being impl'd (here `WriteLock`).
     fn acquire(dir: &Path) -> Result<Self, VaultError> {
-        let path = dir.join(LOCK_FILE);
+        let path = dir.join(LOCK_FILE); // `.join()` appends a path component
         // The lock file carries no contents; never truncate it (avoids racing a
         // concurrent holder's handle), just ensure it exists and is lockable.
+        // The trailing `?` propagates any I/O error: on `Err` it returns it from
+        // this function immediately (after `#[from]`-converting it to VaultError).
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        let _ = harden_file(&path); // 0600 for consistency with the other vault files
+        let _ = harden_file(&path); // `let _ =` deliberately ignores the Result (best-effort 0600)
+        // `match` examines every possible variant of the Result and picks one arm.
+        // `try_lock` returns `Ok(())` if we got the lock, or specific errors otherwise.
         match file.try_lock() {
             Ok(()) => Ok(WriteLock { _file: file }),
-            Err(fs::TryLockError::WouldBlock) => Err(VaultError::Locked),
-            Err(fs::TryLockError::Error(e)) => Err(VaultError::Io(e)),
+            Err(fs::TryLockError::WouldBlock) => Err(VaultError::Locked), // someone else holds it
+            Err(fs::TryLockError::Error(e)) => Err(VaultError::Io(e)),   // `e` binds the inner error
         }
     }
 }
 
+// The main API surface of the vault: all the public operations live as methods here.
 impl OpenVault {
     /// Create a brand-new vault in the directory containing `path`
     /// (`<dir>/vault.pmv`), protected by two passwords.
+    // `path: PathBuf` is taken *by value* (this function now owns it / can keep it).
+    // `pw1: &[u8]` / `pw2: &[u8]` are read-only borrows of the password bytes — the
+    // caller keeps ownership, and we never copy or store them.
     pub fn create(path: PathBuf, pw1: &[u8], pw2: &[u8], params: KdfParams) -> Result<Self, VaultError> {
         if path.exists() {
             return Err(VaultError::AlreadyExists(path));
         }
-        let dir = parent_dir(&path);
+        let dir = parent_dir(&path); // `&path` lends the path without giving it away
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
         // Take the single-writer lock before writing anything into the directory.
         let write_lock = Some(WriteLock::acquire(&dir)?);
+        // `::<SALT_LEN>` is a turbofish: it pins the generic length parameter so the
+        // call returns a `[u8; SALT_LEN]` of random bytes.
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &params)?;
 
-        let mut vault = Vault::default();
+        let mut vault = Vault::default(); // `default()` builds an empty/zeroed value
         vault.version = FORMAT_VERSION;
         vault.last_opened_at = records::unix_now();
         vault.id = records::random_id()?; // binds the volumes/manifests to this vault
@@ -223,6 +281,8 @@ impl OpenVault {
 
         let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
 
+        // Construct the struct, moving each local into the matching field. After
+        // this, those locals are owned by `open` and can't be used again.
         let mut open = OpenVault {
             vault,
             key,
@@ -235,10 +295,12 @@ impl OpenVault {
             storage,
             _write_lock: write_lock,
         };
-        open.save()?;
+        open.save()?; // first on-disk commit of the new vault file
         Ok(open)
     }
 
+    // The three `open*` methods are thin wrappers that forward to `open_inner`
+    // with the read-only flag set appropriately (a small convenience API).
     /// Unlock an existing vault read-write.
     pub fn open(path: PathBuf, pw1: &[u8], pw2: &[u8]) -> Result<Self, VaultError> {
         Self::open_inner(path, pw1, pw2, false)
@@ -264,6 +326,8 @@ impl OpenVault {
         // Finish/abort an interrupted password change before touching the vault.
         recover_pending_rekey(&dir, read_only)?;
 
+        // Destructuring assignment: the returned 3-tuple is unpacked into three
+        // bindings at once. `mut vault` is mutable so we can update its timestamp.
         let (mut vault, header, key) = decrypt_file(&path, pw1, pw2)?;
         let previous_access = vault.last_opened_at;
         let previous_generation = vault.generation;
@@ -271,8 +335,9 @@ impl OpenVault {
 
         let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         // Consistency: every document a record references must be present.
+        // `for id in ...` iterates the returned Vec, binding each element to `id`.
         for id in referenced_doc_ids(&vault) {
-            if !storage.contains(&id) {
+            if !storage.contains(&id) { // `!` is boolean NOT
                 return Err(VaultError::ArchiveMismatch);
             }
         }
@@ -290,6 +355,8 @@ impl OpenVault {
             _write_lock: write_lock,
         };
         // Best-effort refresh of last-opened; skipped entirely in read-only mode.
+        // `let _ =` discards the Result: if this write fails we still hand back the
+        // opened vault (the refresh is non-essential).
         if !read_only {
             let _ = open.save();
         }
@@ -297,7 +364,11 @@ impl OpenVault {
     }
 
     /// Decrypt the vault and return its contents **without** modifying any file.
+    // Note these `export*` functions take `&Path` (a borrow) and are "associated
+    // functions" you call as `OpenVault::export(...)` — they don't need a live
+    // `OpenVault`; they open, read, and drop everything internally.
     pub fn export(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<Vault, VaultError> {
+        // The `_header` / `_key` names start with `_` to say "intentionally unused".
         let (vault, _header, _key) = decrypt_file(path, pw1, pw2)?;
         Ok(vault)
     }
@@ -321,10 +392,10 @@ impl OpenVault {
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         // Collect entries first so the immutable borrow for reads is clean.
         let entries: Vec<ManifestEntry> = selected_entries(&store, part)?;
-        let mut out = Vec::new();
-        for e in entries {
-            let bytes = store.read(&e.id, &key)?;
-            out.push((e, bytes));
+        let mut out = Vec::new(); // a growable, initially-empty result vector
+        for e in entries { // `e` is moved out of the vector on each iteration
+            let bytes = store.read(&e.id, &key)?; // decrypt this doc's plaintext
+            out.push((e, bytes)); // append the (entry, plaintext) pair
         }
         Ok(out)
     }
@@ -347,11 +418,18 @@ impl OpenVault {
     }
 
     /// Re-encrypt the vault and write it atomically, bumping the write-generation.
+    // `&mut self` is an *exclusive* borrow: this method may mutate the vault, and
+    // while it runs no one else can read or write the same `OpenVault`.
+    // `Result<(), VaultError>` returns `()` (the empty/unit value) on success —
+    // i.e. "succeeded, no data to hand back".
     pub fn save(&mut self) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
+        // `saturating_add` increments but clamps at the max value instead of
+        // overflowing/panicking — a monotonically rising version counter.
         self.vault.generation = self.vault.generation.saturating_add(1);
+        // No `?`/`Ok` wrapper: this call's `Result` is returned directly as ours.
         write_vault_file(&self.path, &self.vault, &self.key, &self.salt, self.params)
     }
 
@@ -373,18 +451,26 @@ impl OpenVault {
 
         // Re-encrypt every document into a fresh store under the new key.
         let new_store = VolumeStore::open(&staging, &new_key, &self.vault.id, self.vault.settings.volume_max_size)?;
-        let mut new_store = new_store;
+        let mut new_store = new_store; // re-bind as mutable (shadowing the previous name)
+        // Iterator pipeline: `.ids()` yields each id, `.map(|s| s.to_string())`
+        // converts each borrowed `&str` to an owned `String` (the closure `|s| ...`
+        // is an inline function), and `.collect()` gathers them into a `Vec`. We own
+        // the ids up front so the loop below can borrow `self.storage` freely.
         let ids: Vec<String> = self.storage.ids().map(|s| s.to_string()).collect();
-        for id in &ids {
-            let bytes = self.storage.read(id, &self.key)?;
+        for id in &ids { // `&ids` iterates by reference, so `ids` survives the loop
+            let bytes = self.storage.read(id, &self.key)?; // decrypt under the OLD key
+            // `.entry(id)` returns an `Option`; `.map(...)` runs the closure only if
+            // it's `Some`, producing `Some((path, time))`; `.unwrap_or_default()`
+            // substitutes a default pair if it was `None`. `e.path.clone()` makes an
+            // owned copy because `e` is only borrowed here.
             let (path, uploaded_at) = self
                 .storage
                 .entry(id)
                 .map(|e| (e.path.clone(), e.uploaded_at))
                 .unwrap_or_default();
-            new_store.put(id, &path, &bytes, uploaded_at, &new_key)?;
+            new_store.put(id, &path, &bytes, uploaded_at, &new_key)?; // re-encrypt under NEW key
         }
-        drop(new_store);
+        drop(new_store); // explicitly drop now to flush/close the staged store before commit
 
         // Stage the re-encrypted vault, mark the staging complete, then commit.
         // Bump the write-generation so a rekeyed vault is detectably newer than
@@ -401,12 +487,16 @@ impl OpenVault {
         // new-key tree. Poison the handle (read-only) so the caller must reopen,
         // which finishes the idempotent roll-forward. A crash here is handled the
         // same way by recover_pending_rekey on the next open.
+        // `if let Err(e) = ...` runs the block only when the call returned an `Err`,
+        // binding the error to `e` (a concise alternative to a full `match`).
         if let Err(e) = commit_rekey(&dir, &staging) {
-            self.read_only = true;
+            self.read_only = true; // poison this handle so the caller must reopen
             return Err(e);
         }
 
         // Adopt the new key/salt/state and reopen the store under the new key.
+        // Assigning to `self.key` moves `new_key` in; the OLD key value is dropped
+        // here and (being a `Key`) zeroized out of memory.
         self.key = new_key;
         self.salt = new_salt;
         self.vault = staged_vault;
@@ -415,6 +505,8 @@ impl OpenVault {
         Ok(())
     }
 
+    // Simple read-only getters: `&self` borrows the vault, and each returns a copy
+    // of a small `Copy` field (integers copy implicitly, so no `.clone()` needed).
     pub fn previous_access(&self) -> i64 {
         self.previous_access
     }
@@ -435,7 +527,7 @@ impl OpenVault {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let bytes = bytes.max(1);
+        let bytes = bytes.max(1); // shadow `bytes` with a clamped copy (floor of 1)
         self.vault.settings.volume_max_size = bytes;
         self.storage.set_max_size(bytes);
         self.vault.audit.push(Change::new("volume_size_changed", bytes.to_string()));
@@ -459,6 +551,8 @@ impl OpenVault {
         if vpath.len() > storage::MAX_PATH_LEN {
             return Err(VaultError::Storage(StorageError::PathTooLong));
         }
+        // Read the source file into memory wrapped in `Zeroizing`, so the plaintext
+        // bytes are wiped when `data` goes out of scope at the end of this function.
         let data = Zeroizing::new(fs::read(source)?);
         let id = records::random_id()?;
         self.storage.put(&id, &vpath, &data, records::unix_now(), &self.key)?;
@@ -488,7 +582,11 @@ impl OpenVault {
     }
 
     /// The virtual path ("/loc/filename") of a stored document, for UI display.
+    // `&str` is a borrowed string slice (read-only view); `String` is owned. The
+    // `Option<String>` return is `Some(path)` if the id exists, else `None`.
     pub fn doc_path(&self, file_id: &str) -> Option<String> {
+        // `.map(|e| e.path.clone())` transforms a `Some(entry)` into `Some(owned_path)`,
+        // leaving `None` as `None`. We `.clone()` because `e` is only a borrow.
         self.storage.entry(file_id).map(|e| e.path.clone())
     }
 
@@ -499,6 +597,8 @@ impl OpenVault {
 
     // --- Category lists (stored in the vault) --------------------------------
 
+    // Returns a *borrow* (`&TypeLists`) into the vault rather than a copy: the
+    // caller may read the category lists but the data stays owned by the vault.
     pub fn categories(&self) -> &TypeLists {
         &self.vault.categories
     }
@@ -515,11 +615,16 @@ impl OpenVault {
         self.mutate_categories(|c| c.add_account_subtype(type_name, subtype))
     }
 
+    // Shared helper for the three `add_*` methods above. `edit: impl FnOnce(...)`
+    // accepts any closure (here `|c| c.add_*(...)`) that takes an exclusive borrow
+    // of the category lists and returns whether it actually changed something.
+    // `FnOnce` means the closure is callable at least once. This is the generics +
+    // higher-order-function pattern: behavior is passed in as a parameter.
     fn mutate_categories(&mut self, edit: impl FnOnce(&mut TypeLists) -> bool) -> Result<bool, VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        if edit(&mut self.vault.categories) {
+        if edit(&mut self.vault.categories) { // run the closure; only persist if it changed state
             self.save()?;
             Ok(true)
         } else {
@@ -530,17 +635,23 @@ impl OpenVault {
 
 /// The directory containing the vault file (its parent, or "." if none).
 fn parent_dir(vault_file: &Path) -> PathBuf {
+    // `.parent()` yields an `Option<&Path>`. The `match` has a guarded arm:
+    // `Some(p) if <cond>` matches only when there's a parent AND it's non-empty;
+    // `_` is the catch-all (covers `None` and the empty-parent case).
     match vault_file.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(), // own a copy of the borrowed path
+        _ => PathBuf::from("."), // fall back to the current directory
     }
 }
 
 /// Normalize `location` and join `filename` into a virtual path "/a/b/file".
 /// Exposed to the UIs so they can validate path length against
 /// [`storage::MAX_PATH_LEN`] with the exact string the core will store.
+// `pub(crate)` = visible to the rest of this crate but not external callers.
 pub(crate) fn virtual_path(location: &str, filename: &str) -> String {
     let loc = normalize_dir(location);
+    // `if ... { } else { }` is an *expression* here: the chosen branch's value is
+    // returned. `format!` builds a `String` (like sprintf); `{filename}` inlines it.
     if loc.is_empty() { format!("/{filename}") } else { format!("{loc}/{filename}") }
 }
 
@@ -548,20 +659,29 @@ pub(crate) fn virtual_path(location: &str, filename: &str) -> String {
 /// only partition `n`'s entries (erroring if `n` is out of range); `None`
 /// returns every partition's entries.
 fn selected_entries(store: &VolumeStore, part: Option<u32>) -> Result<Vec<ManifestEntry>, VaultError> {
+    // Branch on whether a specific partition was requested (`Some(p)`) or not (`None`).
     match part {
         Some(p) => {
+            // `p as usize` is an explicit numeric cast (u32 -> usize) so it can be
+            // compared against the count, which is a `usize`.
             if p as usize >= store.partition_count() {
                 return Err(VaultError::NoSuchPartition(p));
             }
+            // Iterator: yield this partition's entries (each a `&ManifestEntry`),
+            // `.cloned()` turns each borrow into an owned value, `.collect()` into a Vec.
             Ok(store.partition_entries(p).cloned().collect())
         }
-        None => Ok(store.entries().cloned().collect()),
+        None => Ok(store.entries().cloned().collect()), // all partitions
     }
 }
 
 /// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
 fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
     let mut ids = Vec::new();
+    // `for t in &vault.trust_wills` iterates by shared reference (doesn't consume
+    // the vault's vector). `if let Some(f) = &t.file` runs the body only when the
+    // optional field holds a value, binding the inner id to `f`. `.clone()` because
+    // `f` is borrowed but we need an owned `String` in the result list.
     for t in &vault.trust_wills {
         if let Some(f) = &t.file {
             ids.push(f.clone());
@@ -579,6 +699,9 @@ fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
 fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, Key), VaultError> {
     // Bound the read before slurping the whole file (DoS guard): a crafted,
     // oversized vault.pmv must be rejected before allocation, not after.
+    // Guarded match arms: `Ok(m) if m.len() > CAP` only fires when the metadata
+    // call succeeded *and* the file is over the cap. The `_ => {}` arm does nothing
+    // (`{}` is an empty block) for the normal in-range case.
     match fs::metadata(path) {
         Ok(m) if m.len() > MAX_VAULT_SIZE => return Err(VaultError::TooLarge),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -586,21 +709,27 @@ fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, K
         }
         _ => {}
     }
+    // This `match` is itself an expression assigned to `raw`: on `Ok(b)` it
+    // evaluates to the bytes `b`; the error arms early-return instead.
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(VaultError::NotFound(path.to_path_buf()));
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e.into()), // `.into()` converts io::Error -> VaultError (via #[from])
     };
     let header = Header::parse(&raw)?;
-    let ciphertext = &raw[HEADER_LEN..];
+    let ciphertext = &raw[HEADER_LEN..]; // slice from byte 61 to the end (everything after the header)
     let key = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params)?;
     // The full header (incl. nonce) is the AEAD associated data.
     let aad = header.to_bytes();
+    // Decrypt into a `Zeroizing` buffer so the plaintext JSON is wiped on drop.
+    // `?` here means: if decryption fails (wrong password or tampering), return early.
     let plaintext = Zeroizing::new(crypto::decrypt(&key, &header.nonce, ciphertext, &aad)?);
+    // Parse the JSON plaintext into a `Vault`. The `: Vault` annotation tells
+    // serde which type to deserialize into. `&plaintext` lends the bytes read-only.
     let vault: Vault = serde_json::from_slice(&plaintext)?;
-    Ok((vault, header, key))
+    Ok((vault, header, key)) // hand back all three so callers can reuse the key/header
 }
 
 /// Encrypt `vault` under `key` and write it atomically to `path` (new nonce, full
@@ -612,19 +741,28 @@ fn write_vault_file(
     salt: &[u8; SALT_LEN],
     params: KdfParams,
 ) -> Result<(), VaultError> {
+    // Serialize the vault to JSON bytes (wiped on drop), pick a fresh random nonce,
+    // and build the header. `*salt` dereferences the `&[u8; N]` borrow to copy the
+    // array by value into the new `Header`.
     let plaintext = Zeroizing::new(serde_json::to_vec(vault)?);
     let nonce = crypto::random_bytes::<NONCE_LEN>()?;
     let header = Header { params, salt: *salt, nonce };
     let header_bytes = header.to_bytes();
     let ciphertext = crypto::encrypt_with_nonce(key, &nonce, &plaintext, &header_bytes)?;
 
+    // A *let-chain*: the block runs only if `path.parent()` is `Some(parent)` AND
+    // that parent is non-empty. `parent` is in scope for the whole condition + body.
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
         harden_dir(parent);
     }
+    // Atomic write: stage to a temp sibling file, then rename over the target.
+    // A rename is atomic on POSIX, so a reader never sees a half-written vault.
     let tmp = sibling_tmp(path)?;
+    // `if let Err(e) = ...` = handle just the failure case. On error, best-effort
+    // delete the temp (`let _ =` ignores that cleanup's own result) then return.
     if let Err(e) = write_new_file(&tmp, &header_bytes, &ciphertext) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -633,7 +771,7 @@ fn write_vault_file(
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
-    sync_parent_dir(path);
+    sync_parent_dir(path); // fsync the directory so the rename is durable on disk
     Ok(())
 }
 
@@ -646,15 +784,15 @@ fn write_vault_file(
 fn recover_pending_rekey(dir: &Path, read_only: bool) -> Result<(), VaultError> {
     let staging = dir.join(REKEY_DIR);
     if !staging.exists() {
-        return Ok(());
+        return Ok(()); // nothing pending — the common case
     }
     if read_only {
-        return Err(VaultError::RekeyPending);
+        return Err(VaultError::RekeyPending); // can't write, so can't recover; report it
     }
     if staging.join(REKEY_READY).exists() {
-        commit_rekey(dir, &staging)?;
+        commit_rekey(dir, &staging)?; // marker present -> the new tree is complete -> finish it
     } else {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&staging); // no marker -> incomplete -> throw it away (best-effort)
     }
     Ok(())
 }
@@ -676,13 +814,13 @@ fn replace_dir(live: &Path, staged: &Path) -> Result<(), VaultError> {
     if !staged.exists() {
         return Ok(());
     }
-    let old = sibling_old(live);
-    let _ = fs::remove_dir_all(&old);
+    let old = sibling_old(live); // a temporary ".<name>.old" path next to `live`
+    let _ = fs::remove_dir_all(&old); // clear any leftover from a prior crash (best-effort)
     if live.exists() {
-        fs::rename(live, &old)?;
+        fs::rename(live, &old)?; // move the current dir aside...
     }
-    fs::rename(staged, live)?;
-    let _ = fs::remove_dir_all(&old);
+    fs::rename(staged, live)?; // ...then move the staged dir into its place
+    let _ = fs::remove_dir_all(&old); // drop the old copy (best-effort; harmless if it lingers)
     Ok(())
 }
 
@@ -696,6 +834,9 @@ fn replace_path(live: &Path, staged: &Path) -> Result<(), VaultError> {
 }
 
 fn sibling_old(path: &Path) -> PathBuf {
+    // `.file_name()` -> `Option<&OsStr>`; `.and_then(|n| n.to_str())` chains another
+    // optional step (the name may not be valid UTF-8, giving `None`); `.unwrap_or("x")`
+    // supplies a fallback name if either step yielded `None`.
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("x");
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(format!(".{name}.old")),
@@ -705,11 +846,17 @@ fn sibling_old(path: &Path) -> PathBuf {
 
 /// Normalize a virtual directory path to `/a/b/c` form (empty string == root).
 fn normalize_dir(path: &str) -> String {
+    // Iterator pipeline: split on '/', `.filter(|p| !p.is_empty())` drops empty
+    // segments (so "a//b" and trailing slashes collapse), then `.collect()` gathers
+    // the kept `&str` pieces into a `Vec`. The closure `|p| !p.is_empty()` is the test.
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() { String::new() } else { format!("/{}", parts.join("/")) }
 }
 
 fn rand_suffix() -> Result<String, CryptoError> {
+    // 8 random bytes -> `.iter()` over them -> `.map(|b| format!("{b:02x}"))` formats
+    // each as a 2-digit lowercase hex string -> `.collect()` concatenates into one
+    // `String` (a 16-char hex suffix). `?` propagates a failure of the RNG call.
     Ok(crypto::random_bytes::<8>()?.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -743,8 +890,9 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
     let stamp = compact_timestamp(records::unix_now());
     let mut target = dest_dir.join(format!("backup-{stamp}"));
     let mut n = 1;
+    // Find a non-colliding name: keep appending `_n` while the path already exists.
     while target.exists() {
-        target = dest_dir.join(format!("backup-{stamp}_{n}"));
+        target = dest_dir.join(format!("backup-{stamp}_{n}")); // reassign `target` (it's `mut`)
         n += 1;
     }
     fs::create_dir_all(&target)?;
@@ -752,6 +900,7 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
 
     fs::copy(vault_path, target.join(VAULT_FILE))?;
     harden_file(&target.join(VAULT_FILE))?;
+    // Iterate a literal array of the two subdirectory names; `sub` binds each in turn.
     for sub in ["manifest", "volume"] {
         let s = src_dir.join(sub);
         if s.exists() {
@@ -765,12 +914,14 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), VaultError> {
     fs::create_dir_all(dst)?;
     harden_dir(dst);
+    // `read_dir` yields each entry as a `Result`; `let entry = entry?;` unwraps it
+    // (propagating any I/O error), shadowing the loop variable with the unwrapped value.
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            copy_dir(&from, &to)?;
+            copy_dir(&from, &to)?; // recurse into subdirectories
         } else {
             fs::copy(&from, &to)?;
             harden_file(&to)?;
@@ -788,48 +939,59 @@ fn compact_timestamp(ts: i64) -> String {
 // --- Cross-platform file hardening (compile on Windows + Linux) --------------
 // `pub` so the CLI binary (a separate crate over this library) can reuse them.
 
+// `#[cfg(unix)]` is *conditional compilation*: this version of the function is
+// compiled ONLY on Unix-like systems. The `#[cfg(not(unix))]` twin below is
+// compiled everywhere else. Exactly one definition of `harden_file` exists per
+// build, so the rest of the code can call it unconditionally.
 #[cfg(unix)]
 pub fn harden_file(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt; // trait that adds `.set_mode()` to permissions
     let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
+    perms.set_mode(0o600); // owner read/write only — no access for group/others
     fs::set_permissions(path, perms)
 }
 #[cfg(not(unix))]
 pub fn harden_file(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+    Ok(()) // no-op on non-Unix; the `_path` name marks the arg as intentionally unused
 }
 
+// Same Unix / non-Unix split as `harden_file`, but for directories (0700 =
+// owner-only access). Returns nothing and ignores errors (best-effort hardening).
 #[cfg(unix)]
 pub fn harden_dir(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
+    // `if let Ok(meta) = ...` runs the body only when the metadata read succeeded.
     if let Ok(meta) = fs::metadata(dir) {
         let mut perms = meta.permissions();
-        perms.set_mode(0o700);
-        let _ = fs::set_permissions(dir, perms);
+        perms.set_mode(0o700); // owner: read/write/execute; group & others: nothing
+        let _ = fs::set_permissions(dir, perms); // best-effort; ignore the result
     }
 }
 #[cfg(not(unix))]
-pub fn harden_dir(_dir: &Path) {}
+pub fn harden_dir(_dir: &Path) {} // no-op on non-Unix (empty body)
 
 /// Open a brand-new file with `create_new` (O_EXCL; no symlink-follow) + 0600.
 fn create_new_0600(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = OpenOptions::new();
+    // `.create_new(true)` = fail if the path already exists (atomic O_EXCL). This
+    // refuses to clobber an existing file and won't follow a planted symlink.
     opts.write(true).create_new(true);
+    // A `#[cfg(unix)]` on a *block*: this whole `{ ... }` is compiled only on Unix.
+    // There it sets the file's creation mode to 0600 (owner read/write only).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt; // brings `.mode()` into scope
         opts.mode(0o600);
     }
     opts.open(path)
 }
 
 fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultError> {
-    let mut f = create_new_0600(path)?;
+    let mut f = create_new_0600(path)?; // `f` is mutable: writing to it changes its state
     harden_file(path)?;
-    f.write_all(part1)?;
-    f.write_all(part2)?;
-    f.sync_all()?;
+    f.write_all(part1)?; // write the header bytes...
+    f.write_all(part2)?; // ...then the ciphertext bytes
+    f.sync_all()?; // flush to disk (fsync) before returning, for durability
     Ok(())
 }
 
@@ -838,35 +1000,50 @@ fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultEr
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
     harden_file(path)?;
+    // `.and_then(|()| f.sync_all())` chains the fsync onto the write: it runs only
+    // if `write_all` returned `Ok(())`, and the whole expression is `Err` if either
+    // step failed. On failure: close the file, delete the partial output, return.
     if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
-        drop(f);
+        drop(f); // close the handle before unlinking (matters on some platforms)
         let _ = fs::remove_file(path);
         return Err(e.into());
     }
     Ok(())
 }
 
+// fsync the *directory* so a rename/create is durable (a crash can't lose it).
+// Only meaningful on Unix; the non-Unix twin is a no-op.
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
+    // `.filter(...)` keeps the parent only if non-empty; `.unwrap_or_else(closure)`
+    // computes the fallback `"."` lazily (the closure runs only when needed).
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
+        let _ = dir.sync_all(); // best-effort directory fsync
     }
 }
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
 
 /// Fuzzing entry point (hidden). The vault-file header parser; see `fuzz/`.
+// `mod fuzz { ... }` declares an inner module (a namespace). `#[doc(hidden)]`
+// keeps it out of generated docs. It just exposes the header parser so a fuzzer
+// can feed it arbitrary bytes; `super::` means "the parent module" (this file).
 #[doc(hidden)]
 pub mod fuzz {
     pub fn header(buf: &[u8]) {
-        let _ = super::Header::parse(buf);
+        let _ = super::Header::parse(buf); // discard result; we only care that it doesn't crash
     }
 }
 
+// Everything below is the test suite. `#[cfg(test)]` compiles this module ONLY
+// when running `cargo test` — it is never part of the shipped binary. Each
+// `#[test]` function is an independent check the test runner executes; `assert!`
+// / `assert_eq!` fail (panic) the test if a condition doesn't hold. `.unwrap()`
+// is used liberally here because a panic in a test is just a test failure.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*; // pull every item from the parent module (this file) into the tests
     use crate::records::{self, Account};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -904,6 +1081,9 @@ mod tests {
         let mut v = OpenVault::create(path.clone(), b"first", b"second", fast()).unwrap();
         records::upsert(&mut v.vault.accounts, sample_account("octocat", "hunter2"));
         v.save().unwrap();
+        // `drop(v)` ends `v`'s lifetime right here (instead of at the end of scope),
+        // which runs its destructor and releases the single-writer lock so the
+        // reopen below can take it. This `drop`-to-release pattern recurs throughout.
         drop(v); // release the single-writer lock before reopening
 
         let reopened = OpenVault::open(path.clone(), b"first", b"second").unwrap();
@@ -929,6 +1109,9 @@ mod tests {
         let path = tmp_path("exists");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
         let err = OpenVault::create(path.clone(), b"a", b"b", fast()).err().unwrap();
+        // `matches!(value, Pattern)` is true if `value` fits the pattern. Here `_`
+        // inside the variant ignores the contained path — we only check the *kind*
+        // of error. Used throughout these tests to assert a specific failure.
         assert!(matches!(err, VaultError::AlreadyExists(_)));
         cleanup(&path);
     }
@@ -1650,6 +1833,10 @@ mod tests {
         cleanup(&path);
     }
 
+    // Property-based testing: instead of fixed inputs, `proptest!` generates many
+    // random inputs matching the given specs (the `in "regex"` strings) and checks
+    // the `prop_assert!` invariants hold for all of them. `prelude::*` imports its
+    // common names with a single glob.
     use proptest::prelude::*;
     proptest! {
         /// Virtual paths are always rooted, and `normalize_dir` is idempotent and

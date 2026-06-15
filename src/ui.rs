@@ -9,16 +9,30 @@
 //! written back on save — so the per-type knowledge lives in two small places
 //! (`start_edit` and `save_edit`) instead of throughout the key handler.
 
+// `use` brings names into scope (like `import` in other languages). The `{a, b}`
+// braces import several items from one module at once.
+//
+// `Path` is a borrowed filesystem path (a view, like `&str`); `PathBuf` is an
+// owned, growable path (like `String`). You hand out `&Path` to read, keep a
+// `PathBuf` to own.
 use std::path::{Path, PathBuf};
+// `Duration` = a length of time; `Instant` = a specific moment on the monotonic
+// clock (used for "do X after N seconds").
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
+// `self` in a `{...}` import also brings in the module itself, so we can write
+// both `event::poll(...)` (via `event`) and the individual `Event`, `KeyCode`… types.
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+// Secret-wiping helpers. `Zeroize` = a trait (interface) providing `.zeroize()`
+// to overwrite memory with zeros; `ZeroizeOnDrop` makes a type wipe itself
+// automatically when it goes out of scope; `Zeroizing<T>` wraps a value so it is
+// zeroed on drop. These keep passwords from lingering in RAM.
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::KdfParams;
@@ -30,12 +44,32 @@ use crate::vault::{self, OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits. `writable` enables mutations;
 /// when false the vault is opened read-only and write keys are inert.
+///
+/// `&mut DefaultTerminal` is an *exclusive borrow*: this function may mutate the
+/// terminal but does not own it (the caller keeps it). `path` and `writable` are
+/// passed by value (moved/copied in). The return type `anyhow::Result<()>` is
+/// either `Ok(())` (success, no useful value) or `Err(e)` (some error);
+/// `anyhow::Result` is a convenience alias whose error type can hold any error.
 pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, writable: bool) -> anyhow::Result<()> {
+    // `let mut` = a mutable variable (without `mut`, bindings are read-only).
     let mut app = App::new(path, writable);
     loop {
+        // `|frame| app.draw(frame)` is a closure (an inline anonymous function);
+        // `terminal.draw` calls it back with a drawing surface.
+        // The trailing `?` means "if this returns an error, stop and return it
+        // from `run`"; on success it unwraps the `Ok` value and continues.
         terminal.draw(|frame| app.draw(frame))?;
         // Poll rather than block so the clipboard auto-clear deadline fires even
         // when the user isn't pressing keys.
+        //
+        // This is a *let-chain*: a sequence of `&&`-joined conditions where some
+        // bind with `let`. It only enters the `if` body when ALL hold, evaluated
+        // left to right (short-circuiting). Read it as:
+        //   - a key event arrived within the poll interval, AND
+        //   - `event::read()` produced an `Event::Key` (the `let Event::Key(key)`
+        //     pattern matched and bound `key`), AND
+        //   - it was a key *press* (not release/repeat), AND
+        //   - `app.handle_key(key)` returned true (meaning "quit").
         if event::poll(CLIPBOARD_POLL_INTERVAL)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -48,6 +82,10 @@ pub fn run(terminal: &mut DefaultTerminal, path: PathBuf, writable: bool) -> any
     Ok(())
 }
 
+// `enum` defines a type with a fixed set of named variants (like a tagged union
+// / a closed set of states). `#[derive(...)]` auto-generates trait impls so we
+// don't write them by hand: `PartialEq`/`Eq` enable `==`, `Debug` enables
+// `{:?}` formatting for logging/tests.
 #[derive(PartialEq, Eq, Debug)]
 enum Screen {
     Auth,
@@ -56,6 +94,9 @@ enum Screen {
     Config,
 }
 
+// `Clone` allows explicit `.clone()` copies; `Copy` makes the type copy
+// implicitly on assignment (cheap value types like this small enum). With `Copy`,
+// passing a `Tab` around does not "move" (consume) it.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Tab {
     Instructions,
@@ -65,10 +106,17 @@ enum Tab {
     RealEstate,
 }
 
+// `impl Tab { ... }` attaches methods/constants to the `Tab` type.
 impl Tab {
+    // `[Tab; 5]` is a fixed-size array of 5 `Tab` values. `const` = a
+    // compile-time constant.
     const ALL: [Tab; 5] =
         [Tab::Instructions, Tab::TrustWill, Tab::Assets, Tab::Accounts, Tab::RealEstate];
 
+    // Methods take `self`; because `Tab` is `Copy`, taking `self` by value here is
+    // cheap and does not consume the caller's copy. The return type
+    // `&'static str` is a borrowed string slice that lives for the whole program
+    // (`'static` is the lifetime of program-long data, e.g. string literals).
     fn title(self) -> &'static str {
         match self {
             Tab::Instructions => "Instructions",
@@ -80,10 +128,17 @@ impl Tab {
     }
 
     fn index(self) -> usize {
+        // `.iter()` walks the array by reference; `.position(closure)` returns the
+        // index of the first element where the closure is true, as `Option<usize>`
+        // (`Some(i)` or `None`). `|t| *t == self` is a closure taking each item as
+        // `t: &Tab`; `*t` dereferences the borrow to compare by value.
+        // `.unwrap_or(0)` yields the inner index, or `0` if `None`.
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 
     fn shifted(self, delta: isize) -> Tab {
+        // `as` is a primitive numeric cast. `rem_euclid` is a modulo that always
+        // returns a non-negative result, so stepping left past 0 wraps to the end.
         let n = Tab::ALL.len() as isize;
         let i = (self.index() as isize + delta).rem_euclid(n) as usize;
         Tab::ALL[i]
@@ -99,6 +154,11 @@ enum AuthMode {
     ChangePassword,
 }
 
+// A `struct` groups named fields (like a record/object). Deriving `Zeroize` and
+// `ZeroizeOnDrop` here means: when an `AuthField` is dropped, its memory is wiped.
+// `#[zeroize(skip)]` excludes a field — `label` is a non-secret static string, so
+// it is skipped; `value` (a typed password) is wiped. `String` is an owned,
+// growable, heap-allocated UTF-8 string (vs `&str`, a borrowed view).
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct AuthField {
     #[zeroize(skip)]
@@ -108,13 +168,19 @@ struct AuthField {
 
 struct AuthState {
     mode: AuthMode,
+    // `Vec<T>` is a growable array (heap-allocated list) of `T`.
     fields: Vec<AuthField>,
     focus: usize,
+    // `Option<T>` is either `Some(value)` or `None` — Rust's null-free "maybe".
     error: Option<String>,
 }
 
 impl AuthState {
+    // `Self` is shorthand for the enclosing type (`AuthState`).
     fn new(mode: AuthMode) -> Self {
+        // `&[&'static str]` is a slice (borrowed view) of static string slices.
+        // `if` is an expression here: the chosen `&[...]` array literal is bound
+        // to `labels`.
         let labels: &[&'static str] = if mode == AuthMode::Unlock {
             &["Password 1", "Password 2"]
         } else {
@@ -122,6 +188,10 @@ impl AuthState {
         };
         AuthState {
             mode,
+            // Iterator pipeline: `.iter()` borrows each label, `.map(closure)`
+            // transforms each into an `AuthField`, `.collect()` gathers the
+            // results into the `Vec<AuthField>` the field's type demands.
+            // `String::new()` makes an empty owned string.
             fields: labels.iter().map(|l| AuthField { label: l, value: String::new() }).collect(),
             focus: 0,
             error: None,
@@ -131,6 +201,8 @@ impl AuthState {
 
 // --- Edit form ---------------------------------------------------------------
 
+// An enum variant can carry data: `Choice(Vec<String>)` holds the list of
+// selectable options; the others are data-less markers.
 #[derive(Clone)]
 enum FieldKind {
     Text,
@@ -150,11 +222,19 @@ struct Field {
 
 // FieldKind holds no secrets; skip-zeroize is fine. Implement Zeroize for it as
 // a no-op so the derive on Field is satisfied without wiping option lists.
+//
+// (To satisfy `#[derive(Zeroize)]` on `Field`, every field's type must itself be
+// `Zeroize`; this manual `impl` makes `FieldKind` count, doing nothing. `&mut
+// self` is an exclusive borrow of the value being zeroized.)
 impl Zeroize for FieldKind {
     fn zeroize(&mut self) {}
 }
 
 impl Field {
+    // These are "constructor" helper functions (no `self`, called as
+    // `Field::text(...)`). `label: &str` is a borrowed string view; `.into()`
+    // converts it into the owned `String` the field needs. `value` uses field
+    // init shorthand (the variable name matches the field name).
     fn text(label: &str, value: String) -> Field {
         Field { label: label.into(), value, kind: FieldKind::Text }
     }
@@ -170,9 +250,18 @@ impl Field {
 
     /// Cycle a Choice field's value by `delta` (no-op for other kinds).
     fn cycle(&mut self, delta: isize) {
+        // `if let PATTERN = EXPR` runs the body only when the pattern matches.
+        // Here it both checks that `self.kind` is the `Choice` variant AND binds
+        // its inner list to `opts` (as a borrow, via `&self.kind`). Combined with
+        // `&& !opts.is_empty()` it is a let-chain: enter only when both hold.
         if let FieldKind::Choice(opts) = &self.kind
             && !opts.is_empty()
         {
+            // Find the current option's index (defaulting to 0 if not found),
+            // step by `delta` with wrap-around, then store an owned copy of the
+            // new option. `&self.value` borrows the value to compare without
+            // moving it; `.clone()` is needed because we can't move out of the
+            // borrowed `opts` slice.
             let cur = opts.iter().position(|o| o == &self.value).unwrap_or(0);
             let i = (cur as isize + delta).rem_euclid(opts.len() as isize) as usize;
             self.value = opts[i].clone();
@@ -185,6 +274,8 @@ impl Field {
 /// / upload-from / export-to) for the doc-bearing tabs.
 struct EditState {
     tab: Tab,
+    // `Option<String>`: `Some(id)` for an existing record, `None` for a brand-new
+    // one whose id has not been generated yet.
     id: Option<String>,
     created_at: i64,
     fields: Vec<Field>,
@@ -197,6 +288,8 @@ struct EditState {
 
 /// The tabs whose records can carry an attached document (single source of truth).
 fn tab_has_docs(tab: Tab) -> bool {
+    // `matches!(value, PATTERN)` is a one-shot boolean: true if `value` fits the
+    // pattern. The `|` means "or" — TrustWill or Assets.
     matches!(tab, Tab::TrustWill | Tab::Assets)
 }
 
@@ -206,12 +299,16 @@ impl EditState {
     }
 }
 
+// The whole application state lives in one struct, passed around as `&self`
+// (read) or `&mut self` (mutate).
 struct App {
     path: PathBuf,
     /// When false the vault is opened read-only and mutating keys are inert.
     writable: bool,
     screen: Screen,
     auth: AuthState,
+    // The unlocked vault, present only after a successful unlock/create
+    // (`None` while on the Auth screen).
     vault: Option<OpenVault>,
     tab: Tab,
     selected: usize,
@@ -243,6 +340,10 @@ const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(15);
 /// How often the event loop wakes (when idle) to check the auto-clear deadline.
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+// `Drop` is the destructor trait: `drop()` runs automatically when an `App` goes
+// out of scope (including on quit or panic). This is a security cleanup hook —
+// if a password was copied to the OS clipboard this session, wipe it on exit so
+// it does not outlive the program.
 impl Drop for App {
     fn drop(&mut self) {
         if self.clipboard_dirty {
@@ -284,6 +385,8 @@ impl App {
     /// Wipe the clipboard once the auto-clear deadline has passed. Called from the
     /// event loop, so a copied password is cleared even with no further input.
     fn tick_clipboard(&mut self) {
+        // Let-chain: only act when a deadline is set (`Some(deadline)`) AND the
+        // current time has reached it.
         if let Some(deadline) = self.clipboard_clear_at
             && Instant::now() >= deadline
         {
@@ -294,6 +397,11 @@ impl App {
         }
     }
 
+    // Returns a shared (read-only) borrow of the open vault.
+    // `self.vault` is an `Option`; `.as_ref()` turns `&Option<T>` into
+    // `Option<&T>` (borrow the inner value without moving it). `.expect(msg)`
+    // unwraps the `Some`, or panics with `msg` if it is `None`. Safe here because
+    // the Browse/Edit/Config screens are only reachable once the vault is open.
     fn vault_ref(&self) -> &OpenVault {
         self.vault.as_ref().expect("vault open on browse/edit")
     }
@@ -301,17 +409,30 @@ impl App {
     /// `(id, label)` pairs for the current tab's records. The Accounts tab is
     /// additionally filtered by the active type/subtype/owner/review filters, and
     /// the Assets tab by the review filter.
+    // Returns `(id, label)` pairs; `(String, String)` is a tuple (two values in
+    // one). `match self.tab { ... }` branches on which tab is active — `match`
+    // must cover every variant.
     fn current_labels(&self) -> Vec<(String, String)> {
         let v = &self.vault_ref().vault;
         match self.tab {
             Tab::Instructions => label_list(&v.instructions),
             Tab::TrustWill => label_list(&v.trust_wills),
+            // Iterator pipeline: borrow each asset (`.iter()`), keep only those
+            // passing the closure in `.filter(...)`, transform survivors into
+            // `(id, label)` tuples with `.map(...)`, then `.collect()` into a Vec.
+            // `.clone()`/`a.label()` build owned `String`s because the records are
+            // only borrowed here. The filter keeps an asset when the review filter
+            // is off (`!self.asset_filter_review`) OR the asset is flagged.
             Tab::Assets => v
                 .assets
                 .iter()
                 .filter(|a| !self.asset_filter_review || a.review)
                 .map(|a| (a.id.clone(), a.label()))
                 .collect(),
+            // Same shape, but four chained filters (each must pass).
+            // `Option::as_deref()` turns `&Option<String>` into `Option<&str>`;
+            // `.is_none_or(closure)` is true when the filter is unset (`None`) OR
+            // the closure holds — i.e. "no filter, or it matches".
             Tab::Accounts => v
                 .accounts
                 .iter()
@@ -326,7 +447,14 @@ impl App {
     }
 
     /// Distinct, sorted, non-empty values of an account field (for filter cycling).
+    // `field: impl Fn(&Account) -> &str` is a generic parameter: the caller passes
+    // ANY closure/function that takes `&Account` and returns a `&str` (e.g.
+    // `|a| &a.owner`). This lets one method extract whichever field is wanted.
     fn account_values(&self, field: impl Fn(&Account) -> &str) -> Vec<String> {
+        // Build owned strings (`.to_string()`), drop empties, collect to a Vec,
+        // then sort and `dedup` (remove adjacent duplicates — effective after
+        // sorting) to get distinct values. The final bare `v` is the return value
+        // (Rust returns the last expression of a block; no `return` keyword needed).
         let mut v: Vec<String> = self
             .vault_ref()
             .vault
@@ -350,6 +478,10 @@ impl App {
     }
 
     fn persist(&mut self) {
+        // Let-chain: get an exclusive borrow of the vault (`.as_mut()` →
+        // `Option<&mut T>`), and if the save returns `Err(e)` (a `Result` failure),
+        // bind the error and surface it. `format!("...{e}")` builds a String,
+        // interpolating `e` inline (Rust's captured-identifier formatting).
         if let Some(ov) = self.vault.as_mut()
             && let Err(e) = ov.save()
         {
@@ -358,6 +490,8 @@ impl App {
     }
 
     /// Gate a mutating action: returns true if writable, else sets a status hint.
+    // `&mut self` because it may set `self.status`. An early `return true` exits
+    // immediately; otherwise the function falls through to the final `false`.
     fn require_writable(&mut self) -> bool {
         if self.writable {
             return true;
@@ -368,6 +502,8 @@ impl App {
 
     // --- Key handling: returns true to quit ---------------------------------
 
+    // Dispatch a key press to the active screen's handler. The bool result
+    // (returned by each handler) bubbles up to the event loop: true = quit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self.screen {
             Screen::Auth => self.handle_auth_key(key),
@@ -378,6 +514,8 @@ impl App {
     }
 
     fn handle_auth_key(&mut self, key: KeyEvent) -> bool {
+        // `match` on the key code. Arms can have guards (`if ...`) and patterns
+        // that bind data (e.g. `Char(c)`); the wildcard `_` matches anything else.
         match key.code {
             KeyCode::Esc => {
                 if self.auth.mode == AuthMode::ChangePassword {
@@ -386,10 +524,13 @@ impl App {
                 }
                 return true;
             }
+            // Guarded arm: a typed character that is NOT a Ctrl-combo. `Char(c)`
+            // binds the typed char to `c`; append it to the focused field's value.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.auth.fields[self.auth.focus].value.push(c);
             }
             KeyCode::Backspace => {
+                // `.pop()` removes the last char (returns an `Option`, ignored here).
                 self.auth.fields[self.auth.focus].value.pop();
             }
             KeyCode::Tab | KeyCode::Down => {
@@ -411,21 +552,31 @@ impl App {
         false
     }
 
+    // Returns `Result<(Zeroizing<String>, Zeroizing<String>), String>`:
+    // on success the two passwords (each wrapped so it self-wipes on drop), or on
+    // failure an error message. `&self` (read-only) — it only inspects fields.
     fn confirmed_passwords(&self) -> Result<(Zeroizing<String>, Zeroizing<String>), String> {
         let f = &self.auth.fields;
+        // Destructure a tuple of borrows into four named bindings at once.
         let (pw1, c1, pw2, c2) = (&f[0].value, &f[1].value, &f[2].value, &f[3].value);
         if pw1.is_empty() || pw2.is_empty() {
+            // `Err(...)` early-returns the failure variant of the Result.
             return Err("Both passwords are required.".into());
         }
         if pw1 != c1 || pw2 != c2 {
             return Err("Password confirmations do not match.".into());
         }
+        // `Zeroizing::new(s)` wraps an owned String so its bytes are zeroed when
+        // the wrapper drops. We must `.clone()` because the originals are borrowed.
         Ok((Zeroizing::new(pw1.clone()), Zeroizing::new(pw2.clone())))
     }
 
     /// Wipe entered passwords from the auth fields once we leave the auth screen,
     /// so they don't linger in memory for the rest of the session.
     fn wipe_auth(&mut self) {
+        // `for f in &mut self.auth.fields` iterates by exclusive borrow, so each
+        // `f` can be mutated. `.zeroize()` overwrites the string's bytes with
+        // zeros; `.clear()` then resets its length to 0.
         for f in &mut self.auth.fields {
             f.value.zeroize();
             f.value.clear();
@@ -437,6 +588,8 @@ impl App {
     fn submit_auth(&mut self) {
         match self.auth.mode {
             AuthMode::ChangePassword => {
+                // `match` on a `Result` to handle both outcomes: on `Ok(p)` take
+                // the passwords; on `Err(m)` record the message and `return` early.
                 let (pw1, pw2) = match self.confirmed_passwords() {
                     Ok(p) => p,
                     Err(m) => {
@@ -445,6 +598,8 @@ impl App {
                     }
                 };
                 if let Some(ov) = self.vault.as_mut() {
+                    // `.as_bytes()` views a String as a `&[u8]` (raw byte slice) —
+                    // the crypto layer works on bytes, not text.
                     match ov.change_password(pw1.as_bytes(), pw2.as_bytes()) {
                         Ok(()) => {
                             self.status = "Master passwords changed.".into();
@@ -460,12 +615,16 @@ impl App {
     }
 
     fn submit_open_or_create(&mut self) {
+        // `creating` is a bool snapshot of the mode; computed once and reused.
         let creating = self.auth.mode == AuthMode::Create;
         if creating && !self.writable {
             self.auth.error =
                 Some("No vault here, and this is read-only. Relaunch with --write to create one.".into());
             return;
         }
+        // `result` holds a `Result<OpenVault, VaultError>` from whichever branch
+        // ran (both branches must produce the same type). `self.path.clone()` hands
+        // an owned copy to the constructor (which takes ownership of the path).
         let result = if creating {
             let (pw1, pw2) = match self.confirmed_passwords() {
                 Ok(p) => p,
@@ -478,6 +637,7 @@ impl App {
         } else {
             let f = &self.auth.fields;
             let (p1, p2) = (f[0].value.as_bytes(), f[1].value.as_bytes());
+            // `!self.writable` becomes the read-only flag.
             OpenVault::open_with(self.path.clone(), p1, p2, !self.writable)
         };
         match result {
@@ -497,10 +657,14 @@ impl App {
                 self.wipe_auth();
                 self.screen = Screen::Browse;
             }
+            // Match a specific error variant. `Crypto(_)` matches the Crypto case
+            // while ignoring its payload (`_`); shown as a generic message so we
+            // don't leak whether the password or the file was the problem.
             Err(VaultError::Crypto(_)) => {
                 self.auth = AuthState::new(self.auth.mode);
                 self.auth.error = Some("Wrong password(s) or corrupted vault.".into());
             }
+            // Catch-all for any other error variant; `e` binds the whole error.
             Err(e) => {
                 self.auth = AuthState::new(self.auth.mode);
                 self.auth.error = Some(format!("{e}"));
@@ -519,6 +683,9 @@ impl App {
                 self.tab = self.tab.shifted(-1);
                 self.selected = 0;
             }
+            // `c @ '1'..='5'` is a range pattern that also binds the matched char
+            // to `c`: a digit key 1-5 jumps straight to that tab. `c as usize -
+            // '1' as usize` converts the char to its 0-based tab index.
             KeyCode::Char(c @ '1'..='5') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
                 self.selected = 0;
@@ -526,9 +693,12 @@ impl App {
             KeyCode::Down => {
                 let n = self.current_labels().len();
                 if n > 0 {
+                    // `.min(n - 1)` clamps so we can't move past the last item.
                     self.selected = (self.selected + 1).min(n - 1);
                 }
             }
+            // `saturating_sub` subtracts but stops at 0 instead of underflowing
+            // (unsigned `usize` cannot go negative).
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Enter => {
                 if !self.current_labels().is_empty() {
@@ -546,7 +716,10 @@ impl App {
                 }
             }
             // Accounts-only display filters: cycle by type / subtype / owner.
+            // Guarded arms (`if self.tab == Tab::Accounts`): the same key does
+            // nothing on other tabs (falls through to the `_ => {}` arm).
             KeyCode::Char('t') if self.tab == Tab::Accounts => {
+                // `|a| &a.account_type` is a closure selecting which field to list.
                 let opts = self.account_values(|a| &a.account_type);
                 self.acct_filter_type = cycle_filter(&self.acct_filter_type, &opts);
                 self.acct_filter_subtype = None; // subtypes are type-specific
@@ -557,9 +730,13 @@ impl App {
                 // UNION any free-text subtypes actually present on its accounts;
                 // otherwise cycle the subtypes present across all accounts.
                 let opts = match self.acct_filter_type.clone() {
+                    // A type filter is active: start with that type's configured
+                    // subtypes, then add any free-text subtypes actually used.
                     Some(t) => {
                         let mut opts = self.vault_ref().categories().subtypes_for(&t);
                         for a in &self.vault_ref().vault.accounts {
+                            // `&&` chains the conditions; `.contains(&x)` checks
+                            // membership (takes a borrow to compare).
                             if a.account_type == t
                                 && !a.account_subtype.is_empty()
                                 && !opts.contains(&a.account_subtype)
@@ -606,6 +783,7 @@ impl App {
     }
 
     fn handle_config_key(&mut self, key: KeyEvent) -> bool {
+        // A local `const` (compile-time constant) for the field count.
         const CFG_FIELDS: usize = 6;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
@@ -623,6 +801,9 @@ impl App {
         false
     }
 
+    // Returns `&mut String`: an exclusive borrow of whichever input field is
+    // currently focused, so the caller can push/pop characters into it. Each arm
+    // hands back a mutable reference to one of the config strings.
     fn cfg_field_mut(&mut self) -> &mut String {
         match self.cfg_focus {
             0 => &mut self.cfg_asset_type,
@@ -645,6 +826,11 @@ impl App {
         }
         match self.cfg_focus {
             0 => {
+                // `.trim()` strips surrounding whitespace; `.to_string()` makes an
+                // owned copy. `.expect(...)` unwraps the open vault (panics with the
+                // message if absent — safe, since Config is only reachable unlocked).
+                // The result is a `Result<bool, _>`: `Ok(true)` = added, `Ok(false)`
+                // = no-op (empty/duplicate), `Err(e)` = save failed.
                 let name = self.cfg_asset_type.trim().to_string();
                 match self.vault.as_mut().expect("vault open on config").add_asset_type(&name) {
                     Ok(true) => {
@@ -683,8 +869,12 @@ impl App {
                     Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
+            // `.parse::<u64>()` attempts to read the text as an unsigned 64-bit
+            // integer, returning `Result<u64, _>`. The guarded `Ok(mib) if mib >= 1`
+            // arm accepts only a positive number; anything else falls to `_`.
             4 => match self.cfg_volume_size.trim().parse::<u64>() {
                 Ok(mib) if mib >= 1 => {
+                    // `saturating_mul` clamps to the max instead of overflowing.
                     let bytes = mib.saturating_mul(1024 * 1024);
                     match self.vault.as_mut().expect("vault open on config").set_volume_max_size(bytes) {
                         Ok(()) => {
@@ -719,6 +909,10 @@ impl App {
         // Resolve the selected record by id: the browse list may be filtered
         // (Accounts), so a positional index must not be applied to the unfiltered
         // vector. `sel` finds a record by that id in any record vector.
+        // `.get(i)` returns `Option<&T>` (None if out of bounds — no panic).
+        // `.map(|(id, _)| id.clone())` transforms the inner `Some` value: it
+        // destructures the `(id, label)` tuple, ignores the label (`_`), and clones
+        // the id into an owned String. For a new record there is no selection.
         let sel_id: Option<String> = if existing {
             self.current_labels().get(self.selected).map(|(id, _)| id.clone())
         } else {
@@ -726,6 +920,9 @@ impl App {
         };
         let v = &self.vault_ref().vault;
 
+        // Destructure the chosen branch's tuple into five named bindings; `mut
+        // fields` is mutable because doc inputs may be appended below. The explicit
+        // type annotation documents what each arm of the following `match` returns.
         let (id, created_at, mut fields, attached, history): (
             Option<String>,
             i64,
@@ -734,6 +931,15 @@ impl App {
             Vec<Change>,
         ) = match tab {
             Tab::Instructions => {
+                // Find the selected record, else build a fresh one:
+                //  - `.as_ref()` borrows inside the `Option` so it isn't consumed.
+                //  - `.and_then(closure)` runs the closure only if `Some`, and the
+                //    closure itself returns an `Option` (flattening the two).
+                //  - `.find(|r| &r.id == id)` scans for the matching record and
+                //    returns `Option<&Instruction>`; `.cloned()` makes it owned.
+                //  - `.unwrap_or_else(|| ...)` supplies a default when `None`; the
+                //    inner `unwrap_or_default()` falls back if `Instruction::new()`
+                //    (which can fail) returns an error.
                 let r = sel_id
                     .as_ref()
                     .and_then(|id| v.instructions.iter().find(|r| &r.id == id).cloned())
@@ -814,6 +1020,10 @@ impl App {
                         // Subtype is a dependent dropdown of the chosen type's
                         // subtypes; the current value is kept selectable even if
                         // it is not in the configured list (e.g. legacy data).
+                        // The third argument is a block expression `{ ... }` that
+                        // computes the options list. `.any(|x| x == &...)` returns
+                        // true if any option equals the current value; if not, the
+                        // current value is prepended so legacy data stays selectable.
                         Field::choice("Subtype", r.account_subtype.clone(), {
                             let mut s = self.vault_ref().categories().subtypes_for(&r.account_type);
                             if !r.account_subtype.is_empty()
@@ -858,6 +1068,8 @@ impl App {
             }
         };
 
+        // Remember how many fields belong to the record itself, before appending
+        // the extra doc-upload inputs (so the two groups can be told apart later).
         let record_fields = fields.len();
         // Append document-upload inputs for the doc-bearing tabs.
         if tab_has_docs(tab) {
@@ -883,6 +1095,11 @@ impl App {
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // `let Some(es) = ... else { ... }` is a *let-else*: if the pattern matches,
+        // `es` is bound (here an exclusive borrow of the edit buffer) and used
+        // after the block; if it does NOT match (no edit in progress), the `else`
+        // block runs and MUST diverge (here it `return`s), so `es` is always valid
+        // below.
         let Some(es) = self.edit.as_mut() else {
             self.screen = Screen::Browse;
             return false;
@@ -899,6 +1116,9 @@ impl App {
                 }
             }
             KeyCode::Char('g') if ctrl => {
+                // Let-chain: only if writable AND there is a password field.
+                // `.iter_mut()` yields exclusive borrows; `.find(...)` returns the
+                // first whose kind matches `FieldKind::Password` (via `matches!`).
                 if self.writable
                     && let Some(f) = es.fields.iter_mut().find(|f| matches!(f.kind, FieldKind::Password))
                 {
@@ -909,9 +1129,13 @@ impl App {
                     self.require_writable();
                 }
             }
+            // Toggle reveal: `!` flips the bool.
             KeyCode::Char('r') if ctrl => es.reveal = !es.reveal,
             KeyCode::Char('y') if ctrl => {
+                // `.iter()` (shared borrows) to find the password and copy it.
                 if let Some(f) = es.fields.iter().find(|f| matches!(f.kind, FieldKind::Password)) {
+                    // Clone into a `Zeroizing<String>` so the temporary copy is
+                    // wiped from memory as soon as `pw` drops.
                     let pw = Zeroizing::new(f.value.clone());
                     self.copy_to_clipboard(pw);
                 }
@@ -934,14 +1158,18 @@ impl App {
                 let n = es.fields.len();
                 es.focus = (es.focus + n - 1) % n;
             }
+            // One arm handles both arrow keys (`A | B` = "A or B"); `delta` is -1
+            // for Left, +1 for Right, used to step a Choice field's selection.
             KeyCode::Left | KeyCode::Right => {
                 let delta = if matches!(key.code, KeyCode::Left) { -1 } else { 1 };
                 es.fields[es.focus].cycle(delta);
                 // On the Accounts tab, cycling the account-type field reconstrains
                 // the dependent subtype field: rebuild its options for the new type
                 // and drop a value that no longer belongs to it.
+                // `.as_str()` borrows the `String` label as a `&str` for comparison.
                 if self.tab == Tab::Accounts && es.fields[es.focus].label.as_str() == "Account type" {
                     let new_type = es.fields[es.focus].value.clone();
+                    // `.position(...)` finds the subtype field's index, if present.
                     if let Some(si) = es.fields.iter().position(|f| f.label.as_str() == "Subtype") {
                         let opts = self
                             .vault
@@ -949,11 +1177,16 @@ impl App {
                             .map(|ov| ov.categories().subtypes_for(&new_type))
                             .unwrap_or_default();
                         let cur = es.fields[si].value.clone();
+                        // Keep the current subtype only if it's still a valid option.
                         let value = if opts.iter().any(|o| o == &cur) { cur } else { String::new() };
                         es.fields[si] = Field::choice("Subtype", value, opts);
                     }
                 }
             }
+            // A typed char (non-Ctrl): append it, but only to free-text fields —
+            // `!matches!(f.kind, FieldKind::Choice(_))` skips dropdowns, which are
+            // edited with the arrow keys instead. `&mut es.fields[es.focus]` is an
+            // exclusive borrow of the focused field.
             KeyCode::Char(c) if !ctrl => {
                 let f = &mut es.fields[es.focus];
                 if !matches!(f.kind, FieldKind::Choice(_)) {
@@ -973,6 +1206,9 @@ impl App {
 
     /// Ensure the edit buffer has a stable id (generating one for a new record),
     /// so a brand-new record can't end up with an empty colliding id.
+    // No `self` — this is an associated function, called as `Self::ensure_id(...)`.
+    // `.map_err(|e| e.to_string())` converts the generator's error into a String,
+    // and the `?` then early-returns that `Err` if id generation failed.
     fn ensure_id(es: &mut EditState) -> Result<(), String> {
         if es.id.is_none() {
             es.id = Some(records::random_id().map_err(|e| e.to_string())?);
@@ -983,6 +1219,10 @@ impl App {
     /// Read the doc-input fields, upload the document into the volume, and
     /// immediately persist the record→document link so there is no orphan.
     fn attach_document(&mut self) {
+        // `.take()` moves the value out of the `Option`, leaving `None` behind, so
+        // we own `es` (mutably) for the duration; the `else { return }` bails if
+        // there is no edit in progress. Throughout this function, on any early
+        // exit we put `es` back with `self.edit = Some(es)` so the buffer survives.
         let Some(mut es) = self.edit.take() else { return };
         if !es.has_docs() {
             self.edit = Some(es);
@@ -1022,7 +1262,10 @@ impl App {
         };
         // Replacing an existing attachment: reclaim the previous blob so it does
         // not become an orphan in the archive.
+        // `.replace(id)` stores the new id and returns the OLD one (as an Option).
         let previous = es.attached_file_id.replace(id);
+        // `rc..rc + 3` is a half-open range (rc, rc+1, rc+2): clear the three doc
+        // input fields now that the upload consumed them.
         for i in rc..rc + 3 {
             es.fields[i].value.clear();
         }
@@ -1035,6 +1278,8 @@ impl App {
         // Persist the new link BEFORE reclaiming the replaced blob: a crash in
         // between must not leave the vault referencing a dropped doc.
         self.persist();
+        // `let _ = expr` deliberately discards the result (ignore any error from
+        // reclaiming the now-replaced blob — it's a best-effort cleanup).
         if let Some(old) = previous
             && let Some(ov) = self.vault.as_mut()
         {
@@ -1054,6 +1299,7 @@ impl App {
             self.edit = Some(es);
             return;
         }
+        // `.take()` clears the attachment and returns the old id (if any).
         let id = es.attached_file_id.take();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
@@ -1064,6 +1310,8 @@ impl App {
         // Persist the unlink BEFORE reclaiming the blob (crash-safety: a dangling
         // reference is fatal on reopen, an orphaned blob is harmless).
         self.persist();
+        // Three-condition let-chain: only when there was an id, the vault is open,
+        // and the removal failed do we capture the error to report below.
         let mut cleanup_err = None;
         if let Some(id) = id
             && let Some(ov) = self.vault.as_mut()
@@ -1080,12 +1328,14 @@ impl App {
     }
 
     fn export_document(&mut self) {
+        // Shared borrow here (`.as_ref()`) since export only reads the buffer.
         let Some(es) = self.edit.as_ref() else { return };
         if !es.has_docs() {
             return;
         }
         let rc = es.record_fields;
         let dest = es.fields[rc + 3].value.clone();
+        // let-else: require an attached document, or report and bail.
         let Some(id) = es.attached_file_id.clone() else {
             self.status = "No document attached to export.".into();
             return;
@@ -1104,13 +1354,21 @@ impl App {
 
     /// Rebuild the typed record from the edit fields (using the buffer's stable
     /// id, which must already be set) and upsert it into the vault.
+    // `es: &EditState` is a shared borrow — this reads the edit buffer and writes
+    // into the vault.
     fn commit_edit_record(&mut self, es: &EditState) {
+        // A local closure: `f(i)` returns an owned copy of field `i`'s value,
+        // keeping the per-tab record-building below terse (`f(0)`, `f(1)`, …).
         let f = |i: usize| es.fields[i].value.clone();
+        // Use the buffer's id, or an empty default if somehow unset.
         let id = es.id.clone().unwrap_or_default();
         let Some(ov) = self.vault.as_mut() else { return };
+        // `&mut ov.vault` — exclusive borrow so we can push/replace records.
         let v = &mut ov.vault;
         match es.tab {
             Tab::Instructions => {
+                // `Instruction::default()` builds an all-default record, which we
+                // then overwrite field by field from the form.
                 let mut r = Instruction::default();
                 r.id = id;
                 r.created_at = es.created_at;
@@ -1140,6 +1398,7 @@ impl App {
                 r.institution = f(6);
                 r.asset_type = f(7);
                 r.url = f(8);
+                // The "Review" Choice stores "Yes"/"No"; compare to get a bool.
                 r.review = f(9) == "Yes";
                 r.statement = es.attached_file_id.clone();
                 records::upsert(&mut v.assets, r);
@@ -1176,6 +1435,8 @@ impl App {
 
     /// Save the current edit form back into the vault.
     fn save_edit(&mut self) {
+        // Take ownership of the buffer; on the id-generation error path we put it
+        // back so the user keeps their entered data.
         let Some(mut es) = self.edit.take() else { return };
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = format!("Could not create id: {e}");
@@ -1191,6 +1452,8 @@ impl App {
 
     fn delete_selected(&mut self) {
         let labels = self.current_labels();
+        // let-else with a tuple pattern: take the selected `(id, label)`, ignore
+        // the label (`_`), clone an owned id; bail if nothing is selected.
         let Some((id, _)) = labels.get(self.selected).cloned() else { return };
         // Collect any attached document blob to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
@@ -1235,9 +1498,13 @@ impl App {
         self.status = "Deleted.".into();
     }
 
+    // `text: Zeroizing<String>` is taken by value (moved in): this function owns
+    // it and it is wiped from memory when it drops at the end of the call.
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
         // `text` wipes on drop; arboard copies into the OS clipboard (auto-cleared
         // on the 15s timer and on exit).
+        // `.and_then(closure)` chains two fallible steps: open the clipboard, then
+        // set its text — the whole thing is `Ok` only if both succeed.
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
             Ok(()) => {
                 self.clipboard_dirty = true;
@@ -1250,6 +1517,9 @@ impl App {
 
     // --- Drawing -------------------------------------------------------------
 
+    // Drawing reads state only, hence `&self`; `frame: &mut Frame` is the
+    // ratatui canvas we render widgets onto for this tick. Dispatch to the
+    // active screen's draw routine.
     fn draw(&self, frame: &mut Frame) {
         match self.screen {
             Screen::Auth => self.draw_auth(frame),
@@ -1260,11 +1530,16 @@ impl App {
     }
 
     fn draw_config(&self, frame: &mut Frame) {
+        // Builder pattern: each `.method(...)` returns the (modified) builder, so
+        // calls chain. This splits the screen vertically into a flexible main area
+        // (`Min(1)`) and a fixed 3-row footer (`Length(3)`); `chunks` is a slice
+        // of `Rect`s indexed below.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(frame.area());
 
+        // An array of `(label, &String)` tuples pairing each input with its value.
         let inputs = [
             ("New asset/liability type", &self.cfg_asset_type),
             ("New account type", &self.cfg_account_type),
@@ -1293,6 +1568,8 @@ impl App {
             Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(""));
+        // `.enumerate()` pairs each item with its index; the pattern
+        // `(i, (label, value))` destructures index plus the inner tuple in one go.
         for (i, (label, value)) in inputs.iter().enumerate() {
             let focused = i == self.cfg_focus;
             let marker = if focused { "> " } else { "  " };
@@ -1335,6 +1612,8 @@ impl App {
         for (i, field) in self.auth.fields.iter().enumerate() {
             let focused = i == self.auth.focus;
             let marker = if focused { "> " } else { "  " };
+            // Never render the actual password: show one `*` per character.
+            // `.chars().count()` counts Unicode characters (not raw bytes).
             let masked = "*".repeat(field.value.chars().count());
             let style = if focused {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -1366,6 +1645,9 @@ impl App {
             .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)])
             .split(frame.area());
 
+        // `.collect::<Vec<_>>()` is the "turbofish" syntax telling `collect` which
+        // collection to build (a `Vec`; `_` lets the compiler infer the element
+        // type). Here it gathers every tab's title into a list for the tab bar.
         let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
             .select(self.tab.index())
             .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-5) "))
@@ -1373,6 +1655,8 @@ impl App {
         frame.render_widget(tabs, chunks[0]);
 
         let labels = self.current_labels();
+        // Turn each `(id, label)` into a `ListItem`, ignoring the id (`_`) and using
+        // the label text. `Vec<ListItem>` annotation drives the `.collect()` type.
         let items: Vec<ListItem> =
             labels.iter().map(|(_, l)| ListItem::new(Line::from(l.clone()))).collect();
         let count = items.len();
@@ -1397,6 +1681,9 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
             .highlight_symbol("> ");
+        // A `ListState` tracks which row is highlighted. `render_stateful_widget`
+        // takes `&mut state` because it updates scrolling/selection internals as
+        // it draws.
         let mut state = ListState::default();
         if count > 0 {
             state.select(Some(self.selected.min(count - 1)));
@@ -1422,6 +1709,9 @@ impl App {
         for (i, field) in es.fields.iter().enumerate() {
             let focused = i == es.focus;
             let marker = if focused { "> " } else { "  " };
+            // Decide what to display per field kind: a hidden password shows bullets
+            // (unless `reveal` is on); a Choice shows arrows around the value; others
+            // show their text verbatim. `&field.kind` matches by borrow.
             let shown = match &field.kind {
                 FieldKind::Password if !es.reveal => "•".repeat(field.value.chars().count()),
                 FieldKind::Choice(_) => format!("◄ {} ►", field.value),
@@ -1438,6 +1728,9 @@ impl App {
             ]));
         }
         if es.has_docs() {
+            // Resolve the attached blob id to a human path: borrow the Option
+            // (`.as_ref()`), look it up (`.and_then` runs only if `Some` and itself
+            // returns an Option), and fall back to "(none)" if there's no doc.
             let attached = es
                 .attached_file_id
                 .as_ref()
@@ -1452,6 +1745,8 @@ impl App {
         if !es.history.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("History:", Style::default().add_modifier(Modifier::BOLD))));
+            // `.rev()` walks newest-first, `.take(6)` keeps only the first six —
+            // iterators are lazy, so this never materializes the whole history.
             for c in es.history.iter().rev().take(6) {
                 let detail = if c.detail.is_empty() { c.action.clone() } else { c.detail.clone() };
                 lines.push(Line::from(Span::styled(
@@ -1489,6 +1784,10 @@ impl App {
     }
 }
 
+// Generic helper: `<R: Record>` means "for any type `R` that implements the
+// `Record` trait" (a trait bound — `R` must provide `.id()` and `.label()`).
+// `list: &[R]` is a slice (borrowed view) of any record type, so one function
+// serves every tab. Builds `(id, label)` pairs as owned strings.
 fn label_list<R: Record>(list: &[R]) -> Vec<(String, String)> {
     list.iter().map(|r| (r.id().to_string(), r.label())).collect()
 }
@@ -1504,6 +1803,11 @@ fn bool_choice(b: bool) -> String {
 }
 
 /// Advance a filter through: None → opts[0] → opts[1] → … → None (wrap to off).
+// `current: &Option<String>` borrows the active filter (no ownership taken).
+// `match` on it: if currently off (`None`), pick the first option (`.first()` →
+// `Option<&String>`, `.cloned()` → owned). If a value is set (`Some(cur)`), find
+// its index and — only if there is a next one (guard `i + 1 < len`) — return it;
+// otherwise (`_`) wrap back to `None` (filter off).
 fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
     match current {
         None => opts.first().cloned(),
@@ -1514,6 +1818,8 @@ fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
     }
 }
 
+// Best-effort wipe of the OS clipboard (set it to empty). `let _ =` discards the
+// `Result`: if the clipboard is unavailable there is nothing useful to do.
 fn clear_clipboard() {
     let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(String::new()));
 }
@@ -1521,14 +1827,22 @@ fn clear_clipboard() {
 /// Format a unix-seconds timestamp as `YYYY-MM-DD HH:MM:SS UTC` (no date crate).
 /// Returns "never" for a zero/negative timestamp. Shared with the GUI; the
 /// calendar math lives once in [`crate::records::civil_from_unix`].
+// `pub(crate)` = visible to this crate (the whole program) but not external
+// users — wider than private, narrower than fully `pub`.
 pub(crate) fn format_time(ts: i64) -> String {
     if ts <= 0 {
         return "never".to_string();
     }
+    // Destructure the six returned date/time components into named bindings.
     let (year, mo, d, h, m, s) = records::civil_from_unix(ts);
+    // `{year:04}` etc. are format specs: zero-pad to the given width (4 or 2).
     format!("{year:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
+// `#[cfg(test)]` is conditional compilation: this whole `mod tests` module is
+// only built when running `cargo test`, so it adds nothing to the shipped binary.
+// `use super::*;` pulls in everything from the parent (this file) so the tests can
+// reach private items like `App`, `Tab`, and the helper functions.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,6 +1895,10 @@ mod tests {
         }
     }
 
+    // Tiny constructors for synthetic key events: `key(code)` = a plain key,
+    // `ctrl(c)` = Ctrl + a character. Used to drive `handle_key` in tests.
+    // (`.unwrap()` is used liberally throughout the tests below: it panics on
+    // `Err`/`None`, which is exactly how a test should fail.)
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1588,6 +1906,8 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    // `#[test]` marks a function the test runner executes; it takes no args and a
+    // panic (e.g. a failed `assert_eq!`) means failure.
     #[test]
     fn cycle_filter_wraps_through_none() {
         let opts = vec!["a".to_string(), "b".to_string()];
