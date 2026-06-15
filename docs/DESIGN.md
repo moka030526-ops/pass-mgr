@@ -1,16 +1,34 @@
 # pass-mgr — Design Document
 
-_Last updated: 2026-06-13_
+_Last updated: 2026-06-15. Format version 4 (partitioned document store)._
 
 ## 1. Purpose
 
-`pass-mgr` is a **standalone, offline** password manager. It stores credentials
-in a single, strongly-encrypted file on the local disk. It never opens a network
-socket and has no remote sync, telemetry, or update mechanism. The whole point is
-that the secrets never leave the machine.
+`pass-mgr` is a **standalone, offline, two-password encrypted estate vault**. It
+keeps the things a family needs to settle an estate — account credentials, asset
+and liability records, real-estate details, trust/will documents, and free-text
+instructions — in one strongly-encrypted location on the local disk, together
+with the scanned documents that back them up.
 
-The code is deliberately small and readable so that a single person can audit the
-entire security-critical path in one sitting.
+Three properties define it:
+
+- **Offline by construction.** It never opens a network socket and has no remote
+  sync, telemetry, auto-update, or cloud anything. There is no async runtime and
+  no networking crate in the dependency tree (a load-bearing decision, not an
+  omission — see §3, req. 1). The secrets never leave the machine.
+- **Two passwords, both required.** The encryption key is derived by chaining two
+  Argon2id passes over two independently-entered passwords (§5.2), so the vault
+  can be split across two trustees and neither half alone can open it.
+- **Auditable.** The code is deliberately small (a handful of modules, no
+  `unsafe`, heavily commented, extensively tested) so one person can read the
+  entire security-critical path — KDF, AEAD, the on-disk format, and the crash-
+  safety protocol — in a single sitting. That reviewability *is* a security
+  feature (req. 13).
+
+The intended user is non-technical (someone organising their own estate, or an
+executor opening it later); the intended reviewer is a security-conscious
+engineer auditing what they run. This document is the "why"; `IMPLEMENTATION.md`
+is the "how" and the "where".
 
 ## 2. Requirements traceability
 
@@ -18,40 +36,65 @@ Each numbered requirement from the brief maps to a concrete design element.
 
 | # | Requirement | Where it lives |
 |---|-------------|----------------|
-| 1 | Standalone, no internet | No network crates in `Cargo.toml`; verified by dependency audit (§8) |
-| 2 | Filter screen + custom types | `Entry.kind` (freeform), filter bar in TUI (`ui.rs`) |
-| 3 | Description, username, password, URL | `Entry` fields |
-| 4 | Each change logged with timestamp | `Entry.history: Vec<Change>` + `Vault.audit` |
-| 5 | History maintained | Per-entry `history` retained on every edit |
-| 6 | Last access maintained | `Vault.last_opened_at`, surfaced on unlock |
-| 7 | Highest encryption level | Argon2id + XChaCha20-Poly1305 (§5) |
-| 8 | Encrypted JSON file | JSON plaintext, AEAD-encrypted on disk (§6) |
-| 9 | Two passwords, set sequentially | Chained KDF (§5.2) |
-| 10 | Intuitive interface | Ratatui TUI, single-screen list + detail (§7) |
-| 11 | File identifiable | `PMVAULT\0` magic + self-describing header (§6) |
-| 12 | Random password generator | `password.rs`, bias-free CSPRNG sampling |
-| 13 | Simple to review | ~5 small modules, no `unsafe`, heavily commented, unit-tested |
-| + | Compiles on Windows + Linux | Portable std + `#[cfg]`-gated permissions (§9.9), `directories` for paths |
+| 1 | Standalone, no internet | No network/async crates in `Cargo.toml`; offline by construction (§3) |
+| 2 | Filter screens + custom category types | Per-tab filters (account type/subtype/owner/review; asset review); editable `categories` stored in-vault (§4.2, §4.3) |
+| 3 | Rich records (accounts, assets, real estate, trust/will, instructions) | Five record types, one per tab (§4.1) |
+| 4 | Each change logged with timestamp | Per-record `history: Vec<Change>` + vault-level `audit` (§4.2) |
+| 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2) |
+| 6 | Last access maintained | `Vault.last_opened_at` + a monotonic `generation`, surfaced on unlock (§4.2) |
+| 7 | Highest encryption level | Argon2id KDF + XChaCha20-Poly1305 AEAD, per-blob (§5) |
+| 8 | Encrypted JSON | JSON vault + JSON manifests, all AEAD-encrypted on disk (§6) |
+| 9 | Two passwords, set sequentially | Chained Argon2id derivation (§5.2) |
+| 10 | Intuitive interface | Two interchangeable front-ends (egui GUI default, ratatui TUI) over one API (§7) |
+| 11 | File identifiable | `PMVAULT\0` magic + self-describing header; fixed directory layout (§6) |
+| 12 | Random password generator | `password.rs`, bias-free rejection sampling over the OS CSPRNG (§5, §7) |
+| 13 | Simple to review | Small modules, no `unsafe` (crate-wide `#![forbid]`), commented, unit/property/fuzz/mutation-tested |
+| 14 | Attach supporting documents | Partitioned, per-blob-encrypted, crash-safe document store (§4.3, §6, §11) |
+| 15 | Survive crashes / power loss | Ordered per-operation commit + recovery; staged crash-safe rekey (§6.4, §11) |
+| + | Compiles on Windows + Linux | Portable `std` + `#[cfg]`-gated permissions (§9.9), `directories` for paths |
 
 ## 3. Technology choices
 
-- **Language:** Rust (edition 2024). Memory safety without a GC; `zeroize`
-  support for wiping secrets.
+- **Language:** Rust (edition 2024). Memory safety without a garbage collector —
+  no use-after-free or buffer overflow in safe code, which matters for a program
+  that parses attacker-controlled files. The crate sets `#![forbid(unsafe_code)]`
+  crate-wide, so there is *no* `unsafe` anywhere (even the page-locking goes
+  through a safe wrapper, see below). `zeroize` integrates cleanly for wiping
+  secrets on drop.
 - **Interface:** two interchangeable front-ends over the same vault API —
   a [`ratatui`](https://crates.io/crates/ratatui) terminal UI (`ui.rs`, good for
   SSH/headless) and an [`egui`/`eframe`](https://crates.io/crates/eframe)
   graphical UI (`gui.rs`, the default). Both compile into the single standalone
-  binary; neither uses a browser, Electron, or the network. The GUI is the
-  default; `--tui` selects the terminal UI.
-- **KDF:** `argon2` (Argon2id).
-- **Cipher:** `chacha20poly1305` (XChaCha20-Poly1305 AEAD).
-- **Clipboard:** `arboard`, for copying a password without displaying it.
-- **Randomness:** `getrandom` (OS CSPRNG).
-- **Serialization:** `serde` + `serde_json`.
-- **Secret hygiene:** `zeroize` to wipe keys and decrypted buffers.
+  binary; neither uses a browser, Electron, or the network. Keeping all crypto
+  and storage behind one `OpenVault` API means the (larger, less-audited) UI code
+  is *not* security-critical and can't reach around the core. `--tui` selects the
+  terminal UI.
+- **KDF:** `argon2` (Argon2id) — the current best-practice memory-hard password
+  hash (PHC winner, OWASP-recommended). Memory-hardness is what makes offline
+  guessing expensive on GPUs/ASICs. Chosen over PBKDF2/bcrypt for that reason.
+- **Cipher:** `chacha20poly1305` (XChaCha20-Poly1305 AEAD). AEAD gives
+  confidentiality *and* integrity in one primitive (encrypt-then-MAC built in), so
+  tampering is detected on decrypt. The **X**ChaCha variant has a 192-bit (24-byte)
+  nonce, large enough that **random** nonces effectively never collide — which lets
+  every write pick a fresh random nonce with no counter state to corrupt. Chosen
+  over AES-GCM to avoid AES-GCM's smaller nonce (reuse is catastrophic) and its
+  reliance on hardware AES for constant-time safety.
+- **Clipboard:** `arboard` (default features disabled — the image stack is not
+  pulled in), for copying a password without displaying it; auto-cleared (§7.1).
+- **Randomness:** `getrandom` (the OS CSPRNG) for salts, nonces, ids, and the
+  password generator — no userspace PRNG to seed or mis-seed.
+- **Serialization:** `serde` + `serde_json`. JSON keeps the plaintext
+  human-inspectable (it round-trips through `export-tree`, §6.3) and the parser is
+  mature and fuzzed upstream.
+- **Secret hygiene:** `zeroize` to wipe keys and decrypted buffers on drop;
+  `region` to memory-lock (`mlock`/`VirtualLock`) the derived key's pages so they
+  are not paged to swap (best-effort, §9.6).
 
-There is intentionally **no async runtime and no networking crate**. This is a
-load-bearing design decision, not an omission (req. 1).
+There is intentionally **no async runtime and no networking crate** — verified by
+`cargo audit`/dependency review and by the absence of `tokio`/`reqwest`/etc. in
+`Cargo.lock`. This is a load-bearing design decision, not an omission (req. 1):
+nothing in the process can open a socket, so secrets cannot exfiltrate even if a
+dependency tried.
 
 ## 4. Data model
 
@@ -342,31 +385,94 @@ offset  len  field
 > vault AAD; manifests and volume frames each bind `vault_id ‖ partition` in their
 > own AAD.
 
+### 6.3 Plaintext mirror — full decrypt / import round-trip
+
+Two CLI commands form a **lossless round-trip** between the encrypted vault and a
+fully-decrypted directory that *mirrors its structure* (distinct from `extract`,
+which writes a human-readable virtual tree and is one-way):
+
+```
+pass-mgr export-tree [DIR] OUTDIR    # decrypt the whole vault into a plaintext mirror
+pass-mgr import-tree  SRCDIR [DIR]   # build a NEW encrypted vault from a mirror
+```
+
+**Mirror layout** (everything decrypted, names mirroring the encrypted tree):
+
+```text
+OUTDIR/vault.json                 # the decrypted Vault (records, categories,
+                                  #   settings, audit, id, version, generation)
+OUTDIR/manifest/manifest.<N>.json # the decrypted manifest of partition N
+                                  #   (entries: {id, path, size, uploaded_at, ...})
+OUTDIR/volume/vol.<N>/<id>        # each document's raw decrypted bytes, by id,
+                                  #   grouped by the partition it lived in
+```
+
+`export-tree` decrypts the vault once (one Argon2 derivation), then walks every
+partition writing the three kinds of file; it refuses a half-committed rekey
+(`RekeyPending`) so the mirror is always self-consistent.
+
+`import-tree` reverses it: read `vault.json` (preserving the records, categories,
+settings, and vault `id`), then re-encrypt every document from the mirror — using
+its manifest entry for the virtual `path`/`uploaded_at` and the `vol.<N>/<id>`
+bytes for content — into a brand-new encrypted vault under **two new passwords**
+(fresh salt, fresh per-blob nonces). Documents are re-placed by the current
+`volume_max_size`, so the imported partition layout reflects the imported
+`settings`, not necessarily the source's. It refuses to overwrite an existing
+vault.
+
+**No duplicated crypto.** Both commands are thin orchestration over the same
+primitives used everywhere else: `export-tree` reuses the decrypt path and the
+`VolumeStore` read accessors; `import-tree` reuses `VolumeStore::open` +
+`put` (the exact per-blob re-encryption a password change already performs) +
+the atomic vault writer, then hands back a normal `OpenVault` via the standard
+open path (which re-validates and runs the referenced⊆stored consistency check).
+
+**Uses.** Disaster recovery and migration (rotate to a clean vault, or move to a
+new machine, via a human-inspectable intermediate), format introspection, and
+re-keying by full rebuild. Because the mirror is **plaintext on disk**, it
+carries the same warning as `decrypt`/`extract`: write it only to encrypted or
+ephemeral storage and delete it promptly (§9.10, §9.17).
+
 ## 7. User interface (req. 10)
 
-The app ships **two front-ends** that share the same `OpenVault` API and the
-same four-screen state machine (Auth / List / Detail / Edit), so all crypto and
-data-model logic is common:
+The app ships **two interchangeable front-ends** that drive the **same**
+`OpenVault` API and the same screen shape (Auth → browse → edit, plus a Config
+screen), so every line of crypto, storage, and data-model logic is shared and
+UI-independent. Adding or changing a front-end touches no security-critical code.
 
-- **Graphical (`gui.rs`, default)** — `egui`/`eframe`, immediate-mode, on-screen
-  buttons. Needs a desktop (X11/Wayland).
-- **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH.
+- **Graphical (`gui.rs`, the default)** — `egui`/`eframe`, immediate-mode,
+  on-screen buttons and tabs. Needs a desktop (X11/Wayland).
+- **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
+  headless. Key bindings are shown on-screen at all times; no mouse required.
 
-Because the security-critical modules (`crypto.rs`, `vault.rs`, `password.rs`)
-are UI-independent, adding the GUI changed no crypto and required no schema
-change. The terminal UI has three screens beyond Auth:
+Both present the estate vault as **five tabs**, one per record type — Instructions,
+Trust & Will, Assets & Liabilities, Accounts, Real Estate — over four screens:
 
-1. **Unlock / Create.** Prompts for password 1, then password 2 (masked). On a
-   missing file, switches to a create flow that asks for each password twice to
-   confirm. Shows "Last opened: <timestamp>" after a successful unlock (req. 6).
-2. **List.** A filter bar (`All` + type chips) and a search box at the top, the
-   entry list in the middle, key hints at the bottom. Typing filters live.
-3. **Detail / Edit.** Shows all fields; password masked with a reveal toggle and
-   a "copy to clipboard" action. An edit form writes a `Change` to history on
-   save. A "History" pane lists timestamped changes for the entry (req. 4, 5).
+1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
+   On a missing vault it switches to a create flow that asks for each password
+   twice to confirm. After unlock it shows the last-opened time and the write
+   `generation` (req. 6; a jump backwards in generation hints at a rollback,
+   §9.12). The same screen drives **change-password** (re-key), which calls
+   `OpenVault::change_password`.
+2. **Browse.** The selected tab's records as a list, with per-tab **filters**
+   (Accounts by type/subtype/owner/"needs review"; Assets by "needs review")
+   driven by the in-vault category lists. Selection resolves **by record id**, so
+   a filtered list never edits the wrong record.
+3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
+   a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
+   to the record's history (req. 4, 5), shown in a History pane. Document-bearing
+   tabs (Trust & Will, Assets) can **attach / detach / replace / export** a
+   supporting document; the attach path enforces the 256-byte virtual-path limit
+   (the GUI disables the button with an inline error, the TUI rejects the upload
+   key) and persists the record→document link before reclaiming any old blob
+   (crash-safe ordering, §11).
+4. **Config (write mode only).** Edit the category lists (asset types, account
+   types + subtypes) and the **volume size** (`volume_max_size`), and run a
+   `backup`. All edits persist into the encrypted vault — there are no external
+   config files.
 
-Key bindings are shown on-screen at all times (intuitive, discoverable). No
-mouse required.
+Read-only is the default and is enforced in the core (§4.4), with the UIs hiding
+write controls and showing a read-only badge.
 
 ### 7.1 Clipboard caveat
 
@@ -377,25 +483,50 @@ clipboard" action, but cannot guarantee the OS hasn't already captured it. See
 
 ## 8. Threat model
 
+**Adversary.** Someone who can read and/or write the on-disk vault *directory*
+(`vault.pmv`, `manifest/`, `volume/`) and may supply a crafted vault/manifest/
+volume, but who does **not** know the two passwords. The machine is assumed
+trustworthy *while the vault is unlocked* (host compromise is out of scope, below).
+
 **In scope (defended):**
 
-- **Theft of the vault file at rest.** Without both passwords, the file is
-  indistinguishable from random beyond its plaintext header. Argon2id makes
-  offline guessing expensive.
-- **Tampering with the file** (flipping bits, editing the header). Detected by
-  the AEAD tag; decrypt fails closed.
-- **Wrong password.** Fails closed with a generic error; no partial decrypt.
+- **Theft of the files at rest.** Without both passwords, every encrypted unit is
+  indistinguishable from random beyond the plaintext header. Argon2id makes
+  offline guessing expensive, and the header KDF parameters are size-bounded so a
+  crafted header can't force an unbounded Argon2 allocation (§9.13).
+- **Tampering / forgery.** Every unit is AEAD-authenticated and *bound to its
+  place*: the vault to its full header, each manifest and each volume frame to
+  `vault_id ‖ partition`, and each frame's id/path checked against the manifest on
+  read (§4.3, §5.5). So bit-flips, a swapped salt/nonce/param, a frame moved
+  across partitions, a manifest/volume from another vault, or a relabelled
+  document all fail the tag or the id check — decrypt fails closed.
+- **Crafted-input safety.** The hand-rolled frame/manifest parsers are fully
+  bounds-checked, size-capped, and fuzzed; arbitrary bytes yield `Err`, never a
+  panic, over-read, or OOM (§6.4, §9.13).
+- **Crash / power loss.** An interrupted write (including a password change)
+  recovers to a fully-committed state — never a partial or mixed one (§11).
+- **Wrong password.** Fails closed with a generic error; no partial decrypt and
+  no independent oracle for either password (§9.2).
+- **Accidental local exposure.** 0600/0700 permissions, swap-locked keys, and a
+  read-only default reduce *incidental* leakage to other local accounts or to disk.
 
 **Out of scope (cannot defend, by design or by platform):**
 
-- **A compromised host.** Malware, a keylogger, or a root user on the same
-  machine can capture passwords as you type or read process memory. No userland
-  password manager can defend against this.
-- **Cold-boot / swap / hibernation.** Keys live in RAM while unlocked and may be
-  paged to disk by the OS. We zeroize on drop but cannot prevent the OS from
-  having swapped earlier.
+- **A compromised host.** Malware, a keylogger, a debugger, or a root user on the
+  same machine can capture passwords as you type or read process memory while the
+  vault is unlocked. No userland password manager can defend against this.
+- **Cold-boot / swap / hibernation.** Keys live in RAM while unlocked and may have
+  been paged to disk earlier; zeroize/`mlock` are best-effort (§9.6).
+- **Rollback to authentic older state.** An attacker who can write the files can
+  restore an earlier, self-consistent snapshot (whole tree, a partition, or a
+  truncated volume); defeating this needs an external trusted counter (§9.12).
+- **Destruction.** Anyone who can write the directory can also delete it; the
+  format protects confidentiality/integrity, not availability.
 - **Shoulder-surfing / screen capture** of revealed passwords.
 - **Rubber-hose / coercion.** Both passwords can be extracted from the user.
+- **Plaintext the user exports.** `decrypt`/`extract`/`export-tree` deliberately
+  write secrets in the clear; protecting that output is the user's job (§9.10,
+  §9.17).
 
 ## 9. Security caveats & known limitations
 
@@ -583,6 +714,16 @@ narrow same-moment race, not corruption. The intended model is single-user,
 single-active-session; don't back up or extract while actively editing in another
 window.
 
+### 9.17 Plaintext export writes secrets to disk
+`export-tree` (§6.3) — like `decrypt` and `extract` — writes **unencrypted** data
+to disk: the full vault JSON (every password, in the clear), the document index,
+and every document's bytes. That is the whole point of the command, but it
+recreates exactly the exposure the vault exists to prevent. Treat any mirror as
+radioactive: write it only to an encrypted volume (LUKS/BitLocker/FileVault) or a
+tmpfs/ramdisk, re-encrypt it with `import-tree` promptly, and securely delete the
+plaintext when done. The mirror has no integrity binding once on disk — anyone who
+can edit it can change what `import-tree` will encrypt.
+
 ## 10. Non-goals
 
 - Browser integration / autofill.
@@ -640,3 +781,112 @@ password) is in `PLAN.md` §7.
 **CLI** gains directory-based decryption facilities: `decrypt` (vault JSON),
 `manifest [--part N]` (one or all manifests), and `extract [--part N]` (decrypt one
 or all volumes' documents). See `PLAN.md` §8.
+
+## 12. Crash-safety and recovery (req. 15)
+
+This is the property the vault treats as non-negotiable: **after any abrupt
+failure, reopening yields a consistent, openable vault equal to some committed
+state, losing at most the single in-flight operation — never a corrupt or
+unopenable vault, and never silent loss of older committed data.**
+
+### 12.1 Failure modes considered
+
+| Mode | What it does to the disk |
+|---|---|
+| **Force-kill (`SIGKILL`)** | Process dies instantly: no `Drop`, no destructors, no buffered flush. Bytes already `write()`-en may be in the OS page cache but not on the platter; an in-progress `write()` can be half-applied. |
+| **Full disk (`ENOSPC`)** | A `write`/`set_len`/`fsync`/`rename` returns an error *mid-operation*; later steps don't run; partial bytes may be on disk. The code must clean up and propagate the error, leaving prior state intact. |
+| **Power loss** | Everything not `fsync`'d is lost — *including directory entries* for newly-created or renamed files whose parent directory wasn't `fsync`'d. An `fsync`'d file is durable; a `rename` is atomic but only durable once its directory is `fsync`'d. |
+| **Forced shutdown** | Power loss combined with the process being killed — the union of the above. |
+
+### 12.2 The commit primitives
+
+Two atomic primitives underlie everything:
+
+- **Atomic file replace** (`write_atomic`, used for manifests and `vault.pmv`):
+  write a uniquely-named hidden temp with `create_new`/`O_EXCL` (mode `0600`),
+  `fsync` it, `rename` over the target, then `fsync` the directory. A crash before
+  the rename leaves the original untouched and removes the temp; the rename is
+  atomic (old-or-new, never half); the directory `fsync` makes it durable. An
+  `ENOSPC` during the temp write removes the temp and returns the error.
+- **Durable append** (`append_frame`, used for volume frames): open the volume,
+  `write` the frame at the committed `end_offset`, `set_len` to drop any torn
+  tail, `fsync` the file, then `fsync` the volume *directory* (so a first-ever
+  `vol.<N>` entry is durable before anything references it). It also refuses to
+  follow a symlink at the volume path.
+
+### 12.3 Per-operation commit order and recovery
+
+**Add / update a document (`storage::put`).**
+1. `append_frame` the encrypted frame at `end_offset`; fsync file + dir.
+2. `write_atomic` the partition manifest (its new `end_offset` now *includes* the
+   frame) — the storage commit point.
+3. Update the in-memory index (only after the on-disk commit succeeds).
+
+Recovery: the manifest's `end_offset` is authoritative. A crash/`ENOSPC` after
+step 1 but before step 2 leaves the frame as a torn tail *beyond* the committed
+`end_offset` — invisible on reopen and overwritten by the next append. A crash
+during step 2 leaves the old manifest authoritative (atomic replace). Either way
+the document either fully exists or doesn't; nothing in between, no corruption.
+
+**Delete (`storage::remove`)** is a single `write_atomic` of the manifest with the
+entry dropped — atomic, so it either happened or didn't. (The blob lingers as
+garbage; no compaction in v1.)
+
+**Save the vault (`vault::save` / `write_vault_file`)** is a single atomic replace
+of `vault.pmv`. The vault is the **final commit point**: a document blob/manifest
+committed in `storage::put` but not yet referenced by a saved vault is harmless
+garbage. So even a crash *between* a document commit and the vault save leaves a
+consistent vault (it just doesn't reference the new doc yet).
+
+**UI document lifecycle.** Attach commits the blob *then* links + saves the vault
+(a crash before the save leaves an unreferenced orphan — harmless). Delete /
+detach / replace **save the unlinked vault first, then reclaim the blob** — so a
+crash in between leaves an orphan, never a dangling reference (which would be
+`ArchiveMismatch` on open). See §11.
+
+**Password change (`change_password`)** is the only multi-file commit, handled by
+**stage + READY + roll-forward**:
+1. Stage a complete new-key tree in `mypath/.rekey/` (`vault.pmv`, `manifest/`,
+   `volume/`), re-encrypting every blob; fsync the files and dirs.
+2. Write the `.rekey/READY` marker (fsync) — the staging is now complete & valid.
+3. **Commit by roll-forward:** move `volume/`, then `manifest/`, then `vault.pmv`
+   **last**; fsync; remove `.rekey/`.
+
+On the next open, `recover_pending_rekey` runs *before* anything else:
+`.rekey/` with `READY` → finish the (idempotent) roll-forward → the new passwords
+open it; `.rekey/` without `READY` → discard it → the old passwords still open the
+intact old tree. A crash mid-commit therefore always lands on one whole tree,
+never a mix. If `commit_rekey` fails *in-process* (e.g. `ENOSPC` on a rename), the
+live handle is **poisoned** (made read-only) so it cannot write the new key over a
+half-moved tree; the next open completes the roll-forward.
+
+### 12.4 What "minimal corruption" means here
+
+The unit of possible loss is **one operation**: a crash can lose the document
+add/update/delete or the vault save that was in flight, and nothing older. There
+is no scenario in which a committed earlier record, document, or the whole vault
+becomes unreadable due to a crash — corruption is contained to the torn tail of a
+volume (ignored by `end_offset`) or an abandoned temp/`.rekey` (discarded on
+open). A lost or bit-rotted manifest is *rebuilt* by scanning its self-describing
+volume, so even losing an entire manifest is recoverable.
+
+### 12.5 How this is verified
+
+Crash-safety is tested at three levels (see `IMPLEMENTATION.md`):
+
+- **Direct on-disk state** — reproduce the exact bytes a crash would leave (torn
+  tails, truncated/garbage manifests, half-staged `.rekey` with/without `READY`,
+  each roll-forward sub-step) and assert recovery on reopen.
+- **In-process fault injection** — a feature-gated hook makes a chosen
+  `write`/`fsync`/`rename` return `ENOSPC`, asserting the operation fails cleanly
+  and the prior state stays intact and openable.
+- **Subprocess abort** — a child process performs a real operation and is aborted
+  at a chosen commit point (a feature-gated crash point), modelling a true
+  force-kill / power loss against the real code path; the parent then reopens and
+  asserts full recovery.
+
+> Residual platform caveat: durability ultimately depends on the OS and hardware
+> honoring `fsync`. On a filesystem/mount that ignores barriers, or hardware with
+> a lying write cache, a power loss can still lose the last fsync'd write — that is
+> below the application's control. The format never *corrupts*; at worst it loses
+> the most recent operation. See §9.11.
