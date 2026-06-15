@@ -318,6 +318,54 @@ breaking old vaults. Secrets are memory-locked (§9.6) and zeroized on drop.
   random per write, and the 24-byte XChaCha nonce space makes collision
   negligible — but this relies on the OS CSPRNG being sound.
 
+### 5.5 How this compares to BitLocker, Office/Excel passwords, and encrypted disks
+
+It is worth being precise about where `pass-mgr` sits relative to the encryption
+people already know, because the systems solve *different* problems and the
+honest comparison is "complementary, not competing." `pass-mgr` is **application-
+level, file-scoped, authenticated encryption that you actively unlock and that
+re-locks** — it protects one small estate vault even while you are logged in and
+even from other programs running as you. Full-disk encryption (FDE) —
+**BitLocker**, **LUKS/dm-crypt**, **FileVault**, **VeraCrypt** — instead protects
+a *whole volume at rest*: it is transparent once the machine is booted and the
+volume mounted, so it defends against a stolen or powered-off disk but does
+**nothing** to stop a logged-in attacker, malware, or another app from reading
+your files. **Office/Excel password protection** is the closest analogue (one
+encrypted document opened on demand), but it is the weakest of the group.
+
+Three axes matter most:
+
+| | KDF (offline-guessing cost) | Cipher / integrity | Scope & escrow |
+|---|---|---|---|
+| **pass-mgr** | **Argon2id**, memory-hard (64 MiB), chained over **two** required passwords | **XChaCha20-Poly1305 AEAD** — authenticated; tampering fails closed | one file-set; **no escrow/recovery, no backdoor** |
+| **BitLocker** | volume key **sealed to the TPM** (+ optional PIN); not a memory-hard passphrase hash. 48-digit recovery key = 128-bit random | **AES-XTS** — confidentiality only, **no authentication** (malleable; tamper not detected) | whole volume; recovery key is often **escrowed** to AD/Azure/Microsoft account |
+| **LUKS2** | **Argon2id** (comparable to pass-mgr) | AES-XTS — **no authentication** by default (dm-integrity is separate) | whole volume; multiple key slots (any one unlocks) |
+| **FileVault / VeraCrypt** | **PBKDF2**, many iterations (fast on GPUs relative to Argon2id) | AES-XTS — no authentication | whole volume; FileVault offers a recovery-key escrow |
+| **Excel / Office (.xlsx, 2013+)** | **iterated SHA-512** (e.g. ~100 k spins) — *not* memory-hard, fast to crack on GPUs; older `.xls` RC4 is trivially broken, and "protect sheet/workbook" is just a removable flag, not encryption | AES-CBC + an HMAC integrity check (agile encryption) | one document; no escrow |
+
+The upshot: pass-mgr's **key-derivation hardness matches the strongest of these
+(LUKS2's Argon2id)** and is far stronger than Excel's fast SHA-512 or FileVault/
+VeraCrypt's PBKDF2 against an attacker who has the file and guesses offline.
+Its **authentication is stronger than every disk encryptor's**: AES-XTS used by
+BitLocker/LUKS/FileVault/VeraCrypt provides confidentiality but is *malleable* and
+detects neither bit-flips nor swaps, whereas pass-mgr's AEAD (and its per-frame
+`vault_id ‖ partition ‖ id` binding, §4.3) makes any tampering fail closed. It is
+also **escrow-free with no recovery path** — unlike BitLocker's commonly-escrowed
+recovery key, losing both pass-mgr passwords means the data is gone (intentional
+for a two-trustee estate vault; a footgun if you simply forget). And its
+**two-passwords-both-required** design is unusual: BitLocker can require TPM+PIN
+(an AND, but bound to one machine's hardware), LUKS exposes multiple slots that
+each unlock independently (an OR), and Excel takes a single password.
+
+What pass-mgr deliberately gives up: FDE's *transparent, whole-disk* coverage (it
+protects only its own vault, not your `/home` or temp files), and BitLocker's
+hardware-bound, anti-hammering TPM and enterprise recovery. So the recommended
+posture is to run pass-mgr **on top of** an encrypted disk: FDE protects
+everything at rest and ties the key to the machine/TPM; pass-mgr adds a second,
+independently-keyed, authenticated, app-isolated layer for the estate secrets
+that stays locked while you work and that no other process — or a future you who
+only remembers one password — can open without both secrets.
+
 ## 6. On-disk file format (req. 8, 11)
 
 The vault is a **directory** `mypath/` holding three things:
@@ -497,7 +545,7 @@ trustworthy *while the vault is unlocked* (host compromise is out of scope, belo
 - **Tampering / forgery.** Every unit is AEAD-authenticated and *bound to its
   place*: the vault to its full header, each manifest and each volume frame to
   `vault_id ‖ partition`, and each frame's id/path checked against the manifest on
-  read (§4.3, §5.5). So bit-flips, a swapped salt/nonce/param, a frame moved
+  read (§4.3). So bit-flips, a swapped salt/nonce/param, a frame moved
   across partitions, a manifest/volume from another vault, or a relabelled
   document all fail the tag or the id check — decrypt fails closed.
 - **Crafted-input safety.** The hand-rolled frame/manifest parsers are fully
