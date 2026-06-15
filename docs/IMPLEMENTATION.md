@@ -172,8 +172,11 @@ Both share the four-screen shape (Auth / browse list / edit / Config). The GUI
 the render closures to keep `self` borrows disjoint). The TUI (`ui.rs`) builds
 each edit form as a flat `Vec<Field>` and rebuilds the typed record by field
 index in `commit_edit_record`. Selection resolves **by id** so filtered lists
-never edit the wrong record. Accounts filter by type/subtype/owner/review;
-Assets by review. A copied password is auto-cleared from the clipboard after 15s
+never edit the wrong record. Accounts filter by type/subtype/owner/review and a
+free-text **username search** (case-insensitive substring via the shared
+`records::matches_search`; the GUI has a search box, the TUI enters search input
+with `/`, Enter keeps / Esc clears); Assets by review. A copied password is
+auto-cleared from the clipboard after 15s
 (a deadline the event loop polls for) and again on exit; the write `generation`
 is shown on unlock so a rollback is noticeable. Both UIs validate a document's
 virtual path against `storage::MAX_PATH_LEN` (256 bytes) before attaching — the

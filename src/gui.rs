@@ -169,6 +169,8 @@ struct GuiApp {
     acct_filter_subtype: String,
     acct_filter_owner: String,
     acct_filter_review: bool,
+    // Free-text, case-insensitive substring search over account usernames.
+    acct_search_user: String,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -243,6 +245,7 @@ impl GuiApp {
             acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
             acct_filter_review: false,
+            acct_search_user: String::new(),
             asset_filter_review: false,
             new_asset_type: String::new(),
             new_account_type: String::new(),
@@ -1022,6 +1025,23 @@ impl GuiApp {
 
     // --- Tab: Accounts -------------------------------------------------------
 
+    /// The Accounts that pass the current filters (type/subtype/owner/review) and
+    /// the username search, as `(id, label)` pairs. Extracted from the render so it
+    /// can be unit-tested; the search uses [`records::matches_search`].
+    fn filtered_account_labels(&self) -> Vec<(String, String)> {
+        self.vault_ref()
+            .vault
+            .accounts
+            .iter()
+            .filter(|a| self.acct_filter_type.is_empty() || a.account_type == self.acct_filter_type)
+            .filter(|a| self.acct_filter_subtype.is_empty() || a.account_subtype == self.acct_filter_subtype)
+            .filter(|a| self.acct_filter_owner.is_empty() || a.owner == self.acct_filter_owner)
+            .filter(|a| !self.acct_filter_review || a.review)
+            .filter(|a| records::matches_search(&a.username, &self.acct_search_user))
+            .map(|a| (a.id.clone(), a.label()))
+            .collect()
+    }
+
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
         let type_names = self.vault_ref().categories().account_type_names();
         let owners_present =
@@ -1059,31 +1079,23 @@ impl GuiApp {
             ui.label("owner:");
             filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &owners_present);
             ui.checkbox(&mut self.acct_filter_review, "review only");
+            ui.label("username:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.acct_search_user)
+                    .hint_text("search…")
+                    .desired_width(140.0),
+            );
             if ui.button("Clear").clicked() {
                 self.acct_filter_type.clear();
                 self.acct_filter_subtype.clear();
                 self.acct_filter_owner.clear();
                 self.acct_filter_review = false;
+                self.acct_search_user.clear();
             }
         });
 
         // Filtered list (after the filter row, so a change applies this frame).
-        let labels: Vec<(String, String)> = {
-            let ft = self.acct_filter_type.clone();
-            let fs = self.acct_filter_subtype.clone();
-            let fo = self.acct_filter_owner.clone();
-            let fr = self.acct_filter_review;
-            self.vault_ref()
-                .vault
-                .accounts
-                .iter()
-                .filter(|a| ft.is_empty() || a.account_type == ft)
-                .filter(|a| fs.is_empty() || a.account_subtype == fs)
-                .filter(|a| fo.is_empty() || a.owner == fo)
-                .filter(|a| !fr || a.review)
-                .map(|a| (a.id.clone(), a.label()))
-                .collect()
-        };
+        let labels = self.filtered_account_labels();
         let cur = self.edit_account.as_ref().map(|r| r.id.clone());
         let mut new = false;
         let mut select = None;
@@ -1805,6 +1817,27 @@ mod tests {
         assert!(app.vault.is_some());
         assert!(app.screen == Screen::Main);
         assert!(app.pw1.is_empty(), "passwords wiped after submit");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_username_search_filters() {
+        let (mut app, path) = app_unlocked("usersearch");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            for u in ["alice", "alice2", "bob"] {
+                let mut a = Account::new().unwrap();
+                a.username = u.into();
+                records::upsert(&mut v.accounts, a);
+            }
+        }
+        assert_eq!(app.filtered_account_labels().len(), 3, "no search → all");
+        app.acct_search_user = "ALI".into(); // case-insensitive substring
+        assert_eq!(app.filtered_account_labels().len(), 2, "alice + alice2");
+        app.acct_search_user = "bob".into();
+        assert_eq!(app.filtered_account_labels().len(), 1);
+        app.acct_search_user = "zzz".into();
+        assert_eq!(app.filtered_account_labels().len(), 0, "no match");
         cleanup(&path);
     }
 

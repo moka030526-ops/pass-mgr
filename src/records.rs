@@ -48,6 +48,15 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Case-insensitive substring match used by the UIs' free-text search (e.g.
+/// searching accounts by username). An empty/whitespace-only `query` matches
+/// everything (no filter). Both sides are lower-cased and the query is trimmed.
+// `haystack`/`query` are borrowed `&str`; the function only reads them.
+pub fn matches_search(haystack: &str, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    q.is_empty() || haystack.to_lowercase().contains(&q)
+}
+
 /// A random 128-bit hex id, used for records and volume blobs.
 // Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
@@ -576,6 +585,18 @@ pub struct Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_search_is_case_insensitive_substring() {
+        assert!(matches_search("alice@example.com", "ALICE"));
+        assert!(matches_search("Bob", "b"));
+        assert!(matches_search("a.user", "USER"));
+        assert!(matches_search("anything", ""), "empty query matches all");
+        assert!(matches_search("anything", "   "), "whitespace query matches all");
+        assert!(matches_search("john", "  JOHN  "), "query is trimmed");
+        assert!(!matches_search("alice", "bob"));
+        assert!(!matches_search("", "x"));
+    }
 
     #[test]
     fn unix_now_is_a_realistic_timestamp() {

@@ -318,6 +318,10 @@ struct App {
     acct_filter_subtype: Option<String>,
     acct_filter_owner: Option<String>,
     acct_filter_review: bool,
+    // Accounts-tab username search: `acct_search` is the active (case-insensitive
+    // substring) query; `search_active` is true while typing it (entered with '/').
+    acct_search: String,
+    search_active: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -368,6 +372,8 @@ impl App {
             acct_filter_subtype: None,
             acct_filter_owner: None,
             acct_filter_review: false,
+            acct_search: String::new(),
+            search_active: false,
             asset_filter_review: false,
             cfg_focus: 0,
             cfg_asset_type: String::new(),
@@ -440,6 +446,8 @@ impl App {
                 .filter(|a| self.acct_filter_subtype.as_deref().is_none_or(|s| a.account_subtype == s))
                 .filter(|a| self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o))
                 .filter(|a| !self.acct_filter_review || a.review)
+                // Username search: case-insensitive substring (empty = no filter).
+                .filter(|a| records::matches_search(&a.username, &self.acct_search))
                 .map(|a| (a.id.clone(), a.label()))
                 .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
@@ -690,6 +698,30 @@ impl App {
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> bool {
+        // Username-search input mode (Accounts tab): capture typed text into
+        // `acct_search` until Enter (keep) or Esc (clear). Intercept BEFORE the
+        // normal command keys so letters edit the query instead of triggering
+        // commands, and so Esc cancels the search rather than quitting the app.
+        if self.search_active {
+            match key.code {
+                KeyCode::Enter => self.search_active = false,
+                KeyCode::Esc => {
+                    self.acct_search.clear();
+                    self.search_active = false;
+                    self.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.acct_search.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.acct_search.push(c);
+                    self.selected = 0;
+                }
+                _ => {}
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Right | KeyCode::Tab => {
@@ -774,6 +806,10 @@ impl App {
                 let opts = self.account_values(|a| &a.owner);
                 self.acct_filter_owner = cycle_filter(&self.acct_filter_owner, &opts);
                 self.selected = 0;
+            }
+            // Enter username-search input mode (Accounts tab).
+            KeyCode::Char('/') if self.tab == Tab::Accounts => {
+                self.search_active = true;
             }
             // Review-only filter toggle (Accounts and Assets tabs).
             KeyCode::Char('v') if self.tab == Tab::Accounts => {
@@ -1690,13 +1726,23 @@ impl App {
             && (self.acct_filter_type.is_some()
                 || self.acct_filter_subtype.is_some()
                 || self.acct_filter_owner.is_some()
-                || self.acct_filter_review)
+                || self.acct_filter_review
+                || !self.acct_search.is_empty()
+                || self.search_active)
         {
             let t = self.acct_filter_type.as_deref().unwrap_or("any");
             let s = self.acct_filter_subtype.as_deref().unwrap_or("any");
             let o = self.acct_filter_owner.as_deref().unwrap_or("any");
             let r = if self.acct_filter_review { " · review" } else { "" };
-            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o}{r}] ")
+            // Username search: show the query, with a trailing caret while typing.
+            let u = if self.search_active {
+                format!(" · user~\"{}_\"", self.acct_search)
+            } else if !self.acct_search.is_empty() {
+                format!(" · user~\"{}\"", self.acct_search)
+            } else {
+                String::new()
+            };
+            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o}{r}{u}] ")
         } else if self.tab == Tab::Assets && self.asset_filter_review {
             format!(" Assets & Liabilities ({count})  [review only] ")
         } else {
@@ -1715,10 +1761,16 @@ impl App {
         }
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        let hints = match self.tab {
-            Tab::Accounts => "↑↓ · Enter edit · n new · d del · t/s/o filter · v review · ←→ tab · c config · p pw · q quit",
-            Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
-            _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
+        let hints = if self.search_active {
+            "type to search usernames · Enter keep · Esc clear"
+        } else {
+            match self.tab {
+                Tab::Accounts => {
+                    "↑↓ · Enter edit · n new · d del · t/s/o filter · v review · / search user · ←→ tab · c config · p pw · q quit"
+                }
+                Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
+                _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
+            }
         };
         self.draw_footer(frame, chunks[2], hints);
     }
@@ -1944,6 +1996,43 @@ mod tests {
         assert_eq!(s, None); // wraps back to "no filter"
         assert_eq!(cycle_filter(&Some("gone".into()), &opts), None);
         assert_eq!(cycle_filter(&None, &[]), None);
+    }
+
+    #[test]
+    fn account_username_search_via_slash_key() {
+        let (mut app, path) = app_unlocked("uisearch");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            for u in ["alice", "alice2", "bob"] {
+                let mut a = Account::new().unwrap();
+                a.username = u.into();
+                records::upsert(&mut v.accounts, a);
+            }
+        }
+        app.tab = Tab::Accounts;
+        assert_eq!(app.current_labels().len(), 3);
+
+        // '/' enters search input mode; typed letters edit the query (not commands).
+        assert!(!app.handle_key(key(KeyCode::Char('/'))));
+        assert!(app.search_active);
+        for c in "ali".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.current_labels().len(), 2, "matches alice + alice2");
+
+        // Enter keeps the query and exits input mode.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.search_active);
+        assert_eq!(app.acct_search, "ali");
+        assert_eq!(app.current_labels().len(), 2, "query persists after Enter");
+
+        // Re-enter and Esc CLEARS the query without quitting the app.
+        app.handle_key(key(KeyCode::Char('/')));
+        let quit = app.handle_key(key(KeyCode::Esc));
+        assert!(!quit, "Esc in search mode must not quit");
+        assert!(!app.search_active && app.acct_search.is_empty());
+        assert_eq!(app.current_labels().len(), 3, "cleared → all accounts");
+        cleanup(&path);
     }
 
     #[test]

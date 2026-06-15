@@ -504,8 +504,10 @@ Trust & Will, Assets & Liabilities, Accounts, Real Estate — over four screens:
    `OpenVault::change_password`.
 2. **Browse.** The selected tab's records as a list, with per-tab **filters**
    (Accounts by type/subtype/owner/"needs review"; Assets by "needs review")
-   driven by the in-vault category lists. Selection resolves **by record id**, so
-   a filtered list never edits the wrong record.
+   driven by the in-vault category lists, plus a free-text **username search** on
+   the Accounts tab (case-insensitive substring; the GUI has a search box, the TUI
+   enters it with `/`). Selection resolves **by record id**, so a filtered or
+   searched list never edits the wrong record.
 3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
    a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
    to the record's history (req. 4, 5), shown in a History pane. Document-bearing
@@ -938,3 +940,36 @@ Crash-safety is tested at three levels (see `IMPLEMENTATION.md`):
 > a lying write cache, a power loss can still lose the last fsync'd write — that is
 > below the application's control. The format never *corrupts*; at worst it loses
 > the most recent operation. See §9.11.
+
+### 12.6 What a half-finished write looks like on disk (vault vs. volume)
+
+A natural worry is: *"if I'm writing and it fails midway, is there now a
+half-written file?"* The answer differs by what is being written, and in neither
+case is the live data left partially overwritten.
+
+- **Writing the vault (`vault.pmv`) — never modified in place.** The vault is not
+  edited where it sits; `write_vault_file` re-encrypts the *whole* vault to a new,
+  uniquely-named temp file, fsyncs it, and only then `rename`s it over `vault.pmv`
+  (then fsyncs the directory). So a failure *during the write* lands entirely in
+  the throwaway temp — `vault.pmv` is still the previous, complete file — and a
+  failure *during the rename* is atomic (you get the whole old file or the whole
+  new file, never a spliced one). There is **no "partial bytes in the middle of
+  `vault.pmv`" state**; the worst case is that the save didn't happen. (And a
+  truncated/garbled file would still fail the AEAD tag on open, i.e. fail closed,
+  rather than load corrupt data.)
+- **Writing a document — a torn frame at the *end* of the volume, ignored.** A
+  document is appended to the end of `vol.<N>` at the committed `end_offset`,
+  fsynced, and only then is the manifest (which records the new `end_offset`)
+  committed by the same atomic temp+rename. A failure mid-append leaves a
+  partial/torn frame *beyond* the old `end_offset`, but the manifest still records
+  the old value, which is authoritative: on reopen everything past `end_offset` is
+  ignored, and the next append seeks back to `end_offset` and `set_len`s the file,
+  physically discarding the tail. So the document is simply *not added*; nothing
+  earlier in the volume is touched. If the manifest itself is lost or corrupt, it
+  is rebuilt by scanning the volume up to the last *fully decryptable* frame.
+
+In both cases the rule from §12.4 holds: at most the single in-flight operation is
+lost, the existing data is intact, and the vault reopens cleanly. The `vault.pmv`
+is also the final commit point, so a document fully committed to its volume +
+manifest but not yet referenced by a saved vault is just harmless unreferenced
+garbage — not a dangling reference.
