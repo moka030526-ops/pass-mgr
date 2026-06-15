@@ -43,8 +43,11 @@ executed in a later session step-by-step (§12).
    `review`; Accounts have `account_subtype`, `review`. (Field list otherwise as
    in the spec: Instructions, Trust&Will, Assets/Liabilities, Accounts, Real Estate.)
 2. **Category type lists** stay **inside the encrypted vault** (no external files).
-3. **No compaction in v1.** Updates/deletes leave dead blobs as garbage in the
-   volume; a separate crash-safe `compact` maintenance command is future work.
+3. **Compaction is a separate, on-demand maintenance command** (not automatic).
+   Updates/deletes leave dead blobs as garbage in the volume; the crash-safe
+   `compact` command (CLI) reclaims them — and optionally trims record history —
+   by reusing the password-change staged-rewrite machinery. (Shipped post-v1; see
+   `DESIGN.md` §11.1.)
 4. **Password change = full re-encryption** under a fresh key (Option A), done
    crash-safely (§7). No long-lived data-encryption key.
 5. **CLI must decrypt all volumes** (extract every document across all
@@ -103,8 +106,9 @@ Plaintext (JSON or length-prefixed) =
   entries: [ { id, virtual_path, size, blob_offset, blob_len, uploaded_at } ] }
 ```
 Only **live** entries are listed; bytes in `[0, end_offset)` not covered by a live
-entry are garbage (no compaction in v1). `end_offset` is authoritative for "where
-valid data ends" regardless of any torn trailing bytes.
+entry are garbage (reclaimed on demand by `compact`, see `DESIGN.md` §11.1).
+`end_offset` is authoritative for "where valid data ends" regardless of any torn
+trailing bytes.
 
 ### 2.3 Volume `vol.<N>` (append-only, per-blob encrypted, self-describing)
 A sequence of frames:

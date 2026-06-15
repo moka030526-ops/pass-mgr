@@ -200,3 +200,66 @@ fn force_kill_during_recovery_is_idempotent() {
     assert_eq!(referenced_doc(&v), doc_one());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- Compaction (reuses the rekey staged-commit machinery) ------------------
+// `compact` keeps the SAME passwords, so a rolled-forward compaction still opens
+// with a/b; the referenced document must survive every crash point.
+
+#[test]
+fn force_kill_mid_compact_rolls_forward() {
+    let dir = tmp_dir("comp1");
+    setup(&dir);
+    // Abort mid commit (new volume swapped, old manifest+vault live, .rekey+READY).
+    assert!(!run_crashop(&dir, "compact", Some("rekey.after_volume")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("rolled forward to the compacted tree");
+    assert_eq!(referenced_doc(&v), doc_one(), "document survives compaction");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_mid_compact_after_manifest_rolls_forward() {
+    let dir = tmp_dir("comp2");
+    setup(&dir);
+    assert!(!run_crashop(&dir, "compact", Some("rekey.after_manifest")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("rolled forward");
+    assert_eq!(referenced_doc(&v), doc_one());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_mid_compact_after_vault_rolls_forward() {
+    let dir = tmp_dir("comp3");
+    setup(&dir);
+    // The last commit step: all three swapped, `.rekey` not yet removed — the next
+    // open re-runs the idempotent commit and finishes.
+    assert!(!run_crashop(&dir, "compact", Some("rekey.after_vault")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("rolled forward (cleanup re-run)");
+    assert_eq!(referenced_doc(&v), doc_one());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_during_compact_staging_discards_and_old_vault_stands() {
+    let dir = tmp_dir("compdisc");
+    setup(&dir);
+    // Abort while re-encrypting into the staging tree (a volume frame write), BEFORE
+    // the READY marker. On reopen the incomplete staging is discarded and the
+    // original (uncompacted) vault opens unchanged with the same passwords.
+    assert!(!run_crashop(&dir, "compact", Some("volume.write")), "child must abort mid-staging");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("original vault intact");
+    assert_eq!(referenced_doc(&v), doc_one(), "document untouched");
+    assert!(!dir.join(".rekey").exists(), "incomplete staging discarded");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn multi_partition_compact_force_kill_rolls_forward() {
+    let dir = tmp_dir("compmulti");
+    setup(&dir); // doc-one in partition 0
+    assert!(run_crashop(&dir, "adddoc", None), "clean add of doc-two -> partition 1");
+    // Compaction re-encrypts BOTH documents across BOTH partitions; abort mid-commit.
+    assert!(!run_crashop(&dir, "compact", Some("rekey.after_manifest")), "child must abort");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("rolled forward");
+    assert_eq!(all_referenced_docs(&v), vec![doc_one(), doc_two()], "both docs survive compaction");
+    std::fs::remove_dir_all(&dir).ok();
+}

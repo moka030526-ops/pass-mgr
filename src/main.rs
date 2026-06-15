@@ -44,7 +44,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 // `PathBuf` is an owned, growable filesystem path (the owned counterpart of the
 // borrowed `&Path`, much like `String` is the owned form of the borrowed `&str`).
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 // `ExitCode` is the process exit status this `main` returns to the OS.
 use std::process::ExitCode;
 
@@ -93,6 +93,18 @@ USAGE:
                                     (vault.json + manifest/ + volume/); round-trips with import-tree
     pass-mgr import-tree SRC [DIR]  Build a NEW encrypted vault (new passwords) from a
                                     plaintext mirror SRC produced by export-tree
+    pass-mgr compact [DIR] <what>   Reclaim space (writable; backs up first by default).
+                                    Crash-safe: a power loss leaves the old OR the
+                                    compacted vault, never a mix. <what> is one or both:
+                                      --volume   re-pack the document store, dropping the
+                                                 dead blocks left by edits/deletes
+                                      --json     trim each record's edit-history log; pick
+                                                 --history-before YYYY-MM-DD (UTC; keeps
+                                                 entries on/after that date) OR --history-all
+                                    Options: --dry-run (report only, no changes),
+                                      --backup DEST (where to back up; must be outside DIR),
+                                      --no-backup (skip the pre-compaction backup).
+                                    The vault-level audit log is always preserved.
     pass-mgr --help                 Show this help
 
 The vault is protected by two passwords entered in sequence. The interactive UI
@@ -148,6 +160,75 @@ fn extract_part_flag(args: Vec<String>) -> anyhow::Result<(Option<u32>, Vec<Stri
     Ok((part, rest))
 }
 
+/// Flags for the `compact` command, pulled out of the argument list the same way
+/// `--part` is (so they may appear in any position). `--volume`/`--json` choose
+/// what to reclaim; `--history-before DATE`/`--history-all` set the JSON history
+/// retention; `--no-backup`/`--backup DEST` control the pre-compaction backup;
+/// `--dry-run` reports without writing.
+// `#[derive(Default)]` gives an all-false/None starting value via `::default()`.
+#[derive(Default)]
+struct CompactFlags {
+    volume: bool,
+    json: bool,
+    history_before: Option<String>,
+    history_all: bool,
+    no_backup: bool,
+    backup_dest: Option<String>,
+    dry_run: bool,
+}
+
+impl CompactFlags {
+    /// Whether any compact-only flag was supplied (used to reject them on other
+    /// commands, mirroring the `--part` guard).
+    fn any(&self) -> bool {
+        self.volume
+            || self.json
+            || self.history_before.is_some()
+            || self.history_all
+            || self.no_backup
+            || self.backup_dest.is_some()
+            || self.dry_run
+    }
+}
+
+/// Pull the `compact` flags out of `args`, returning them plus the leftover
+/// (positional + other) arguments. Errors if a value-taking flag is missing its
+/// value. Both `--flag value` and `--flag=value` spellings are accepted for the
+/// two value flags. Recognized flags are stripped for every command; a guard in
+/// `main` rejects their use outside `compact`.
+fn extract_compact_flags(args: Vec<String>) -> anyhow::Result<(CompactFlags, Vec<String>)> {
+    let mut f = CompactFlags::default();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--volume" {
+            f.volume = true;
+        } else if a == "--json" {
+            f.json = true;
+        } else if a == "--history-all" {
+            f.history_all = true;
+        } else if a == "--no-backup" {
+            f.no_backup = true;
+        } else if a == "--dry-run" {
+            f.dry_run = true;
+        } else if a == "--history-before" {
+            // The value is the NEXT argument; a missing one is an error.
+            let v = it.next().ok_or_else(|| anyhow::anyhow!("--history-before requires a YYYY-MM-DD date"))?;
+            f.history_before = Some(v);
+        } else if let Some(v) = a.strip_prefix("--history-before=") {
+            f.history_before = Some(v.to_string());
+        } else if a == "--backup" {
+            let v = it.next().ok_or_else(|| anyhow::anyhow!("--backup requires a destination directory"))?;
+            f.backup_dest = Some(v);
+        } else if let Some(v) = a.strip_prefix("--backup=") {
+            f.backup_dest = Some(v.to_string());
+        } else {
+            rest.push(a); // not a compact flag — keep it
+        }
+    }
+    Ok((f, rest))
+}
+
 fn main() -> ExitCode {
     // Collect the process arguments, skipping arg 0 (the program name), into a
     // `Vec<String>`. `.skip(1)` drops the first item; `.collect()` materializes
@@ -169,6 +250,15 @@ fn main() -> ExitCode {
     // same name, deliberately replacing the old `args` from here on. `{e:#}` is
     // alternate debug formatting (anyhow uses it to print the full error chain).
     let (part, args) = match extract_part_flag(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pass-mgr error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Pull the `compact` flags out next (same shadowing of `args`), so the
+    // positional/`--write` logic below never sees them.
+    let (cflags, args) = match extract_compact_flags(args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("pass-mgr error: {e:#}");
@@ -197,6 +287,12 @@ fn main() -> ExitCode {
     let cmd = pos.first().map(String::as_str);
     if part.is_some() && !matches!(cmd, Some("manifest") | Some("extract")) {
         eprintln!("pass-mgr error: --part only applies to 'manifest' and 'extract'");
+        return ExitCode::FAILURE;
+    }
+    if cflags.any() && cmd != Some("compact") {
+        eprintln!(
+            "pass-mgr error: --volume/--json/--history-before/--history-all/--backup/--no-backup/--dry-run only apply to 'compact'"
+        );
         return ExitCode::FAILURE;
     }
 
@@ -245,6 +341,8 @@ fn main() -> ExitCode {
             3 => cli_import_tree(PathBuf::from(&pos[1]), vault_file(&pos[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr import-tree <SOURCE_DIR> [DIR]")),
         },
+        // `compact [DIR] <flags>` — reclaim dead volume bytes and/or trim history.
+        Some("compact") => cli_compact(&pos, &cflags),
         // Otherwise the (optional) positional argument is the vault directory for
         // the interactive UI (graphical by default, terminal with --tui).
         _ => {
@@ -330,6 +428,159 @@ fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
     let backup = vault::backup(&path, &dest_dir)?;
     eprintln!("Backed up to {}", backup.display());
     Ok(())
+}
+
+/// Reclaim space: rewrite the document volume to drop dead frames (`--volume`)
+/// and/or trim per-record history (`--json` with `--history-before`/`--history-all`).
+/// Crash-safe: the volume rewrite stages a fresh tree and swaps it in atomically,
+/// so a power loss leaves either the old or the compacted vault, never a mix. By
+/// default the encrypted tree is backed up first (`--no-backup` opts out); the
+/// trimmed history and reclaimed bytes are otherwise gone permanently. `--dry-run`
+/// reports what would be reclaimed without writing. Prompts for both passwords.
+fn cli_compact(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
+    // `pos[0]` is "compact"; an optional `pos[1]` is the vault DIR.
+    let path = match pos.len() {
+        1 => default_vault_path(),
+        2 => vault_file(&pos[1]),
+        _ => anyhow::bail!(
+            "usage: pass-mgr compact [DIR] [--volume] [--json (--history-before YYYY-MM-DD | --history-all)] [--dry-run] [--no-backup] [--backup DEST]"
+        ),
+    };
+    if !path.exists() {
+        anyhow::bail!("no vault found at {}", path.display());
+    }
+
+    // Validate the flag combination BEFORE prompting for passwords.
+    if !f.volume && !f.json {
+        anyhow::bail!("compact: specify --volume and/or --json (nothing to do otherwise)");
+    }
+    if f.json {
+        match (f.history_before.is_some(), f.history_all) {
+            (true, true) => anyhow::bail!("compact --json: give either --history-before or --history-all, not both"),
+            (false, false) => {
+                anyhow::bail!("compact --json: choose --history-before YYYY-MM-DD or --history-all")
+            }
+            _ => {}
+        }
+    } else if f.history_before.is_some() || f.history_all {
+        anyhow::bail!("compact: --history-before/--history-all only apply together with --json");
+    }
+
+    // Parse the cutoff (UTC midnight); `--history-all` removes every entry instead.
+    let history_cutoff = match &f.history_before {
+        Some(s) => Some(
+            pass_mgr::records::parse_ymd_utc(s)
+                .ok_or_else(|| anyhow::anyhow!("invalid --history-before date {s:?}; expected YYYY-MM-DD (UTC)"))?,
+        ),
+        None => None,
+    };
+    let opts = vault::CompactOptions {
+        volume: f.volume,
+        json: f.json,
+        history_cutoff,
+        drop_all_history: f.history_all,
+    };
+
+    // The vault DIRECTORY (parent of vault.pmv) — used for the default backup
+    // location and the inside-the-vault guard.
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+    // Validate an explicit backup destination up front (a pure arg check, before
+    // prompting or opening): a backup placed inside the vault dir would be copied
+    // into the very tree being rewritten.
+    if let Some(d) = &f.backup_dest
+        && dest_inside(&dir, &PathBuf::from(d))
+    {
+        anyhow::bail!("--backup destination must be OUTSIDE the vault directory");
+    }
+
+    // --- Dry run: open READ-ONLY (no lock contention), report, write nothing. ---
+    if f.dry_run {
+        let pw1 = read_password("Password 1: ")?;
+        let pw2 = read_password("Password 2: ")?;
+        let v = OpenVault::open_read_only(path.clone(), pw1.as_bytes(), pw2.as_bytes())?;
+        let report = v.compact_dry_run(&opts);
+        print_compact_report(&report, &opts, true, None);
+        return Ok(());
+    }
+
+    // --- Real run: writable open (takes the single-writer lock + rolls forward any
+    // pending rekey), optional backup, then the compaction itself. ---
+    let pw1 = read_password("Password 1: ")?;
+    let pw2 = read_password("Password 2: ")?;
+    let mut v = OpenVault::open(path.clone(), pw1.as_bytes(), pw2.as_bytes())?;
+
+    // Skip the backup + rewrite entirely when there is genuinely nothing to do.
+    let pre = v.compact_dry_run(&opts);
+    if pre.bytes_reclaimed == 0 && pre.history_removed == 0 {
+        eprintln!("Nothing to reclaim (no dead volume bytes, no history to trim).");
+        return Ok(());
+    }
+
+    // Auto-backup the encrypted tree first (unless opted out). This MUST happen
+    // before the staged rewrite creates `.rekey` — `vault::backup` refuses while a
+    // rekey is staged. Default destination: a sibling `<name>-backups/` dir.
+    let mut backup_path = None;
+    if !f.no_backup {
+        // Resolve the destination (explicit, or the default sibling) and validate it
+        // is OUTSIDE the vault dir for BOTH sources, right before the write. The
+        // earlier check only covered an explicit --backup; the DEFAULT must be gated
+        // too (it could resolve inside via a crafted/symlinked layout), and checking
+        // adjacent to the call shrinks the validate-vs-write window.
+        let dest = f.backup_dest.as_ref().map(PathBuf::from).unwrap_or_else(|| default_backup_dir(&dir));
+        if dest_inside(&dir, &dest) {
+            anyhow::bail!("backup destination must be OUTSIDE the vault directory");
+        }
+        let bp = vault::backup(&path, &dest)?;
+        eprintln!("Backed up to {} before compacting.", bp.display());
+        backup_path = Some(bp);
+    }
+
+    let report = v.compact(&opts)?;
+    print_compact_report(&report, &opts, false, backup_path.as_deref());
+    Ok(())
+}
+
+/// Print a compaction report. `dry` switches the verbs between "would" and the
+/// past tense; the partition transition is shown only for a real volume run.
+fn print_compact_report(r: &vault::CompactReport, opts: &vault::CompactOptions, dry: bool, backup: Option<&Path>) {
+    if opts.volume {
+        if dry {
+            eprintln!("Would reclaim {} bytes of dead volume data.", r.bytes_reclaimed);
+        } else {
+            eprintln!(
+                "Reclaimed {} bytes of dead volume data ({} -> {} partitions).",
+                r.bytes_reclaimed, r.partitions_before, r.partitions_after
+            );
+        }
+    }
+    if opts.json {
+        let verb = if dry { "Would remove" } else { "Removed" };
+        eprintln!("{verb} {} history entries.", r.history_removed);
+    }
+    if let Some(b) = backup {
+        eprintln!("Backup written to {}", b.display());
+    }
+}
+
+/// Default backup destination for `compact`: a sibling `<name>-backups/` directory
+/// next to the vault directory, so it is never inside the tree being rewritten.
+fn default_backup_dir(vault_dir: &Path) -> PathBuf {
+    let name = vault_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "vault".to_string());
+    match vault_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(format!("{name}-backups")),
+        _ => PathBuf::from(format!("{name}-backups")),
+    }
+}
+
+/// Whether `dest` is the vault directory itself or a path inside it (a backup
+/// there would be copied into the very tree being rewritten). Best-effort: uses
+/// canonical paths when both exist, else a lexical prefix check.
+fn dest_inside(vault_dir: &Path, dest: &Path) -> bool {
+    match (std::fs::canonicalize(vault_dir).ok(), std::fs::canonicalize(dest).ok()) {
+        (Some(v), Some(d)) => d == v || d.starts_with(&v),
+        _ => dest == vault_dir || dest.starts_with(vault_dir),
+    }
 }
 
 /// Decrypt stored documents and write them into `out_dir`, reconstructing the
@@ -632,6 +883,14 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             let mut v = OpenVault::open(path, b"a", b"b")?;
             v.change_password(b"c", b"d")?;
         }
+        // Compact (volume re-pack + drop all history). Like rekey it stages a full
+        // rewrite and swaps it in, so the SAME rekey.* crash points fire mid-commit;
+        // recovery must roll forward to the compacted tree with both docs intact.
+        "compact" => {
+            let mut v = OpenVault::open(path, b"a", b"b")?;
+            let opts = vault::CompactOptions { volume: true, json: true, history_cutoff: None, drop_all_history: true };
+            v.compact(&opts)?;
+        }
         // Just open under the NEW passwords — triggers recover_pending_rekey, so a
         // crash point can abort recovery itself (testing idempotent re-recovery).
         "open" => {
@@ -757,6 +1016,108 @@ mod tests {
     #[test]
     fn default_vault_path_ends_with_vault_pmv() {
         assert!(super::default_vault_path().ends_with("vault.pmv"));
+    }
+
+    // ---- compact CLI flag parsing & guards ---------------------------------
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_compact_flags_parses_every_flag_form() {
+        let (f, rest) = super::extract_compact_flags(argv(&[
+            "compact", "DIR", "--volume", "--json", "--history-before", "2025-01-01", "--no-backup", "--dry-run",
+            "--backup", "/tmp/x", "extra",
+        ]))
+        .unwrap();
+        assert!(f.volume && f.json && f.no_backup && f.dry_run && f.any());
+        assert_eq!(f.history_before.as_deref(), Some("2025-01-01"));
+        assert_eq!(f.backup_dest.as_deref(), Some("/tmp/x"));
+        // Non-flag args are preserved in order for positional/dispatch handling.
+        assert_eq!(rest, argv(&["compact", "DIR", "extra"]));
+    }
+
+    #[test]
+    fn extract_compact_flags_accepts_equals_forms_and_history_all() {
+        let (f, _) = super::extract_compact_flags(argv(&["--history-before=2024-12-31", "--backup=/d"])).unwrap();
+        assert_eq!(f.history_before.as_deref(), Some("2024-12-31"));
+        assert_eq!(f.backup_dest.as_deref(), Some("/d"));
+        let (g, _) = super::extract_compact_flags(argv(&["--history-all"])).unwrap();
+        assert!(g.history_all && g.any());
+    }
+
+    #[test]
+    fn extract_compact_flags_errors_on_missing_values() {
+        assert!(super::extract_compact_flags(argv(&["--history-before"])).is_err());
+        assert!(super::extract_compact_flags(argv(&["--backup"])).is_err());
+    }
+
+    #[test]
+    fn extract_compact_flags_absent_means_none_and_passthrough() {
+        let (f, rest) = super::extract_compact_flags(argv(&["decrypt", "DIR"])).unwrap();
+        assert!(!f.any());
+        assert_eq!(rest, argv(&["decrypt", "DIR"]));
+    }
+
+    #[test]
+    fn default_backup_dir_is_a_sibling_outside_the_vault() {
+        let vault_dir = Path::new("/home/u/myvault");
+        let d = super::default_backup_dir(vault_dir);
+        assert_eq!(d, PathBuf::from("/home/u/myvault-backups"));
+        assert!(!d.starts_with(vault_dir), "default backup dir must be outside the vault dir");
+    }
+
+    #[test]
+    fn dest_inside_flags_self_and_children_allows_siblings() {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let vault_dir = std::env::temp_dir().join(format!("pmdi-{nanos}"));
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        // The vault dir itself, and an existing child, are "inside".
+        assert!(super::dest_inside(&vault_dir, &vault_dir));
+        let child = vault_dir.join("volume");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(super::dest_inside(&vault_dir, &child));
+        // A not-yet-existing absolute child is still caught (lexical fallback).
+        assert!(super::dest_inside(&vault_dir, &vault_dir.join("backups")));
+        // A sibling directory outside the vault is allowed.
+        let sibling = vault_dir.parent().unwrap().join(format!("pmdi-out-{nanos}"));
+        assert!(!super::dest_inside(&vault_dir, &sibling));
+        let _ = std::fs::remove_dir_all(&vault_dir);
+    }
+
+    #[test]
+    fn cli_compact_rejects_missing_vault_then_bad_flag_combos() {
+        use super::CompactFlags;
+        // Missing vault: bails before any prompt/validation.
+        let f = CompactFlags { volume: true, ..Default::default() };
+        assert!(super::cli_compact(&argv(&["compact", "/no/such/pmvault/dir"]), &f).is_err());
+
+        // A dummy (non-empty) vault dir so path.exists() passes; the flag-combination
+        // validation below all bails BEFORE opening the vault or prompting.
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("pmclic-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vault.pmv"), b"PMVAULT\0 dummy").unwrap();
+        let d = dir.to_str().unwrap();
+        let bad: &[CompactFlags] = &[
+            // no mode flag
+            CompactFlags::default(),
+            // --json without a retention choice
+            CompactFlags { json: true, ..Default::default() },
+            // retention flag without --json
+            CompactFlags { volume: true, history_all: true, ..Default::default() },
+            // both retention choices at once
+            CompactFlags { json: true, history_before: Some("2025-01-01".into()), history_all: true, ..Default::default() },
+            // unparseable cutoff date
+            CompactFlags { json: true, history_before: Some("not-a-date".into()), ..Default::default() },
+        ];
+        for f in bad {
+            assert!(super::cli_compact(&argv(&["compact", d]), f).is_err(), "expected validation error");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

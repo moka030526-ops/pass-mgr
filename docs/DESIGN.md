@@ -40,7 +40,7 @@ Each numbered requirement from the brief maps to a concrete design element.
 | 2 | Filter screens + custom category types | Per-tab filters (account type/subtype/owner/review; asset review); editable `categories` stored in-vault (§4.2, §4.3) |
 | 3 | Rich records (accounts, assets, real estate, trust/will, instructions) | Five record types, one per tab (§4.1) |
 | 4 | Each change logged with timestamp | Per-record `history: Vec<Change>` + vault-level `audit` (§4.2) |
-| 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2) |
+| 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2); trimmable on demand via `compact --json` (§11.1) |
 | 6 | Last access maintained | `Vault.last_opened_at` + a monotonic `generation`, surfaced on unlock (§4.2) |
 | 7 | Highest encryption level | Argon2id KDF + XChaCha20-Poly1305 AEAD, per-blob (§5) |
 | 8 | Encrypted JSON | JSON vault + JSON manifests, all AEAD-encrypted on disk (§6) |
@@ -176,8 +176,9 @@ design is in **§11**; the essentials:
 - **Lifecycle.** Attaching persists the record→document link immediately.
   Removing/detaching/deleting **persists the unlinked vault first, then** reclaims
   the blob (drops its manifest entry), so a crash in between leaves at most a
-  harmless orphan, never a dangling reference. There is no compaction in v1, so a
-  reclaimed blob's bytes linger in the volume as garbage until a future `compact`.
+  harmless orphan, never a dangling reference. A reclaimed blob's bytes linger in
+  the volume as garbage until the `compact` command (§11.1) rewrites the volume
+  keeping only live blobs.
 - **In-memory footprint.** Only the (small) manifests are decrypted on open;
   volume bytes are read on demand, one frame at a time — the whole document set is
   never held in memory at once.
@@ -420,7 +421,10 @@ offset  len  field
 - **File permissions:** on Unix every vault file (`vault.pmv`, manifests,
   volumes, and the lock file) is `0600` and the directories `0700`; temp files are
   created `0600` *atomically* (no world-readable window). Volume appends additionally
-  refuse to write through a symlink at the volume path.
+  open with **`O_NOFOLLOW`** (Unix), so the kernel atomically refuses if the volume
+  path's final component is a symlink — closing the check-then-open race a bare
+  pre-check leaves; a `symlink_metadata` pre-check is kept only as a fast early
+  error. The `backup` destination directory is likewise refused if it is a symlink.
 - **Untrusted-input bounds:** KDF parameters read from the file header are
   range-checked before the memory-hard derivation runs, and `vault.pmv`, each
   manifest, and each document are size-capped before being read, so a crafted file
@@ -693,8 +697,10 @@ is an attacker restoring older-but-authentic state that the user once wrote:
   version — it simply looks like the vault as it was then.
 - Deleting a `manifest.<N>`: it is rebuilt by scanning `vol.<N>` (recovery for a
   genuinely lost manifest), which also re-indexes documents that had been
-  *deleted* (a delete drops only the manifest entry; the blob lingers because
-  there is no compaction in v1, §4.3), effectively undoing those deletes.
+  *deleted* (a delete drops only the manifest entry; the blob lingers until a
+  `compact` rewrite removes it, §4.3/§11.1), effectively undoing those not-yet-
+  compacted deletes. Running `compact --volume` physically drops those frames and
+  closes this window for them.
 - Truncating a `vol.<N>` to an earlier `end_offset` to drop recently-appended
   frames.
 
@@ -818,8 +824,8 @@ volumes are opened on demand and flushed/closed when idle.
 
 **Partitioning.** A configurable `volume_max_size` (default 256 MiB, stored in the
 vault) governs placement of *new* documents; exceeding it starts a new partition.
-Updates append to the **same** partition as the original. No compaction in v1
-(dead blobs accumulate as garbage; a future `compact` command reclaims them).
+Updates append to the **same** partition as the original. The dead blobs that
+updates and deletes leave behind are reclaimed on demand by `compact` (§11.1).
 
 **Password change** re-encrypts **everything** under a fresh key (full
 re-encryption, not a wrapped data-key), staged in `mypath/.rekey/` with a `READY`
@@ -827,6 +833,44 @@ marker and committed by roll-forward, so a crash mid-rotation leaves either the
 old or the new tree fully working — never a mix. Rationale for full re-encryption
 over an envelope/data-key scheme (rotation must defend against a leaked *old*
 password) is in `PLAN.md` §7.
+
+### 11.1 Compaction (`compact`)
+
+The append-only volume never shrinks on its own: an update appends a new frame and
+drops the old manifest entry; a delete drops the entry. The old frames remain as
+**garbage** in `[0, end_offset)`. Separately, every record carries an append-only
+per-edit `history` log that grows monotonically. The CLI `compact` command reclaims
+both, individually or together (`pass-mgr compact [DIR] --volume --json …`):
+
+- **Volume compaction (`--volume`)** rewrites the document store keeping only the
+  **live** blobs (those still referenced by a manifest entry), dropping every dead
+  frame. It is implemented as a **same-key re-key**: it reuses the exact
+  stage→`READY`→roll-forward machinery of a password change (§12.3), re-encrypting
+  each live document with a fresh nonce into `.rekey/` and swapping the new tree in
+  atomically. Documents may be re-packed into fewer partitions, so **partition
+  numbers are not stable across a compaction or rekey** (records reference document
+  *ids*, never partitions, so this is invisible to the data model). The
+  write-generation is bumped, exactly as a rekey does.
+- **History compaction (`--json`)** trims each record's `history`: either entries
+  older than a `--history-before YYYY-MM-DD` cutoff (UTC; entries on/after the date
+  are kept) or all of them (`--history-all`). The vault-level `audit` log is
+  **always preserved**, and a `compacted` event is appended to it. JSON-only
+  compaction needs no volume work — it is an in-memory trim followed by the normal
+  atomic `vault.pmv` save.
+
+**Safety.** Compaction is power-loss-safe by construction (it reuses the rekey
+commit, §12.3) but it is **irreversible** — trimmed history and reclaimed bytes are
+gone. The command therefore **backs up the encrypted tree first** by default (to a
+sibling `<dir>-backups/` directory; `--backup DEST` overrides, `--no-backup` opts
+out), and offers `--dry-run` to report what would be reclaimed without writing.
+
+**Threat-model note.** A volume compaction can visibly shrink `vol.<N>` at rest,
+which signals to an at-rest observer that data was deleted — a filesystem-level
+metadata leak the never-shrinking v1 volume avoided. This is consistent with the
+already-accepted at-rest limitations (§8, §9.12); it leaks *that* data was removed,
+never *what*. Conversely, compaction **physically removes** the deleted-but-lingering
+frames, which closes the "delete a `manifest.<N>` to resurrect deletes" window
+(§9.12) for those frames.
 
 **CLI** gains directory-based decryption facilities: `decrypt` (vault JSON),
 `manifest [--part N]` (one or all manifests), and `extract [--part N]` (decrypt one
@@ -861,8 +905,9 @@ Two atomic primitives underlie everything:
 - **Durable append** (`append_frame`, used for volume frames): open the volume,
   `write` the frame at the committed `end_offset`, `set_len` to drop any torn
   tail, `fsync` the file, then `fsync` the volume *directory* (so a first-ever
-  `vol.<N>` entry is durable before anything references it). It also refuses to
-  follow a symlink at the volume path.
+  `vol.<N>` entry is durable before anything references it). The open uses
+  **`O_NOFOLLOW`** so a symlink planted at the volume path (even in the race window
+  after the pre-check) is refused atomically by the kernel rather than followed.
 
 ### 12.3 Per-operation commit order and recovery
 
@@ -880,7 +925,7 @@ the document either fully exists or doesn't; nothing in between, no corruption.
 
 **Delete (`storage::remove`)** is a single `write_atomic` of the manifest with the
 entry dropped — atomic, so it either happened or didn't. (The blob lingers as
-garbage; no compaction in v1.)
+garbage until a `compact --volume` rewrite, §11.1.)
 
 **Save the vault (`vault::save` / `write_vault_file`)** is a single atomic replace
 of `vault.pmv`. The vault is the **final commit point**: a document blob/manifest
@@ -909,6 +954,20 @@ intact old tree. A crash mid-commit therefore always lands on one whole tree,
 never a mix. If `commit_rekey` fails *in-process* (e.g. `ENOSPC` on a rename), the
 live handle is **poisoned** (made read-only) so it cannot write the new key over a
 half-moved tree; the next open completes the roll-forward.
+
+**Compaction (`compact --volume`)** is the same multi-file commit as a password
+change — it shares one `staged_rewrite` helper, the same `.rekey/` staging,
+`READY` marker, roll-forward order (`volume/` → `manifest/` → `vault.pmv`), the
+same `rekey.after_volume`/`after_manifest`/`after_vault` fault points, and the same
+handle-poisoning on a partial commit — differing only in that it **keeps the
+current key** instead of deriving a new one. Recovery is therefore identical and
+needs no new code: a crash before `READY` discards the staging (the *un*compacted
+vault stands); a crash after it rolls forward to the compacted vault. The one extra
+case compaction introduces — *every* document deleted, so the staged store has zero
+partitions — is handled by materializing empty staged `volume/`+`manifest/` dirs so
+the commit still swaps the garbage dirs out. History-only compaction (`--json`
+without `--volume`) is just an in-memory trim plus the single atomic `vault.pmv`
+save above, so it inherits that step's crash-safety directly.
 
 ### 12.4 What "minimal corruption" means here
 

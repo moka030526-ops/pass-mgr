@@ -109,8 +109,8 @@ The vault is a **directory** (`mypath/vault.pmv` + `manifest/` + `volume/` +
     manifest (rejects a relocated/substituted frame). All length fields are
     bounds-checked; per-doc/per-manifest sizes are capped.
   - **Partitioning:** `volume_max_size` (vault `settings`, default 256 MiB)
-    governs placement of new docs; updates stay in the original partition. No
-    compaction in v1 (reclaimed blobs linger as garbage).
+    governs placement of new docs; updates stay in the original partition.
+    Reclaimed/updated blobs linger as garbage until a `compact --volume` rewrite.
   - **Lifecycle:** attaching persists the record→doc link immediately; remove/
     detach/delete persist the unlinked vault **first**, then reclaim the blob, so
     a crash leaves at most a harmless orphan, never a dangling reference.
@@ -118,7 +118,24 @@ The vault is a **directory** (`mypath/vault.pmv` + `manifest/` + `volume/` +
   key+salt, staged in `.rekey/` (`vault.pmv` + `manifest/` + `volume/` + `READY`),
   committed by roll-forward (volumes, then manifests, then `vault.pmv` last), and
   recovered on the next open if interrupted. Poisons the live handle if a partial
-  commit fails.
+  commit fails. It is now a thin wrapper over the shared `staged_rewrite` helper.
+- **Compaction** (`OpenVault::compact` / `compact_dry_run`, CLI `compact`):
+  reclaims space without rotating the password. Two independent modes, combinable:
+  - **`--volume`**: re-pack the store keeping only live blobs. Implemented as a
+    **same-key** `staged_rewrite` — the very machinery `change_password` uses, but
+    `new_key = None` so reads and writes use the current key (fresh per-frame
+    nonces). The copy loop iterates `storage.ids()` (live manifest entries only),
+    so dead frames are dropped; docs may re-pack into fewer partitions. The
+    all-deleted edge (zero staged partitions) materializes empty staged
+    `volume/`+`manifest/` so the commit still swaps the garbage dirs out.
+  - **`--json`**: `records::compact_history` trims each record's `history` —
+    entries older than a `--history-before` UTC cutoff (parsed by `parse_ymd_utc`,
+    a `days_from_civil` inverse, zero new deps) or all (`--history-all`). The
+    vault-level `audit` is preserved; a `compacted` event is appended. JSON-only
+    runs in memory then a normal atomic `save()` (no volume work).
+  - Shares the rekey crash-safety end-to-end (same `.rekey/`, `READY`,
+    `commit_rekey`, fault points, handle-poisoning, generation bump). Reclaim math
+    uses `VolumeStore::space_stats()` (`Σ end_offset − Σ live frame length`).
 - **Single-writer lock:** a writable open/create takes an OS advisory lock on
   `pass-mgr.lock` (`File::try_lock`, released on process exit); a second writable
   instance gets `VaultError::Locked`. Read-only opens skip it.
@@ -183,6 +200,10 @@ virtual path against `storage::MAX_PATH_LEN` (256 bytes) before attaching — th
 GUI disables the Attach button with an inline error, the TUI rejects the upload
 key — and the Config screen (write mode only) edits the volume-size setting via
 `OpenVault::set_volume_max_size` (which updates the live store cap and persists).
+The Config screen also has a **color-theme picker** (Light / Dark / High-contrast /
+Solarized / Sepia, built by `visuals_for`); the choice applies live (even read-only)
+and persists to a small non-secret `prefs.json` in the per-user config dir
+(`load_theme`/`save_theme`, best-effort — never blocks startup; holds no vault data).
 Change-password runs through the Auth screen into `OpenVault::change_password`.
 
 ## 7. CLI (`main.rs`)
@@ -199,6 +220,9 @@ pass-mgr extract [DIR] OUT [--part N]   decrypt documents into OUT: one volume o
 pass-mgr backup [DIR] DEST       copy the whole encrypted vault tree into DEST
 pass-mgr export-tree [DIR] OUT   decrypt the whole vault into a plaintext mirror
 pass-mgr import-tree SRC [DIR]   build a new encrypted vault from a plaintext mirror
+pass-mgr compact [DIR] <what>    reclaim space: --volume (re-pack store) and/or
+                                 --json (--history-before YYYY-MM-DD | --history-all);
+                                 --dry-run, --backup DEST, --no-backup
 ```
 
 `--write`/`--tui` are position-independent flags. **Read-only is the default**,
@@ -216,6 +240,15 @@ hardened `write_new_bytes` (0600), and creates dirs 0700. `decrypt`/`manifest`/
 `extract`/`backup` are read operations (refuse a half-committed rekey). The
 no-echo password reader uses crossterm raw mode on a TTY and falls back to a piped
 line otherwise.
+
+`compact` is the first CLI command that opens **writable** (taking the single-writer
+lock). Its flags are pulled out by `extract_compact_flags` and rejected on other
+commands. It validates the mode/retention combination, then: `--dry-run` opens
+read-only and prints what `compact_dry_run` would reclaim (no writes); otherwise it
+opens writable, **backs up the encrypted tree first** (`vault::backup` to a sibling
+`<dir>-backups/` by default, `--backup DEST` outside the vault dir, `--no-backup`
+to skip), skips entirely when nothing is reclaimable, then runs `OpenVault::compact`
+and prints the result.
 
 ## 8. Build, test, coverage
 
@@ -240,8 +273,10 @@ prior state intact and recoverable (the failed op vanishes; a torn tail past
 crash_recovery.rs` *spawns the real binary* (the hidden `__crashop` subcommand)
 and aborts it (`std::process::abort` — no `Drop`/flush, like SIGKILL/power-loss)
 after the volume append, after the manifest commit, during the vault save, and
-mid-rekey, then reopens and asserts recovery (document intact, lock released,
-rekey rolled forward). See DESIGN.md §12 for the matrix.
+mid-rekey **and mid-compaction**, then reopens and asserts recovery (document
+intact, lock released, rekey/compaction rolled forward or the staging discarded).
+Because compaction reuses the rekey commit, the same `rekey.*` crash points and a
+before-`READY` discard are exercised for it too. See DESIGN.md §12 for the matrix.
 
 Tests cover the core thoroughly (crypto, storage, vault, records, types,
 password): per-operation crash-injection and the full rekey roll-forward matrix,
@@ -292,6 +327,19 @@ the volume-dir fsync ordering, persist-before-reclaim in the delete/detach paths
 the `vault.pmv` size cap, and the `append_frame` symlink refusal. The residual
 limitations (at-rest rollback, the Argon2-cost open DoS, single-active-session
 concurrency) are documented in `DESIGN.md` §9.12/§9.13/§9.16.
+
+A later round added the **`compact`** command (§3, `DESIGN.md` §11.1), the GUI
+**color-theme** picker (§6), and a whole-codebase **deep security audit** (8 lenses
+× *find → two independent adversarial verifiers → triage*). Four confirmed findings
+were fixed with regression tests: (1) `append_frame` now opens with `O_NOFOLLOW` so
+a symlink swapped in after the pre-check is refused atomically (the pre-check is now
+just a fast early error); (2) the GUI `prefs.json` read is size-capped and
+symlink-refused so a hostile/oversized file can't stall startup; (3) `compact`
+validates the **default** backup destination (not only an explicit `--backup`) is
+outside the vault dir, right before the write; (4) `vault::backup` refuses a
+symlinked destination directory at the library boundary. The append/backup symlink
+guards are best-effort against a same-machine attacker racing the filesystem; the
+`O_NOFOLLOW` open is the atomic part.
 
 ## 11. Definition of done
 

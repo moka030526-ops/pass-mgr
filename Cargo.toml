@@ -20,6 +20,13 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
+# Unix-only: the `O_NOFOLLOW` open flag, used to make the volume-append open
+# atomically refuse a symlink (closing a TOCTOU window the pre-open stat cannot).
+# Already present transitively; named here so it can be used directly, through the
+# safe `OpenOptionsExt::custom_flags` API only. No effect on Windows builds.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Compiles the crash-safety fault-injection hooks (src/fault.rs) into the storage
 # and vault commit paths. OFF by default (and in every release build), where the

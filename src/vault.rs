@@ -554,80 +554,191 @@ impl OpenVault {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
+        // Derive a brand-new key under a fresh salt, then drive the shared staged
+        // full-rewrite: re-encrypt every live document and the vault under the new
+        // key, stage it, and atomically swap it in. `Some(...)` tells
+        // `staged_rewrite` to ADOPT the new key/salt once the commit succeeds; the
+        // transform records the rotation in the audit log.
+        let new_salt = crypto::random_bytes::<SALT_LEN>()?;
+        let new_key = crypto::derive_key_chained(pw1, pw2, &new_salt, &self.params)?;
+        self.staged_rewrite(Some((new_key, new_salt)), |v| {
+            v.audit.push(Change::new("password_changed", String::new()));
+        })
+    }
+
+    /// The shared **staged full-rewrite** behind both `change_password` and
+    /// `compact`. It re-encrypts every *live* document (and the vault) into the
+    /// `.rekey` staging directory, writes a `READY` marker, then atomically swaps
+    /// the new tree into place via `commit_rekey`. A crash before `READY` is
+    /// discarded on reopen (the old tree stands); a crash after it rolls forward
+    /// (`recover_pending_rekey`). On a partial commit the live handle is poisoned
+    /// (`read_only`) so the caller must reopen and finish the idempotent commit.
+    ///
+    /// `new_key` is `Some((key, salt))` to re-key (the staged tree is encrypted
+    /// under the new key, adopted on success) or `None` to reuse the current
+    /// key/salt (compaction — reads and writes both use `self.key`, with fresh
+    /// per-frame nonces). `transform` mutates the staged vault clone before it is
+    /// written (e.g. trim history, append an audit event). The write-generation is
+    /// always bumped so the committed tree is detectably newer than any snapshot.
+    fn staged_rewrite(
+        &mut self,
+        new_key: Option<(Key, [u8; SALT_LEN])>,
+        transform: impl FnOnce(&mut Vault),
+    ) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
         let dir = parent_dir(&self.path);
         let staging = dir.join(REKEY_DIR);
         let _ = fs::remove_dir_all(&staging); // clear any stale staging
         fs::create_dir_all(&staging)?;
         harden_dir(&staging);
 
-        let new_salt = crypto::random_bytes::<SALT_LEN>()?;
-        let new_key = crypto::derive_key_chained(pw1, pw2, &new_salt, &self.params)?;
+        // The key/salt the STAGED tree is encrypted under: the new key when
+        // re-keying, else the current key (compaction). Reads always decrypt under
+        // the CURRENT key (`self.key`). `match &new_key` borrows, so `new_key`
+        // stays available to move out of after the staged tree is written.
+        let (write_key, write_salt) = match &new_key {
+            Some((k, s)) => (k, s),
+            None => (&self.key, &self.salt),
+        };
 
-        // Re-encrypt every document into a fresh store under the new key.
-        let new_store = VolumeStore::open(&staging, &new_key, &self.vault.id, self.vault.settings.volume_max_size)?;
-        let mut new_store = new_store; // re-bind as mutable (shadowing the previous name)
-        // Iterator pipeline: `.ids()` yields each id, `.map(|s| s.to_string())`
-        // converts each borrowed `&str` to an owned `String` (the closure `|s| ...`
-        // is an inline function), and `.collect()` gathers them into a `Vec`. We own
-        // the ids up front so the loop below can borrow `self.storage` freely.
+        // Re-encrypt every LIVE document into the fresh staged store. Iterating
+        // `self.storage.ids()` yields only manifest-referenced (live) blobs, so the
+        // dead frames left by updates/deletes are dropped here — this is exactly
+        // what makes the rewrite double as a volume compaction.
+        let mut new_store =
+            VolumeStore::open(&staging, write_key, &self.vault.id, self.vault.settings.volume_max_size)?;
         let ids: Vec<String> = self.storage.ids().map(|s| s.to_string()).collect();
-        for id in &ids { // `&ids` iterates by reference, so `ids` survives the loop
-            let bytes = self.storage.read(id, &self.key)?; // decrypt under the OLD key
-            // `.entry(id)` returns an `Option`; `.map(...)` runs the closure only if
-            // it's `Some`, producing `Some((path, time))`; `.unwrap_or_default()`
-            // substitutes a default pair if it was `None`. `e.path.clone()` makes an
-            // owned copy because `e` is only borrowed here.
+        for id in &ids {
+            let bytes = self.storage.read(id, &self.key)?; // decrypt under the CURRENT key
             let (path, uploaded_at) = self
                 .storage
                 .entry(id)
                 .map(|e| (e.path.clone(), e.uploaded_at))
                 .unwrap_or_default();
-            new_store.put(id, &path, &bytes, uploaded_at, &new_key)?; // re-encrypt under NEW key
+            new_store.put(id, &path, &bytes, uploaded_at, write_key)?; // encrypt under the staged key
         }
-        drop(new_store); // explicitly drop now to flush/close the staged store before commit
+        drop(new_store); // flush/close the staged store before commit
 
-        // Stage the re-encrypted vault, mark the staging complete, then commit.
-        // Bump the write-generation so a rekeyed vault is detectably newer than
-        // any pre-rekey snapshot (stale/rollback detection across a rotation).
+        // If the live tree has a volume directory (possibly full of garbage) but
+        // the staged store wrote no partitions — e.g. every document was deleted,
+        // the maximum-garbage case — materialize empty staged `volume/`+`manifest/`
+        // dirs so `commit_rekey` swaps the garbage dirs OUT. Otherwise `replace_dir`
+        // no-ops on the absent staged dirs and the live garbage would survive.
+        if self.storage.partition_count() > 0 {
+            for sub in ["volume", "manifest"] {
+                let d = staging.join(sub);
+                fs::create_dir_all(&d)?;
+                harden_dir(&d);
+            }
+        }
+
+        // Stage the rewritten vault: clone, bump the write-generation, apply the
+        // caller's transform, write it, then mark the staging complete with READY.
         let mut staged_vault = self.vault.clone();
         staged_vault.generation = staged_vault.generation.saturating_add(1);
-        staged_vault.audit.push(Change::new("password_changed", String::new()));
-        write_vault_file(&staging.join(VAULT_FILE), &staged_vault, &new_key, &new_salt, self.params)?;
+        transform(&mut staged_vault);
+        write_vault_file(&staging.join(VAULT_FILE), &staged_vault, write_key, write_salt, self.params)?;
         write_new_bytes(&staging.join(REKEY_READY), b"ready")?;
         sync_parent_dir(&staging.join(REKEY_READY));
-        // commit_rekey moves volume/ then manifest/ then vault.pmv. If it fails
-        // PARTWAY (a rename errors), the on-disk tree is half-new while this live
-        // handle still holds the OLD key — a subsequent save/put would corrupt the
-        // new-key tree. Poison the handle (read-only) so the caller must reopen,
-        // which finishes the idempotent roll-forward. A crash here is handled the
-        // same way by recover_pending_rekey on the next open.
-        // `if let Err(e) = ...` runs the block only when the call returned an `Err`,
-        // binding the error to `e` (a concise alternative to a full `match`).
+
+        // commit_rekey moves volume/ then manifest/ then vault.pmv (the final commit
+        // point). A partial failure leaves a half-new tree while this handle is
+        // stale: poison it so the caller must reopen (which finishes the idempotent
+        // roll-forward). A crash here recovers the same way on the next open.
         if let Err(e) = commit_rekey(&dir, &staging) {
             self.read_only = true; // poison this handle so the caller must reopen
             return Err(e);
         }
 
-        // Adopt the new key/salt/state and reopen the store under the new key.
-        // Assigning to `self.key` moves `new_key` in; the OLD key value is dropped
-        // here and (being a `Key`) zeroized out of memory.
-        self.key = new_key;
-        self.salt = new_salt;
+        // The on-disk tree is now the committed new tree. Adopt the new key/salt
+        // when re-keying (moving `new_key` in drops & zeroizes the old `Key`); for
+        // compaction the key/salt are unchanged. Then reopen the store so the
+        // in-memory index reflects the re-keyed/compacted volume.
+        if let Some((k, s)) = new_key {
+            self.key = k;
+            self.salt = s;
+        }
         self.vault = staged_vault;
         self.previous_generation = self.vault.generation;
-        // The on-disk tree is already the committed new-key tree. If reopening the
-        // store under the new key fails here, self.storage is still the OLD store
-        // while self.key is the new key — a mismatched handle. Poison it so no
-        // later save/put can act on the stale store; the next open re-validates.
         match VolumeStore::open(&dir, &self.key, &self.vault.id, self.vault.settings.volume_max_size) {
             Ok(store) => {
                 self.storage = store;
                 Ok(())
             }
             Err(e) => {
-                self.read_only = true;
+                self.read_only = true; // mismatched handle; force a fresh open
                 Err(e.into())
             }
+        }
+    }
+
+    /// Reclaim space without changing the passwords. `opts.volume` rewrites the
+    /// document store keeping only live blobs (dropping the dead frames left by
+    /// updates/deletes), reusing the crash-safe staged rewrite above. `opts.json`
+    /// trims each record's per-edit `history` (older than the cutoff, or all),
+    /// leaving the vault-level `audit` intact and appending a `compacted` event.
+    /// Either or both may run; refused on a read-only handle. Returns a report of
+    /// what was reclaimed.
+    pub fn compact(&mut self, opts: &CompactOptions) -> Result<CompactReport, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        // Measure reclaimable garbage and removable history BEFORE mutating, so the
+        // report reflects the change (the staged rewrite reproduces live frames at
+        // their original size, so committed-after ≈ live-before).
+        let (committed, live) = self.storage.space_stats();
+        let bytes_reclaimed = if opts.volume { committed.saturating_sub(live) } else { 0 };
+        let history_removed = if opts.json {
+            records::history_stats(&self.vault, opts.history_cutoff, opts.drop_all_history)
+        } else {
+            0
+        };
+        let partitions_before = self.storage.partition_count();
+        let detail = compaction_detail(opts, bytes_reclaimed, history_removed);
+
+        if opts.volume {
+            // Re-pack the volume AND (optionally) trim history in one atomic commit.
+            // The closure captures only Copy values + the owned `detail` string, so
+            // it does not borrow `self` (no conflict with `&mut self`).
+            let (cutoff, drop_all, do_json) = (opts.history_cutoff, opts.drop_all_history, opts.json);
+            self.staged_rewrite(None, move |v| {
+                if do_json {
+                    records::compact_history(v, cutoff, drop_all);
+                }
+                v.audit.push(Change::new("compacted", detail));
+            })?;
+        } else {
+            // JSON-only: trim history in place, then the normal atomic vault save
+            // (which bumps the generation). The volume is untouched.
+            records::compact_history(&mut self.vault, opts.history_cutoff, opts.drop_all_history);
+            self.vault.audit.push(Change::new("compacted", detail));
+            self.save()?;
+        }
+
+        Ok(CompactReport {
+            bytes_reclaimed,
+            history_removed,
+            partitions_before,
+            partitions_after: self.storage.partition_count(),
+        })
+    }
+
+    /// Compute what `compact` *would* reclaim without writing anything (used by
+    /// `--dry-run`; safe on a read-only handle). `partitions_after` mirrors the
+    /// current count — the post-compaction count is only known after a real run.
+    pub fn compact_dry_run(&self, opts: &CompactOptions) -> CompactReport {
+        let (committed, live) = self.storage.space_stats();
+        CompactReport {
+            bytes_reclaimed: if opts.volume { committed.saturating_sub(live) } else { 0 },
+            history_removed: if opts.json {
+                records::history_stats(&self.vault, opts.history_cutoff, opts.drop_all_history)
+            } else {
+                0
+            },
+            partitions_before: self.storage.partition_count(),
+            partitions_after: self.storage.partition_count(),
         }
     }
 
@@ -686,7 +797,7 @@ impl OpenVault {
     }
 
     /// Permanently remove a stored document by id (drops its manifest entry; the
-    /// blob lingers as garbage until a future compaction).
+    /// blob lingers as garbage until reclaimed by a `compact` volume rewrite).
     pub fn remove_document(&mut self, file_id: &str) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
@@ -823,6 +934,39 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
         return Err(VaultError::TooLarge);
     }
     Ok(fs::read(path)?)
+}
+
+/// Options for [`OpenVault::compact`]. `volume` re-packs the document store
+/// (drops dead frames); `json` trims each record's per-edit history. When
+/// `drop_all_history` is false, `history_cutoff` (Unix seconds) keeps entries
+/// with `at >= cutoff` and drops older ones; when true, all history is removed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompactOptions {
+    pub volume: bool,
+    pub json: bool,
+    pub history_cutoff: Option<i64>,
+    pub drop_all_history: bool,
+}
+
+/// What a compaction reclaimed. Also returned by `compact_dry_run` as a
+/// pre-flight estimate (its `partitions_after` mirrors `partitions_before`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompactReport {
+    pub bytes_reclaimed: u64,
+    pub history_removed: usize,
+    pub partitions_before: usize,
+    pub partitions_after: usize,
+}
+
+/// One-line summary of a compaction run, recorded in the vault `audit` log.
+fn compaction_detail(opts: &CompactOptions, bytes_reclaimed: u64, history_removed: usize) -> String {
+    let mode = match (opts.volume, opts.json) {
+        (true, true) => "volume+history",
+        (true, false) => "volume",
+        (false, true) => "history",
+        (false, false) => "noop",
+    };
+    format!("{mode}: reclaimed {bytes_reclaimed} bytes, removed {history_removed} history entries")
 }
 
 /// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
@@ -1043,6 +1187,17 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
     // discard) the pending rekey by opening with --write first.
     if src_dir.join(REKEY_DIR).exists() {
         return Err(VaultError::RekeyPending);
+    }
+    // Refuse a symlinked destination directory: an attacker who can write the vault
+    // dir could otherwise point the backup into the very tree we are reading, or at
+    // arbitrary files the user can write. `symlink_metadata` inspects the link
+    // itself (does not follow it). The CLI also validates the dest is outside the
+    // vault dir; this is defense-in-depth at the library boundary so every caller is
+    // covered. (A non-existent dest is fine — it is created below as a real dir.)
+    if let Ok(meta) = fs::symlink_metadata(dest_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(VaultError::Storage(StorageError::Corrupt("backup destination is a symlink".to_string())));
     }
     fs::create_dir_all(dest_dir)?;
     harden_dir(dest_dir);
@@ -2153,6 +2308,254 @@ mod tests {
         assert!(!parent_dir(&path).join(REKEY_DIR).exists(), "staging discarded");
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    // ---- Compaction --------------------------------------------------------
+
+    /// A vault with one live, record-referenced document plus `garbage` extra
+    /// documents that are added then immediately removed, leaving dead frames in
+    /// the volume. Returns the vault path and the id of the live ("keep") doc.
+    fn seed_with_garbage(tag: &str, garbage: usize) -> (PathBuf, String) {
+        let path = tmp_path(tag);
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src(tag, &vec![9u8; 400]);
+        let keep = v.add_document("/keep", "keep.bin", &src).unwrap();
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.file = Some(keep.clone());
+        records::upsert(&mut v.vault.trust_wills, tw);
+        // Dead frames: add then remove (drops the manifest entry; frame lingers).
+        for i in 0..garbage {
+            let id = v.add_document("/g", &format!("g{i}.bin"), &src).unwrap();
+            v.remove_document(&id).unwrap();
+        }
+        v.save().unwrap();
+        fs::remove_file(&src).ok();
+        (path, keep)
+    }
+
+    fn volume_opts() -> CompactOptions {
+        CompactOptions { volume: true, json: false, history_cutoff: None, drop_all_history: false }
+    }
+
+    #[test]
+    fn compact_volume_reclaims_garbage_and_keeps_live_docs() {
+        let (path, keep) = seed_with_garbage("cvol", 3);
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        let opts = volume_opts();
+        let before = v.compact_dry_run(&opts).bytes_reclaimed;
+        assert!(before > 0, "garbage should be reclaimable, got {before}");
+        let report = v.compact(&opts).unwrap();
+        assert_eq!(report.bytes_reclaimed, before);
+        // No garbage remains, and the live doc is still readable.
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "garbage fully reclaimed");
+        assert_eq!(&*v.read_document(&keep).unwrap(), &vec![9u8; 400][..]);
+        assert!(v.vault.audit.iter().any(|c| c.action == "compacted"));
+        drop(v);
+        // Reopens cleanly (consistency check passes), doc intact, no staging debris.
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re.read_document(&keep).unwrap(), &vec![9u8; 400][..]);
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_volume_when_all_docs_deleted_shrinks_to_nothing() {
+        // Maximum-garbage case: every document removed. The staged store has zero
+        // partitions, so compaction must still swap the garbage volume/manifest out
+        // (regression guard for the all-deleted reclaim fix in `staged_rewrite`).
+        let (path, docs) = seed_multi_partition("calldel", b"a", b"b");
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        for (id, _) in &docs {
+            v.remove_document(id).unwrap();
+        }
+        let opts = volume_opts();
+        assert!(v.compact_dry_run(&opts).bytes_reclaimed > 0);
+        v.compact(&opts).unwrap();
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "all garbage gone");
+        assert_eq!(v.storage.partition_count(), 0, "empty store after all-deleted compaction");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(re.storage.partition_count(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_json_trims_history_by_cutoff_and_keeps_audit() {
+        let path = tmp_path("cjson");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        // Controlled history: one old, one recent entry (plus the upsert "created").
+        v.vault.accounts[0].history.push(records::Change { at: 1_000, action: "updated".into(), detail: "old".into() });
+        v.vault.accounts[0].history.push(records::Change { at: 9_000, action: "updated".into(), detail: "newer".into() });
+        v.save().unwrap();
+        let audit_before = v.vault.audit.len();
+        let opts = CompactOptions { volume: false, json: true, history_cutoff: Some(3_000), drop_all_history: false };
+        let removed = v.compact(&opts).unwrap().history_removed;
+        assert_eq!(removed, 1, "only the at=1000 entry is older than the cutoff");
+        // The old entry is gone; the recent one (and the created one) remain.
+        assert!(v.vault.accounts[0].history.iter().all(|c| c.at >= 3_000));
+        assert!(v.vault.accounts[0].history.iter().any(|c| c.at == 9_000));
+        // Audit preserved and gained exactly the compaction event.
+        assert_eq!(v.vault.audit.len(), audit_before + 1);
+        assert!(v.vault.audit.iter().any(|c| c.action == "compacted"));
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.vault.accounts[0].history.iter().all(|c| c.at >= 3_000));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_json_drop_all_clears_history_only() {
+        let path = tmp_path("cjsonall");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        v.vault.accounts[0].history.push(records::Change { at: 1, action: "updated".into(), detail: "x".into() });
+        v.save().unwrap();
+        let opts = CompactOptions { volume: false, json: true, history_cutoff: None, drop_all_history: true };
+        v.compact(&opts).unwrap();
+        assert!(v.vault.accounts[0].history.is_empty(), "all record history dropped");
+        assert!(v.vault.audit.iter().any(|c| c.action == "compacted"), "audit retained");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_both_reclaims_and_trims_in_one_commit() {
+        let (path, keep) = seed_with_garbage("cboth", 2);
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        v.vault.accounts[0].history.push(records::Change { at: 1, action: "updated".into(), detail: "old".into() });
+        v.save().unwrap();
+        let opts = CompactOptions { volume: true, json: true, history_cutoff: None, drop_all_history: true };
+        let report = v.compact(&opts).unwrap();
+        assert!(report.bytes_reclaimed > 0 && report.history_removed >= 1);
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re.read_document(&keep).unwrap(), &vec![9u8; 400][..]);
+        assert!(re.vault.accounts.iter().all(|a| a.history.is_empty()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_on_clean_vault_is_a_safe_noop_rewrite() {
+        let path = tmp_path("cclean");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("cc", b"body");
+        let id = v.add_document("/d", "d.bin", &src).unwrap();
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.file = Some(id.clone());
+        records::upsert(&mut v.vault.trust_wills, tw);
+        v.save().unwrap();
+        fs::remove_file(&src).ok();
+        let report = v.compact(&volume_opts()).unwrap();
+        assert_eq!(report.bytes_reclaimed, 0, "nothing to reclaim on a clean vault");
+        assert_eq!(&*v.read_document(&id).unwrap(), b"body", "doc intact after no-op rewrite");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_refused_on_read_only_handle() {
+        let path = tmp_path("cro");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        assert!(matches!(ro.compact(&volume_opts()), Err(VaultError::ReadOnly)));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_bumps_write_generation() {
+        let (path, _keep) = seed_with_garbage("cgen", 1);
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        let before = v.vault.generation;
+        v.compact(&volume_opts()).unwrap();
+        assert!(v.vault.generation > before, "compaction advances the generation");
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_during_compact_staging_leaves_original_tree_intact() {
+        // The disk fills while re-encrypting into the .compact staging tree, BEFORE
+        // READY. The compaction fails cleanly, the handle is poisoned, and the
+        // ORIGINAL (uncompacted) vault still opens with its live doc intact.
+        let (path, keep) = seed_with_garbage("cenospc", 2);
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        crate::fault::fail_at("volume.write", 1);
+        let err = v.compact(&volume_opts()).unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, VaultError::Storage(_)), "got {err:?}");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re.read_document(&keep).unwrap(), &vec![9u8; 400][..]);
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists(), "staging discarded");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_json_only_leaves_volume_garbage_untouched() {
+        // JSON-only compaction must not rewrite the volume: the dead bytes stay.
+        let (path, _keep) = seed_with_garbage("cjvol", 2);
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        v.vault.accounts[0].history.push(records::Change { at: 1, action: "u".into(), detail: String::new() });
+        v.save().unwrap();
+        let before = v.compact_dry_run(&volume_opts()).bytes_reclaimed;
+        assert!(before > 0, "there should be reclaimable volume garbage");
+        let opts = CompactOptions { volume: false, json: true, history_cutoff: None, drop_all_history: true };
+        let report = v.compact(&opts).unwrap();
+        assert_eq!(report.bytes_reclaimed, 0, "json-only reclaims no volume bytes");
+        assert!(report.history_removed >= 1);
+        // The volume garbage is exactly as before — untouched by a json-only run.
+        assert_eq!(v.compact_dry_run(&volume_opts()).bytes_reclaimed, before);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_preserves_unreferenced_orphan_blobs() {
+        // Compaction copies every live manifest entry (storage.ids()), so an
+        // unreferenced orphan blob is conservatively kept (never silently dropped),
+        // while genuinely dead frames (removed) are reclaimed.
+        let path = tmp_path("corphan");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("co", &vec![3u8; 300]);
+        let referenced = v.add_document("/r", "r.bin", &src).unwrap();
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.file = Some(referenced.clone());
+        records::upsert(&mut v.vault.trust_wills, tw);
+        let orphan = v.add_document("/o", "o.bin", &src).unwrap(); // never linked → orphan
+        let garbage = v.add_document("/g", "g.bin", &src).unwrap();
+        v.remove_document(&garbage).unwrap(); // dead frame
+        v.save().unwrap();
+        fs::remove_file(&src).ok();
+
+        v.compact(&volume_opts()).unwrap();
+        assert!(v.has_document(&referenced));
+        assert!(v.has_document(&orphan), "unreferenced orphan is preserved by compaction");
+        assert!(!v.has_document(&garbage), "removed doc's frame is reclaimed");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.has_document(&referenced) && re.has_document(&orphan));
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_refuses_symlinked_destination() {
+        // Defense in depth: an attacker who can write the vault dir must not be able
+        // to redirect a backup through a symlinked destination directory.
+        let path = tmp_path("bksym");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let realdest = std::env::temp_dir().join(format!("pmbkreal-{}", nanos()));
+        fs::create_dir_all(&realdest).unwrap();
+        let linkdest = std::env::temp_dir().join(format!("pmbklink-{}", nanos()));
+        std::os::unix::fs::symlink(&realdest, &linkdest).unwrap();
+        let err = backup(&path, &linkdest).unwrap_err();
+        assert!(matches!(err, VaultError::Storage(_)), "symlinked dest refused, got {err:?}");
+        // A normal (non-symlink) destination still backs up fine.
+        let bp = backup(&path, &realdest).unwrap();
+        assert!(bp.exists());
+        cleanup(&path);
+        let _ = fs::remove_dir_all(&realdest);
+        let _ = fs::remove_file(&linkdest);
     }
 
     use proptest::prelude::*;

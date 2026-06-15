@@ -269,6 +269,17 @@ impl VolumeStore {
         self.manifests.len()
     }
 
+    /// `(committed, live)` on-disk volume bytes: `committed` is the sum of each
+    /// partition's `end_offset` (the authoritative valid length), and `live` is
+    /// the sum of the on-disk frame lengths still referenced by a manifest entry.
+    /// `committed - live` is the **reclaimable garbage** — dead frames left by
+    /// updates and deletes — that a `compact` rewrite would remove.
+    pub fn space_stats(&self) -> (u64, u64) {
+        let committed: u64 = self.manifests.iter().map(|m| m.end_offset).sum();
+        let live: u64 = self.manifests.iter().flat_map(|m| m.entries.iter()).map(|e| e.length).sum();
+        (committed, live)
+    }
+
     /// Update the per-partition size cap for **future** placement decisions
     /// (existing partitions are untouched). Clamped to at least 1 byte.
     pub fn set_max_size(&mut self, max_size: u64) {
@@ -376,7 +387,8 @@ impl VolumeStore {
     }
 
     /// Remove a document: drop its entry from the partition manifest and commit.
-    /// The blob stays in the volume as garbage (no compaction in v1).
+    /// The blob stays in the volume as garbage until reclaimed by a `compact`
+    /// volume rewrite (see `OpenVault::compact`).
     pub fn remove(&mut self, id: &str, key: &Key) -> Result<(), StorageError> {
         // `let Some(loc) = .. else { .. }`: if `index.get(id).copied()` is `Some`, bind
         // `loc`; if it's `None` (id not present), run the else block (here: nothing to
@@ -663,9 +675,11 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     // the 0600 chmod) to an arbitrary file the user can write. The atomic
     // manifest/vault writes use O_EXCL + rename; this append path opens the file
     // directly, so it needs its own guard.
-    // Let-chain guard: enter the block only if we can stat the path AND it is a
-    // symlink. `symlink_metadata` does not follow the link, so this inspects the link
-    // itself rather than its target.
+    // This stat is a fast, friendly EARLY rejection — but it is NOT the security
+    // boundary, because the file could be swapped for a symlink between this check
+    // and the open below (a TOCTOU race). The atomic guarantee comes from opening
+    // with O_NOFOLLOW (see below), which makes the kernel refuse a final-component
+    // symlink at open time. `symlink_metadata` does not follow the link.
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -677,11 +691,17 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     let mut opts = OpenOptions::new(); // builder for how to open the file
     opts.read(true).write(true).create(true); // chained builder calls
     // `#[cfg(unix)]` compiles this block ONLY on unix targets (conditional
-    // compilation). It brings the unix-only `mode` extension into scope to set 0600.
+    // compilation). It sets 0600 perms and, crucially, adds `O_NOFOLLOW` so the
+    // open itself fails atomically (ELOOP) if the path's final component is a
+    // symlink — closing the TOCTOU window the stat above cannot. `custom_flags` is
+    // a safe API (no `unsafe`); the flag only affects the final component, matching
+    // the stat's scope. Legitimate `vol.<N>` files are regular files, so this never
+    // rejects a valid append.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600); // owner read/write only
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut f = opts.open(path)?;
     harden_file(path); // belt-and-suspenders chmod (no-op on non-unix)
