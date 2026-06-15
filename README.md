@@ -128,6 +128,12 @@ to your computer.
   the program **automatically clears the clipboard 15 seconds later** (and when
   you close the program), so a copied password doesn't linger.
 
+## Changing the colors (theme)
+
+Open the **Config** screen and pick a **Color theme** (Light, Dark, High contrast,
+Solarized, or Sepia). The change applies immediately and is remembered for next
+time. It's only a display preference — it changes nothing about your data.
+
 ## Making a backup (please do this regularly)
 
 1. In **Edit mode**, open the **Config** screen.
@@ -137,6 +143,44 @@ to your computer.
    documents. Keep at least one backup on a **separate** drive or location.
 
 Backups are still encrypted — they need the same two passwords to open.
+
+## If something goes wrong (power loss, crash, disk full)
+
+pass-mgr is built so that a power cut, a forced shutdown, or a full disk **cannot
+corrupt your vault**. Whatever you were doing either fully completed or did not
+happen at all — there is never a half-saved, broken state. In almost every case the
+fix is the same: **just open the vault again.** It repairs itself automatically when
+it opens.
+
+What to expect after an interruption, by what you were doing at the time:
+
+- **Adding, editing, or deleting an entry, or uploading a document.** If the
+  interruption happened before it finished, that one change simply didn't take —
+  reopen and do it again. Everything else is exactly as it was. A full disk shows an
+  error and changes nothing; free up space and try again.
+- **Changing your master passwords.** Open the vault again and try the **new**
+  passwords first; if those don't work, the change didn't complete, so use the
+  **old** passwords. One of the two always works — an interruption can never lock you
+  out. (Opening the vault quietly finishes, or cancels, a half-done change.)
+- **Compacting (reclaiming space / trimming history — see Part 2).** Same as a
+  password change: reopen and you'll have either the old vault or the compacted one,
+  never a mix. Compacting also makes a dated backup **before** it starts (unless you
+  turned that off), so the pre-compaction state is saved either way.
+- **Making a backup, exporting, or extracting documents.** These only ever *read*
+  your vault, so it is never at risk. If one was interrupted you may find a
+  half-written copy in the destination folder — just delete that partial copy and
+  run it again.
+
+**Two rules:**
+
+1. **Always safe to reopen.** After any crash, just start pass-mgr again — recovery
+   is automatic; there is nothing manual to run.
+2. **Never hand-edit the vault folder.** Don't move, rename, or delete the files
+   inside it (`vault.pmv`, the `manifest/` and `volume/` folders, a temporary
+   `.rekey/` folder, or `pass-mgr.lock`). They are a matched set — let the program
+   manage them. If it ever reports the vault is "locked" after a hard crash, make
+   sure no other pass-mgr window is open and try again; the lock releases itself when
+   the program exits.
 
 ## If you are a family member or executor
 
@@ -217,6 +261,7 @@ pass-mgr --vol PATH ...       Use PATH as the document archive instead of <VAULT
 pass-mgr decrypt [VAULT]      Decrypt the vault and print its JSON to stdout
 pass-mgr extract [VAULT] DIR  Decrypt all stored documents into DIR
 pass-mgr backup [VAULT] DIR   Copy the encrypted vault + archive into DIR (timestamped)
+pass-mgr compact [VAULT] ...  Reclaim space: re-pack documents and/or trim history
 pass-mgr --help               Show help
 ```
 
@@ -242,6 +287,31 @@ pass-mgr decrypt ./vault.pmv > backup.json        # interactive prompts
 printf 'pw1\npw2\n' | pass-mgr decrypt ./vault.pmv # scripted (passwords via stdin)
 pass-mgr extract ./vault.pmv ./out                 # documents -> ./out/...
 ```
+
+### Compacting (reclaim space)
+
+Editing and deleting leave behind dead data in the document store, and every entry
+keeps a growing edit-history log. `compact` reclaims either or both. It opens in
+**edit mode** and is **irreversible**, so by default it makes a dated backup of the
+encrypted vault **before** it starts. It is crash-safe (a power loss leaves either
+the old or the compacted vault, never a mix).
+
+```bash
+pass-mgr compact ./myvault --volume                       # drop dead document data
+pass-mgr compact ./myvault --json --history-all           # remove all edit history
+pass-mgr compact ./myvault --json --history-before 2025-01-01  # keep history on/after that date
+pass-mgr compact ./myvault --volume --json --history-all  # both at once
+pass-mgr compact ./myvault --volume --dry-run             # just report what it would free
+```
+
+- **`--volume`** re-packs the document store, removing the dead blocks left by edits
+  and deletes (documents may end up in fewer partitions; this is invisible to your
+  entries). **`--json`** trims each entry's edit-history: `--history-all` removes it
+  all, or `--history-before YYYY-MM-DD` keeps entries on/after that UTC date. The
+  vault-wide audit log is always kept, and a `compacted` event is recorded in it.
+- **`--dry-run`** reports what would be reclaimed without changing anything.
+  **`--backup DEST`** chooses where the pre-compaction backup goes (must be outside
+  the vault folder); **`--no-backup`** skips it. Prompts for the two passwords.
 
 ### Terminal (`--tui`) key bindings
 

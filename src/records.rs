@@ -96,6 +96,122 @@ pub(crate) fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
     (year, month, day, h, m, s)
 }
 
+/// Days since the Unix epoch for a civil UTC date — Howard Hinnant's
+/// `days_from_civil`, the exact inverse of the `civil_from_unix` calendar math
+/// above (proleptic Gregorian). `div_euclid(400)` is floored division, which is
+/// what the algorithm needs for the era.
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    // March-based year: shift Jan/Feb into the previous year so the leap day is
+    // the last day of the year, simplifying the day-of-year formula.
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400; // year of era, [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // month, March=0 .. Feb=11
+    let doy = (153 * mp + 2) / 5 + d - 1; // day of year, [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era, [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Unix seconds for a civil UTC date-time — inverse of `civil_from_unix`.
+pub(crate) fn unix_from_civil(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+    days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s
+}
+
+/// Parse a `YYYY-MM-DD` date as **UTC midnight**, returning Unix seconds.
+/// Returns `None` for malformed input or an impossible calendar date (e.g.
+/// `2026-02-31`), which the round-trip canonicalization check rejects. Used by
+/// the `compact --history-before` cutoff.
+pub fn parse_ymd_utc(s: &str) -> Option<i64> {
+    // `split('-')` then `collect` into a Vec so we can require exactly 3 fields.
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    // `parse::<i64>()` returns Err on non-numeric text; `.ok()?` maps that to None.
+    let y: i64 = parts[0].parse().ok()?;
+    let mo: i64 = parts[1].parse().ok()?;
+    let d: i64 = parts[2].parse().ok()?;
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let ts = unix_from_civil(y, mo, d, 0, 0, 0);
+    // Canonicalization: re-deriving the date must reproduce the input, which
+    // rejects impossible dates (Feb 31, Apr 31, ...) that days_from_civil would
+    // otherwise silently normalize.
+    let (cy, cmo, cd, ..) = civil_from_unix(ts);
+    if (cy, cmo, cd) != (y, mo, d) {
+        return None;
+    }
+    Some(ts)
+}
+
+/// Trim every record's per-edit `history` log in `vault`. With `drop_all`, all
+/// history entries are removed; otherwise entries strictly older than `cutoff`
+/// (Unix seconds) are dropped and `at >= cutoff` are kept (inclusive keep). The
+/// vault-level `audit` log is deliberately **left untouched**. Returns the count
+/// of history entries removed. Removed `Change`s are `ZeroizeOnDrop`, so their
+/// (possibly secret-bearing) before/after detail strings are wiped from RAM.
+pub fn compact_history(vault: &mut Vault, cutoff: Option<i64>, drop_all: bool) -> usize {
+    // Each of the five record collections shares the generic `Record` interface,
+    // so one helper trims them all.
+    trim_histories(&mut vault.instructions, cutoff, drop_all)
+        + trim_histories(&mut vault.trust_wills, cutoff, drop_all)
+        + trim_histories(&mut vault.assets, cutoff, drop_all)
+        + trim_histories(&mut vault.accounts, cutoff, drop_all)
+        + trim_histories(&mut vault.real_estate, cutoff, drop_all)
+}
+
+/// How many history entries `compact_history` would remove for the same
+/// arguments — a non-mutating count for `--dry-run` and result reporting.
+pub fn history_stats(vault: &Vault, cutoff: Option<i64>, drop_all: bool) -> usize {
+    // Closure counting removable entries in one record's history.
+    let count = |list: &[Change]| -> usize {
+        if drop_all {
+            list.len()
+        } else if let Some(c) = cutoff {
+            list.iter().filter(|ch| ch.at < c).count()
+        } else {
+            0
+        }
+    };
+    let mut n = 0;
+    for r in &vault.instructions {
+        n += count(&r.history);
+    }
+    for r in &vault.trust_wills {
+        n += count(&r.history);
+    }
+    for r in &vault.assets {
+        n += count(&r.history);
+    }
+    for r in &vault.accounts {
+        n += count(&r.history);
+    }
+    for r in &vault.real_estate {
+        n += count(&r.history);
+    }
+    n
+}
+
+/// Apply the history trim to one record collection; returns entries removed.
+// Generic over any `Record` (uses its `history_mut` accessor). `&mut [R]` borrows
+// the caller's Vec as a mutable slice. `retain` keeps only matching elements,
+// dropping (and zeroizing) the rest in place.
+fn trim_histories<R: Record>(list: &mut [R], cutoff: Option<i64>, drop_all: bool) -> usize {
+    let mut removed = 0;
+    for rec in list.iter_mut() {
+        let h = rec.history_mut();
+        let before = h.len();
+        if drop_all {
+            h.clear();
+        } else if let Some(c) = cutoff {
+            h.retain(|ch| ch.at >= c);
+        }
+        removed += before - h.len();
+    }
+    removed
+}
+
 /// A single timestamped audit record. Pushed onto a record's history on every
 /// edit, or onto the vault-level audit / volume upload log.
 // `#[derive(...)]` auto-implements these traits for the struct below:
@@ -715,5 +831,118 @@ mod tests {
         // The last second of a year (year rollover boundary).
         assert_eq!(civil_from_unix(1_609_459_199), (2020, 12, 31, 23, 59, 59));
         assert_eq!(civil_from_unix(-100), (1970, 1, 1, 0, 0, 0)); // clamps to epoch
+    }
+
+    #[test]
+    fn parse_ymd_utc_known_dates_and_roundtrip() {
+        assert_eq!(parse_ymd_utc("1970-01-01"), Some(0));
+        assert_eq!(parse_ymd_utc("2021-01-01"), Some(1_609_459_200));
+        // Leap day.
+        assert_eq!(parse_ymd_utc("2024-02-29"), Some(1_709_164_800));
+        // Whitespace is trimmed; unpadded fields parse.
+        assert_eq!(parse_ymd_utc("  2021-1-1  "), Some(1_609_459_200));
+        // Round-trips against the civil formatter at midnight.
+        for ts in [0, 1_609_459_200, 1_709_164_800, 4_102_444_800] {
+            let (y, m, d, ..) = civil_from_unix(ts);
+            assert_eq!(unix_from_civil(y, m, d, 0, 0, 0), ts);
+        }
+    }
+
+    #[test]
+    fn parse_ymd_utc_rejects_invalid() {
+        for s in ["2026-02-31", "2026-13-01", "2026-01-32", "1969-12-31", "not-a-date", "2026/01/01", "20260101", "2026-01", ""] {
+            assert!(parse_ymd_utc(s).is_none(), "{s:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn compact_history_cutoff_and_drop_all_preserve_audit() {
+        let mut vault = Vault::default();
+        let mut a = Account::default();
+        a.history = vec![
+            Change { at: 100, action: "updated".into(), detail: "a".into() },
+            Change { at: 500, action: "updated".into(), detail: "b".into() },
+        ];
+        vault.accounts.push(a);
+        vault.audit.push(Change::new("opened", String::new()));
+
+        // Counting matches the actual trim, and the audit is never counted/touched.
+        assert_eq!(history_stats(&vault, Some(300), false), 1);
+        assert_eq!(history_stats(&vault, None, true), 2);
+
+        let removed = compact_history(&mut vault, Some(300), false);
+        assert_eq!(removed, 1);
+        assert_eq!(vault.accounts[0].history.len(), 1);
+        assert_eq!(vault.accounts[0].history[0].at, 500, "kept the at >= cutoff entry");
+        assert_eq!(vault.audit.len(), 1, "audit untouched by record-history trim");
+
+        let removed2 = compact_history(&mut vault, None, true);
+        assert_eq!(removed2, 1);
+        assert!(vault.accounts[0].history.is_empty());
+        assert_eq!(vault.audit.len(), 1, "audit still untouched after drop-all");
+    }
+
+    #[test]
+    fn parse_ymd_utc_boundaries_have_no_overflow() {
+        assert_eq!(parse_ymd_utc("1970-01-01"), Some(0));
+        // The far-future date stays within i64 (no multiplication overflow/panic)
+        // and round-trips through the civil formatter.
+        let secs = parse_ymd_utc("9999-12-31").expect("9999-12-31 is valid");
+        assert!(secs > 0);
+        assert_eq!(civil_from_unix(secs), (9999, 12, 31, 0, 0, 0));
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_unix() {
+        // Round-trip midnight timestamps across centuries + leap days.
+        for ts in [0i64, 86_400, 951_782_400, 1_709_164_800, 4_102_444_800, 253_370_764_800] {
+            let (y, m, d, _, _, _) = civil_from_unix(ts);
+            assert_eq!(unix_from_civil(y, m, d, 0, 0, 0), ts, "round-trip failed for ts={ts}");
+        }
+    }
+
+    #[test]
+    fn compact_history_cutoff_is_inclusive_keep() {
+        let mut vault = Vault::default();
+        let mut a = Account::default();
+        a.history = vec![
+            Change { at: 999, action: "u".into(), detail: String::new() },
+            Change { at: 1000, action: "u".into(), detail: String::new() },
+            Change { at: 1001, action: "u".into(), detail: String::new() },
+        ];
+        vault.accounts.push(a);
+        // cutoff == 1000: only at=999 is older (dropped); at=1000 is kept (inclusive).
+        let removed = compact_history(&mut vault, Some(1000), false);
+        assert_eq!(removed, 1);
+        assert_eq!(vault.accounts[0].history.iter().map(|c| c.at).collect::<Vec<_>>(), vec![1000, 1001]);
+    }
+
+    #[test]
+    fn compact_history_handles_empty_and_every_record_type() {
+        let mut vault = Vault::default();
+        // Empty vault: nothing to do, no panic.
+        assert_eq!(history_stats(&vault, Some(0), false), 0);
+        assert_eq!(compact_history(&mut vault, None, true), 0);
+        // One+ history entries in each of the five record types.
+        let mk = |at| Change { at, action: "u".into(), detail: String::new() };
+        let mut ins = Instruction::default();
+        ins.history = vec![mk(1)];
+        let mut tw = TrustWill::default();
+        tw.history = vec![mk(1), mk(2)];
+        let mut al = AssetLiability::default();
+        al.history = vec![mk(1)];
+        let mut ac = Account::default();
+        ac.history = vec![mk(1)];
+        let mut re = RealEstate::default();
+        re.history = vec![mk(1)];
+        vault.instructions.push(ins);
+        vault.trust_wills.push(tw);
+        vault.assets.push(al);
+        vault.accounts.push(ac);
+        vault.real_estate.push(re);
+        // history_stats must agree with the actual removal count across all types.
+        assert_eq!(history_stats(&vault, None, true), 6);
+        assert_eq!(compact_history(&mut vault, None, true), 6, "all five record types trimmed");
+        assert!(vault.trust_wills[0].history.is_empty());
     }
 }

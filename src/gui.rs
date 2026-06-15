@@ -61,8 +61,9 @@ pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
         // heap value. `move |cc| ...` is a closure that *takes ownership* of the
         // captured `path`/`writable` (the `move` keyword) so they outlive `run`.
         Box::new(move |cc| {
-            // Lighter, higher-contrast theme.
-            cc.egui_ctx.set_visuals(light_visuals());
+            // Apply the saved color theme before the first frame (avoids a flash of
+            // the default theme); the app re-applies it live when the user changes it.
+            cc.egui_ctx.set_visuals(visuals_for(load_theme()));
             Ok(Box::new(GuiApp::new(path, writable)))
         }),
     )
@@ -89,6 +90,181 @@ fn light_visuals() -> egui::Visuals {
     v.selection.bg_fill = egui::Color32::from_rgb(198, 222, 255);
     v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 90, 170));
     v
+}
+
+/// The selectable GUI color themes (curated palettes). The chosen theme is
+/// remembered in a small **non-secret** preferences file (`load_theme`/`save_theme`)
+/// — it holds no vault data, so it can apply on the lock screen too.
+#[derive(PartialEq, Eq, Clone, Copy, Default, Debug)]
+enum Theme {
+    #[default]
+    Light,
+    Dark,
+    HighContrast,
+    Solarized,
+    Sepia,
+}
+
+impl Theme {
+    /// Every theme, in menu order.
+    const ALL: [Theme; 5] = [Theme::Light, Theme::Dark, Theme::HighContrast, Theme::Solarized, Theme::Sepia];
+
+    /// Stable on-disk id (kept separate from the display label so relabelling
+    /// never invalidates a saved preference).
+    fn id(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+            Theme::HighContrast => "high-contrast",
+            Theme::Solarized => "solarized",
+            Theme::Sepia => "sepia",
+        }
+    }
+
+    /// Human-readable name for the dropdown.
+    fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+            Theme::HighContrast => "High contrast",
+            Theme::Solarized => "Solarized",
+            Theme::Sepia => "Sepia",
+        }
+    }
+
+    /// Parse a saved id back into a theme (`None` for an unknown id).
+    fn from_id(id: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.id() == id)
+    }
+}
+
+/// Build the egui visuals for a theme. Each curated palette starts from egui's
+/// light or dark base and overrides the panel/widget fills, the text color, and
+/// the selection color for a coherent look.
+fn visuals_for(theme: Theme) -> egui::Visuals {
+    use egui::Color32;
+    let rgb = Color32::from_rgb;
+    match theme {
+        Theme::Light => light_visuals(),
+        Theme::Dark => {
+            let mut v = egui::Visuals::dark();
+            v.selection.bg_fill = rgb(40, 80, 140);
+            v.selection.stroke = egui::Stroke::new(1.0, rgb(120, 170, 240));
+            v.hyperlink_color = rgb(110, 170, 240);
+            v
+        }
+        Theme::HighContrast => {
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = Color32::BLACK;
+            v.window_fill = Color32::BLACK;
+            v.extreme_bg_color = Color32::BLACK;
+            v.faint_bg_color = rgb(18, 18, 18);
+            v.override_text_color = Some(Color32::WHITE);
+            v.widgets.noninteractive.bg_fill = rgb(14, 14, 14);
+            v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.4, Color32::WHITE);
+            v.widgets.inactive.bg_fill = rgb(32, 32, 32);
+            v.widgets.inactive.weak_bg_fill = rgb(24, 24, 24);
+            v.widgets.hovered.bg_fill = rgb(64, 64, 64);
+            v.widgets.active.bg_fill = rgb(0, 120, 215);
+            v.selection.bg_fill = rgb(0, 90, 180);
+            v.selection.stroke = egui::Stroke::new(1.2, rgb(140, 200, 255));
+            v.hyperlink_color = rgb(120, 200, 255);
+            v
+        }
+        Theme::Solarized => {
+            // Ethan Schoonover's Solarized Dark palette.
+            let base03 = rgb(0, 43, 54);
+            let base02 = rgb(7, 54, 66);
+            let base01 = rgb(88, 110, 117);
+            let base1 = rgb(147, 161, 161);
+            let blue = rgb(38, 139, 210);
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = base03;
+            v.window_fill = base03;
+            v.extreme_bg_color = rgb(0, 33, 43);
+            v.faint_bg_color = base02;
+            v.override_text_color = Some(base1);
+            v.widgets.noninteractive.bg_fill = base02;
+            v.widgets.inactive.bg_fill = base02;
+            v.widgets.inactive.weak_bg_fill = base02;
+            v.widgets.hovered.bg_fill = base01;
+            v.widgets.active.bg_fill = blue;
+            v.selection.bg_fill = base01;
+            v.selection.stroke = egui::Stroke::new(1.0, blue);
+            v.hyperlink_color = blue;
+            v
+        }
+        Theme::Sepia => {
+            // Warm, paper-like light theme.
+            let ink = rgb(60, 46, 33);
+            let mut v = egui::Visuals::light();
+            v.panel_fill = rgb(244, 236, 216);
+            v.window_fill = rgb(250, 244, 228);
+            v.extreme_bg_color = rgb(252, 248, 236);
+            v.faint_bg_color = rgb(240, 231, 210);
+            v.override_text_color = Some(ink);
+            v.widgets.noninteractive.bg_fill = rgb(243, 234, 213);
+            v.widgets.inactive.bg_fill = rgb(236, 226, 203);
+            v.widgets.inactive.weak_bg_fill = rgb(243, 234, 213);
+            v.widgets.hovered.bg_fill = rgb(226, 212, 182);
+            v.selection.bg_fill = rgb(214, 196, 158);
+            v.selection.stroke = egui::Stroke::new(1.0, rgb(120, 90, 50));
+            v
+        }
+    }
+}
+
+/// Path to the small non-secret GUI preferences file (theme choice) in the
+/// per-user config directory. `None` if no config dir is available.
+fn theme_pref_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "passmgr", "pass-mgr").map(|d| d.config_dir().join("prefs.json"))
+}
+
+/// Hard cap on the preferences file size. It holds one short JSON object, so a
+/// larger file is corrupt or hostile; bounding the read before allocating means a
+/// huge or symlinked `prefs.json` can never stall or OOM the UI thread at startup
+/// (mirrors the bounded reads in the storage layer).
+const MAX_PREFS_SIZE: u64 = 64 * 1024;
+
+/// Load the saved theme from the standard preferences path.
+fn load_theme() -> Theme {
+    theme_pref_path().map(|p| load_theme_from(&p)).unwrap_or_default()
+}
+
+/// Load the theme from a specific path. Best-effort and bounded: a missing file, a
+/// **symlink**, an over-cap size, or any parse error all fall back to the default —
+/// a UI preference must never block (or slow) startup.
+fn load_theme_from(path: &std::path::Path) -> Theme {
+    // `symlink_metadata` does not follow links, so a symlinked prefs file fails the
+    // `is_file()` check; the size check rejects an oversized file BEFORE reading it.
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_PREFS_SIZE => {}
+        _ => return Theme::default(),
+    }
+    // `let Ok(x) = expr else { return ... }` (let-else) takes the success value or
+    // runs the diverging `else`, keeping the happy path unindented.
+    let Ok(bytes) = std::fs::read(path) else { return Theme::default() };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Theme::default() };
+    value.get("theme").and_then(|t| t.as_str()).and_then(Theme::from_id).unwrap_or_default()
+}
+
+/// Persist the chosen theme to the standard preferences path.
+fn save_theme(theme: Theme) {
+    if let Some(path) = theme_pref_path() {
+        save_theme_to(&path, theme);
+    }
+}
+
+/// Persist the theme to a specific path. Best-effort: a write failure is ignored
+/// (the theme is non-critical and trivially re-picked).
+fn save_theme_to(path: &std::path::Path, theme: Theme) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let value = serde_json::json!({ "theme": theme.id() });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
+        let _ = std::fs::write(path, bytes);
+    }
 }
 
 // `enum` is a closed set of named alternatives (a tagged union). `#[derive(...)]`
@@ -191,6 +367,10 @@ struct GuiApp {
     // When set, the clipboard should be wiped at/after this instant.
     // `Option<Instant>`: `None` = no pending wipe, `Some(t)` = wipe at time `t`.
     clipboard_clear_at: Option<Instant>,
+    /// The selected color theme, and the one currently applied to egui — so we
+    /// only call `set_visuals` (and persist) when the selection actually changes.
+    theme: Theme,
+    applied_theme: Theme,
 }
 
 /// How long a copied password stays on the clipboard before it is auto-cleared.
@@ -223,6 +403,9 @@ impl GuiApp {
         // `if ... { } else { }` is an expression here: its value initializes
         // `auth_mode` (unlock an existing vault file, else offer to create one).
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
+        // Load the saved theme; `applied_theme` starts equal to it so the first
+        // frame doesn't needlessly re-apply/re-save (the same value `run` already set).
+        let theme = load_theme();
         GuiApp {
             path,
             writable,
@@ -260,6 +443,8 @@ impl GuiApp {
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,
+            theme,
+            applied_theme: theme,
         }
     }
 
@@ -611,6 +796,17 @@ impl GuiApp {
             .collect();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Appearance: a color-theme picker. Changing it applies live and is
+            // saved to a small preferences file (it carries no vault data), so it
+            // works in read-only mode too and persists to the next launch.
+            ui.label(egui::RichText::new("Appearance").strong());
+            egui::ComboBox::from_label("Color theme").selected_text(self.theme.label()).show_ui(ui, |ui| {
+                for t in Theme::ALL {
+                    ui.selectable_value(&mut self.theme, t, t.label());
+                }
+            });
+            ui.add_space(14.0);
+
             ui.label(egui::RichText::new("Asset / Liability types").strong());
             ui.label(egui::RichText::new(asset_list).weak());
             ui.horizontal(|ui| {
@@ -1512,6 +1708,12 @@ impl eframe::App for GuiApp {
     // The leading `_` in `_frame` marks the parameter as intentionally unused.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick_clipboard(ui.ctx());
+        // Apply (and persist) the color theme only when the selection changed.
+        if self.theme != self.applied_theme {
+            ui.ctx().set_visuals(visuals_for(self.theme));
+            save_theme(self.theme);
+            self.applied_theme = self.theme;
+        }
         if self.screen == Screen::Auth {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_auth(ui));
             return;
@@ -1802,6 +2004,47 @@ mod tests {
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
+    }
+
+    #[test]
+    fn theme_id_round_trips_and_defaults_to_light() {
+        for t in Theme::ALL {
+            assert_eq!(Theme::from_id(t.id()), Some(t), "{} id must round-trip", t.label());
+        }
+        assert_eq!(Theme::from_id("nonsense"), None);
+        assert_eq!(Theme::default(), Theme::Light);
+        // Every theme builds a usable Visuals (no panic / field mismatch).
+        for t in Theme::ALL {
+            let _ = visuals_for(t);
+        }
+    }
+
+    #[test]
+    fn load_theme_from_round_trips_and_is_bounded_and_symlink_safe() {
+        let dir = std::env::temp_dir().join(format!("pmprefs-{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prefs.json");
+        // A valid small prefs file round-trips through save/load.
+        save_theme_to(&p, Theme::Solarized);
+        assert_eq!(load_theme_from(&p), Theme::Solarized);
+        // Unknown id falls back to the default.
+        std::fs::write(&p, br#"{"theme":"nope"}"#).unwrap();
+        assert_eq!(load_theme_from(&p), Theme::Light);
+        // Over-cap file is rejected before the body is parsed (DoS guard).
+        std::fs::write(&p, vec![b'{'; (MAX_PREFS_SIZE as usize) + 1]).unwrap();
+        assert_eq!(load_theme_from(&p), Theme::Light);
+        // Missing file -> default.
+        assert_eq!(load_theme_from(&dir.join("absent.json")), Theme::Light);
+        // A symlinked prefs file is refused even if its target is a valid prefs file.
+        #[cfg(unix)]
+        {
+            let real = dir.join("real.json");
+            save_theme_to(&real, Theme::Dark);
+            let link = dir.join("link.json");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(load_theme_from(&link), Theme::Light, "symlinked prefs refused");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
