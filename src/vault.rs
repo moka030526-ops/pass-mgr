@@ -508,6 +508,12 @@ impl OpenVault {
             let entries: Vec<ManifestEntry> = serde_json::from_slice(&fs::read(&man_path)?)?;
             let vol_dir = vol_root.join(format!("vol.{p}"));
             for e in &entries {
+                // The mirror is untrusted input: the blob is read from
+                // `vol.<p>/<id>`, so a crafted id containing a path separator or
+                // `..` would traverse out of the mirror. Require a plain filename.
+                if !is_safe_blob_id(&e.id) {
+                    return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document id in mirror: {:?}", e.id))));
+                }
                 let bytes = Zeroizing::new(fs::read(vol_dir.join(&e.id))?);
                 store.put(&e.id, &e.path, &bytes, e.uploaded_at, &key)?;
             }
@@ -790,6 +796,14 @@ fn selected_entries(store: &VolumeStore, part: Option<u32>) -> Result<Vec<Manife
         }
         None => Ok(store.entries().cloned().collect()), // all partitions
     }
+}
+
+/// True if `id` is a safe single path component to use as a blob filename when
+/// reading an (untrusted) import mirror: non-empty, no path separators, no NUL,
+/// and not a `.`/`..` traversal. Real ids are random hex, so this never rejects a
+/// genuine export — it only stops a crafted mirror from escaping its directory.
+fn is_safe_blob_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
 
 /// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
