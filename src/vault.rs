@@ -240,7 +240,12 @@ impl WriteLock {
         // The trailing `?` propagates any I/O error: on `Err` it returns it from
         // this function immediately (after `#[from]`-converting it to VaultError).
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        let _ = harden_file(&path); // `let _ =` deliberately ignores the Result (best-effort 0600)
+        // NOTE: deliberately do NOT chmod this path. `open(create)` follows a
+        // symlink, and `harden_file` (metadata + set_permissions) would then chmod
+        // the symlink's *target* — a chmod-through-symlink primitive an attacker
+        // could aim at another of the user's files. The lock file holds no secrets,
+        // and its parent directory is already 0700, so leaving it at the default
+        // umask mode is safe. (append_frame guards its own path the same way.)
         // `match` examines every possible variant of the Result and picks one arm.
         // `try_lock` returns `Ok(())` if we got the lock, or specific errors otherwise.
         match file.try_lock() {
@@ -501,8 +506,20 @@ impl OpenVault {
         self.salt = new_salt;
         self.vault = staged_vault;
         self.previous_generation = self.vault.generation;
-        self.storage = VolumeStore::open(&dir, &self.key, &self.vault.id, self.vault.settings.volume_max_size)?;
-        Ok(())
+        // The on-disk tree is already the committed new-key tree. If reopening the
+        // store under the new key fails here, self.storage is still the OLD store
+        // while self.key is the new key — a mismatched handle. Poison it so no
+        // later save/put can act on the stale store; the next open re-validates.
+        match VolumeStore::open(&dir, &self.key, &self.vault.id, self.vault.settings.volume_max_size) {
+            Ok(store) => {
+                self.storage = store;
+                Ok(())
+            }
+            Err(e) => {
+                self.read_only = true;
+                Err(e.into())
+            }
+        }
     }
 
     // Simple read-only getters: `&self` borrows the vault, and each returns a copy
@@ -761,15 +778,20 @@ fn write_vault_file(
     // Atomic write: stage to a temp sibling file, then rename over the target.
     // A rename is atomic on POSIX, so a reader never sees a half-written vault.
     let tmp = sibling_tmp(path)?;
-    // `if let Err(e) = ...` = handle just the failure case. On error, best-effort
-    // delete the temp (`let _ =` ignores that cleanup's own result) then return.
-    if let Err(e) = write_new_file(&tmp, &header_bytes, &ciphertext) {
+    // `if let Err(e) = ...` = handle just the failure case. On error (incl. an
+    // injected ENOSPC), best-effort delete the temp (`let _ =` ignores that
+    // cleanup's own result) then return — the live vault.pmv is never touched.
+    if let Err(e) = crate::fault::point("vault.write").map_err(VaultError::from).and_then(|()| {
+        write_new_file(&tmp, &header_bytes, &ciphertext)
+    }) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = fs::rename(&tmp, path) {
+    if let Err(e) =
+        crate::fault::point("vault.rename").map_err(VaultError::from).and_then(|()| Ok(fs::rename(&tmp, path)?))
+    {
         let _ = fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(e);
     }
     sync_parent_dir(path); // fsync the directory so the rename is durable on disk
     Ok(())
@@ -802,8 +824,13 @@ fn recover_pending_rekey(dir: &Path, read_only: bool) -> Result<(), VaultError> 
 /// after a partial move finishes the remaining items.
 fn commit_rekey(dir: &Path, staging: &Path) -> Result<(), VaultError> {
     replace_dir(&dir.join("volume"), &staging.join("volume"))?;
+    // Fault point: a crash here (new volume in place, old manifest+vault still
+    // live, .rekey still present with READY) must roll forward on the next open.
+    crate::fault::point("rekey.after_volume")?;
     replace_dir(&dir.join("manifest"), &staging.join("manifest"))?;
+    crate::fault::point("rekey.after_manifest")?;
     replace_path(&dir.join(VAULT_FILE), &staging.join(VAULT_FILE))?;
+    crate::fault::point("rekey.after_vault")?;
     sync_parent_dir(&dir.join(VAULT_FILE));
     let _ = fs::remove_dir_all(staging);
     Ok(())
@@ -1837,6 +1864,54 @@ mod tests {
     // random inputs matching the given specs (the `in "regex"` strings) and checks
     // the `prop_assert!` invariants hold for all of them. `prelude::*` imports its
     // common names with a single glob.
+    // ---- Full-disk (ENOSPC) fault injection (cargo test --features fault-injection) ----
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_on_save_keeps_old_vault() {
+        let path = tmp_path("enospc-save");
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            records::upsert(&mut v.vault.accounts, sample_account("u", "p1"));
+            v.save().unwrap();
+            // The disk fills on the next save; the prior vault.pmv must survive.
+            v.vault.accounts[0].password = "p2".into();
+            crate::fault::fail_at("vault.write", 1);
+            assert!(matches!(v.save(), Err(VaultError::Io(_))));
+            crate::fault::clear();
+        }
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(re.vault.accounts[0].password, "p1", "old vault.pmv intact after a failed save");
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_during_rekey_discards_staging_and_old_passwords_work() {
+        let path = tmp_path("enospc-rekey");
+        let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+        let src = write_src("rk", b"will body");
+        let id = v.add_document("/w", "w.txt", &src).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        v.save().unwrap();
+        // The disk fills while re-encrypting documents into the .rekey staging tree,
+        // BEFORE the READY marker is written.
+        crate::fault::fail_at("volume.write", 1);
+        let err = v.change_password(b"n1", b"n2").unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, VaultError::Storage(_)), "rekey staging fails cleanly, got {err:?}");
+        drop(v); // release the lock before reopening
+        // No READY was written, so the staging is discarded on reopen: the OLD
+        // passwords still open the intact vault; the new ones do not.
+        assert!(OpenVault::open(path.clone(), b"n1", b"n2").is_err());
+        let re = OpenVault::open(path.clone(), b"o1", b"o2").unwrap();
+        assert_eq!(re.vault.accounts.len(), 1);
+        assert_eq!(&*re.read_document(&id).unwrap(), b"will body");
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists(), "staging discarded");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
     use proptest::prelude::*;
     proptest! {
         /// Virtual paths are always rooted, and `normalize_dir` is idempotent and

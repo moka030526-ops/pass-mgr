@@ -20,6 +20,13 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
+[features]
+# Compiles the crash-safety fault-injection hooks (src/fault.rs) into the storage
+# and vault commit paths. OFF by default (and in every release build), where the
+# hooks are zero-cost no-ops. Enable for crash/full-disk tests:
+#   cargo test --features fault-injection
+fault-injection = []
+
 [dev-dependencies]
 # Property-based testing for the parsers, the store invariants, and path
 # normalization (§13.4).

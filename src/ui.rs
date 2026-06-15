@@ -477,15 +477,21 @@ impl App {
         }
     }
 
-    fn persist(&mut self) {
-        // Let-chain: get an exclusive borrow of the vault (`.as_mut()` →
-        // `Option<&mut T>`), and if the save returns `Err(e)` (a `Result` failure),
-        // bind the error and surface it. `format!("...{e}")` builds a String,
-        // interpolating `e` inline (Rust's captured-identifier formatting).
-        if let Some(ov) = self.vault.as_mut()
-            && let Err(e) = ov.save()
-        {
-            self.status = format!("Save failed: {e}");
+    /// Save the open vault. Returns `true` only if it was actually written. A
+    /// caller that reclaims a document blob AFTER persisting MUST gate the reclaim
+    /// on this return: a failed save (e.g. full disk) leaves `vault.pmv` still
+    /// referencing the doc, so dropping its blob would create a dangling reference
+    /// (`ArchiveMismatch` — an unopenable vault) on the next open.
+    fn persist(&mut self) -> bool {
+        match self.vault.as_mut() {
+            Some(ov) => match ov.save() {
+                Ok(()) => true,
+                Err(e) => {
+                    self.status = format!("Save failed: {e}");
+                    false
+                }
+            },
+            None => false,
         }
     }
 
@@ -606,7 +612,18 @@ impl App {
                             self.wipe_auth();
                             self.screen = Screen::Browse;
                         }
-                        Err(e) => self.auth.error = Some(format!("{e}")),
+                        Err(e) => {
+                            // A failed rekey may have poisoned the handle (read-only)
+                            // and left a pending `.rekey` on disk. Drop the handle to
+                            // release the single-writer lock and return to the unlock
+                            // screen; reopening runs recover_pending_rekey, which
+                            // finishes or discards the interrupted rekey idempotently.
+                            self.vault = None;
+                            self.auth = AuthState::new(AuthMode::Unlock);
+                            self.auth.error =
+                                Some(format!("Password change interrupted: {e}. Unlock again to recover."));
+                            self.screen = Screen::Auth;
+                        }
                     }
                 }
             }
@@ -1275,12 +1292,12 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
-        // Persist the new link BEFORE reclaiming the replaced blob: a crash in
-        // between must not leave the vault referencing a dropped doc.
-        self.persist();
-        // `let _ = expr` deliberately discards the result (ignore any error from
-        // reclaiming the now-replaced blob — it's a best-effort cleanup).
-        if let Some(old) = previous
+        // Persist the new link BEFORE reclaiming the replaced blob, AND only
+        // reclaim if the save succeeded — a failed save leaves vault.pmv pointing
+        // at `old`, so dropping it would make the vault unopenable.
+        // `let _ = expr` discards the best-effort reclaim result.
+        if self.persist()
+            && let Some(old) = previous
             && let Some(ov) = self.vault.as_mut()
         {
             let _ = ov.remove_document(&old);
@@ -1307,9 +1324,14 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
-        // Persist the unlink BEFORE reclaiming the blob (crash-safety: a dangling
-        // reference is fatal on reopen, an orphaned blob is harmless).
-        self.persist();
+        // Persist the unlink BEFORE reclaiming the blob, and bail if the save
+        // failed: reclaiming after a failed persist would leave vault.pmv pointing
+        // at a missing doc (ArchiveMismatch). A dangling reference is fatal on
+        // reopen; an orphaned blob is harmless.
+        if !self.persist() {
+            self.edit = Some(es); // persist() already set the "Save failed" status
+            return;
+        }
         // Three-condition let-chain: only when there was an id, the vault is open,
         // and the removal failed do we capture the error to report below.
         let mut cleanup_err = None;
@@ -1487,11 +1509,14 @@ impl App {
                 }
             }
         }
-        // Persist the record removal before reclaiming blobs (crash-safety).
-        self.persist();
-        for fid in doc_ids {
-            if let Some(ov) = self.vault.as_mut() {
-                let _ = ov.remove_document(&fid);
+        // Persist the record removal before reclaiming blobs, and only reclaim if
+        // the save succeeded — otherwise the on-disk vault still references the
+        // record and dropping its blobs would make it unopenable (ArchiveMismatch).
+        if self.persist() {
+            for fid in doc_ids {
+                if let Some(ov) = self.vault.as_mut() {
+                    let _ = ov.remove_document(&fid);
+                }
             }
         }
         self.clamp_selection();

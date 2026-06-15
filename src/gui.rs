@@ -289,15 +289,25 @@ impl GuiApp {
     }
 
     /// Persist the in-memory vault, reporting any error to the status bar.
-    fn persist(&mut self) {
+    /// Save the open vault. Returns `true` only if the vault was actually written
+    /// to disk. Callers that reclaim a document blob AFTER persisting MUST gate the
+    /// reclaim on this: if the save failed (e.g. a full disk), `vault.pmv` still
+    /// references the doc, so dropping its blob would leave a dangling reference
+    /// (`ArchiveMismatch` — an unopenable vault) on the next open.
+    fn persist(&mut self) -> bool {
         // A "let-chain": both conditions must hold to enter the block. First
         // `.as_mut()` borrows the vault mutably if present (binding `ov`); then
         // `ov.save()` runs and we match its `Err(e)` case. `&&` short-circuits,
         // so save is only attempted when the vault exists.
-        if let Some(ov) = self.vault.as_mut()
-            && let Err(e) = ov.save()
-        {
-            self.status = format!("Save failed: {e}");
+        match self.vault.as_mut() {
+            Some(ov) => match ov.save() {
+                Ok(()) => true,
+                Err(e) => {
+                    self.status = format!("Save failed: {e}");
+                    false
+                }
+            },
+            None => false,
         }
     }
 
@@ -350,7 +360,21 @@ impl GuiApp {
                             self.wipe_passwords();
                             self.screen = Screen::Main;
                         }
-                        Err(e) => self.auth_error = Some(format!("{e}")),
+                        Err(e) => {
+                            // The rekey may have left the handle poisoned (read-only)
+                            // with a pending `.rekey` on disk. Drop the handle to
+                            // release the single-writer lock, then return to the
+                            // unlock screen: reopening runs recover_pending_rekey,
+                            // which finishes or discards the interrupted rekey
+                            // idempotently. Without this the dead handle keeps the
+                            // lock and the session can't recover in place.
+                            self.vault = None;
+                            self.auth_mode = AuthMode::Unlock;
+                            self.screen = Screen::Auth;
+                            self.wipe_passwords();
+                            self.auth_error =
+                                Some(format!("Password change interrupted: {e}. Unlock again to recover."));
+                        }
                     }
                 }
             }
@@ -1315,9 +1339,11 @@ impl GuiApp {
                 // Persist the record→document link immediately so the manifest
                 // entry is referenced (no orphan if the user navigates away).
                 self.upsert_doc_target(target);
-                self.persist();
-                // Reclaim a replaced attachment's blob AFTER persisting the new link.
-                if let Some(old) = previous
+                // Only reclaim the replaced blob if the new link actually reached
+                // disk. If the save failed, vault.pmv still references `old`, so
+                // dropping it would create a dangling reference (ArchiveMismatch).
+                if self.persist()
+                    && let Some(old) = previous
                     && let Some(ov) = self.vault.as_mut()
                 {
                     // `let _ = ...` deliberately discards the `Result`: a failure
@@ -1366,11 +1392,13 @@ impl GuiApp {
                     }
                 }
                 self.upsert_doc_target(target);
-                // Persist the unlink BEFORE reclaiming the blob: a crash in between
-                // would otherwise leave vault.pmv referencing a doc whose manifest
-                // entry is already gone (ArchiveMismatch -> unopenable). An
-                // orphaned blob is harmless (it lingers until a future compaction).
-                self.persist();
+                // Persist the unlink BEFORE reclaiming the blob, AND only reclaim if
+                // the save succeeded. A crash or a failed save between the two would
+                // otherwise leave vault.pmv referencing a doc whose manifest entry is
+                // gone (ArchiveMismatch -> unopenable). An orphaned blob is harmless.
+                if !self.persist() {
+                    return; // persist() already set the "Save failed" status
+                }
                 // Three-part let-chain: there is an id, the vault is open, and the
                 // blob removal failed — only then report the cleanup error.
                 if let Some(id) = id
@@ -1429,12 +1457,14 @@ impl GuiApp {
                 }
             }
         }
-        // Persist the record removal BEFORE reclaiming its blobs, so a crash can't
-        // leave the vault referencing a doc whose manifest entry is already gone.
-        self.persist();
-        for id in doc_ids {
-            if let Some(ov) = self.vault.as_mut() {
-                let _ = ov.remove_document(&id);
+        // Persist the record removal BEFORE reclaiming its blobs, AND only reclaim
+        // if the save succeeded — otherwise the on-disk vault still references the
+        // record and dropping its blobs would make it unopenable (ArchiveMismatch).
+        if self.persist() {
+            for id in doc_ids {
+                if let Some(ov) = self.vault.as_mut() {
+                    let _ = ov.remove_document(&id);
+                }
             }
         }
         self.status = "Deleted.".into();
@@ -1834,6 +1864,39 @@ mod tests {
         app.handle_doc(DocReq::Attach, DocTarget::Asset);
         assert!(app.status.contains("too long"), "status was: {}", app.status);
         assert!(app.edit_asset.as_ref().unwrap().statement.is_none(), "nothing attached");
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn detach_skips_blob_reclaim_when_save_fails_keeping_vault_openable() {
+        // The cross-confirmed HIGH fix: if the vault save fails (full disk), the
+        // blob reclaim must be SKIPPED, or the on-disk vault would reference a
+        // dropped doc (ArchiveMismatch -> unopenable). Here the doc must survive.
+        let (mut app, path) = app_unlocked("faildetach");
+        let src = std::env::temp_dir().join(format!("passmgr-faild-{}.txt", nanos()));
+        std::fs::write(&src, b"statement body").unwrap();
+        let id = {
+            let ov = app.vault.as_mut().unwrap();
+            let id = ov.add_document("/a", "stmt.txt", std::path::Path::new(&src)).unwrap();
+            let mut a = AssetLiability::new().unwrap();
+            a.statement = Some(id.clone());
+            records::upsert(&mut ov.vault.assets, a.clone());
+            ov.save().unwrap();
+            app.edit_asset = Some(a);
+            id
+        };
+        // Detach with the disk full at the vault save.
+        crate::fault::fail_at("vault.write", 1);
+        app.handle_doc(DocReq::Remove, DocTarget::Asset);
+        crate::fault::clear();
+        assert!(app.status.contains("Save failed"), "status was: {}", app.status);
+        drop(app); // release the lock
+        // The save failed, so the on-disk vault still references the doc; because the
+        // reclaim was skipped, the doc is still present -> the vault opens cleanly.
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.has_document(&id), "blob retained; vault openable");
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }

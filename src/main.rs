@@ -194,6 +194,21 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Hidden test affordance: a scripted vault operation that honors the
+    // PMVAULT_CRASH_AT fault points, so the crash-recovery integration tests can
+    // run a REAL operation in this binary and abort it at a chosen commit step.
+    // Compiled ONLY with `--features fault-injection`; absent from release builds.
+    #[cfg(feature = "fault-injection")]
+    if cmd == Some("__crashop") {
+        return match crashop(&pos) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("crashop error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Dispatch on the subcommand. Matching on `Option<&str>` lets each arm test a
     // specific command name (with `|` allowing aliases like decrypt/export). The
     // chosen arm calls the matching handler, and the resulting `Result` is stored.
@@ -512,6 +527,50 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     // Propagate a read error now (after raw mode is restored), then hand back input.
     outcome?;
     Ok(input)
+}
+
+/// Test-only scripted vault operation behind the `__crashop` subcommand (compiled
+/// only with `--features fault-injection`). It runs a real vault operation in this
+/// binary so the crash-recovery integration tests can abort it at a chosen commit
+/// step via `PMVAULT_CRASH_AT` (handled by the fault points in storage/vault).
+/// `pos` is `["__crashop", <scenario>, <DIR>]`.
+#[cfg(feature = "fault-injection")]
+fn crashop(pos: &[String]) -> anyhow::Result<()> {
+    use pass_mgr::records;
+    let scenario = pos.get(1).map(String::as_str).unwrap_or("");
+    let dir = pos.get(2).cloned().ok_or_else(|| anyhow::anyhow!("crashop: missing DIR"))?;
+    let path = vault_file(&dir);
+    let src = PathBuf::from(&dir).join("__crashop_src.bin");
+    match scenario {
+        // Create a vault (fast KDF) with one committed, record-referenced document.
+        "setup" => {
+            let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+            let mut v = OpenVault::create(path, b"a", b"b", params)?;
+            std::fs::write(&src, b"doc-one")?;
+            let id = v.add_document("/w", "d1.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.file = Some(id);
+            records::upsert(&mut v.vault.trust_wills, tw);
+            v.save()?;
+        }
+        // Add a second document + link it + save. Crash points put.*/vault.* fire.
+        "adddoc" => {
+            let mut v = OpenVault::open(path, b"a", b"b")?;
+            std::fs::write(&src, b"doc-two")?;
+            let id = v.add_document("/w", "d2.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.file = Some(id);
+            records::upsert(&mut v.vault.trust_wills, tw);
+            v.save()?;
+        }
+        // Rotate the passwords (a -> c). Crash points rekey.* fire mid roll-forward.
+        "rekey" => {
+            let mut v = OpenVault::open(path, b"a", b"b")?;
+            v.change_password(b"c", b"d")?;
+        }
+        other => anyhow::bail!("crashop: unknown scenario {other:?}"),
+    }
+    Ok(())
 }
 
 // `#[cfg(test)]` is *conditional compilation*: this whole module is compiled only

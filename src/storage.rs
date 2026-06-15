@@ -337,6 +337,9 @@ impl VolumeStore {
         // `.unwrap_or(0)` supplies 0 for a not-yet-existing partition.
         let start = self.manifests.get(part as usize).map(|m| m.end_offset).unwrap_or(0);
         append_frame(&self.volume_path(part), start, &frame)?;
+        // Fault point: a crash here (volume durable, manifest NOT yet committed)
+        // must leave the frame as an ignored tail past end_offset on reopen.
+        crate::fault::point("put.after_append")?;
 
         // (2) Build and atomically commit the new manifest for that partition.
         // `.cloned()` turns `Option<&Manifest>` into an owned `Option<Manifest>`;
@@ -356,6 +359,9 @@ impl VolumeStore {
         manifest.end_offset = start + frame.len() as u64;
         manifest.seq += 1;
         self.commit_manifest(part, &manifest, key)?; // disk commit point; `?` aborts on failure
+        // Fault point: a crash here (both volume + manifest committed) is a fully
+        // committed put; reopen must show the document.
+        crate::fault::point("put.after_commit")?;
 
         // Reflect in memory only after the on-disk commit succeeds.
         // If `part` is one past the current end, this is a brand-new partition (push);
@@ -680,6 +686,7 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     let mut f = opts.open(path)?;
     harden_file(path); // belt-and-suspenders chmod (no-op on non-unix)
     f.seek(SeekFrom::Start(start))?;
+    crate::fault::point("volume.write")?; // inject ENOSPC before the volume append
     f.write_all(frame)?; // `frame: &[u8]` is borrowed, not consumed
     // Drop any pre-existing garbage tail beyond the new committed end.
     f.set_len(start + frame.len() as u64)?;
@@ -720,18 +727,26 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), StorageError> {
         }
         let mut f = opts.open(&tmp)?;
         // Write then fsync, chained: `and_then(|()| ..)` runs the sync only if the write
-        // succeeded. On any error, close the file and remove the temp before returning.
-        if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+        // succeeded. On any error (incl. an injected ENOSPC), close the file and remove
+        // the temp before returning — the live target is never touched.
+        if let Err(e) = crate::fault::point("atomic.write")
+            .and_then(|()| f.write_all(data))
+            .and_then(|()| f.sync_all())
+        {
             drop(f); // close explicitly before deleting
             let _ = fs::remove_file(&tmp); // `let _ =` deliberately ignores the result
             return Err(e.into()); // `.into()` converts io::Error -> StorageError
         }
     }
     // Atomic step: rename temp over the target. On a crash, either the old or new file
-    // is fully present — never a half-written one.
-    if let Err(e) = fs::rename(&tmp, path) {
+    // is fully present — never a half-written one. The fault point models a failure
+    // (e.g. ENOSPC) at the rename; on any error the temp is removed and the live
+    // target is left untouched.
+    if let Err(e) =
+        crate::fault::point("atomic.rename").map_err(StorageError::from).and_then(|()| Ok(fs::rename(&tmp, path)?))
+    {
         let _ = fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(e);
     }
     if let Some(d) = dir {
         sync_dir(d); // fsync the directory so the rename itself is durable
@@ -1262,6 +1277,69 @@ mod tests {
     // random inputs matching each parameter's strategy (e.g. the regex `"[ -~]{0,40}"`
     // or `vec(any::<u8>(), 0..200)`) and asserts the property holds for all of them.
     // `prop_assert_eq!` is the property-test form of `assert_eq!`.
+    // ---- Full-disk (ENOSPC) fault injection (cargo test --features fault-injection) ----
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_on_volume_append_leaves_prior_state_intact() {
+        let dir = tmp_dir("enospc-vol");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap();
+        // Disk fills exactly as the next document's frame is about to be written.
+        crate::fault::fail_at("volume.write", 1);
+        let err = s.put("b", "/b", b"bravo", 2, &key).unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, StorageError::Io(_)), "put fails cleanly, got {err:?}");
+        // Reopen: the failed put left no trace; the prior doc is intact and a later
+        // put now succeeds.
+        let mut s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(s2.contains("a") && !s2.contains("b"));
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"alpha");
+        s2.put("b", "/b", b"bravo", 2, &key).unwrap();
+        assert_eq!(&*s2.read("b", &key).unwrap(), b"bravo");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_on_manifest_commit_ignores_the_uncommitted_frame() {
+        let dir = tmp_dir("enospc-man");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap();
+        // The volume append succeeds but the manifest commit hits a full disk: the
+        // new frame is now a torn tail past the committed end_offset.
+        crate::fault::fail_at("atomic.write", 1);
+        assert!(s.put("b", "/b", b"bravo", 2, &key).is_err());
+        crate::fault::clear();
+        let mut s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(s2.contains("a") && !s2.contains("b"), "uncommitted frame is invisible");
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"alpha");
+        // The torn tail is overwritten by the next successful put — no corruption.
+        s2.put("c", "/c", b"charlie", 3, &key).unwrap();
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"alpha");
+        assert_eq!(&*s2.read("c", &key).unwrap(), b"charlie");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_on_manifest_rename_keeps_old_manifest() {
+        let dir = tmp_dir("enospc-ren");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap();
+        crate::fault::fail_at("atomic.rename", 1);
+        assert!(s.put("b", "/b", b"bravo", 2, &key).is_err());
+        crate::fault::clear();
+        // No stray manifest temp is loaded; the old manifest stands.
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        assert!(s2.contains("a") && !s2.contains("b"));
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"alpha");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use proptest::prelude::*;
     proptest! {
         /// Length-prefixed frames round-trip for arbitrary id/path/body, even with

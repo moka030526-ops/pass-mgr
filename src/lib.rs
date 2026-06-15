@@ -32,6 +32,7 @@
 // other front-end, and the fuzz targets can all reach into them. Items inside a
 // module are private by default unless they too are marked `pub`.
 pub mod crypto; // security-critical: key derivation + authenticated encryption
+pub mod fault; // crash-safety fault-injection hooks (no-op without the feature)
 pub mod gui; // graphical front-end (drives the same vault API as `ui`)
 pub mod password; // random password generator
 pub mod records; // the secret records stored in the vault
