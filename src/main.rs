@@ -29,6 +29,8 @@
 //!   pass-mgr manifest [DIR] [--part N]  print the document manifest (one partition or all)
 //!   pass-mgr extract [DIR] OUT [--part N]  decrypt documents into OUT (one volume or all)
 //!   pass-mgr backup [DIR] DEST       copy the encrypted vault tree into DEST
+//!   pass-mgr export-tree [DIR] OUT   decrypt the whole vault into OUT (plaintext mirror)
+//!   pass-mgr import-tree SRC [DIR]   build a new encrypted vault from a plaintext mirror
 //!   pass-mgr --help                  show this help
 //! ```
 // Crate-wide attribute: refuse to even compile any `unsafe` block in this crate.
@@ -87,6 +89,10 @@ USAGE:
                                     Decrypt documents into OUT: one volume/partition
                                     N, or ALL volumes (default)
     pass-mgr backup [DIR] DEST      Copy the whole encrypted vault tree into DEST (timestamped)
+    pass-mgr export-tree [DIR] OUT  Decrypt the WHOLE vault into OUT as a plaintext mirror
+                                    (vault.json + manifest/ + volume/); round-trips with import-tree
+    pass-mgr import-tree SRC [DIR]  Build a NEW encrypted vault (new passwords) from a
+                                    plaintext mirror SRC produced by export-tree
     pass-mgr --help                 Show this help
 
 The vault is protected by two passwords entered in sequence. The interactive UI
@@ -226,6 +232,18 @@ fn main() -> ExitCode {
             2 => cli_backup(default_vault_path(), PathBuf::from(&pos[1])),
             3 => cli_backup(vault_file(&pos[1]), PathBuf::from(&pos[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr backup [DIR] <DEST_DIR>")),
+        },
+        // `export-tree [DIR] OUTDIR` — full decrypted mirror (OUTDIR is last).
+        Some("export-tree") => match pos.len() {
+            2 => cli_export_tree(default_vault_path(), PathBuf::from(&pos[1])),
+            3 => cli_export_tree(vault_file(&pos[1]), PathBuf::from(&pos[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr export-tree [DIR] <OUTPUT_DIR>")),
+        },
+        // `import-tree SRCDIR [DIR]` — build a new encrypted vault from a mirror.
+        Some("import-tree") => match pos.len() {
+            2 => cli_import_tree(PathBuf::from(&pos[1]), default_vault_path()),
+            3 => cli_import_tree(PathBuf::from(&pos[1]), vault_file(&pos[2])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr import-tree <SOURCE_DIR> [DIR]")),
         },
         // Otherwise the (optional) positional argument is the vault directory for
         // the interactive UI (graphical by default, terminal with --tui).
@@ -369,6 +387,45 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
         written += 1;
     }
     eprintln!("Extracted {written} document(s) to {}", out_dir.display());
+    Ok(())
+}
+
+/// Decrypt the WHOLE vault into a plaintext mirror at `out_dir` that mirrors the
+/// encrypted layout: `vault.json` + `manifest/manifest.<N>.json` +
+/// `volume/vol.<N>/<id>`. Round-trips with `import-tree`. Prompts for both
+/// passwords. WARNING: writes everything UNENCRYPTED (see DESIGN.md §9.17).
+fn cli_export_tree(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no vault found at {}", path.display());
+    }
+    eprintln!(
+        "Decrypting the ENTIRE vault into {} — vault.json + manifests + documents, all UNENCRYPTED.",
+        out_dir.display()
+    );
+    let pw1 = read_password("Password 1: ")?;
+    let pw2 = read_password("Password 2: ")?;
+    vault::OpenVault::export_tree(&path, pw1.as_bytes(), pw2.as_bytes(), &out_dir)?;
+    eprintln!("Wrote a decrypted mirror to {} (re-encrypt it with `import-tree`).", out_dir.display());
+    Ok(())
+}
+
+/// Build a NEW encrypted vault (at `dest`'s directory) from a plaintext mirror at
+/// `src_dir` (as produced by `export-tree`), under two NEW passwords. Refuses to
+/// overwrite an existing vault.
+fn cli_import_tree(src_dir: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
+    if !src_dir.join("vault.json").exists() {
+        anyhow::bail!("no vault.json in {} (expected an `export-tree` mirror)", src_dir.display());
+    }
+    if dest.exists() {
+        anyhow::bail!("a vault already exists at {}", dest.display());
+    }
+    eprintln!("Creating a new encrypted vault at {} from {}.", dest.display(), src_dir.display());
+    eprintln!("Choose TWO NEW passwords for the new vault (entered in sequence).");
+    let pw1 = read_password("New password 1: ")?;
+    let pw2 = read_password("New password 2: ")?;
+    let params = pass_mgr::crypto::KdfParams::default();
+    vault::OpenVault::import_tree(&src_dir, &dest, pw1.as_bytes(), pw2.as_bytes(), params)?;
+    eprintln!("Imported. The new vault directory is {}.", dest.parent().unwrap_or(&dest).display());
     Ok(())
 }
 

@@ -422,6 +422,106 @@ impl OpenVault {
         selected_entries(&store, part)
     }
 
+    /// Decrypt the **entire** vault directory into a plaintext mirror at `out`
+    /// (DESIGN.md §6.3): `out/vault.json`, `out/manifest/manifest.<N>.json`, and
+    /// `out/volume/vol.<N>/<id>` (the raw decrypted document bytes). This reuses the
+    /// standard decrypt + store-read paths — it adds no new crypto — and refuses a
+    /// half-committed rekey. The inverse is [`OpenVault::import_tree`].
+    ///
+    /// WARNING: the output is UNENCRYPTED (every password + document in the clear);
+    /// see DESIGN.md §9.17. Files are written 0600 with `create_new` (no clobber).
+    pub fn export_tree(path: &Path, pw1: &[u8], pw2: &[u8], out: &Path) -> Result<(), VaultError> {
+        let (vault, _header, key) = decrypt_file(path, pw1, pw2)?;
+        let dir = parent_dir(path);
+        if dir.join(REKEY_DIR).exists() {
+            return Err(VaultError::RekeyPending);
+        }
+        let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+
+        fs::create_dir_all(out)?;
+        harden_dir(out);
+        // vault.json — pretty for human inspection; the buffer wipes on drop.
+        let vault_json = Zeroizing::new(serde_json::to_vec_pretty(&vault)?);
+        write_new_bytes(&out.join("vault.json"), &vault_json)?;
+
+        let man_dir = out.join("manifest");
+        let vol_root = out.join("volume");
+        // Walk every partition: write its manifest as JSON and each blob by id.
+        for p in 0..store.partition_count() as u32 {
+            let entries: Vec<ManifestEntry> = store.partition_entries(p).cloned().collect();
+            fs::create_dir_all(&man_dir)?;
+            harden_dir(&man_dir);
+            let man_json = serde_json::to_vec_pretty(&entries)?;
+            write_new_bytes(&man_dir.join(format!("manifest.{p}.json")), &man_json)?;
+            let vol_dir = vol_root.join(format!("vol.{p}"));
+            fs::create_dir_all(&vol_dir)?;
+            harden_dir(&vol_dir);
+            for e in &entries {
+                let bytes = store.read(&e.id, &key)?; // decrypts + verifies id/path
+                write_new_bytes(&vol_dir.join(&e.id), &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a **new** encrypted vault (at the `vault.pmv` path `dest`) from a
+    /// plaintext mirror at `src` (as produced by [`export_tree`]), under two new
+    /// passwords. Preserves the records, categories, settings, and vault `id` from
+    /// `src/vault.json` and re-encrypts every document from the mirror — reusing
+    /// the same `VolumeStore::put` + atomic vault writer a password change uses (no
+    /// duplicated crypto), then returns a fully-validated handle via the normal
+    /// open path. Refuses to overwrite an existing vault.
+    pub fn import_tree(
+        src: &Path,
+        dest: &Path,
+        pw1: &[u8],
+        pw2: &[u8],
+        params: KdfParams,
+    ) -> Result<OpenVault, VaultError> {
+        if dest.exists() {
+            return Err(VaultError::AlreadyExists(dest.to_path_buf()));
+        }
+        // Read + validate the mirror's vault JSON (wipe the buffer after parsing).
+        let vault_json = Zeroizing::new(fs::read(src.join("vault.json"))?);
+        let vault: Vault = serde_json::from_slice(&vault_json)?;
+        if vault.version != FORMAT_VERSION {
+            return Err(VaultError::BadVersion(vault.version));
+        }
+        let dir = parent_dir(dest);
+        fs::create_dir_all(&dir)?;
+        harden_dir(&dir);
+        let salt = crypto::random_bytes::<SALT_LEN>()?;
+        let key = crypto::derive_key_chained(pw1, pw2, &salt, &params)?;
+
+        // Re-encrypt every document from the mirror into a fresh store under the
+        // new key (fresh per-blob nonces). Partitions are re-placed by the imported
+        // volume_max_size, so the layout reflects the imported settings.
+        let mut store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        let man_dir = src.join("manifest");
+        let vol_root = src.join("volume");
+        let mut p = 0u32;
+        loop {
+            let man_path = man_dir.join(format!("manifest.{p}.json"));
+            if !man_path.exists() {
+                break; // partitions are contiguous from 0
+            }
+            let entries: Vec<ManifestEntry> = serde_json::from_slice(&fs::read(&man_path)?)?;
+            let vol_dir = vol_root.join(format!("vol.{p}"));
+            for e in &entries {
+                let bytes = Zeroizing::new(fs::read(vol_dir.join(&e.id))?);
+                store.put(&e.id, &e.path, &bytes, e.uploaded_at, &key)?;
+            }
+            p += 1;
+        }
+        drop(store);
+
+        // Write the encrypted vault (the final commit point), then open it through
+        // the normal path so validation + the referenced⊆stored consistency check
+        // + the single-writer lock all apply to the freshly-built vault.
+        write_vault_file(dest, &vault, &key, &salt, params)?;
+        OpenVault::open(dest.to_path_buf(), pw1, pw2)
+    }
+
     /// Re-encrypt the vault and write it atomically, bumping the write-generation.
     // `&mut self` is an *exclusive* borrow: this method may mutate the vault, and
     // while it runs no one else can read or write the same `OpenVault`.
@@ -1519,6 +1619,49 @@ mod tests {
         assert_eq!(before, after, "the vault file is byte-identical after read facilities");
         let gen_after = OpenVault::export(&path, b"a", b"b").unwrap().generation;
         assert_eq!(gen_before, gen_after, "generation unchanged");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_then_import_tree_round_trips() {
+        // Seed a vault with an account, three docs across partitions, and a record
+        // that references one doc (so the consistency check is exercised on import).
+        let (path, docs) = seed_multi_partition("exptree", b"o1", b"o2");
+        {
+            let mut v = OpenVault::open(path.clone(), b"o1", b"o2").unwrap();
+            let mut tw = crate::records::TrustWill::new().unwrap();
+            tw.file = Some(docs[0].0.clone());
+            records::upsert(&mut v.vault.trust_wills, tw);
+            v.save().unwrap();
+        }
+        // Decrypt to a plaintext mirror.
+        let mirror = std::env::temp_dir().join(format!("pmmirror-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        assert!(mirror.join("vault.json").exists());
+        assert!(mirror.join("manifest/manifest.0.json").exists());
+        assert!(mirror.join("volume/vol.0").join(&docs[0].0).exists());
+
+        // Rebuild a fresh encrypted vault from the mirror under NEW passwords.
+        let dest_dir = std::env::temp_dir().join(format!("pmimport-{}", nanos()));
+        let dest = dest_dir.join(VAULT_FILE);
+        drop(OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()).unwrap());
+
+        // Only the new passwords open it; every record and document round-tripped.
+        assert!(OpenVault::open(dest.clone(), b"o1", b"o2").is_err(), "old passwords must not work");
+        let v = OpenVault::open(dest.clone(), b"n1", b"n2").unwrap();
+        assert_eq!(v.vault.accounts.len(), 1);
+        assert_eq!(v.vault.trust_wills.len(), 1);
+        for (id, body) in &docs {
+            assert_eq!(&v.read_document(id).unwrap()[..], &body[..], "doc {id} survives the round-trip");
+        }
+        // import-tree refuses to overwrite an existing vault.
+        assert!(matches!(
+            OpenVault::import_tree(&mirror, &dest, b"x", b"y", fast()),
+            Err(VaultError::AlreadyExists(_))
+        ));
+
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(&dest_dir).ok();
         cleanup(&path);
     }
 
