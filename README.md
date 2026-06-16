@@ -405,6 +405,25 @@ For the full architecture, encryption scheme, and security caveats, see
 ## Development
 
 ```bash
-cargo test       # run the test suite
-cargo clippy     # lints
+cargo test                              # unit + integration + property tests
+cargo test --features fault-injection   # + crash / full-disk recovery tests
+cargo clippy --all-targets --all-features -- -D warnings   # lints
+cargo audit                             # dependency vulnerability scan
+cargo +nightly fuzz run parse_frame     # fuzz a parser (parse_header/_manifest/scan_volume)
+sudo tests/dmflakey_powerloss.sh        # real power-loss test (see below)
 ```
+
+**How crash-safety is tested.** Saves are atomic and fsync-ordered, and that is
+verified at four levels (`docs/DESIGN.md` §12.5): exact-on-disk-state tests,
+in-process full-disk (`ENOSPC`) injection, subprocess **force-kill** at every commit
+point (`tests/crash_recovery.rs`), and a real **power-loss** harness
+(`tests/dmflakey_powerloss.sh`). The last one is the deepest: the force-kill tests
+only kill the *process* (the OS still flushes its cache, so a missing `fsync` would
+go unnoticed), whereas the power-loss harness runs the vault on a Linux `dm-flakey`
+device and simulates a power cut that **discards every write the program did not
+`fsync`** — then asserts the vault still opens with its data intact. It needs root
+(it sets up a loop + device-mapper device under unique, auto-cleaned names) and is
+not part of `cargo test`; run it manually with `sudo tests/dmflakey_powerloss.sh`.
+
+Property-based (`proptest`) and `cargo-fuzz` targets additionally hammer the parsers,
+the redundancy-ring invariants, the calendar math, and the password generator.

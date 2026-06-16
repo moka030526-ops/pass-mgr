@@ -2210,6 +2210,90 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A fresh directory for an import-mirror source.
+    fn tmp_src(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pmsrc-mirror-{tag}-{}", nanos()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn import_tree_rejects_unsafe_vault_id() {
+        let src = tmp_src("badid");
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = "../../etc/passwd".into(); // not a safe ASCII-alnum token
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let dest = tmp_path("impbadid");
+        let res = OpenVault::import_tree(&src, &dest, b"a", b"b", fast());
+        assert!(res.is_err(), "an unsafe vault id in the untrusted mirror is rejected");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(parent_dir(&dest));
+    }
+
+    #[test]
+    fn import_tree_clamps_absurd_volume_size() {
+        let src = tmp_src("bigvol");
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = "abc123def456".into(); // valid token
+        vault.settings.volume_max_size = u64::MAX; // absurd, untrusted
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let dest = tmp_path("impbigvol");
+        let v = OpenVault::import_tree(&src, &dest, b"c", b"d", fast()).unwrap();
+        assert!(v.volume_max_size() <= MAX_VOLUME_MAX_SIZE, "absurd volume_max_size clamped on import");
+        assert!(v.volume_max_size() >= MIN_VOLUME_MAX_SIZE);
+        drop(v);
+        let _ = fs::remove_dir_all(&src);
+        cleanup(&dest);
+    }
+
+    #[test]
+    fn read_only_open_does_not_write_redundancy_or_touch_primary() {
+        let path = tmp_path("ro");
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            v.set_redundancy(2).unwrap();
+            v.save().unwrap();
+        }
+        // Remove the redundancy copies; a READ-ONLY open must not regenerate them or
+        // rewrite the primary (no auto-save, no heal, no rotation on a read-only open).
+        let _ = fs::remove_file(mirror_path(&path));
+        for k in 1..=MAX_REDUNDANCY {
+            let _ = fs::remove_file(bak_path(&path, k));
+        }
+        let before = fs::metadata(&path).unwrap().len();
+        {
+            let v = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+            assert!(v.recovery_notice().is_none());
+            drop(v);
+        }
+        assert!(!mirror_path(&path).exists(), "read-only open wrote a mirror");
+        assert!(!bak_path(&path, 1).exists(), "read-only open wrote a generation");
+        assert_eq!(fs::metadata(&path).unwrap().len(), before, "primary unchanged on read-only open");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn stale_temp_files_swept_on_writable_open() {
+        let path = tmp_path("tmpsweep");
+        {
+            let _ = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        }
+        let dir = parent_dir(&path);
+        // Simulate atomic-write temps leaked by a crash mid-save.
+        let stale_primary = dir.join(".vault.pmv.deadbeef.tmp");
+        let stale_mirror = dir.join(".vault.pmv.mirror.cafef00d.tmp");
+        fs::write(&stale_primary, b"leaked encrypted temp").unwrap();
+        fs::write(&stale_mirror, b"leaked encrypted temp").unwrap();
+        {
+            let _ = OpenVault::open(path.clone(), b"a", b"b").unwrap(); // writable open sweeps
+        }
+        assert!(!stale_primary.exists(), "stale primary .tmp swept on writable open");
+        assert!(!stale_mirror.exists(), "stale mirror .tmp swept on writable open");
+        cleanup(&path);
+    }
+
     #[test]
     fn missing_referenced_document_is_rejected_on_open() {
         let path = tmp_path("mismatch");
@@ -3329,6 +3413,64 @@ mod tests {
             prop_assert_eq!(normalize_dir(&n1), n1.clone());
             prop_assert!(!n1.contains("//"), "no empty segments: {n1:?}");
             prop_assert!(n1.is_empty() || n1.starts_with('/'));
+        }
+    }
+
+    proptest! {
+        // Each case creates a real vault and does several Argon2-backed saves, so keep
+        // the case count modest.
+        #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+        /// For ANY depth and ANY sequence of saves, the in-place redundancy ring stays
+        /// well-formed: the vault opens cleanly from the primary, the mirror is the
+        /// current generation, each retained generation decodes with a STRICTLY
+        /// DESCENDING generation number (a contiguous ring), and the ring never exceeds
+        /// the configured depth. Then corrupting the live file recovers from the mirror.
+        #[test]
+        fn prop_redundancy_ring_well_formed(depth in 1u32..=4, saves in 1usize..=6) {
+            let path = tmp_path("propring");
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            v.set_redundancy(depth).unwrap();
+            for i in 0..saves {
+                records::upsert(&mut v.vault.accounts, sample_account(&format!("u{i}"), "p"));
+                v.save().unwrap();
+            }
+            let cur_gen = v.vault.generation;
+            drop(v);
+
+            let gen_of = |p: &Path| {
+                read_capped_vault(p).ok().and_then(|raw| decode_vault_bytes(&raw, b"a", b"b").ok().map(|t| t.0.generation))
+            };
+            // Mirror is the current generation (lossless copy of the latest save).
+            prop_assert_eq!(gen_of(&mirror_path(&path)), Some(cur_gen), "mirror == current generation");
+            // Generations strictly descending, contiguous, never above current, count <= depth.
+            let mut prev = cur_gen;
+            let mut count = 0u32;
+            for k in 1..=MAX_REDUNDANCY {
+                match gen_of(&bak_path(&path, k)) {
+                    Some(g) => {
+                        count += 1;
+                        prop_assert!(g < prev, "bak{} gen {} not strictly below {}", k, g, prev);
+                        prev = g;
+                    }
+                    None => break, // contiguous ring: no holes
+                }
+            }
+            prop_assert!(count <= depth, "ring depth {} exceeds configured {}", count, depth);
+
+            // The vault opens cleanly from the primary; all saved records present.
+            let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+            prop_assert!(v2.recovery_notice().is_none(), "primary intact — no recovery");
+            prop_assert_eq!(v2.vault.accounts.len(), saves);
+            drop(v2);
+
+            // Corrupt the live file: recovery from the (intact) mirror must succeed.
+            std::fs::write(&path, b"garbage not a vault").unwrap();
+            let v3 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+            prop_assert!(v3.recovery_notice().is_some(), "recovered from a redundant copy");
+            prop_assert_eq!(v3.vault.accounts.len(), saves, "no records lost on mirror recovery");
+            drop(v3);
+            cleanup(&path);
         }
     }
 }

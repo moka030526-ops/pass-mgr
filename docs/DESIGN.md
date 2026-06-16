@@ -1013,7 +1013,7 @@ volume, so even losing an entire manifest is recoverable.
 
 ### 12.5 How this is verified
 
-Crash-safety is tested at three levels (see `IMPLEMENTATION.md`):
+Crash-safety is tested at four levels (see `IMPLEMENTATION.md`):
 
 - **Direct on-disk state** — reproduce the exact bytes a crash would leave (torn
   tails, truncated/garbage manifests, half-staged `.rekey` with/without `READY`,
@@ -1033,12 +1033,26 @@ Crash-safety is tested at three levels (see `IMPLEMENTATION.md`):
   redundancy copy, which always runs *after* the authoritative primary commit,
   leaves the vault openable from the primary with committed data intact and no
   recovery needed (`tests/crash_recovery.rs`, redundancy enabled).
+- **Real power loss (`dm-flakey`)** — the abort tests above kill the *process*, but
+  the OS still flushes its page cache afterward, so a **missing `fsync` is invisible
+  to them** (and to mutation testing — removing an `fsync` changes no in-process
+  behaviour). `tests/dmflakey_powerloss.sh` closes that gap: it puts the vault on an
+  ext4 filesystem over a Linux device-mapper `dm-flakey` device, runs each operation
+  (crashed at the commit points above), then simulates a power cut by reloading the
+  device with the `drop_writes` feature and unmounting — so the page cache is flushed
+  but **the device discards everything that was not fsync'd**. On remount the vault
+  must still open with the committed document intact; a missing/incorrect `fsync`
+  would surface here as lost data. It needs root (it manages a loop + dm device), so
+  it is a **manual** harness, not part of `cargo test`. Property-based tests
+  (`proptest`) additionally fuzz the redundancy-ring invariants, the calendar math,
+  and the password generator over random inputs.
 
 > Residual platform caveat: durability ultimately depends on the OS and hardware
 > honoring `fsync`. On a filesystem/mount that ignores barriers, or hardware with
 > a lying write cache, a power loss can still lose the last fsync'd write — that is
-> below the application's control. The format never *corrupts*; at worst it loses
-> the most recent operation. See §9.11.
+> below the application's control (and below what even the `dm-flakey` harness can
+> see, since it trusts the device to honor the writes it does *not* drop). The format
+> never *corrupts*; at worst it loses the most recent operation. See §9.11.
 
 ### 12.6 What a half-finished write looks like on disk (vault vs. volume)
 
