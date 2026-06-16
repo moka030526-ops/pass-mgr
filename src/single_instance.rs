@@ -142,8 +142,17 @@ fn acquire_in(dir: &Path, vault_path: &Path) -> io::Result<Instance> {
     let lock_path = dir.join(format!("instance-{key}.lock"));
 
     // Same rationale as the vault's write-lock: never truncate (would race a
-    // concurrent holder's handle); just ensure the file exists and is lockable.
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
+    // concurrent holder's handle); just ensure the file exists and is lockable. On
+    // Unix, open with O_NOFOLLOW so a symlink planted at the lock path is refused
+    // (ELOOP) rather than followed — matching `append_frame`'s discipline.
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&lock_path)?;
 
     match file.try_lock() {
         Ok(()) => {
@@ -162,16 +171,19 @@ fn acquire_in(dir: &Path, vault_path: &Path) -> io::Result<Instance> {
     }
 }
 
-/// The directory holding the lock/socket: prefer the volatile per-user runtime dir
-/// (cleared on logout), then the cache dir, then the system temp dir. Made 0700.
+/// The directory holding the lock/socket: a **private** per-user directory — the
+/// volatile runtime dir (cleared on logout) if available, else the cache dir (both
+/// owner-scoped). Made 0700.
+///
+/// We deliberately do NOT fall back to a world-writable temp dir: a lock file there
+/// could be pre-created and held by another user to force every launch into
+/// "already running" (a DoS that keeps the GUI from opening). If no private dir is
+/// available, return an error so [`acquire`] degrades to "run unguarded" rather than
+/// trusting a shared location.
 fn base_dir() -> io::Result<PathBuf> {
-    let dir = match ProjectDirs::from("dev", "passmgr", "pass-mgr") {
-        Some(pd) => pd
-            .runtime_dir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| pd.cache_dir().to_path_buf()),
-        None => std::env::temp_dir(),
-    };
+    let pd = ProjectDirs::from("dev", "passmgr", "pass-mgr")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no per-user directory available for the instance guard"))?;
+    let dir = pd.runtime_dir().map(Path::to_path_buf).unwrap_or_else(|| pd.cache_dir().to_path_buf());
     fs::create_dir_all(&dir)?;
     crate::vault::harden_dir(&dir); // 0700 on Unix; no-op elsewhere
     Ok(dir)
@@ -190,11 +202,12 @@ fn instance_key(vault_path: &Path) -> String {
 }
 
 fn canonical_best_effort(path: &Path) -> PathBuf {
-    if let Ok(c) = fs::canonicalize(path) {
-        return c;
-    }
-    // The vault may not exist yet (first run / create). Anchor on the canonical
-    // parent + the final component so the token is still stable and absolute.
+    // Always anchor on the canonical PARENT + the literal final component. This is
+    // deliberately uniform across "create" (vault file doesn't exist yet) and "open"
+    // (it does): fully canonicalizing the whole path would resolve a symlinked leaf
+    // and so produce a DIFFERENT token before vs. after the vault exists, splitting
+    // the single-instance rendezvous. The parent (the vault directory) normally
+    // exists in both cases.
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
         && let Ok(cp) = fs::canonicalize(parent)
     {

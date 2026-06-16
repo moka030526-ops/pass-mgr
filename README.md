@@ -142,7 +142,26 @@ time. It's only a display preference — it changes nothing about your data.
 3. The program saves a dated, still-encrypted copy of your vault and its
    documents. Keep at least one backup on a **separate** drive or location.
 
-Backups are still encrypted — they need the same two passwords to open.
+Backups are still encrypted — each one needs the **two passwords that were in effect
+when it was made** (see the next section about changing passwords).
+
+## Changing your master passwords
+
+Use the **🔑 Passwords** button (Edit mode) — or `p` in the terminal UI — to set two
+new passwords. The program fully re-encrypts your vault under the new passwords.
+
+**Important — this does NOT change your old backups.** A backup is a separate copy,
+so changing your passwords only re-encrypts the vault on this computer; any backup you
+made earlier still opens with the **old** passwords (and a new backup opens with the
+new ones). So after changing your passwords:
+
+- **Make a fresh backup** right away, so you have a recoverable copy under the new
+  passwords. (Changing passwords does not auto-backup; only *Compact* does.)
+- **If you changed because the old passwords may have been seen by someone else,**
+  remember that your **old backups are still readable with those old passwords** —
+  securely delete the old backups (or keep them only if you trust where they are).
+- To restore an old backup, open it with the passwords it was made under; it will be
+  an older copy (anything you changed since is not in it).
 
 ## If something goes wrong (power loss, crash, disk full)
 

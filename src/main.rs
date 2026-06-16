@@ -482,8 +482,15 @@ fn cli_compact(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
     };
 
     // The vault DIRECTORY (parent of vault.pmv) — used for the default backup
-    // location and the inside-the-vault guard.
-    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    // location and the inside-the-vault guard. A bare relative vault path (e.g.
+    // `vault.pmv`) has an EMPTY parent; map that to "." and canonicalize to an
+    // absolute path so `default_backup_dir` sees real path components (otherwise the
+    // default sibling backup gets wrongly flagged as inside the vault dir).
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
 
     // Validate an explicit backup destination up front (a pure arg check, before
     // prompting or opening): a backup placed inside the vault dir would be copied
@@ -900,6 +907,32 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         // Add a second document (0xB2 x600) — rolls into a NEW partition (vol.1)
         // given the tiny cap — link it + save. Crash points put.*/vault.* fire.
         "adddoc" => {
+            let mut v = OpenVault::open(path, b"a", b"b")?;
+            std::fs::write(&src, body(0xB2))?;
+            let id = v.add_document("/w", "d2.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.file = Some(id);
+            records::upsert(&mut v.vault.trust_wills, tw);
+            v.save()?;
+        }
+        // Like `setup`, but with in-place redundancy enabled (depth 2) so the §12.8
+        // mirror + generation-ring writes run. One committed, record-referenced doc.
+        "setup_redundant" => {
+            let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+            let mut v = OpenVault::create(path, b"a", b"b", params)?;
+            v.set_volume_max_size(1024)?;
+            v.set_redundancy(2)?;
+            std::fs::write(&src, body(0xA1))?;
+            let id = v.add_document("/w", "d1.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.file = Some(id);
+            records::upsert(&mut v.vault.trust_wills, tw);
+            v.save()?;
+        }
+        // A redundancy-enabled save that adds a 2nd doc. The redundancy.* crash points
+        // (rotate/bak/mirror) fire AFTER the authoritative primary commit, so an abort
+        // there must still leave an openable vault with both committed docs intact.
+        "redundant_save" => {
             let mut v = OpenVault::open(path, b"a", b"b")?;
             std::fs::write(&src, body(0xB2))?;
             let id = v.add_document("/w", "d2.txt", &src)?;

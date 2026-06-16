@@ -338,6 +338,7 @@ struct App {
     cfg_subtype_name: String,
     cfg_volume_size: String,
     cfg_backup_dest: String,
+    cfg_redundancy: String,
     status: String,
     clipboard_dirty: bool,
     // When set, the clipboard should be wiped at/after this instant (auto-clear
@@ -388,6 +389,7 @@ impl App {
             cfg_subtype_name: String::new(),
             cfg_volume_size: String::new(),
             cfg_backup_dest: String::new(),
+            cfg_redundancy: String::new(),
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,
@@ -673,7 +675,12 @@ impl App {
         };
         match result {
             Ok(v) => {
-                self.status = if creating {
+                // A recovery from an in-place redundant copy (§12.8) takes priority —
+                // the user needs to know a roll-forward/rollback happened.
+                let recovered = v.recovery_notice().map(|s| s.to_string());
+                self.status = if let Some(notice) = recovered {
+                    notice
+                } else if creating {
                     "New vault created.".into()
                 } else if v.previous_access() == 0 {
                     "Vault unlocked.".into()
@@ -843,7 +850,7 @@ impl App {
 
     fn handle_config_key(&mut self, key: KeyEvent) -> bool {
         // A local `const` (compile-time constant) for the field count.
-        const CFG_FIELDS: usize = 6;
+        const CFG_FIELDS: usize = 7;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
@@ -870,7 +877,8 @@ impl App {
             2 => &mut self.cfg_subtype_type,
             3 => &mut self.cfg_subtype_name,
             4 => &mut self.cfg_volume_size,
-            _ => &mut self.cfg_backup_dest,
+            5 => &mut self.cfg_backup_dest,
+            _ => &mut self.cfg_redundancy,
         }
     }
 
@@ -945,7 +953,7 @@ impl App {
                 }
                 _ => self.status = "Enter a whole number of MiB (at least 1).".into(),
             },
-            _ => {
+            5 => {
                 let dest = self.cfg_backup_dest.trim().to_string();
                 if dest.is_empty() {
                     self.status = "Enter a backup destination directory.".into();
@@ -956,6 +964,22 @@ impl App {
                     }
                 }
             }
+            // Vault file redundancy depth (0 = off). See `docs/DESIGN.md` §12.8.
+            _ => match self.cfg_redundancy.trim().parse::<u32>() {
+                Ok(depth) => match self.vault.as_mut().expect("vault open on config").set_redundancy(depth) {
+                    Ok(()) => {
+                        let applied = self.vault_ref().redundancy();
+                        self.status = if applied == 0 {
+                            "Vault file redundancy turned off (extra copies removed).".into()
+                        } else {
+                            format!("Vault file redundancy set to {applied} (mirror + {applied} prior generation(s)).")
+                        };
+                        self.cfg_redundancy.clear();
+                    }
+                    Err(e) => self.status = format!("Save failed: {e}"),
+                },
+                _ => self.status = "Enter a whole number (0 = off).".into(),
+            },
         }
     }
 
@@ -1626,6 +1650,7 @@ impl App {
             ("Subtype — name", &self.cfg_subtype_name),
             ("Volume size (MiB)", &self.cfg_volume_size),
             ("Backup destination dir", &self.cfg_backup_dest),
+            ("Vault redundancy (0=off)", &self.cfg_redundancy),
         ];
         let cats = self.vault_ref().categories();
         let mut lines = vec![
@@ -1644,6 +1669,13 @@ impl App {
                 "Volume size: {} MiB (new documents roll into a fresh volume past this)",
                 self.vault_ref().volume_max_size() / (1024 * 1024)
             ),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            match self.vault_ref().redundancy() {
+                0 => "Vault redundancy: off (set N>0 to keep a mirror + N prior copies; not a backup)".to_string(),
+                n => format!("Vault redundancy: {n} (mirror + {n} prior generation(s); not a backup)"),
+            },
             Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(""));
