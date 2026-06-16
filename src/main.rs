@@ -959,11 +959,17 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         "open" => {
             let _ = OpenVault::open(path, b"c", b"d")?;
         }
-        // Recovery check (used by the dm-flakey power-loss harness): open under a/b and
-        // assert the committed, record-referenced document (doc-one) survived intact.
-        // Exits non-zero on any failure (won't open, missing reference, byte mismatch).
+        // Recovery check (used by the dm-flakey power-loss harness): the vault must
+        // open and the committed, record-referenced document (doc-one) must be intact.
+        // A crashed password change may have rolled FORWARD (a/b -> c/d) or been
+        // DISCARDED (still a/b), and either outcome is a valid recovery — so accept
+        // whichever password pair opens it. A wrong pair fails the AEAD (it cannot
+        // open an a/b vault with c/d), so there is no false acceptance. Exits non-zero
+        // if NEITHER pair opens (real corruption) or the document is lost/mismatched.
         "verify" => {
-            let v = OpenVault::open(path, b"a", b"b")?;
+            let v = OpenVault::open(path.clone(), b"a", b"b")
+                .or_else(|_| OpenVault::open(path, b"c", b"d"))
+                .map_err(|e| anyhow::anyhow!("verify: vault did not open under a/b or c/d: {e}"))?;
             let tw = v
                 .vault
                 .trust_wills

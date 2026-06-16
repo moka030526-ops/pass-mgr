@@ -47,6 +47,8 @@
 # never touches your real vault or any existing block device.
 
 set -euo pipefail
+# The crash injection aborts the process on purpose; don't litter core dumps for it.
+ulimit -c 0 2>/dev/null || true
 
 # ---- config -----------------------------------------------------------------
 NAME="pmflakey$$"                       # unique dm + mount name for this run
@@ -165,8 +167,11 @@ run_case() {
 
   # 2) Run the operation; abort it mid-commit at `label` (or run it fully if empty).
   #    Its fsync'd writes reach the device; un-fsync'd writes stay in the page cache.
+  #    The abort (SIGABRT) is EXPECTED — wrap it in a sub-bash whose stderr is dropped
+  #    so the shell's "Aborted (core dumped)" job notice does not clutter the output.
   if [[ -n "$label" ]]; then
-    PMVAULT_CRASH_AT="$label" "$BIN" __crashop "$op" "$vault" >/dev/null 2>&1 || true
+    bash -c 'PMVAULT_CRASH_AT="$1" "$2" __crashop "$3" "$4" >/dev/null 2>&1' _ \
+      "$label" "$BIN" "$op" "$vault" 2>/dev/null || true
   else
     "$BIN" __crashop "$op" "$vault" >/dev/null 2>&1 || true
   fi
