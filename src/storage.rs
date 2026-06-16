@@ -190,8 +190,20 @@ impl VolumeStore {
             //   - Err(e): otherwise propagate the original error.
             let manifest = match store.load_manifest(part, key) {
                 Ok(m) => m,
-                // A missing/corrupt manifest with a present volume is rebuilt.
-                Err(_) if vpath.exists() => store.rebuild_manifest(part, key)?,
+                // Genuine corruption (won't decrypt, won't parse, or truncated) with a
+                // present volume → rebuild by scanning the self-describing volume.
+                Err(StorageError::Corrupt(_) | StorageError::Crypto(_) | StorageError::Json(_))
+                    if vpath.exists() =>
+                {
+                    store.rebuild_manifest(part, key)?
+                }
+                // A *missing* manifest (file absent) but present volume → also rebuild.
+                // But a manifest that IS present and failed for a transient/operational
+                // reason (an I/O glitch, or a momentary size-cap trip) is NOT corruption:
+                // propagate it rather than discard a valid manifest — and its
+                // authoritative `end_offset` — via a lossy volume scan that silently
+                // drops every frame past the first unreadable one.
+                Err(_) if vpath.exists() && !mpath.exists() => store.rebuild_manifest(part, key)?,
                 Err(e) => return Err(e),
             };
             store.manifests.push(manifest); // append to the vec
@@ -511,7 +523,7 @@ fn scan_volume<R: Read + Seek>(f: &mut R, file_len: u64, key: &Key, aad: &[u8]) 
     // Last write wins for a repeated id (updates append a newer frame).
     let mut latest: BTreeMap<String, ManifestEntry> = BTreeMap::new(); // id -> newest entry seen
     let mut order: Vec<String> = Vec::new(); // preserve first-seen order of ids
-    while offset + FRAME_PREFIX_LEN <= file_len {
+    while offset.checked_add(FRAME_PREFIX_LEN).is_some_and(|end| end <= file_len) {
         match read_frame_at(f, file_len, offset, 0, key, aad) {
             Ok((id, path, bytes)) => {
                 // read_frame_at(length=0) parsed the prefix to learn the size;
@@ -609,7 +621,11 @@ fn read_frame_at<R: Read + Seek>(
 ) -> Result<(String, String, Zeroizing<Vec<u8>>), StorageError> {
     // `.into()` converts the string literal into the `String` the Corrupt variant
     // holds. Each check below guards against a corrupt length over-reading/-allocating.
-    if offset + FRAME_PREFIX_LEN > file_len {
+    // `checked_add` so a corrupt/forged near-u64::MAX offset yields a clean Corrupt
+    // error instead of wrapping (release) or panicking (debug-overflow). Authentic
+    // offsets come from an AEAD-authenticated manifest or a bounded volume scan, so
+    // this is defense-in-depth, not a reachable path with a valid vault.
+    if offset.checked_add(FRAME_PREFIX_LEN).is_none_or(|end| end > file_len) {
         return Err(StorageError::Corrupt("frame offset past EOF".into()));
     }
     f.seek(SeekFrom::Start(offset))?;
@@ -621,7 +637,11 @@ fn read_frame_at<R: Read + Seek>(
     if frame_len < NONCE_LEN as u64 || frame_len > MAX_DOC_SIZE + 4096 {
         return Err(StorageError::Corrupt("implausible frame length".into()));
     }
-    if offset + FRAME_PREFIX_LEN + frame_len > file_len {
+    if offset
+        .checked_add(FRAME_PREFIX_LEN)
+        .and_then(|x| x.checked_add(frame_len))
+        .is_none_or(|end| end > file_len)
+    {
         return Err(StorageError::Corrupt("frame overruns EOF".into()));
     }
     // `&&` is logical AND: only check the manifest agreement when a non-zero

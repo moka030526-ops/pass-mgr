@@ -30,6 +30,11 @@ const DIGITS: &[u8] = b"0123456789";
 // Deliberately excludes quotes/backslash/space to stay shell- and form-safe.
 const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{};:,.<>?/";
 
+// Upper bound on a generated password's length. Any real password is far shorter;
+// this just stops a programmatic caller (the public `GenOptions.length` field has
+// no inherent ceiling) from requesting a multi-gigabyte allocation.
+const MAX_LENGTH: usize = 4096;
+
 // `#[derive(...)]` auto-generates standard method implementations for this type:
 //   Debug -> can be printed for debugging; Clone -> can be duplicated explicitly;
 //   Copy  -> cheap to copy implicitly (so passing it around does NOT "move"/
@@ -104,6 +109,11 @@ pub enum GenError {
     // Requested length was zero.
     #[error("length must be greater than zero")]
     ZeroLength,
+    // Requested length was absurdly large (would allocate gigabytes for no sane
+    // reason). Guards the public `GenOptions.length` field against a programmatic
+    // caller passing a huge value.
+    #[error("length must be at most {MAX_LENGTH}")]
+    TooLong,
     // Wraps an underlying CryptoError. `#[from]` auto-generates a conversion so a
     // `CryptoError` turns into this variant automatically — that is what lets the
     // `?` operator (used later) propagate randomness failures with no extra code.
@@ -126,20 +136,20 @@ fn uniform(n: usize) -> Result<usize, CryptoError> {
     // 64-bit unsigned int). `as u64` is an explicit numeric cast. The old
     // `usize` `n` is now hidden for the rest of the function.
     let n = n as u64;
-    // Largest multiple of n that fits in u32's range; reject anything above it.
-    // Drawing only from [0, zone) and then taking `% n` is exactly uniform,
-    // because that interval contains a whole number of n-sized blocks.
-    let zone = ((u64::from(u32::MAX) + 1) / n) * n;
-    // `loop { ... }` repeats forever until something inside returns/breaks.
+    // Largest multiple of n that fits in a 64-bit draw; reject anything above it.
+    // Drawing only from [0, zone) and then taking `% n` is exactly uniform, because
+    // that interval contains a whole number of n-sized blocks. The zone math is done
+    // in u128 so `span` (2^64) does not overflow and so `zone` stays > 0 for EVERY
+    // n in 1..=u64::MAX — a 64-bit draw never lets the accept zone collapse to 0
+    // (which, with a 32-bit draw, made `uniform` spin forever for n > 2^32).
+    let span = u128::from(u64::MAX) + 1; // 2^64
+    let zone = (span / u128::from(n)) * u128::from(n);
+    // `loop { ... }` repeats until an in-range draw returns.
     loop {
-        // Read 4 fresh random bytes. `random_bytes::<4>()` uses a const generic
-        // (`<4>`) to request a fixed-size 4-byte array; the trailing `?` is the
-        // try operator: if the call returned `Err`, `?` returns that error from
-        // `uniform` immediately, otherwise it unwraps the `Ok` value.
-        // `from_le_bytes` interprets the 4 bytes as a little-endian u32, then
-        // `u64::from(...)` widens it to u64 so the comparison/modulo below fit.
-        let r = u64::from(u32::from_le_bytes(random_bytes::<4>()?));
-        if r < zone {
+        // Read 8 fresh random bytes as a little-endian u64. The trailing `?` is the
+        // try operator: on `Err` it returns that error from `uniform` immediately.
+        let r = u64::from_le_bytes(random_bytes::<8>()?);
+        if u128::from(r) < zone {
             // In range: take modulo n to get the index, cast back to usize, and
             // return success. `Ok(...)` wraps it in the success variant of Result.
             return Ok((r % n) as usize);
@@ -157,6 +167,9 @@ pub fn generate(opts: &GenOptions) -> Result<String, GenError> {
     if opts.length == 0 {
         // `return Err(...)` exits early with the error variant of Result.
         return Err(GenError::ZeroLength);
+    }
+    if opts.length > MAX_LENGTH {
+        return Err(GenError::TooLong);
     }
     let classes = opts.classes();
     if classes.is_empty() {
@@ -276,6 +289,24 @@ mod tests {
     fn rejects_zero_length() {
         let opts = GenOptions { length: 0, ..Default::default() };
         assert!(matches!(generate(&opts), Err(GenError::ZeroLength)));
+    }
+
+    #[test]
+    fn rejects_overlong_length() {
+        // A programmatic caller asking for an absurd length is refused with a clean
+        // error, not served a multi-gigabyte allocation.
+        let opts = GenOptions { length: usize::MAX, ..Default::default() };
+        assert!(matches!(generate(&opts), Err(GenError::TooLong)));
+    }
+
+    // Regression: with a 32-bit draw the rejection zone collapsed to 0 for any
+    // n > 2^32, so `uniform` spun forever. A 64-bit draw must return promptly. Gated
+    // to 64-bit targets, where `usize` can actually exceed 2^32.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn uniform_terminates_for_n_above_2_pow_32() {
+        let n: usize = (1usize << 33) + 1; // > 2^32
+        assert!(uniform(n).unwrap() < n);
     }
 
     #[test]

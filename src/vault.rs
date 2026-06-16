@@ -491,6 +491,13 @@ impl OpenVault {
         let dir = parent_dir(dest);
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
+        // Hold the single-writer lock for the WHOLE build. The `dest.exists()` check
+        // above is a TOCTOU on its own — two concurrent imports into the same fresh
+        // directory could both pass it and then interleave their volume/manifest
+        // writes into a corrupt, mixed tree. The lock makes the build exclusive, in
+        // keeping with the create/open paths (which lock before writing anything). It
+        // is released before the final `OpenVault::open` re-acquires it below.
+        let build_lock = WriteLock::acquire(&dir)?;
         let salt = crypto::random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key_chained(pw1, pw2, &salt, &params)?;
 
@@ -528,6 +535,10 @@ impl OpenVault {
         // the normal path so validation + the referenced⊆stored consistency check
         // + the single-writer lock all apply to the freshly-built vault.
         write_vault_file(dest, &vault, &key, &salt, params)?;
+        // Release the build lock before reopening: `OpenVault::open` takes its own
+        // single-writer lock, which (being a second handle in this process) would
+        // otherwise collide with the one still held here.
+        drop(build_lock);
         OpenVault::open(dest.to_path_buf(), pw1, pw2)
     }
 
@@ -780,17 +791,29 @@ impl OpenVault {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let src_len = fs::metadata(source)?.len();
-        if src_len > MAX_DOC_SIZE {
+        // `source` is a user-chosen file. `fs::metadata` follows symlinks, so a
+        // symlink to a real document is fine, but a non-regular file (character
+        // device like /dev/zero, a FIFO, …) reports len()==0 yet reads unboundedly —
+        // reject it up front so it can't drive an OOM.
+        let meta = fs::metadata(source)?;
+        if !meta.file_type().is_file() {
+            return Err(VaultError::Storage(StorageError::Corrupt(format!(
+                "document source is not a regular file: {}",
+                source.display()
+            ))));
+        }
+        if meta.len() > MAX_DOC_SIZE {
             return Err(VaultError::TooLarge);
         }
         let vpath = virtual_path(location, filename);
         if vpath.len() > storage::MAX_PATH_LEN {
             return Err(VaultError::Storage(StorageError::PathTooLong));
         }
-        // Read the source file into memory wrapped in `Zeroizing`, so the plaintext
-        // bytes are wiped when `data` goes out of scope at the end of this function.
-        let data = Zeroizing::new(fs::read(source)?);
+        // Read into memory wrapped in `Zeroizing` (plaintext wiped on drop), with a
+        // HARD ceiling rather than the unbounded `fs::read`: a file that grows between
+        // the stat and the read — or a special file that slips past the is_file()
+        // check on an exotic filesystem — still cannot exhaust memory.
+        let data = Zeroizing::new(read_file_capped(source, MAX_DOC_SIZE)?);
         let id = records::random_id()?;
         self.storage.put(&id, &vpath, &data, records::unix_now(), &self.key)?;
         Ok(id)
@@ -934,6 +957,24 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
         return Err(VaultError::TooLarge);
     }
     Ok(fs::read(path)?)
+}
+
+/// Read a file with a hard size ceiling (unlike `fs::read`, which allocates without
+/// bound). Reads at most `max + 1` bytes — one past the limit — so an over-size
+/// source is detected and rejected without ever allocating more than `max + 1`.
+/// Follows symlinks (the caller has already vetted the target with `fs::metadata`).
+fn read_file_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
+    use std::io::Read;
+    let f = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    // `take(max + 1)` bounds the read; `read_to_end` grows `buf` only as needed (so a
+    // small file does not pre-allocate the whole ceiling). The returned Vec is moved
+    // into the caller's `Zeroizing` wrapper, so its bytes are wiped on drop.
+    f.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(VaultError::TooLarge);
+    }
+    Ok(buf)
 }
 
 /// Options for [`OpenVault::compact`]. `volume` re-packs the document store
@@ -1453,6 +1494,21 @@ mod tests {
         assert_eq!(&*v2.read_document(&id2).unwrap(), b"statement contents");
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn add_document_rejects_non_regular_source() {
+        let path = tmp_path("nonreg");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // A directory is not a regular file; add_document must refuse it rather than
+        // attempt an unbounded read (the /dev/zero / FIFO class of zero-length-but-
+        // endless inputs that would otherwise drive an OOM).
+        let dir_src = std::env::temp_dir().join(format!("pmsrc-dir-{}", nanos()));
+        fs::create_dir_all(&dir_src).unwrap();
+        let err = v.add_document("/d", "f.txt", &dir_src).unwrap_err();
+        assert!(matches!(err, VaultError::Storage(StorageError::Corrupt(_))));
+        let _ = fs::remove_dir_all(&dir_src);
+        cleanup(&path);
     }
 
     #[test]

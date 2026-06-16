@@ -679,7 +679,8 @@ itself is atomic, so a crash during it yields either the complete old file or th
 complete new one — never a half-written vault. On platforms without directory
 fsync a hard power loss could still lose the last save (never corrupt the file).
 Any truncated/garbled file is additionally caught by the AEAD tag on open (fails
-closed). See §6.
+closed). See §6, the full crash-safety treatment in §12, and the corruption
+taxonomy (crash vs. media bit-rot vs. tampering, with per-case recovery) in §12.7.
 
 ### 9.12 Rollback of authentic at-rest state is out of scope
 Every encrypted unit is authenticated and bound to its vault and partition: the
@@ -1032,3 +1033,205 @@ lost, the existing data is intact, and the vault reopens cleanly. The `vault.pmv
 is also the final commit point, so a document fully committed to its volume +
 manifest but not yet referenced by a saved vault is just harmless unreferenced
 garbage — not a dangling reference.
+
+### 12.7 Potential corruptions: taxonomy, detection, and recovery
+
+§12.1–12.6 cover **crash-induced** damage (power loss, force-kill, `ENOSPC`),
+which is always bounded to the in-flight operation and is self-healing on reopen.
+But "corruption" can also come from two other sources, and it is worth being
+explicit about all three and what each means in practice:
+
+1. **Crash-induced** (the in-flight write was interrupted). Covered by §12.1–12.6:
+   recovers to the last committed state, losing at most the one operation.
+2. **At-rest / media corruption** (bit-rot, a bad sector, a failing disk, a
+   truncated or garbled file from an interrupted *copy* to a USB stick). Unrelated
+   to any pass-mgr operation; this section is mainly about these.
+3. **Deliberate tampering by someone without the two passwords.** *Recovering* from
+   this is out of scope as a goal (an attacker with write access to the files can
+   always delete or roll them back — see §8 and §9.12), but the cryptography still
+   **detects** it: every read is authenticated, so tampering surfaces as an error,
+   never as plausible-but-wrong data.
+
+**The fail-closed principle.** Every byte the vault hands back has passed an AEAD
+(XChaCha20-Poly1305) tag check: `vault.pmv` as a whole, each partition manifest,
+and each document frame are individually authenticated, with the vault `id` +
+partition bound in as associated data (§5.4, §6.2). A wrong password, a flipped
+bit, a truncation, or a substituted file therefore all produce the **same**
+outcome — an explicit "won't decrypt / corrupted" error — rather than silently
+decrypting to garbage or to the wrong record. The format never returns
+plausible-but-wrong plaintext. And the recovery scanner that rebuilds a lost
+manifest is itself fully bounds-checked (lengths capped before allocation, all
+offset arithmetic via `checked_add`), so even a maliciously-corrupt volume cannot
+panic it or drive an out-of-bounds read or an unbounded allocation.
+
+**What each kind of damage does, and how it is handled:**
+
+| Where the damage is | How it is detected | Automatic recovery | If not recoverable in place |
+|---|---|---|---|
+| Torn frame at the **end** of a volume (crash mid-append) | manifest `end_offset` is authoritative | ignored on reopen; physically dropped by the next append's `set_len` | — |
+| A whole **manifest** lost or undecryptable, its volume intact | manifest fails to decrypt/parse, or the file is absent | **rebuilt** by scanning the self-describing volume up to the last good frame (`rebuild_manifest`/`scan_volume`) | — |
+| A **transient I/O error** reading a *present, valid* manifest | error class distinguished from corruption (`Io`/`TooLarge` ≠ `Corrupt`/`Crypto`/`Json`) | none needed — the error **propagates** instead of forcing a lossy scan (see §13.2.2); reopen/retry | — (transient) |
+| A single **document frame** bit-rotted | AEAD tag fails (and the frame's id/path are checked against the manifest) — but only when *that document is read* | the vault still **opens**; every other document still reads fine; only that one read errors | restore that document from a backup |
+| **`vault.pmv`** truncated or bit-rotted | header parse and/or the AEAD tag fail on open → fail closed | none — it is a single small AEAD file with **no in-place redundancy** by design | **restore `vault.pmv` from a backup** |
+| A record references a document **id that is absent** from the store | presence check at open | none — open **refuses** with `ArchiveMismatch` rather than silently dropping the reference | restore the store (or that document) from a backup |
+| Frame parser fed **corrupt lengths/offsets** (e.g. from a damaged volume during a rebuild) | bounds + `checked_add` guards | rejected as `Corrupt` — no panic, no over-read, no unbounded allocation | — |
+| A manifest/volume from a **different vault** dropped in | AAD binds the vault `id` + partition → AEAD fails | won't decrypt | restore the matching tree from a backup |
+
+**What genuinely requires a backup.** Self-healing covers a lost/garbled
+*manifest* (rebuilt from its volume) and any crash. It does **not** cover physical
+loss of authenticated *data*: a damaged `vault.pmv`, a bit-rotted document frame,
+or a missing piece of the store. There is deliberately no parity/duplicate-block
+scheme for `vault.pmv` — it is a small file, and the intended redundancy is an
+ordinary external backup (`backup`, §11 / README), which is a full encrypted copy
+needing the same two passwords. The write-generation counter shown at open lets a
+user *notice* a rollback to an older authentic state (§9.12) but is detection, not
+redundancy. Individual documents in an otherwise-healthy vault can also be salvaged
+one at a time with `export-document` / `extract` from any readable copy.
+
+## 13. Single-instance guard and post-audit hardening
+
+This section records two related pieces of work: a new **single-instance guard**
+for the GUI (§13.1), and the **correctness/hardening fixes** that came out of a
+full multi-subsystem bug audit (§13.2). The audit found no memory-safety, crypto,
+or integer-overflow defects (the crate is `#![forbid(unsafe_code)]`); every item
+below is a correctness, durability, resource-limit, or memory-hygiene improvement.
+
+### 13.1 Single-instance guard (`src/single_instance.rs`)
+
+**Symptom.** A user returned to their machine and found *many* pass-mgr windows
+open, each of which had to be closed individually. The binary never spawns itself;
+the cause was structural: `gui::run` opened a window via `eframe::run_native`
+**immediately**, at the lock screen, *before* the vault (and thus the single-writer
+lock, §9.16) is opened. The default GUI is read-only (§4.4), which takes no lock at
+all, so nothing detected an already-running instance — every launch (a
+double-clicked launcher, a Dock/taskbar icon, a wrapper script) stacked a fresh,
+independent window. A second `--write` launch only discovered the contention
+*after* both passwords were typed, then sat at the lock screen showing a "Locked"
+error rather than focusing the existing window.
+
+**Mechanism.** Before opening the window, `gui::run` calls
+`single_instance::acquire(path)`:
+
+- **Primary (first launch for this vault).** Takes an OS advisory lock
+  (`File::try_lock`) on a per-vault lock file in the per-user runtime directory —
+  the *same* kernel-released mechanism as the vault's `WriteLock` (§9.16), so it is
+  crash-safe and never goes stale. On Unix it also binds a tiny `UnixListener`.
+- **Secondary (lock already held).** On Unix it connects to that socket to ask the
+  primary to raise its window (the primary's background thread issues
+  `egui::ViewportCommand::Focus`), then exits without opening a window. On other
+  platforms it simply exits. Either way the pile-up is eliminated.
+
+**Design points.**
+
+- **Keyed per canonical vault path**, so two *different* vaults still get two
+  windows; only repeated launches of the *same* vault coalesce.
+- **Applies in read-only mode too** — that is the default and previously had no
+  coordination whatsoever.
+- **Never blocks the app.** Any setup error degrades to "run as an unguarded
+  primary" (the guard is best-effort, not a security boundary). The socket carries
+  **no vault data** — the connection itself is the "raise your window" signal; no
+  bytes are trusted. The lock file and socket live under a 0700 runtime dir and the
+  socket is chmod 0600.
+- **Escape hatch.** `PMVAULT_ALLOW_MULTIPLE=1` bypasses the guard for power users
+  who deliberately want several windows for one vault.
+
+### 13.2 Audit-driven correctness & hardening fixes
+
+#### 13.2.1 UI durability — "Saved." now means saved
+
+`OpenVault::save` returns a `Result`, and the front-ends' `persist()` helper
+returns a bool that is `true` **only** when the write reached disk. The five GUI
+record-save paths, the GUI document **Attach**, GUI `delete_current`, and the TUI
+`save_edit` / `delete_selected` previously called `persist()` and then
+*unconditionally* overwrote the status line with "Saved." / "Deleted." / "Document
+uploaded…". So when a save failed (full disk, or a read-only/poisoned handle after
+an interrupted rekey), the user was told it succeeded while the change never
+persisted — and the TUI even discarded the edit buffer. The on-disk state was
+always *consistent* (this is not corruption; see §12.6), but the reported outcome
+was wrong and the unsaved edit was silently lost.
+
+Fix: every success message and screen transition is now gated on `persist()`. On
+failure the "Save failed: …" status that `persist()` set is preserved, the record
+is left on disk untouched (a "deleted" record reappears only because it was never
+actually removed), and the TUI keeps the edit buffer open so the user can retry.
+The blob-reclaim paths were already correctly gated on `persist()` (so no dangling
+references, §12.6) — only the status messages were not.
+
+#### 13.2.2 Document-store recovery precision (`VolumeStore::open`)
+
+A lost or corrupt manifest is rebuilt by scanning its self-describing volume
+(§12.6). The trigger was `Err(_) if volume_exists` — i.e. **any** manifest read
+error caused a rebuild, including a transient I/O glitch or a momentary size-cap
+trip on a manifest that is actually valid. Because the scan stops at the first
+undecryptable frame and silently returns only the prefix, a transient failure on a
+*present, valid* manifest could discard its authoritative `end_offset` and drop
+later documents. The trigger is now narrowed to genuine corruption
+(`Corrupt`/`Crypto`/`Json`) or a genuinely *absent* manifest file; transient
+I/O and size-cap errors propagate instead of forcing a lossy scan.
+
+#### 13.2.3 Resource limits (DoS guards, extends §9.13)
+
+- **`add_document` source reads are now bounded.** It guarded size with
+  `fs::metadata().len()`, which reports `0` for character devices (`/dev/zero`),
+  FIFOs, etc., and can change between the stat and an unbounded `fs::read`. A
+  non-regular source is now rejected up front (`fs::metadata().is_file()`, which
+  still follows a symlink to a real document), and the read uses a hard ceiling
+  (`File::take(MAX_DOC_SIZE + 1)`) so a growing or special file cannot exhaust
+  memory.
+- **Password generator can no longer hang or over-allocate.** `uniform(n)` computed
+  its rejection zone from a 32-bit draw, so for `n > 2³²` the zone collapsed to `0`
+  and the sampler looped forever; it now draws 64 bits with a 128-bit zone
+  computation, keeping the zone `> 0` for every `n` (output remains exactly uniform,
+  no modulo bias). `generate` also rejects an absurd `length` (> `MAX_LENGTH`,
+  4096) with a new `GenError::TooLong` rather than attempting a multi-gigabyte
+  allocation. The shipped UIs only ever request length 20; this hardens the public
+  API against a programmatic caller.
+
+#### 13.2.4 Single-writer invariant for `import_tree` (extends §9.16)
+
+`import_tree` built the whole destination vault (volume + manifest writes, then
+`write_vault_file`) and only took the single-writer lock at the very end, via the
+final `OpenVault::open`. Its only guard against a concurrent build into the same
+fresh directory was a `dest.exists()` check — a TOCTOU. It now acquires
+`WriteLock` immediately after creating the directory and holds it for the entire
+build (released just before the final reopen re-acquires it), matching the
+lock-before-writing discipline of `create`/`open`.
+
+#### 13.2.5 Backup-location guard (`dest_inside`, supports §11.1)
+
+The `compact` pre-backup must never be written inside the tree being rewritten.
+When the destination does not yet exist (the normal case), `dest_inside` fell back
+to a raw component-wise `starts_with`, which a `./`-prefixed or otherwise
+equivalently-spelled path could evade (e.g. `./vault/inside` was not recognized as
+inside `vault`). The fallback now lexically normalizes both paths (absolutize
+against the cwd, fold away `.`/`..`) before comparing.
+
+#### 13.2.6 Secret memory hygiene (extends §9.6)
+
+These are defense-in-depth improvements to the "best-effort" wiping described in
+§9.6:
+
+- **Zeroize before overwrite.** Clicking *Generate* (GUI and TUI) assigned a new
+  `String` over the old password; a plain `String` reassignment frees the old heap
+  buffer **without** zeroing it. The old value is now `.zeroize()`d first.
+- **Wipe on failed auth.** The GUI only wiped the entered master passwords on a
+  *successful* unlock; on a wrong-password/error it left them in the `GuiApp`
+  buffers. It now wipes on the error paths too (matching the TUI, which rebuilds —
+  and thus zeroizes — its `AuthState`). A failed auth is exactly when a user may
+  step away.
+- **Pre-sized secret buffers.** The GUI master-password fields, the GUI
+  account-password edit buffer, and the TUI password `Field` are mutated in place
+  one keystroke at a time by the UI frameworks; each capacity growth reallocates
+  and frees an un-zeroized fragment of the secret. The buffers are now pre-sized
+  (generous `with_capacity` / `reserve`) so typing a normal-length password never
+  reallocates, and the TUI's transient incoming copy is zeroized after it is moved
+  into the pre-sized buffer.
+
+#### 13.2.7 Regression tests
+
+New tests lock in the externally-checkable fixes: `password::rejects_overlong_length`
+and `uniform_terminates_for_n_above_2_pow_32`; `vault::add_document_rejects_non_regular_source`;
+and `main::dest_inside_catches_dot_slash_relative_child`; plus the single-instance
+lock-arbitration tests in `single_instance`. The persist-gating fixes are covered
+by the existing crash/fault-injection suite (§12.5), which already exercises failed
+writes.

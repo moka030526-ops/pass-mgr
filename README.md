@@ -150,7 +150,9 @@ pass-mgr is built so that a power cut, a forced shutdown, or a full disk **canno
 corrupt your vault**. Whatever you were doing either fully completed or did not
 happen at all — there is never a half-saved, broken state. In almost every case the
 fix is the same: **just open the vault again.** It repairs itself automatically when
-it opens.
+it opens. (This is about *interruptions*. The rarer case of the file being
+physically *damaged* — a failing drive, a bad copy — is covered in the next
+section.)
 
 What to expect after an interruption, by what you were doing at the time:
 
@@ -182,6 +184,33 @@ What to expect after an interruption, by what you were doing at the time:
    sure no other pass-mgr window is open and try again; the lock releases itself when
    the program exits.
 
+## If the vault file itself is damaged (a failing disk or a bad copy)
+
+The protections above are about *interruptions*. A separate, rarer problem is the
+file being physically **damaged** — for example a failing hard drive or USB stick,
+bit-rot on old storage, or a copy that didn't finish. pass-mgr handles this safely
+too:
+
+- **It never shows you wrong information.** Every part of the vault is sealed with a
+  cryptographic check. If anything has been altered or damaged, pass-mgr reports an
+  error and refuses to open, rather than showing you scrambled or incorrect data.
+  (The very same "can't open" message also appears if you simply mistype a password,
+  so first just **re-check both passwords**, in order.)
+- **Small damage often repairs itself.** The internal index of your documents can be
+  rebuilt automatically from the documents themselves, so losing or damaging that
+  index is not fatal — just reopen.
+- **One damaged document doesn't block the rest.** If a single stored document is
+  damaged, the vault still opens and everything else works normally; only that one
+  document shows an error when you try to open it.
+- **If the main vault file is damaged, restore your backup.** The main file keeps no
+  built-in spare copy — *that is what your backups are for.* Open your most recent
+  backup with the same two passwords. (This is exactly why the first thing this guide
+  asks is to keep regular backups on a separate drive.)
+
+If even a backup won't open, you can still rescue individual documents from any copy
+that *does* open, using **Export** on each entry that has one (or the `extract`
+command in Part 2).
+
 ## If you are a family member or executor
 
 If someone left you this vault:
@@ -203,9 +232,11 @@ Everything lives in a single locked file on the computer:
 | Windows | `C:\Users\<you>\AppData\Roaming\pass-mgr\vault.pmv` |
 | Mac/Linux | `~/.local/share/pass-mgr/vault.pmv` |
 
-Your uploaded documents are in a second locked file next to it
-(`vault.pmv.vol`). Both are encrypted and useless to anyone without your two
-passwords. Keep them — and your backups — safe.
+Your uploaded documents are stored right next to it, inside `manifest/` and
+`volume/` folders in the same `pass-mgr` directory. Everything is encrypted and
+useless to anyone without your two passwords — so treat the **whole folder** as one
+unit: back it up together, and don't move or delete pieces of it. Keep it — and your
+backups — safe.
 
 ---
 
@@ -334,6 +365,17 @@ after 15s and on exit) · `Ctrl+U` upload document · `Ctrl+E` export document �
   are no external configuration files.
 - Saves are **atomic** (write to a temp file, fsync, rename, fsync the
   directory), so an interrupted write cannot corrupt an existing vault or archive.
+  A document append is fsync'd before its manifest is atomically committed, so a
+  crash recovers to the last fully-committed state, losing at most the one
+  in-flight operation.
+- **Corruption fails closed, never silent.** Every read — the vault file, each
+  document index (manifest), and each document — is authenticated, so damage,
+  tampering, or a wrong password all surface as an explicit error, never as
+  wrong/garbled data. A lost or damaged manifest is **rebuilt** by scanning the
+  self-describing volume; a damaged main vault file has no in-place spare and is
+  recovered from a backup. The recovery scanner is fully bounds-checked, so even a
+  maliciously-corrupt volume can't crash it. See `docs/DESIGN.md` §12 (crash-safety)
+  and §12.7 (corruption taxonomy & recovery).
 - No `unsafe` code; the encryption key is locked out of swap; secrets are wiped
   from memory on close.
 

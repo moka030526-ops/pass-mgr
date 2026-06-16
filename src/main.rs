@@ -579,8 +579,38 @@ fn default_backup_dir(vault_dir: &Path) -> PathBuf {
 fn dest_inside(vault_dir: &Path, dest: &Path) -> bool {
     match (std::fs::canonicalize(vault_dir).ok(), std::fs::canonicalize(dest).ok()) {
         (Some(v), Some(d)) => d == v || d.starts_with(&v),
-        _ => dest == vault_dir || dest.starts_with(vault_dir),
+        // The dest usually does not exist yet (it is a fresh backup dir), so we fall
+        // back to a LEXICAL comparison. Normalize both first — absolutize against the
+        // cwd and fold away `.`/`..` — so equivalent spellings like `./vault/inside`
+        // are still recognized as inside `vault` (a raw component-wise `starts_with`
+        // would miss the leading `CurDir` component and wrongly allow it).
+        _ => {
+            let v = lexical_normalize(vault_dir);
+            let d = lexical_normalize(dest);
+            d == v || d.starts_with(&v)
+        }
     }
+}
+
+/// Absolutize `path` against the current directory and fold away `.` and `..`
+/// components purely lexically (no filesystem access, so it works for paths that do
+/// not exist yet). Used by [`dest_inside`] when the destination cannot be canonicalized.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}                       // drop "."
+            Component::ParentDir => { out.pop(); }        // resolve ".." lexically
+            Component::RootDir | Component::Prefix(_) => out.push(comp.as_os_str()),
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    out
 }
 
 /// Decrypt stored documents and write them into `out_dir`, reconstructing the
@@ -1085,6 +1115,18 @@ mod tests {
         let sibling = vault_dir.parent().unwrap().join(format!("pmdi-out-{nanos}"));
         assert!(!super::dest_inside(&vault_dir, &sibling));
         let _ = std::fs::remove_dir_all(&vault_dir);
+    }
+
+    #[test]
+    fn dest_inside_catches_dot_slash_relative_child() {
+        // Regression: the lexical fallback used a raw component-wise starts_with that
+        // missed a leading "./", wrongly allowing a backup INSIDE the vault tree.
+        // These names don't exist, so canonicalize() fails and the lexical path runs.
+        let vault = Path::new("pmrel-vault-zzz");
+        assert!(super::dest_inside(vault, Path::new("./pmrel-vault-zzz/inside")));
+        assert!(super::dest_inside(vault, Path::new("pmrel-vault-zzz/inside")));
+        // A genuinely separate relative dir is still allowed.
+        assert!(!super::dest_inside(vault, Path::new("pmrel-other-zzz")));
     }
 
     #[test]
