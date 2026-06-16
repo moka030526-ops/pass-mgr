@@ -47,6 +47,20 @@ use crate::crypto::KdfParams;
 /// type `anyhow::Result<()>` means "succeeds with the empty value `()` or fails
 /// with a boxed error".
 pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
+    // Single-instance guard: if a window for this vault is already open, ask it to
+    // come to the front and exit instead of stacking another window the user would
+    // have to close one by one (see `crate::single_instance`). `_guard` holds an OS
+    // lock for the lifetime of this function — i.e. the whole GUI session — and
+    // releases it on return; `focus` is moved into the creation closure so later
+    // launches can raise this window.
+    let (_guard, focus) = match crate::single_instance::acquire(&path) {
+        crate::single_instance::Instance::AlreadyRunning => {
+            eprintln!("pass-mgr is already open for this vault; raising the existing window.");
+            return Ok(());
+        }
+        crate::single_instance::Instance::Primary { guard, focus } => (guard, focus),
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
@@ -59,8 +73,10 @@ pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
         options,
         // `Box::new(...)` heap-allocates; `Box<T>` is an owning pointer to a
         // heap value. `move |cc| ...` is a closure that *takes ownership* of the
-        // captured `path`/`writable` (the `move` keyword) so they outlive `run`.
+        // captured `path`/`writable`/`focus` (the `move` keyword) so they outlive `run`.
         Box::new(move |cc| {
+            // Now that the egui context exists, let later launches raise this window.
+            focus.serve(cc.egui_ctx.clone());
             // Apply the saved color theme before the first frame (avoids a flash of
             // the default theme); the app re-applies it live when the user changes it.
             cc.egui_ctx.set_visuals(visuals_for(load_theme()));
@@ -411,10 +427,14 @@ impl GuiApp {
             writable,
             screen: Screen::Auth,
             auth_mode,
-            pw1: String::new(),
-            confirm1: String::new(),
-            pw2: String::new(),
-            confirm2: String::new(),
+            // Pre-reserve generous capacity so typing a password never grows (and so
+            // reallocates) these buffers, which would strand un-zeroized fragments of
+            // the master password in freed heap. `wipe_passwords`/`Drop` wipe the live
+            // buffer; pre-sizing removes the reallocation leak in between.
+            pw1: String::with_capacity(256),
+            confirm1: String::with_capacity(256),
+            pw2: String::with_capacity(256),
+            confirm2: String::with_capacity(256),
             auth_error: None,
             vault: None,
             tab: Tab::Instructions,
@@ -623,9 +643,17 @@ impl GuiApp {
             // the wrong-password case is reported generically (no detail leak).
             Err(VaultError::Crypto(_)) => {
                 self.auth_error = Some("Wrong password(s) or corrupted vault.".into());
+                // Wipe the entered passwords on failure too (not just on success), so
+                // they don't linger in memory after a failed attempt — the moment a
+                // user is most likely to step away. Mirrors the TUI, which rebuilds
+                // (and thus zeroizes) its AuthState on a failed unlock.
+                self.wipe_passwords();
             }
             // `Err(e)` catches every other error variant.
-            Err(e) => self.auth_error = Some(format!("{e}")),
+            Err(e) => {
+                self.auth_error = Some(format!("{e}"));
+                self.wipe_passwords();
+            }
         }
     }
 
@@ -1031,8 +1059,10 @@ impl GuiApp {
                 {
                     records::upsert(&mut ov.vault.instructions, r);
                 }
-                self.persist();
-                self.status = "Saved.".into();
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::Instructions),
             // `_ => {}` handles the remaining `FormAction::None` with a no-op.
@@ -1101,8 +1131,10 @@ impl GuiApp {
                 {
                     records::upsert(&mut ov.vault.trust_wills, r);
                 }
-                self.persist();
-                self.status = "Saved.".into();
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::TrustWill),
             _ => {}
@@ -1211,8 +1243,10 @@ impl GuiApp {
                 {
                     records::upsert(&mut ov.vault.assets, r);
                 }
-                self.persist();
-                self.status = "Saved.".into();
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::Assets),
             _ => {}
@@ -1384,11 +1418,22 @@ impl GuiApp {
                 self.reveal_pw = false;
             }
         }
+        // Pre-size the password buffer so typing in the egui field doesn't reallocate
+        // and strand un-zeroized fragments of the account secret in freed heap. The
+        // Account record is ZeroizeOnDrop, but that only wipes the final buffer, not
+        // the copies abandoned by per-keystroke growth. `reserve` is a no-op once the
+        // capacity is sufficient, so this is cheap to call each frame.
+        if let Some(r) = self.edit_account.as_mut() {
+            r.password.reserve(128);
+        }
         if generate
             && let Some(r) = self.edit_account.as_mut()
         {
-            // `.unwrap_or_default()` yields the generated password on success or
-            // an empty string on the (unexpected) error case, avoiding a panic.
+            // Wipe the previous candidate's bytes before dropping it: a plain
+            // `String` reassignment frees the old buffer WITHOUT zeroizing, leaving a
+            // prior password in freed heap. `.unwrap_or_default()` yields the new
+            // password on success or an empty string on the (unexpected) error case.
+            r.password.zeroize();
             r.password = password::generate(&GenOptions::default()).unwrap_or_default();
             self.reveal_pw = true;
         }
@@ -1403,8 +1448,10 @@ impl GuiApp {
                 {
                     records::upsert(&mut ov.vault.accounts, r);
                 }
-                self.persist();
-                self.status = "Saved.".into();
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::Accounts),
             _ => {}
@@ -1453,8 +1500,10 @@ impl GuiApp {
                 {
                     records::upsert(&mut ov.vault.real_estate, r);
                 }
-                self.persist();
-                self.status = "Saved.".into();
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::RealEstate),
             _ => {}
@@ -1547,19 +1596,21 @@ impl GuiApp {
                 // Persist the record→document link immediately so the manifest
                 // entry is referenced (no orphan if the user navigates away).
                 self.upsert_doc_target(target);
-                // Only reclaim the replaced blob if the new link actually reached
-                // disk. If the save failed, vault.pmv still references `old`, so
-                // dropping it would create a dangling reference (ArchiveMismatch).
-                if self.persist()
-                    && let Some(old) = previous
-                    && let Some(ov) = self.vault.as_mut()
-                {
-                    // `let _ = ...` deliberately discards the `Result`: a failure
-                    // here only orphans a blob (harmless), so it is not reported.
-                    let _ = ov.remove_document(&old);
-                }
                 self.clear_doc_inputs();
-                self.status = "Document uploaded to the encrypted volume.".into();
+                if self.persist() {
+                    // Only reclaim the replaced blob once the new link actually reached
+                    // disk. If the save failed, vault.pmv still references `old`, so
+                    // dropping it would create a dangling reference (ArchiveMismatch).
+                    if let Some(old) = previous
+                        && let Some(ov) = self.vault.as_mut()
+                    {
+                        // `let _ = ...` deliberately discards the `Result`: a failure
+                        // here only orphans a blob (harmless), so it is not reported.
+                        let _ = ov.remove_document(&old);
+                    }
+                    self.status = "Document uploaded to the encrypted volume.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
             }
             DocReq::Export => {
                 let file_id = match target {
@@ -1674,8 +1725,10 @@ impl GuiApp {
                     let _ = ov.remove_document(&id);
                 }
             }
+            self.status = "Deleted.".into();
         }
-        self.status = "Deleted.".into();
+        // On failure persist() has already set the "Save failed: …" status, and the
+        // record is still on disk — so do not claim it was deleted.
     }
 
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {

@@ -241,8 +241,14 @@ impl Field {
     fn multiline(label: &str, value: String) -> Field {
         Field { label: label.into(), value, kind: FieldKind::Multiline }
     }
-    fn password(label: &str, value: String) -> Field {
-        Field { label: label.into(), value, kind: FieldKind::Password }
+    fn password(label: &str, mut value: String) -> Field {
+        // Pre-size the buffer so per-keystroke typing never reallocates (which would
+        // strand un-zeroized fragments of the secret in freed heap). Copy into the
+        // pre-sized buffer, then wipe the transient incoming `String`.
+        let mut buf = String::with_capacity(value.len() + 128);
+        buf.push_str(&value);
+        value.zeroize();
+        Field { label: label.into(), value: buf, kind: FieldKind::Password }
     }
     fn choice(label: &str, value: String, options: Vec<String>) -> Field {
         Field { label: label.into(), value, kind: FieldKind::Choice(options) }
@@ -1175,6 +1181,10 @@ impl App {
                 if self.writable
                     && let Some(f) = es.fields.iter_mut().find(|f| matches!(f.kind, FieldKind::Password))
                 {
+                    // Wipe the previous value before replacing it: a plain `String`
+                    // reassignment frees the old buffer without zeroizing, leaving the
+                    // prior password in freed heap.
+                    f.value.zeroize();
                     f.value = password::generate(&GenOptions::default()).unwrap_or_default();
                     es.reveal = true;
                     self.status = "Generated a random password.".into();
@@ -1502,10 +1512,16 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
-        self.persist();
-        self.status = "Saved.".into();
-        self.screen = Screen::Browse;
-        self.clamp_selection();
+        if self.persist() {
+            self.status = "Saved.".into();
+            self.screen = Screen::Browse;
+            self.clamp_selection();
+        } else {
+            // persist() already set "Save failed: …". Keep the edit buffer open so the
+            // user can retry rather than being told "Saved." while the write failed
+            // (full disk, read-only handle, …) and silently losing their data.
+            self.edit = Some(es);
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -1554,9 +1570,11 @@ impl App {
                     let _ = ov.remove_document(&fid);
                 }
             }
+            self.status = "Deleted.".into();
         }
+        // On failure persist() has already set the "Save failed: …" status, and the
+        // record is still on disk — so do not claim it was deleted.
         self.clamp_selection();
-        self.status = "Deleted.".into();
     }
 
     // `text: Zeroizing<String>` is taken by value (moved in): this function owns
