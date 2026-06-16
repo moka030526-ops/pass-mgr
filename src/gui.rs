@@ -373,6 +373,11 @@ struct GuiApp {
     backup_dest: String,
     // Volume-size config input (whole MiB).
     cfg_volume_size: String,
+    /// The redundancy-depth picker's selection (persistent across frames — egui's
+    /// ComboBox closure only runs while the popup is open, so a frame-local would
+    /// reset before Apply and the control would be dead). Re-seeded from the vault
+    /// each time the Config screen is opened.
+    cfg_redundancy: u32,
     // Shared document-attach input buffers.
     doc_location: String,
     doc_filename: String,
@@ -456,6 +461,7 @@ impl GuiApp {
             new_subtype_name: String::new(),
             backup_dest: String::new(),
             cfg_volume_size: String::new(),
+            cfg_redundancy: 0,
             doc_location: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
@@ -621,7 +627,13 @@ impl GuiApp {
 
         match result {
             Ok(v) => {
-                self.status = if creating {
+                // If the live vault.pmv was unreadable and we recovered from an
+                // in-place redundant copy (§12.8), that notice takes priority — the
+                // user needs to know a roll-forward/rollback happened.
+                let recovered = v.recovery_notice().map(|s| s.to_string());
+                self.status = if let Some(notice) = recovered {
+                    notice
+                } else if creating {
                     "New vault created.".to_string()
                 } else if v.previous_access() == 0 {
                     "Vault unlocked.".to_string()
@@ -760,6 +772,10 @@ impl GuiApp {
                 self.screen = Screen::Auth;
             }
             if ui.button("⚙ Config").clicked() {
+                // Seed the redundancy picker from the live setting each time Config
+                // opens, so the combo reflects the current value (and its selection
+                // survives across frames until Apply).
+                self.cfg_redundancy = self.vault_ref().redundancy();
                 self.screen = Screen::Config;
             }
             if ui.button("Quit").clicked() {
@@ -802,9 +818,14 @@ impl GuiApp {
         let mut add_subtype = false;
         let mut do_backup = false;
         let mut set_volume = false;
+        let mut set_redundancy = false;
         // Snapshot the category lists + volume cap (from the open vault) before the
         // render closure borrows `self` mutably for the text inputs.
         let cur_volume_mib = self.vault_ref().volume_max_size() / (1024 * 1024);
+        // The current on-disk depth, to skip a no-op Apply. The picker's selection
+        // lives in the PERSISTENT `self.cfg_redundancy` (seeded when Config opened),
+        // not a frame-local, so it survives until the user clicks Apply.
+        let cur_redundancy = self.vault_ref().redundancy();
         let cats = self.vault_ref().categories();
         let type_names = cats.account_type_names();
         let asset_list = cats.asset.join(" · ");
@@ -908,6 +929,33 @@ impl GuiApp {
                         set_volume = true;
                     }
                 });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Vault file redundancy (advanced)").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Keeps extra encrypted copies of the small vault file so a damaged \
+                         vault.pmv can be recovered in place: a same-generation mirror plus N \
+                         prior generations (also an 'undo last save'). 0 = off. This does NOT \
+                         replace off-device backups, and it leaves more old encrypted data on disk.",
+                    )
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Copies to keep:");
+                    egui::ComboBox::from_id_salt("redundancy")
+                        .selected_text(if self.cfg_redundancy == 0 { "Off".to_string() } else { self.cfg_redundancy.to_string() })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg_redundancy, 0, "Off");
+                            for n in 1..=5u32 {
+                                ui.selectable_value(&mut self.cfg_redundancy, n, n.to_string());
+                            }
+                        });
+                    if ui.button("Apply").clicked() {
+                        set_redundancy = true;
+                    }
+                });
             }
         });
 
@@ -990,6 +1038,19 @@ impl GuiApp {
                 }
                 // `_` is the catch-all arm: any other case (parse error, or 0).
                 _ => self.status = "Enter a whole number of MiB (at least 1).".into(),
+            }
+        }
+        if set_redundancy && self.cfg_redundancy != cur_redundancy {
+            let choice = self.cfg_redundancy;
+            match self.vault.as_mut().expect("vault open on config").set_redundancy(choice) {
+                Ok(()) => {
+                    self.status = if choice == 0 {
+                        "Vault file redundancy turned off (extra copies removed).".into()
+                    } else {
+                        format!("Vault file redundancy set to {choice} (mirror + {choice} prior generation(s)).")
+                    };
+                }
+                Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
 

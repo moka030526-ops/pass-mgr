@@ -632,6 +632,16 @@ pub struct VaultSettings {
     /// Per-partition document-volume size cap (bytes). A new document that would
     /// push the active partition past this rolls into a fresh partition.
     pub volume_max_size: u64, // u64 = unsigned 64-bit integer
+    /// Opt-in in-place redundancy for `vault.pmv` (see `docs/DESIGN.md` §12.8).
+    /// `0` (the default) = off: just the single `vault.pmv`. `N >= 1` = also write a
+    /// same-generation mirror (`vault.pmv.mirror`) AND retain the last `N` prior
+    /// generations (`vault.pmv.bak1`..`bakN`), so a bit-rotted vault file can be
+    /// recovered in place. This is a complement to off-device backups, NOT a
+    /// replacement, and it leaves more encrypted copies of old secrets on disk.
+    /// `#[serde(default)]` keeps vaults written before this field existed loadable
+    /// (they decode as `0`).
+    #[serde(default)]
+    pub redundancy: u32,
 }
 
 // Hand-written `Default` implementation (the `Default` trait's one method).
@@ -639,7 +649,7 @@ pub struct VaultSettings {
 // constant rather than 0.
 impl Default for VaultSettings {
     fn default() -> Self {
-        VaultSettings { volume_max_size: crate::storage::DEFAULT_VOLUME_MAX_SIZE }
+        VaultSettings { volume_max_size: crate::storage::DEFAULT_VOLUME_MAX_SIZE, redundancy: 0 }
     }
 }
 

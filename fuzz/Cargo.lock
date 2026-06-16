@@ -2914,6 +2914,7 @@ dependencies = [
  "directories",
  "eframe",
  "getrandom 0.4.2",
+ "libc",
  "ratatui",
  "region",
  "serde",

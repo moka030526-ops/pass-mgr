@@ -288,7 +288,11 @@ impl VolumeStore {
     /// updates and deletes — that a `compact` rewrite would remove.
     pub fn space_stats(&self) -> (u64, u64) {
         let committed: u64 = self.manifests.iter().map(|m| m.end_offset).sum();
-        let live: u64 = self.manifests.iter().flat_map(|m| m.entries.iter()).map(|e| e.length).sum();
+        // Sum live bytes from the UNIQUE index (one entry per id), not by summing all
+        // manifest entries — a duplicate id across partitions (only reachable via a
+        // crafted/corrupt authenticated manifest) would otherwise be double-counted,
+        // making `committed - live` underflow-saturate to 0 and under-report garbage.
+        let live: u64 = self.index.values().map(|loc| loc.length).sum();
         (committed, live)
     }
 

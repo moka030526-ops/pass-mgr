@@ -70,6 +70,15 @@ const REKEY_DIR: &str = ".rekey";
 const REKEY_READY: &str = "READY";
 /// Single-writer advisory lock file inside the vault directory.
 const LOCK_FILE: &str = "pass-mgr.lock";
+/// Upper bound on the opt-in in-place redundancy depth (§12.8): the number of prior
+/// `vault.pmv` generations retained. Each generation is a small encrypted copy, so a
+/// few is plenty; this caps disk use and lingering old-secret copies.
+const MAX_REDUNDANCY: u32 = 10;
+/// Sane bounds for `volume_max_size` adopted from an UNTRUSTED import mirror
+/// (`import_tree`): a floor so a tiny value can't fragment the store into a huge
+/// number of partitions, and a generous ceiling that still rejects absurd values.
+const MIN_VOLUME_MAX_SIZE: u64 = 64 * 1024; // 64 KiB
+const MAX_VOLUME_MAX_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
 
 // Sanity bounds for KDF parameters read from an untrusted file header, validated
 // *before* the (expensive, memory-hard) key derivation runs (DoS guard).
@@ -213,6 +222,11 @@ pub struct OpenVault {
     previous_generation: u64,
     read_only: bool,
     storage: VolumeStore,
+    /// Set by the open path when the live `vault.pmv` was unreadable and the vault
+    /// was recovered from an in-place redundant copy (§12.8) — a human-readable
+    /// notice the front-ends surface so the user knows a roll-forward/rollback
+    /// happened. `None` on a normal open.
+    recovery_notice: Option<String>,
     /// Held for a writable session: the OS advisory lock on `pass-mgr.lock`.
     /// `None` for read-only opens. Released automatically when this `OpenVault`
     /// drops (including on process crash), so the lock never goes stale.
@@ -270,8 +284,16 @@ impl OpenVault {
         let dir = parent_dir(&path); // `&path` lends the path without giving it away
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
+        // fsync the new vault directory's own entry into its parent, so a power loss
+        // right after the first save can't lose the directory that holds vault.pmv.
+        sync_parent_dir(&dir);
         // Take the single-writer lock before writing anything into the directory.
         let write_lock = Some(WriteLock::acquire(&dir)?);
+        // Discard any stale `.rekey` staging left in this directory. A fresh create
+        // gets a brand-new vault id/key, so an unrelated leftover staging must never
+        // be rolled forward over it by the next open's `recover_pending_rekey`
+        // (matches `staged_rewrite`'s stale-staging clear). Best-effort.
+        let _ = fs::remove_dir_all(dir.join(REKEY_DIR));
         // `::<SALT_LEN>` is a turbofish: it pins the generic length parameter so the
         // call returns a `[u8; SALT_LEN]` of random bytes.
         let salt = crypto::random_bytes::<SALT_LEN>()?;
@@ -298,6 +320,7 @@ impl OpenVault {
             previous_generation: 0,
             read_only: false,
             storage,
+            recovery_notice: None,
             _write_lock: write_lock,
         };
         open.save()?; // first on-disk commit of the new vault file
@@ -330,19 +353,44 @@ impl OpenVault {
         let write_lock = if read_only { None } else { Some(WriteLock::acquire(&dir)?) };
         // Finish/abort an interrupted password change before touching the vault.
         recover_pending_rekey(&dir, read_only)?;
+        // Sweep stale atomic-write temps left by a crash mid-save (best-effort,
+        // writable only). They are encrypted (no plaintext leak) but sweeping keeps
+        // the dir tidy and avoids old-key temps lingering after a password change.
+        if !read_only {
+            sweep_stale_temps(&dir);
+        }
 
-        // Destructuring assignment: the returned 3-tuple is unpacked into three
-        // bindings at once. `mut vault` is mutable so we can update its timestamp.
-        let (mut vault, header, key) = decrypt_file(&path, pw1, pw2)?;
+        // Destructuring assignment: the returned tuple is unpacked into bindings at
+        // once. `mut vault` is mutable so we can update its timestamp. The 4th element
+        // is `Some(notice)` when the live `vault.pmv` was unreadable and we recovered
+        // from an in-place redundant copy (§12.8); `None` on a normal open.
+        let (mut vault, header, key, notice) = decrypt_with_redundancy(&path, pw1, pw2)?;
         let previous_access = vault.last_opened_at;
         let previous_generation = vault.generation;
         vault.last_opened_at = records::unix_now();
 
-        let storage = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
+        // A concurrent writer's rekey can swap volume/manifest to the NEW key after a
+        // read-only open already read the OLD vault.pmv (a reader-vs-writer race,
+        // §9.16). In that window the store won't decrypt / a referenced doc looks
+        // missing — surface a clear, retryable `RekeyPending` rather than an alarming
+        // Crypto/`ArchiveMismatch`. Best-effort: re-checking `.rekey` catches the
+        // in-flight case (a rekey that fully completed mid-read is the rare tail).
+        let storage = match VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size) {
+            Ok(s) => s,
+            Err(e) => {
+                if dir.join(REKEY_DIR).exists() {
+                    return Err(VaultError::RekeyPending);
+                }
+                return Err(e.into());
+            }
+        };
         // Consistency: every document a record references must be present.
         // `for id in ...` iterates the returned Vec, binding each element to `id`.
         for id in referenced_doc_ids(&vault) {
             if !storage.contains(&id) { // `!` is boolean NOT
+                if dir.join(REKEY_DIR).exists() {
+                    return Err(VaultError::RekeyPending);
+                }
                 return Err(VaultError::ArchiveMismatch);
             }
         }
@@ -357,13 +405,19 @@ impl OpenVault {
             previous_generation,
             read_only,
             storage,
+            recovery_notice: notice,
             _write_lock: write_lock,
         };
         // Best-effort refresh of last-opened; skipped entirely in read-only mode.
         // `let _ =` discards the Result: if this write fails we still hand back the
-        // opened vault (the refresh is non-essential).
+        // opened vault (the refresh is non-essential). When we recovered from a
+        // redundant copy, this same save also HEALS the live tree — it rewrites a
+        // fresh `vault.pmv` (+ mirror) from the recovered state. On a heal we pass
+        // `rotate_ring=false` so the corrupt outgoing primary is NOT ringed into a
+        // generation slot (it would otherwise void that slot with un-decryptable bytes).
         if !read_only {
-            let _ = open.save();
+            let rotate_ring = open.recovery_notice.is_none();
+            let _ = open.save_internal(rotate_ring);
         }
         Ok(open)
     }
@@ -484,10 +538,21 @@ impl OpenVault {
         // Read + validate the mirror's vault JSON (size-capped, symlink-rejected;
         // wipe the buffer after parsing). The mirror is untrusted input.
         let vault_json = Zeroizing::new(read_capped(&src.join("vault.json"), MAX_VAULT_SIZE)?);
-        let vault: Vault = serde_json::from_slice(&vault_json)?;
+        let mut vault: Vault = serde_json::from_slice(&vault_json)?;
         if vault.version != FORMAT_VERSION {
             return Err(VaultError::BadVersion(vault.version));
         }
+        // The mirror is UNTRUSTED. `vault.id` becomes the AEAD AAD domain for every
+        // volume/manifest, and `volume_max_size` drives partition placement — sanitize
+        // both rather than adopting crafted values. The id is normally 32 random hex
+        // chars (`records::random_id`); reject anything that isn't a short ASCII
+        // alphanumeric token. Clamp the volume size into a sane range; cap the
+        // redundancy depth. (Per-blob ids are separately checked by `is_safe_blob_id`.)
+        if vault.id.is_empty() || vault.id.len() > 64 || !vault.id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe vault id in mirror: {:?}", vault.id))));
+        }
+        vault.settings.volume_max_size = vault.settings.volume_max_size.clamp(MIN_VOLUME_MAX_SIZE, MAX_VOLUME_MAX_SIZE);
+        vault.settings.redundancy = vault.settings.redundancy.min(MAX_REDUNDANCY);
         let dir = parent_dir(dest);
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
@@ -548,14 +613,108 @@ impl OpenVault {
     // `Result<(), VaultError>` returns `()` (the empty/unit value) on success —
     // i.e. "succeeded, no data to hand back".
     pub fn save(&mut self) -> Result<(), VaultError> {
+        self.save_internal(true)
+    }
+
+    /// The save path. `rotate_ring` is `true` for a normal save — the outgoing
+    /// generation is ringed into `bak1`. It is `false` for a recovery HEAL save
+    /// (§12.8): there the outgoing `vault.pmv` is the corrupt file we just recovered
+    /// *around*, so it must NOT be preserved as a "generation" (that would silently
+    /// void a ring slot with garbage).
+    fn save_internal(&mut self, rotate_ring: bool) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
         // `saturating_add` increments but clamps at the max value instead of
         // overflowing/panicking — a monotonically rising version counter.
         self.vault.generation = self.vault.generation.saturating_add(1);
-        // No `?`/`Ok` wrapper: this call's `Result` is returned directly as ours.
-        write_vault_file(&self.path, &self.vault, &self.key, &self.salt, self.params)
+
+        // Opt-in in-place redundancy (§12.8). `0` = off (the default): a single
+        // `vault.pmv`, exactly as before. `N >= 1` = keep `N` prior generations and a
+        // same-generation mirror so a bit-rotted vault file can be recovered in place.
+        let depth = self.vault.settings.redundancy;
+
+        // Capture the OUTGOING generation's bytes BEFORE the primary is overwritten,
+        // but ring them in only AFTER the new primary commits (below) — so a FAILED
+        // save never shifts/degrades the ring. Skipped on a heal (the outgoing
+        // primary is known-bad) and on the first save (nothing to retain yet).
+        let prev = if rotate_ring && depth > 0 { read_capped_vault(&self.path).ok() } else { None };
+
+        // The single authoritative commit point — identical to the non-redundant
+        // path. If this fails (e.g. ENOSPC) the whole save fails, the live file is
+        // untouched (atomic temp+rename), AND the ring is untouched (not yet rotated).
+        write_vault_file(&self.path, &self.vault, &self.key, &self.salt, self.params)?;
+
+        if depth > 0 {
+            match &prev {
+                // Normal save: ring the outgoing generation into bak1 (atomic +
+                // symlink-safe), shifting the rest and pruning beyond `depth`.
+                Some(bytes) => rotate_generations(&self.path, depth, bytes),
+                // First save, or a heal: no outgoing generation to ring in — just
+                // prune any slots beyond the configured depth (e.g. after lowering it).
+                None => prune_generations_above(&self.path, depth),
+            }
+            // Best-effort same-generation mirror: a fresh, independent encryption of
+            // the same vault (its own random nonce). Failing it does not fail the
+            // save — the primary already committed.
+            // Fault point (crash-test only): a crash/ENOSPC here is AFTER the
+            // authoritative primary commit, so it must leave the vault openable from
+            // the primary. On an injected ENOSPC the best-effort mirror is skipped.
+            if crate::fault::point("redundancy.mirror").is_ok() {
+                let _ = write_vault_file(&mirror_path(&self.path), &self.vault, &self.key, &self.salt, self.params);
+            }
+        } else {
+            // Redundancy off: remove any copies left over from a previously-enabled
+            // state, so disabling the feature also stops leaving old secrets on disk.
+            cleanup_redundancy(&self.path);
+        }
+        Ok(())
+    }
+
+    /// Best-effort regeneration of the in-place redundancy copies (mirror + `bak1`)
+    /// under the CURRENT key, without bumping the generation. Used right after a
+    /// rekey/compaction commit so the configured protection is restored immediately
+    /// instead of being absent until the next ordinary save (§12.8).
+    fn refresh_redundancy_copies(&self) {
+        let depth = self.vault.settings.redundancy;
+        if depth == 0 {
+            return;
+        }
+        // Fault point (crash-test only): a crash here leaves the just-committed vault
+        // with no redundant copies until the next save — recovery from the primary is
+        // unaffected (it is the authoritative, already-durable tree).
+        let _ = crate::fault::point("redundancy.refresh");
+        // A fresh mirror of the just-committed vault, and a bak1 copy of the live
+        // primary (the post-rekey generations legitimately reset to the new epoch).
+        let _ = write_vault_file(&mirror_path(&self.path), &self.vault, &self.key, &self.salt, self.params);
+        if let Ok(bytes) = read_capped_vault(&self.path) {
+            let _ = write_bytes_atomic(&bak_path(&self.path, 1), &bytes);
+        }
+        prune_generations_above(&self.path, depth);
+    }
+
+    /// Set the in-place redundancy depth (§12.8): `0` = off, `N >= 1` = keep a
+    /// same-generation mirror plus `N` prior generations of `vault.pmv`. Clamped to
+    /// [`MAX_REDUNDANCY`]. Persists immediately (the new copies appear on this save).
+    pub fn set_redundancy(&mut self, depth: u32) -> Result<(), VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        let depth = depth.min(MAX_REDUNDANCY);
+        self.vault.settings.redundancy = depth;
+        self.vault.audit.push(Change::new("redundancy_changed", depth.to_string()));
+        self.save()
+    }
+
+    /// The current in-place redundancy depth (`0` = off).
+    pub fn redundancy(&self) -> u32 {
+        self.vault.settings.redundancy
+    }
+
+    /// A notice if this vault was recovered from a redundant copy on open (§12.8),
+    /// for the front-ends to surface; `None` on a normal open.
+    pub fn recovery_notice(&self) -> Option<&str> {
+        self.recovery_notice.as_deref()
     }
 
     /// Re-key under two new passwords via a **full re-encryption** of the vault and
@@ -604,6 +763,10 @@ impl OpenVault {
         let _ = fs::remove_dir_all(&staging); // clear any stale staging
         fs::create_dir_all(&staging)?;
         harden_dir(&staging);
+        // fsync the vault dir so the `.rekey` directory ENTRY itself is durable before
+        // any staged content (and the READY marker) is written into it — otherwise a
+        // power loss could lose the whole staging directory, defeating the roll-forward.
+        sync_parent_dir(&staging);
 
         // The key/salt the STAGED tree is encrypted under: the new key when
         // re-keying, else the current key (compaction). Reads always decrypt under
@@ -676,6 +839,10 @@ impl OpenVault {
         match VolumeStore::open(&dir, &self.key, &self.vault.id, self.vault.settings.volume_max_size) {
             Ok(store) => {
                 self.storage = store;
+                // commit_rekey cleared the old-key redundancy copies; regenerate them
+                // under the NEW key NOW so the configured protection isn't absent in
+                // the window until the next ordinary save (§12.8). Best-effort.
+                self.refresh_redundancy_copies();
                 Ok(())
             }
             Err(e) => {
@@ -953,10 +1120,24 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
     if meta.file_type().is_symlink() {
         return Err(VaultError::Storage(StorageError::Corrupt(format!("mirror entry is a symlink: {}", path.display()))));
     }
-    if meta.len() > max {
+    // Bound the READ itself (not just a pre-stat), so a file that grows between the
+    // stat and the read can't bypass the ceiling or OOM the import (matches
+    // `read_file_capped`).
+    read_bounded(path, max)
+}
+
+/// Read at most `max + 1` bytes from `path`, erroring `TooLarge` if the file holds
+/// more than `max`. The `+ 1` lets us detect an over-size file without ever
+/// allocating beyond the ceiling, regardless of a concurrent grow-after-stat.
+fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
+    use std::io::Read;
+    let f = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
         return Err(VaultError::TooLarge);
     }
-    Ok(fs::read(path)?)
+    Ok(buf)
 }
 
 /// Read a file with a hard size ceiling (unlike `fs::read`, which allocates without
@@ -1032,39 +1213,254 @@ fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
 
 /// Read, parse, and decrypt the vault file at `path`. Performs no writes.
 fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, Key), VaultError> {
-    // Bound the read before slurping the whole file (DoS guard): a crafted,
-    // oversized vault.pmv must be rejected before allocation, not after.
-    // Guarded match arms: `Ok(m) if m.len() > CAP` only fires when the metadata
-    // call succeeded *and* the file is over the cap. The `_ => {}` arm does nothing
-    // (`{}` is an empty block) for the normal in-range case.
-    match fs::metadata(path) {
-        Ok(m) if m.len() > MAX_VAULT_SIZE => return Err(VaultError::TooLarge),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(VaultError::NotFound(path.to_path_buf()));
-        }
-        _ => {}
-    }
-    // This `match` is itself an expression assigned to `raw`: on `Ok(b)` it
-    // evaluates to the bytes `b`; the error arms early-return instead.
-    let raw = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(VaultError::NotFound(path.to_path_buf()));
-        }
-        Err(e) => return Err(e.into()), // `.into()` converts io::Error -> VaultError (via #[from])
+    let raw = read_capped_vault(path)?;
+    decode_vault_bytes(&raw, pw1, pw2)
+}
+
+/// Read a `vault.pmv`-shaped file with the DoS size cap applied *before* the read
+/// (a crafted, oversized file is rejected before allocation, not after). A missing
+/// file maps to [`VaultError::NotFound`].
+fn read_capped_vault(path: &Path) -> Result<Vec<u8>, VaultError> {
+    use std::io::Read;
+    // Open first so the cap can be enforced on the READ (a bounded `take`), not on a
+    // separate stat that a concurrent grow could outrun. A missing file maps to
+    // NotFound (the create flow + redundancy recovery rely on this).
+    let f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VaultError::NotFound(path.to_path_buf())),
+        Err(e) => return Err(e.into()),
     };
-    let header = Header::parse(&raw)?;
-    let ciphertext = &raw[HEADER_LEN..]; // slice from byte 61 to the end (everything after the header)
+    let mut buf = Vec::new();
+    f.take(MAX_VAULT_SIZE.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_VAULT_SIZE {
+        return Err(VaultError::TooLarge);
+    }
+    Ok(buf)
+}
+
+/// Parse the header, derive the key from the two passwords, AEAD-verify+decrypt, and
+/// deserialize the JSON vault. The full header (incl. nonce) is the AEAD associated
+/// data, so any header tamper or bit-rot fails the tag (fail closed).
+fn decode_vault_bytes(raw: &[u8], pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, Key), VaultError> {
+    let header = Header::parse(raw)?;
     let key = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params)?;
-    // The full header (incl. nonce) is the AEAD associated data.
+    let (vault, _) = decode_vault_with_key(raw, &key)?;
+    Ok((vault, header, key))
+}
+
+/// Like [`decode_vault_bytes`] but with the key **already derived** — used by the
+/// redundancy recovery path so the (expensive, memory-hard) key derivation runs
+/// once even when several copies must be tried (also stops a wrong password from
+/// triggering N Argon2 runs).
+fn decode_vault_with_key(raw: &[u8], key: &Key) -> Result<(Vault, Header), VaultError> {
+    let header = Header::parse(raw)?;
+    let ciphertext = &raw[HEADER_LEN..]; // everything after the fixed-size header
     let aad = header.to_bytes();
     // Decrypt into a `Zeroizing` buffer so the plaintext JSON is wiped on drop.
-    // `?` here means: if decryption fails (wrong password or tampering), return early.
-    let plaintext = Zeroizing::new(crypto::decrypt(&key, &header.nonce, ciphertext, &aad)?);
-    // Parse the JSON plaintext into a `Vault`. The `: Vault` annotation tells
-    // serde which type to deserialize into. `&plaintext` lends the bytes read-only.
+    let plaintext = Zeroizing::new(crypto::decrypt(key, &header.nonce, ciphertext, &aad)?);
     let vault: Vault = serde_json::from_slice(&plaintext)?;
-    Ok((vault, header, key)) // hand back all three so callers can reuse the key/header
+    Ok((vault, header))
+}
+
+/// Open `vault.pmv`, transparently falling back to the opt-in in-place redundant
+/// copies (§12.8) when the live file is unreadable. Returns `Some(notice)` as the
+/// 4th element when recovery happened. Order: the live file, then the
+/// same-generation mirror (no data loss), then prior generations newest-first.
+fn decrypt_with_redundancy(
+    path: &Path,
+    pw1: &[u8],
+    pw2: &[u8],
+) -> Result<(Vault, Header, Key, Option<String>), VaultError> {
+    // Normal path — the live file reads cleanly.
+    let primary_err = match decrypt_file(path, pw1, pw2) {
+        Ok((v, h, k)) => return Ok((v, h, k, None)),
+        Err(e) => e, // live file missing / too big / bit-rotted / wrong password
+    };
+
+    // The live file is unreadable. If no redundant copy exists, surface the original
+    // error unchanged (so a wrong password still reads as "wrong password").
+    let candidates = redundancy_candidates(path);
+    if candidates.is_empty() {
+        return Err(primary_err);
+    }
+
+    // Pre-read the candidate bytes (size-capped, small). CRITICAL: the live header is
+    // NOT a trusted key-derivation source — a corruption confined to its salt/params
+    // would defeat recovery even with a perfect mirror. Derive the key from each
+    // DISTINCT *candidate* salt. All same-epoch copies share one salt, so this is ~1
+    // Argon2 in practice (and a wrong password still costs ~1, not N), while a
+    // candidate whose own header is damaged is covered by trying the next salt.
+    // Pair each blob with its SOURCE PATH. `filter_map` drops unreadable candidates,
+    // so a bare index into `candidates` would desync (e.g. an unreadable mirror would
+    // make a generation-recovery falsely report as a lossless "mirror" recovery). The
+    // paired path keeps the mirror-vs-generation label honest.
+    let blobs: Vec<(&PathBuf, Vec<u8>)> = candidates.iter().filter_map(|c| read_capped_vault(c).ok().map(|b| (c, b))).collect();
+    let mirror = mirror_path(path);
+    let mut tried_salts: Vec<[u8; SALT_LEN]> = Vec::new();
+    for (_, src) in &blobs {
+        let Ok(header) = Header::parse(src) else { continue };
+        if tried_salts.contains(&header.salt) {
+            continue; // already derived a key for this salt
+        }
+        tried_salts.push(header.salt);
+        let Ok(key) = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) else { continue };
+        // Try this key against every candidate (mirror first, then generations).
+        for (cand_path, raw) in &blobs {
+            if let Ok((vault, hdr)) = decode_vault_with_key(raw, &key) {
+                // The mirror is normally the same generation as the lost primary, but
+                // a crash *between* the primary commit and the (best-effort) mirror
+                // write can leave the mirror one generation stale — so we do NOT
+                // promise "no data lost", only that it is usually the latest. A
+                // generation is definitely older (a surfaced rollback). Either way the
+                // user should re-save and refresh backups.
+                let notice = if **cand_path == mirror {
+                    "The main vault file was unreadable and was recovered from its mirror copy \
+                     (normally the latest state — but if a save was interrupted before the \
+                     mirror was written, the most recent change may be missing). Re-save, and \
+                     refresh your off-device backups.".to_string()
+                } else {
+                    "The main vault file AND its mirror were unreadable; recovered from an \
+                     earlier generation — your most recent change(s) may be lost. Re-save, \
+                     and refresh your off-device backups.".to_string()
+                };
+                return Ok((vault, hdr, key, Some(notice)));
+            }
+        }
+    }
+    // No copy decrypted under any candidate-derived key — wrong password, or every
+    // copy is also corrupt. Return the live file's original error.
+    Err(primary_err)
+}
+
+// --- In-place redundancy file management (§12.8) -----------------------------
+
+/// `vault.pmv` -> `vault.pmv<suffix>` (append, not replace-extension).
+fn with_suffix(primary: &Path, suffix: &str) -> PathBuf {
+    let mut name = primary.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| std::ffi::OsString::from(VAULT_FILE));
+    name.push(suffix);
+    match primary.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// The same-generation mirror path (`vault.pmv.mirror`).
+fn mirror_path(primary: &Path) -> PathBuf {
+    with_suffix(primary, ".mirror")
+}
+
+/// The k-th retained prior generation (`vault.pmv.bak1` = newest prior).
+fn bak_path(primary: &Path, k: u32) -> PathBuf {
+    with_suffix(primary, &format!(".bak{k}"))
+}
+
+/// Write `bytes` to `dst` atomically and **symlink-safely**: a fresh O_EXCL temp
+/// (0600, never follows a symlink) is written and fsync'd, then renamed over `dst`
+/// — and a rename REPLACES any symlink planted at `dst` rather than following it.
+/// This matches vault.pmv's own write discipline; using `fs::copy` here would follow
+/// a planted symlink and redirect the (encrypted) write + chmod to an arbitrary file.
+fn write_bytes_atomic(dst: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    // Fault point (crash-test only): abort/ENOSPC while writing a bak generation.
+    crate::fault::point("redundancy.bak").map_err(VaultError::from)?;
+    let tmp = sibling_tmp(dst)?;
+    if let Err(e) = write_new_file(&tmp, bytes, &[]) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, dst).map_err(VaultError::from) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_parent_dir(dst);
+    Ok(())
+}
+
+/// Remove stale `*.tmp` siblings left by a crash mid atomic-write — `.vault.pmv*.tmp`
+/// (primary/mirror/bak temps) in the vault dir and `.manifest*.tmp` in `manifest/`.
+/// Best-effort, writable opens only. The temps are encrypted (no plaintext leak), but
+/// sweeping keeps the directory tidy and avoids old-key temps lingering after a rekey.
+fn sweep_stale_temps(dir: &Path) {
+    let sweep = |d: &Path, prefix: &str| {
+        if let Ok(rd) = fs::read_dir(d) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(prefix) && name.ends_with(".tmp") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    };
+    sweep(dir, &format!(".{VAULT_FILE}")); // .vault.pmv* / .vault.pmv.mirror* / .vault.pmv.bakN*
+    sweep(&dir.join("manifest"), ".manifest"); // .manifest.N* manifest-commit temps
+}
+
+/// Remove every retained generation numbered above `depth` (e.g. after the depth is
+/// lowered), so the on-disk generation count never exceeds the configured retention.
+fn prune_generations_above(primary: &Path, depth: u32) {
+    for k in (depth.min(MAX_REDUNDANCY) + 1)..=MAX_REDUNDANCY {
+        let _ = fs::remove_file(bak_path(primary, k));
+    }
+}
+
+/// Ring the outgoing generation (`prev_bytes` — the just-replaced `vault.pmv`) into
+/// the ring: drop the oldest, shift the rest down, write `prev_bytes` as `bak1`
+/// (atomic + symlink-safe), then prune any slot beyond `depth`. Called AFTER the new
+/// primary has committed, so a failed save never disturbs the ring. Best-effort (a
+/// partial/odd copy is skipped on recovery, since each is AEAD-validated when used).
+fn rotate_generations(primary: &Path, depth: u32, prev_bytes: &[u8]) {
+    let depth = depth.min(MAX_REDUNDANCY);
+    if depth == 0 {
+        return;
+    }
+    // Fault point (crash-test only): abort mid ring-rotation — AFTER the authoritative
+    // primary commit — to prove the primary still opens (the ring is best-effort).
+    let _ = crate::fault::point("redundancy.rotate");
+    let _ = fs::remove_file(bak_path(primary, depth)); // the oldest falls off the ring
+    for k in (1..depth).rev() {
+        let from = bak_path(primary, k);
+        if from.exists() {
+            let _ = fs::rename(&from, bak_path(primary, k + 1)); // bak{k} -> bak{k+1}
+        }
+    }
+    let _ = write_bytes_atomic(&bak_path(primary, 1), prev_bytes); // outgoing -> bak1
+    prune_generations_above(primary, depth);
+    // Make the whole ring shift (renames + drop + prune) durable as a unit. (The bak1
+    // write already fsync'd the dir, but the prune removals after it had not been; one
+    // fsync here covers them so a power loss can't resurrect a pruned generation.)
+    sync_parent_dir(&bak_path(primary, 1));
+}
+
+/// Remove every redundant copy (mirror + all generations). Safe to call on every
+/// non-redundant save. The fast-path no-op (the common default, when no copies
+/// exist) keys on `redundancy_candidates` so it can never skip an orphaned
+/// higher-numbered generation — it returns only when there is genuinely nothing to
+/// remove (each `remove_file` on a non-existent path is itself a cheap ENOENT).
+fn cleanup_redundancy(primary: &Path) {
+    if redundancy_candidates(primary).is_empty() {
+        return;
+    }
+    let _ = fs::remove_file(mirror_path(primary));
+    for k in 1..=MAX_REDUNDANCY {
+        let _ = fs::remove_file(bak_path(primary, k));
+    }
+}
+
+/// Existing redundant copies in recovery-preference order: mirror (same generation,
+/// no data loss) first, then prior generations newest-first.
+fn redundancy_candidates(primary: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let m = mirror_path(primary);
+    if m.exists() {
+        out.push(m);
+    }
+    for k in 1..=MAX_REDUNDANCY {
+        let b = bak_path(primary, k);
+        if b.exists() {
+            out.push(b);
+        }
+    }
+    out
 }
 
 /// Encrypt `vault` under `key` and write it atomically to `path` (new nonce, full
@@ -1149,6 +1545,10 @@ fn commit_rekey(dir: &Path, staging: &Path) -> Result<(), VaultError> {
     crate::fault::point("rekey.after_manifest")?;
     replace_path(&dir.join(VAULT_FILE), &staging.join(VAULT_FILE))?;
     crate::fault::point("rekey.after_vault")?;
+    // The in-place redundancy copies (mirror + prior generations) are now under the
+    // OLD key/garbage layout — drop them. The next normal save regenerates them under
+    // the new key (if redundancy is still enabled). Idempotent across a re-run.
+    cleanup_redundancy(&dir.join(VAULT_FILE));
     sync_parent_dir(&dir.join(VAULT_FILE));
     let _ = fs::remove_dir_all(staging);
     Ok(())
@@ -1262,6 +1662,16 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
         if s.exists() {
             copy_dir(&s, &target.join(sub))?;
         }
+    }
+    // The initial `.rekey` check is a TOCTOU: a concurrent writer may have STARTED a
+    // rekey during the copy window above, so the snapshot could mix an old vault.pmv
+    // with partially-swapped volume/manifest dirs. If `.rekey` appeared, discard the
+    // partial backup and ask the caller to retry. Best-effort — readers are not
+    // lock-isolated from a concurrent writer (§9.16); a rekey that both started and
+    // finished within the window is the rare residual case.
+    if src_dir.join(REKEY_DIR).exists() {
+        let _ = fs::remove_dir_all(&target);
+        return Err(VaultError::RekeyPending);
     }
     Ok(target.join(VAULT_FILE))
 }
@@ -1508,6 +1918,295 @@ mod tests {
         let err = v.add_document("/d", "f.txt", &dir_src).unwrap_err();
         assert!(matches!(err, VaultError::Storage(StorageError::Corrupt(_))));
         let _ = fs::remove_dir_all(&dir_src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn redundancy_off_by_default_writes_no_extra_files() {
+        let path = tmp_path("redoff");
+        let v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        assert_eq!(v.redundancy(), 0, "redundancy is off by default");
+        drop(v);
+        assert!(!mirror_path(&path).exists(), "no mirror when off");
+        assert!(!bak_path(&path, 1).exists(), "no generations when off");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn redundancy_writes_mirror_and_generations() {
+        let path = tmp_path("redon");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap(); // depth 2 + mirror
+        records::upsert(&mut v.vault.accounts, sample_account("u1", "p1"));
+        v.save().unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u2", "p2"));
+        v.save().unwrap();
+        drop(v);
+        assert!(mirror_path(&path).exists(), "mirror is written");
+        assert!(bak_path(&path, 1).exists(), "newest prior generation kept");
+        assert!(bak_path(&path, 2).exists(), "second prior generation kept");
+        assert!(!bak_path(&path, 3).exists(), "ring is bounded to the configured depth");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovers_from_mirror_when_primary_ciphertext_corrupt() {
+        let path = tmp_path("redmir");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p"));
+        v.save().unwrap();
+        drop(v);
+        // Flip a ciphertext byte (header still parses) so the live file fails the AEAD
+        // tag but the same-generation mirror is intact — recovery loses no data.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[HEADER_LEN] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v2.recovery_notice().is_some(), "recovery is reported");
+        let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
+        assert!(users.contains(&"keep-me"), "mirror restores the exact latest state");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovers_from_generation_when_primary_and_mirror_corrupt() {
+        let path = tmp_path("redbak");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p")); // state A
+        v.save().unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("newer", "p")); // state B
+        v.save().unwrap();
+        drop(v);
+        // Destroy BOTH the live file and its mirror; only the prior generation (= A) survives.
+        fs::write(&path, b"not a vault at all").unwrap();
+        fs::write(mirror_path(&path), b"corrupt mirror").unwrap();
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v2.recovery_notice().is_some(), "recovery is reported");
+        let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
+        assert!(users.contains(&"keep-me"), "the prior generation's data survives");
+        assert!(!users.contains(&"newer"), "the most recent change was rolled back (expected for a generation)");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn wrong_password_still_fails_with_redundancy_enabled() {
+        let path = tmp_path("redpw");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        v.save().unwrap();
+        drop(v);
+        // A wrong password must fail (every copy fails the same way) — never a false
+        // "recovery". (Also a regression guard that this stays ~one Argon2, not N.)
+        let res = OpenVault::open(path.clone(), b"a", b"WRONG");
+        assert!(matches!(res, Err(VaultError::Crypto(_))), "wrong password must be a crypto error");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn disabling_redundancy_removes_existing_copies() {
+        let path = tmp_path("reddis");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        v.save().unwrap();
+        assert!(mirror_path(&path).exists());
+        v.set_redundancy(0).unwrap(); // turning it off cleans up the extra copies
+        drop(v);
+        assert!(!mirror_path(&path).exists(), "mirror removed when disabled");
+        assert!(!bak_path(&path, 1).exists(), "generations removed when disabled");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rekey_regenerates_redundancy_under_new_key() {
+        let path = tmp_path("redrekey");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        v.save().unwrap();
+        assert!(mirror_path(&path).exists());
+        v.change_password(b"c", b"d").unwrap();
+        drop(v);
+        // The stale OLD-key copies are cleared and FRESH copies are regenerated under
+        // the NEW key immediately (no redundancy gap until the next save, §12.8).
+        assert!(mirror_path(&path).exists(), "mirror regenerated after rekey");
+        assert!(bak_path(&path, 1).exists(), "a generation regenerated after rekey");
+        // The regenerated mirror decodes under the NEW passwords (not the old ones).
+        let raw = read_capped_vault(&mirror_path(&path)).unwrap();
+        assert!(decode_vault_bytes(&raw, b"c", b"d").is_ok(), "mirror is under the new key");
+        assert!(decode_vault_bytes(&raw, b"a", b"b").is_err(), "mirror is NOT under the old key");
+        // The vault still opens cleanly under the NEW passwords (no recovery needed).
+        let v2 = OpenVault::open(path.clone(), b"c", b"d").unwrap();
+        assert!(v2.recovery_notice().is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovers_from_mirror_when_primary_salt_corrupt() {
+        // Regression for the HIGH finding: recovery must NOT derive the key from the
+        // corrupt live header. Flipping a byte inside the salt region leaves the
+        // header parseable but makes the key derived from it useless; the mirror's
+        // (intact) salt must be used instead.
+        let path = tmp_path("redsalt");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p"));
+        v.save().unwrap();
+        drop(v);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[21] ^= 0xff; // the salt starts at header offset 21
+        fs::write(&path, &bytes).unwrap();
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v2.recovery_notice().is_some(), "recovery is reported");
+        let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
+        assert!(users.contains(&"keep-me"), "recovered the exact latest state from the mirror");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reducing_redundancy_prunes_excess_generations() {
+        let path = tmp_path("redprune");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(5).unwrap();
+        for i in 0..6 {
+            records::upsert(&mut v.vault.accounts, sample_account(&format!("u{i}"), "p"));
+            v.save().unwrap();
+        }
+        assert!(bak_path(&path, 5).exists(), "depth 5 fills the ring up to bak5");
+        v.set_redundancy(2).unwrap(); // lower the depth -> excess generations must be pruned
+        drop(v);
+        assert!(bak_path(&path, 1).exists() && bak_path(&path, 2).exists(), "kept within the new depth");
+        assert!(
+            !bak_path(&path, 3).exists() && !bak_path(&path, 4).exists() && !bak_path(&path, 5).exists(),
+            "generations beyond the new depth are pruned (no stale old secrets left)"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn redundant_copies_decode_to_expected_generations() {
+        let path = tmp_path("redgens");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        for i in 0..3 {
+            records::upsert(&mut v.vault.accounts, sample_account(&format!("u{i}"), "p"));
+            v.save().unwrap();
+        }
+        drop(v);
+        let gen_of = |p: &Path| {
+            let raw = read_capped_vault(p).unwrap();
+            decode_vault_bytes(&raw, b"a", b"b").unwrap().0.generation
+        };
+        let prim = gen_of(&path);
+        assert_eq!(gen_of(&mirror_path(&path)), prim, "mirror == current generation (lossless)");
+        assert_eq!(gen_of(&bak_path(&path, 1)), prim - 1, "bak1 == previous generation");
+        assert_eq!(gen_of(&bak_path(&path, 2)), prim - 2, "bak2 == two generations back");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_discards_stale_rekey_staging() {
+        // A leftover `.rekey/READY` from an aborted rekey of a since-removed vault must
+        // NOT be rolled forward over a freshly created vault on the next open.
+        let path = tmp_path("crrekey");
+        let dir = parent_dir(&path);
+        let staging = dir.join(REKEY_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join(VAULT_FILE), b"bogus stale staged vault").unwrap();
+        fs::write(staging.join(REKEY_READY), b"ready").unwrap();
+        {
+            let _v = OpenVault::create(path.clone(), b"c", b"d", fast()).unwrap();
+        }
+        assert!(!staging.exists(), "create() cleared the stale staging");
+        // Without the fix, the next open would roll the bogus stage over vault.pmv and fail.
+        let v = OpenVault::open(path.clone(), b"c", b"d").unwrap();
+        assert!(v.recovery_notice().is_none());
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redundancy_bak_write_is_symlink_safe() {
+        // A symlink planted at a bak path must be REPLACED by the atomic write, not
+        // followed (which would clobber the symlink's target + chmod it).
+        use std::os::unix::fs::symlink;
+        let path = tmp_path("redsym");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        v.save().unwrap();
+        drop(v);
+        let victim = std::env::temp_dir().join(format!("redsym-victim-{}", nanos()));
+        fs::write(&victim, b"do not touch").unwrap();
+        let b1 = bak_path(&path, 1);
+        let _ = fs::remove_file(&b1);
+        symlink(&victim, &b1).unwrap(); // bak1 -> victim
+        // Reopening (writable) triggers a heal/refresh save that rotates the ring.
+        let mut v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        records::upsert(&mut v2.vault.accounts, sample_account("x", "y"));
+        v2.save().unwrap();
+        drop(v2);
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch", "the symlink target must be untouched");
+        assert!(
+            !fs::symlink_metadata(&b1).unwrap().file_type().is_symlink(),
+            "bak1 is now a real file, not the planted symlink"
+        );
+        let _ = fs::remove_file(&victim);
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn failed_save_does_not_degrade_generation_ring() {
+        // Regression: the ring must be rotated only AFTER the primary commits, so a
+        // failed save leaves the retained generations untouched.
+        let path = tmp_path("redfault");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        for i in 0..3 {
+            records::upsert(&mut v.vault.accounts, sample_account(&format!("u{i}"), "p"));
+            v.save().unwrap();
+        }
+        let b1_before = fs::read(bak_path(&path, 1)).unwrap();
+        let b2_before = fs::read(bak_path(&path, 2)).unwrap();
+        crate::fault::fail_at("vault.write", 1);
+        records::upsert(&mut v.vault.accounts, sample_account("late", "p"));
+        let res = v.save();
+        crate::fault::clear();
+        assert!(res.is_err(), "save fails when the primary write fails");
+        assert_eq!(fs::read(bak_path(&path, 1)).unwrap(), b1_before, "bak1 untouched after a failed save");
+        assert_eq!(fs::read(bak_path(&path, 2)).unwrap(), b2_before, "bak2 untouched after a failed save");
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_recovery_with_unreadable_mirror_reports_loss_not_mirror() {
+        // Regression: when the mirror's READ fails (so it drops out of the candidate
+        // blobs), recovery from a prior generation must NOT be mislabeled as a
+        // lossless mirror recovery — the notice must warn of a possible rollback.
+        let path = tmp_path("redmislabel");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("old", "p")); // state A -> becomes bak1
+        v.save().unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("new", "p")); // state B -> primary + mirror
+        v.save().unwrap();
+        drop(v);
+        // Live file corrupt; mirror replaced by a DIRECTORY so its read fails (EISDIR)
+        // and it drops out of the candidate blobs; only bak1 (=A) survives → recovery
+        // is from an earlier generation, which must be reported as such.
+        fs::write(&path, b"garbage not a vault").unwrap();
+        fs::remove_file(mirror_path(&path)).unwrap();
+        fs::create_dir(mirror_path(&path)).unwrap();
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        let notice = v2.recovery_notice().unwrap_or("");
+        assert!(
+            notice.contains("earlier generation") || notice.contains("may be lost"),
+            "must report a rollback, got: {notice:?}"
+        );
+        assert!(!notice.contains("no data lost"), "must NOT claim no data lost, got: {notice:?}");
+        let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
+        assert!(users.contains(&"old") && !users.contains(&"new"), "recovered the prior generation A");
         cleanup(&path);
     }
 

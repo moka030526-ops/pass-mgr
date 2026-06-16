@@ -263,3 +263,64 @@ fn multi_partition_compact_force_kill_rolls_forward() {
     assert_eq!(all_referenced_docs(&v), vec![doc_one(), doc_two()], "both docs survive compaction");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Helper: create a redundancy-enabled vault (a/b, depth 2) with one committed doc.
+fn setup_redundant(dir: &Path) {
+    assert!(run_crashop(dir, "setup_redundant", None), "setup_redundant should succeed");
+}
+
+/// A force-kill at each best-effort redundancy write (rotate / bak / mirror) happens
+/// AFTER the authoritative primary commit, so the vault must reopen cleanly from the
+/// primary with BOTH committed docs and NO recovery (the primary was never damaged).
+#[test]
+fn force_kill_during_redundancy_rotate_keeps_primary() {
+    let dir = tmp_dir("redrot");
+    setup_redundant(&dir);
+    assert!(!run_crashop(&dir, "redundant_save", Some("redundancy.rotate")), "child must abort mid-rotation");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("vault opens from the committed primary");
+    assert!(v.recovery_notice().is_none(), "primary intact — no recovery needed (the crash hit a best-effort copy)");
+    // The abort lands in a redundancy write (which runs after the authoritative primary
+    // commit), so the previously-committed document is always intact and openable.
+    assert_eq!(referenced_doc(&v), doc_one(), "committed doc intact; vault openable from the primary");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_during_redundancy_bak_keeps_primary() {
+    let dir = tmp_dir("redbakc");
+    setup_redundant(&dir);
+    assert!(!run_crashop(&dir, "redundant_save", Some("redundancy.bak")), "child must abort writing a bak");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("vault opens from the committed primary");
+    assert!(v.recovery_notice().is_none(), "primary intact — no recovery needed (the crash hit a best-effort copy)");
+    // The abort lands in a redundancy write (which runs after the authoritative primary
+    // commit), so the previously-committed document is always intact and openable.
+    assert_eq!(referenced_doc(&v), doc_one(), "committed doc intact; vault openable from the primary");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn force_kill_during_redundancy_mirror_keeps_primary() {
+    let dir = tmp_dir("redmir");
+    setup_redundant(&dir);
+    assert!(!run_crashop(&dir, "redundant_save", Some("redundancy.mirror")), "child must abort before the mirror write");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("vault opens from the committed primary");
+    assert!(v.recovery_notice().is_none(), "primary intact — no recovery needed (the crash hit a best-effort copy)");
+    // The abort lands in a redundancy write (which runs after the authoritative primary
+    // commit), so the previously-committed document is always intact and openable.
+    assert_eq!(referenced_doc(&v), doc_one(), "committed doc intact; vault openable from the primary");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A force-kill at the PRIMARY commit of a redundancy-enabled save: the save did not
+/// commit, so the previous generation stands (one doc), the vault opens, and the
+/// generation ring was not disturbed.
+#[test]
+fn force_kill_during_redundant_primary_save_keeps_old() {
+    let dir = tmp_dir("redprim");
+    setup_redundant(&dir);
+    assert!(!run_crashop(&dir, "redundant_save", Some("vault.rename")), "child must abort at the primary rename");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").expect("previous committed vault stands");
+    assert!(v.recovery_notice().is_none(), "primary intact — no recovery needed");
+    assert_eq!(referenced_doc(&v), doc_one(), "the pre-save committed doc is intact");
+    std::fs::remove_dir_all(&dir).ok();
+}

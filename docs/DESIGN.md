@@ -781,6 +781,37 @@ tmpfs/ramdisk, re-encrypt it with `import-tree` promptly, and securely delete th
 plaintext when done. The mirror has no integrity binding once on disk — anyone who
 can edit it can change what `import-tree` will encrypt.
 
+### 9.18 A password change does not re-encrypt existing backups
+
+`change_password` is a **full re-encryption** of the *live* vault: it derives a new
+key from the new passwords + a fresh salt and stages a complete new-key tree
+(`vault.pmv` + `manifest/` + `volume/`), then atomically swaps it in (§12.3). It can
+only rewrite the files in the live vault directory. A `backup` (§11) is an
+independent encrypted copy elsewhere, so the rekey **never touches it** — there is no
+"re-encrypt all my backups" operation, and there cannot be (backups may be offline or
+on detached media).
+
+Consequently each backup is a self-contained snapshot frozen at the passwords in
+effect when it was taken: a backup made **before** the change opens only with the
+**old** passwords; one made **after** opens with the new ones. The vault `id` is
+preserved across a rekey, so an old backup and the new live vault share an id, but
+their files are not interchangeable — each part is bound to its key by the AEAD, so an
+old-key `volume/`/`manifest/`/`vault.pmv` fails authentication under the new key.
+
+The security consequence: **a password change is not revocation.** If you rotate the
+passwords because the old ones may have leaked, anyone holding an **old backup and the
+old passwords can still read it** — the same reason the per-record password *history*
+retains old secrets (§9.4). So after a password change: make a **fresh** backup (a
+plain change does *not* auto-back-up, unlike `compact`, §11.1), and if the rotation
+was due to compromise, **securely destroy the old backups** (or accept they remain
+readable with the old passwords). Restoring an old backup is just using it as the
+vault directory and opening it with *its* passwords; it is a complete consistent tree,
+but an older **generation**, so the unlock screen flags the rollback (§9.12) and any
+changes made after that backup are not in it. (`backup` refuses to run mid-rekey —
+`RekeyPending` — so it never snapshots a half-re-encrypted tree, and it does not copy
+the opt-in in-place redundancy files §12.8, since a backup *is* the off-device
+redundancy.)
+
 ## 10. Non-goals
 
 - Browser integration / autofill.
@@ -993,7 +1024,15 @@ Crash-safety is tested at three levels (see `IMPLEMENTATION.md`):
 - **Subprocess abort** — a child process performs a real operation and is aborted
   at a chosen commit point (a feature-gated crash point), modelling a true
   force-kill / power loss against the real code path; the parent then reopens and
-  asserts full recovery.
+  asserts full recovery. Crash points cover the storage commit (`volume.write`,
+  `put.after_append`, `put.after_commit`, `atomic.*`), the vault commit
+  (`vault.write`, `vault.rename`), the rekey/compaction roll-forward
+  (`rekey.after_volume`/`after_manifest`/`after_vault`), **and the in-place
+  redundancy writes** (`redundancy.rotate`, `redundancy.bak`, `redundancy.mirror`,
+  `redundancy.refresh`) — the last group asserts that a crash in any best-effort
+  redundancy copy, which always runs *after* the authoritative primary commit,
+  leaves the vault openable from the primary with committed data intact and no
+  recovery needed (`tests/crash_recovery.rs`, redundancy enabled).
 
 > Residual platform caveat: durability ultimately depends on the OS and hardware
 > honoring `fsync`. On a filesystem/mount that ignores barriers, or hardware with
@@ -1080,13 +1119,112 @@ panic it or drive an out-of-bounds read or an unbounded allocation.
 **What genuinely requires a backup.** Self-healing covers a lost/garbled
 *manifest* (rebuilt from its volume) and any crash. It does **not** cover physical
 loss of authenticated *data*: a damaged `vault.pmv`, a bit-rotted document frame,
-or a missing piece of the store. There is deliberately no parity/duplicate-block
+or a missing piece of the store. By default there is no parity/duplicate-block
 scheme for `vault.pmv` — it is a small file, and the intended redundancy is an
 ordinary external backup (`backup`, §11 / README), which is a full encrypted copy
-needing the same two passwords. The write-generation counter shown at open lets a
-user *notice* a rollback to an older authentic state (§9.12) but is detection, not
-redundancy. Individual documents in an otherwise-healthy vault can also be salvaged
-one at a time with `export-document` / `extract` from any readable copy.
+needing the same two passwords. An **opt-in** in-place redundancy for `vault.pmv`
+(a same-generation mirror plus retained prior generations) is available for the
+narrow at-rest bit-rot case — see §12.8 — but it too is a *complement* to backups,
+not a replacement. The write-generation counter shown at open lets a user *notice* a
+rollback to an older authentic state (§9.12) but is detection, not redundancy.
+Individual documents in an otherwise-healthy vault can also be salvaged one at a time
+with `export-document` / `extract` from any readable copy.
+
+### 12.8 Optional in-place redundancy for `vault.pmv`
+
+`vault.pmv` is the one piece with no automatic recovery: a lost/garbled *manifest*
+rebuilds from its volume and a bad *document frame* costs only that document, but a
+damaged vault file (the records index) otherwise needs a backup (§12.7). For users
+who want a same-disk safety net against **localized bit-rot / a single bad sector**,
+an **opt-in** in-place redundancy is available. It is **off by default**, and it is
+emphatically **not a substitute for off-device backups** — it does nothing for
+whole-disk failure, deletion, theft, ransomware, or directory loss, which remain
+backup territory. Two mechanisms work together (one setting enables both):
+
+- A **same-generation mirror** (`vault.pmv.mirror`): a second, independent
+  encryption of the *current* vault written on every save. It recovers the **exact
+  latest** state if the live file bit-rots — no data loss.
+- **Retained prior generations** (`vault.pmv.bak1` … `vault.pmv.bakN`, newest =
+  `bak1`): the last *N* committed vault files. They cover the case where the live
+  file *and* its mirror are both unreadable, and double as an "undo the last save /
+  recover from a bad edit" feature. Recovery from a generation is a **rollback** —
+  the most recent save(s) are lost — so it is the second line after the mirror.
+
+**The setting.** `VaultSettings.redundancy: u32`, stored (encrypted) inside the
+vault, `#[serde(default)] = 0`. `0` = off (a single `vault.pmv`, exactly as before);
+`N ≥ 1` = write a mirror and keep `N` prior generations (capped at `MAX_REDUNDANCY`).
+Configurable in both UIs' Config screen. Because the value lives in the vault it
+governs **writing** only; the **read/recovery** path always uses any redundant copies
+that happen to exist, independent of the current setting.
+
+**Save sequence (depth `N > 0`), all crash-safe.** The live `vault.pmv` commit point
+is unchanged; redundancy is layered around it as strictly best-effort work that can
+never corrupt or block the real save, and **the ring is mutated only AFTER the new
+primary has committed**, so a *failed* save never disturbs it:
+
+1. **Capture** the outgoing generation's bytes (a size-capped read of the current
+   `vault.pmv`) — without touching the ring yet.
+2. **Write the primary** `vault.pmv` with the existing atomic temp→fsync→rename→
+   fsync-dir path (§12.2). This is the sole authoritative commit; if it fails (e.g.
+   `ENOSPC`) the whole save fails, the live file is untouched, AND the ring is
+   untouched (not yet rotated).
+3. **Ring** the captured generation: drop `bakN`, shift `bak{k}→bak{k+1}`, write the
+   captured bytes as `bak1` **atomically and symlink-safely** (an O_EXCL temp →
+   rename — the rename *replaces* any symlink planted at `bak1` instead of following
+   it; a plain `fs::copy` would redirect the encrypted write + 0600 chmod through such
+   a symlink), then **prune** any slot beyond `depth` (so lowering the depth never
+   orphans old generations on disk).
+4. **Write the mirror** `vault.pmv.mirror` (its own fresh nonce). Best-effort: a
+   mirror failure does not fail the save (the primary already committed).
+
+When `N = 0`, steps 1/3/4 are skipped and any leftover copies are removed, so
+disabling the feature also stops leaving old encrypted secrets on disk. Crash
+analysis: a crash before step 2 changes nothing; step 2 is atomic (old-or-new); a
+crash during step 3/4 leaves at most an odd/partial `bak*`/mirror (harmless — each
+copy is AEAD-checked when used, and rewritten next save). The §12.4 guarantee holds.
+
+**Recovery on open.** If the live `vault.pmv` will not decrypt, the open path tries
+the copies in preference order — **mirror first** (same generation, no loss), then
+`bak1`, `bak2`, … (newest-first). Crucially the key is derived from each **distinct
+*candidate*** salt, **not** from the (corrupt) live header — a corruption confined to
+the live header's salt/params would otherwise produce a useless key and defeat
+recovery *even with a perfect mirror*. Since all same-epoch copies share one salt this
+is ~1 Argon2 in practice, and a **wrong password** still costs ~1, not *N* (every copy
+fails the one derived key identically → the original "wrong password / corrupted"
+error is returned). On a writable open the recovery is followed by a **heal** save
+that rewrites a fresh `vault.pmv` + mirror from the recovered state; on a heal the
+corrupt outgoing primary is deliberately **not** ringed into a generation slot (that
+would void a slot with un-decryptable bytes). The user is told what happened via a
+recovery notice surfaced in both UIs (mirror recovery = no data lost; generation
+recovery = a possible rollback: "re-save and refresh your backups").
+
+**Interaction with rekey/compaction.** A password change or `compact` writes a new
+`vault.pmv` (new key / new layout) via the staged `.rekey` roll-forward (§12.3). The
+existing mirror and generations are then under the *old* key and are stale, so
+`commit_rekey` deletes them and the in-process operation immediately **regenerates**
+fresh copies under the new key — so the configured protection is never absent in the
+window until the next ordinary save. A crash-recovered roll-forward regenerates them
+via the normal auto-save on the next open.
+
+**Known limitation — recovery from a generation is a rollback.** Falling back to a
+prior generation happens only when the live file **and** its mirror are both
+unreadable (a rare double-failure), and it is inherently lossy (the most recent
+save(s) are gone). pass-mgr **surfaces** this with the recovery notice rather than
+silently committing it, but it does not keep a separate monotonic high-water mark to
+*refuse* the rollback — off-device backups remain the authority for "is this the
+newest state?". This is a deliberate scope choice: a double-corruption that loses both
+the live file and its same-disk mirror is exactly the situation backups exist for.
+
+**Trade-offs (made explicit so the opt-in is informed).** (1) It is **not a backup**
+— same device, same directory; correlated failures (a dying disk, an `rm` of the
+folder) take every copy. (2) It leaves **more encrypted copies of old secrets** on
+disk for longer (the same privacy consideration as the per-record history feature,
+§9.4), which is why it is off by default and the depth is bounded. (3) A small amount
+of extra write and disk per save (the file is small, so negligible). Recovery from a
+*generation* is a deliberate, surfaced rollback, not silent. The CLI read-only paths
+(`decrypt`/`export`/`extract`) deliberately do **not** auto-fall-back — they fail
+loudly on a corrupt live file so automation never silently reads an older copy;
+recovery (and healing) happens through the interactive open.
 
 ## 13. Single-instance guard and post-audit hardening
 
