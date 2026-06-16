@@ -77,12 +77,35 @@ for t in dmsetup losetup mkfs.ext4 mount umount blockdev; do
 done
 
 # Build (or locate) the test binary. It needs the fault-injection feature for __crashop.
+# NOTE: `sudo` usually strips ~/.cargo/bin from PATH, so plain `cargo` is often NOT
+# found when this script runs as root. We therefore build as the invoking user
+# (SUDO_USER) via a login shell — which puts cargo on PATH and keeps build artifacts
+# user-owned — or fall back to a prebuilt binary / an explicit PASSMGR_BIN.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREBUILT="$SCRIPT_DIR/target/release/pass-mgr"
 BIN="${PASSMGR_BIN:-}"
 if [[ -z "$BIN" ]]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  log "Building pass-mgr (--release --features fault-injection)"
-  ( cd "$SCRIPT_DIR" && cargo build --release --features fault-injection >&2 )
-  BIN="$SCRIPT_DIR/target/release/pass-mgr"
+  if command -v cargo >/dev/null 2>&1; then
+    log "Building pass-mgr (--release --features fault-injection)"
+    ( cd "$SCRIPT_DIR" && cargo build --release --features fault-injection >&2 )
+    BIN="$PREBUILT"
+  elif [[ -n "${SUDO_USER:-}" ]] && sudo -u "$SUDO_USER" bash -lc 'command -v cargo' >/dev/null 2>&1; then
+    log "Building pass-mgr as user '$SUDO_USER' (cargo not on root's PATH)"
+    sudo -u "$SUDO_USER" bash -lc "cd '$SCRIPT_DIR' && cargo build --release --features fault-injection" >&2
+    BIN="$PREBUILT"
+  elif [[ -x "$PREBUILT" ]]; then
+    echo "cargo not found under sudo; using the existing prebuilt binary." >&2
+    BIN="$PREBUILT"
+  else
+    cat >&2 <<MSG
+ERROR: cargo not found (sudo drops ~/.cargo/bin from PATH) and no prebuilt binary at:
+  $PREBUILT
+Build it once as your NORMAL user, then re-run the harness pointing at it:
+  cargo build --release --features fault-injection
+  sudo PASSMGR_BIN="\$PWD/target/release/pass-mgr" tests/dmflakey_powerloss.sh
+MSG
+    exit 2
+  fi
 fi
 [[ -x "$BIN" ]] || { echo "ERROR: binary not found/executable: $BIN" >&2; exit 2; }
 echo "Using binary: $BIN"
