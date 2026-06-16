@@ -558,14 +558,36 @@ cargo +nightly fuzz build                     # build the fuzz targets
 cargo +nightly fuzz run parse_frame           # fuzz a parser (also parse_manifest/
                                               #   scan_volume/parse_header)
 cargo mutants --file src/storage.rs ...       # mutation testing (see below)
+sudo tests/dmflakey_powerloss.sh              # real power-loss test (dm-flakey; root)
 ```
 
-**Test counts (current).** `cargo test` runs **166 library tests + 17 binary
+**Test counts (current).** `cargo test` runs **176 library tests + 17 binary
 (CLI) tests** by default; `cargo test --features fault-injection` adds the
-feature-gated fault tests and the **14** `tests/crash_recovery.rs` integration
-tests (a force-kill harness — see below) for **175 + 17 + 18**. The whole suite is
+feature-gated fault tests and the **18** `tests/crash_recovery.rs` integration
+tests (a force-kill harness — see below) for **185 + 17 + 18**. The whole suite is
 green, clippy is clean with `-D warnings`, the Windows cross-compile checks pass,
-and a short 4-target `cargo-fuzz` campaign (~42M executions) runs crash-free.
+a short 4-target `cargo-fuzz` campaign (~42M executions) runs crash-free, and
+`cargo audit` reports 0 advisories across 567 dependencies.
+
+**Property-based tests (`proptest`).** Beyond the parser/path proptests, randomized
+invariants cover: the in-place redundancy ring (any depth × any save sequence ⇒ the
+vault opens, the mirror is the current generation, the retained generations decode
+with strictly-descending numbers within the configured depth, and corrupting the live
+file recovers from the mirror with no record loss — `vault.rs`); the calendar math
+(`civil_from_unix`/`unix_from_civil` are exact inverses, `parse_ymd_utc` is monotonic,
+round-trips, and never panics — `records.rs`); and the generator (`uniform` is always
+in range, `generate` yields the exact length using only enabled classes — `password.rs`).
+
+**Real power-loss harness (`tests/dmflakey_powerloss.sh`).** A manual, root-only test
+that the abort-based suite cannot replace (see `DESIGN.md` §12.5): it runs the vault on
+an ext4 fs over a `dm-flakey` device, performs each operation crashed at the commit
+labels, then reloads the device with `drop_writes` and unmounts so the page cache is
+flushed but **un-fsync'd writes are discarded** — a true power cut. On remount the
+vault must still open with the committed document intact (`pass-mgr __crashop verify`),
+which is the only way to catch a missing/incorrect `fsync` (invisible to in-process
+abort tests and to mutation testing). Run it with `sudo tests/dmflakey_powerloss.sh`;
+it builds the binary with `--features fault-injection`, sets up/tears down a loop + dm
+device under unique names, and prints a per-scenario PASS/FAIL summary.
 
 **Crash-safety / fault injection (`--features fault-injection`).** `fault::point`
 instruments every commit step (volume append; manifest write+rename; vault

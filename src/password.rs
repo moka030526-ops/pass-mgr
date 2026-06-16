@@ -347,4 +347,37 @@ mod tests {
         let distinct: std::collections::BTreeSet<u8> = pw.bytes().collect();
         assert!(distinct.len() >= 16, "expected diverse output, got {} distinct", distinct.len());
     }
+
+    use proptest::prelude::*;
+    proptest! {
+        /// `uniform(n)` is always in `[0, n)` and never panics, for any `n >= 1`.
+        #[test]
+        fn prop_uniform_in_range(n in 1usize..=2_000_000) {
+            let r = uniform(n).unwrap();
+            prop_assert!(r < n, "uniform({n}) = {r} out of range");
+        }
+
+        /// `generate` produces exactly the requested length using ONLY characters
+        /// from the enabled classes (and never panics).
+        #[test]
+        fn prop_generate_length_and_charset(
+            length in 1usize..=128,
+            lowercase in any::<bool>(),
+            uppercase in any::<bool>(),
+            digits in any::<bool>(),
+            symbols in any::<bool>(),
+        ) {
+            prop_assume!(lowercase || uppercase || digits || symbols); // need >=1 class
+            let opts = GenOptions { length, lowercase, uppercase, digits, symbols };
+            let pw = generate(&opts).unwrap();
+            prop_assert_eq!(pw.len(), length, "exact requested length (ASCII, 1 byte/char)");
+            for c in pw.bytes() {
+                let ok = (lowercase && LOWER.contains(&c))
+                    || (uppercase && UPPER.contains(&c))
+                    || (digits && DIGITS.contains(&c))
+                    || (symbols && SYMBOLS.contains(&c));
+                prop_assert!(ok, "byte {c} is not from any enabled class");
+            }
+        }
+    }
 }

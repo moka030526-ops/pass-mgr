@@ -955,4 +955,39 @@ mod tests {
         assert_eq!(compact_history(&mut vault, None, true), 6, "all five record types trimmed");
         assert!(vault.trust_wills[0].history.is_empty());
     }
+
+    use proptest::prelude::*;
+    proptest! {
+        /// `civil_from_unix` and `unix_from_civil` are exact inverses across the whole
+        /// post-epoch range the app uses — a single off-by-one in the calendar math
+        /// would break this.
+        #[test]
+        fn prop_civil_unix_roundtrip(ts in 0i64..=253_402_300_799i64) {
+            let (y, mo, d, h, mi, s) = civil_from_unix(ts);
+            prop_assert_eq!(unix_from_civil(y, mo, d, h, mi, s), ts);
+        }
+
+        /// `parse_ymd_utc` never panics on arbitrary input (returns None or Some).
+        #[test]
+        fn prop_parse_ymd_never_panics(s in ".*") {
+            let _ = parse_ymd_utc(&s);
+        }
+
+        /// For valid `YYYY-MM-DD` dates, `parse_ymd_utc` is strictly monotonic in the
+        /// calendar date, and a valid date round-trips through `civil_from_unix`.
+        /// (`d in 1..=28` keeps every (y,m,d) a real date, so both parses are `Some`.)
+        #[test]
+        fn prop_parse_ymd_monotonic_and_roundtrips(
+            y1 in 1970..=9999i64, m1 in 1..=12i64, d1 in 1..=28i64,
+            y2 in 1970..=9999i64, m2 in 1..=12i64, d2 in 1..=28i64,
+        ) {
+            let a = format!("{y1:04}-{m1:02}-{d1:02}");
+            let b = format!("{y2:04}-{m2:02}-{d2:02}");
+            let ta = parse_ymd_utc(&a).expect("valid date a");
+            let tb = parse_ymd_utc(&b).expect("valid date b");
+            prop_assert_eq!(ta.cmp(&tb), (y1, m1, d1).cmp(&(y2, m2, d2)));
+            let (cy, cmo, cd, ..) = civil_from_unix(ta);
+            prop_assert_eq!((cy, cmo, cd), (y1, m1, d1));
+        }
+    }
 }

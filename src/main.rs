@@ -959,6 +959,24 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         "open" => {
             let _ = OpenVault::open(path, b"c", b"d")?;
         }
+        // Recovery check (used by the dm-flakey power-loss harness): open under a/b and
+        // assert the committed, record-referenced document (doc-one) survived intact.
+        // Exits non-zero on any failure (won't open, missing reference, byte mismatch).
+        "verify" => {
+            let v = OpenVault::open(path, b"a", b"b")?;
+            let tw = v
+                .vault
+                .trust_wills
+                .iter()
+                .find(|t| t.file.is_some())
+                .ok_or_else(|| anyhow::anyhow!("verify: no record-referenced document found"))?;
+            let id = tw.file.clone().expect("file present");
+            let got = v.read_document(&id)?;
+            if got[..] != body(0xA1)[..] {
+                anyhow::bail!("verify: recovered document does not match the committed doc-one");
+            }
+            eprintln!("verify: OK — vault opened and the committed document is intact");
+        }
         other => anyhow::bail!("crashop: unknown scenario {other:?}"),
     }
     Ok(())
