@@ -1046,6 +1046,18 @@ Crash-safety is tested at four levels (see `IMPLEMENTATION.md`):
   it is a **manual** harness, not part of `cargo test`. Property-based tests
   (`proptest`) additionally fuzz the redundancy-ring invariants, the calendar math,
   and the password generator over random inputs.
+- **Data-race check (ThreadSanitizer)** — the app has exactly one cross-thread
+  hand-off: the detached focus accept loop (§13) touching the `egui::Context` the
+  main thread also renders from. An `#[ignore]`d reproducer
+  (`single_instance::tests::focus_accept_thread_is_race_free`) starts the *real*
+  accept thread on a live `Context` and drives it with concurrent raise-to-front
+  pings while the main thread pokes the same `Context`. Run once under nightly
+  ThreadSanitizer (`RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std
+  --target x86_64-unknown-linux-gnu --lib … -- --ignored`, with the whole dependency
+  tree and `std` instrumented): **no data races reported**. This is the expected
+  result — the crate is `#![forbid(unsafe_code)]` and the only shared object is a
+  `Sync` type used through its safe API — but the run confirms it empirically rather
+  than by argument.
 
 > Residual platform caveat: durability ultimately depends on the OS and hardware
 > honoring `fsync`. On a filesystem/mount that ignores barriers, or hardware with

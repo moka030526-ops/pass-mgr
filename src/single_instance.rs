@@ -350,6 +350,67 @@ mod tests {
         assert!(!env_flag("PMVAULT_DEFINITELY_UNSET_VAR_XYZ"));
     }
 
+    /// ThreadSanitizer reproducer for the focus accept-loop thread. The normal
+    /// tests never call [`FocusServer::serve`] (it needs a live `egui::Context`),
+    /// so the one place we hand a shared object across threads — the detached
+    /// accept loop touching the `Context` the GUI also renders from — goes
+    /// unexercised by `cargo test`. This drives the *real* `serve` thread with a
+    /// real `Context` under concurrent pings while the main thread pokes the same
+    /// `Context`, reproducing the exact cross-thread sharing for TSan to inspect.
+    ///
+    /// `#[ignore]`d: it spawns a detached thread and does hundreds of socket
+    /// connections, which is pointless noise in the normal suite. Run it as the
+    /// one-off race check (needs nightly + `rust-src`):
+    ///
+    /// ```text
+    /// RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
+    ///   --target x86_64-unknown-linux-gnu --lib \
+    ///   single_instance::tests::focus_accept_thread_is_race_free \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "TSan one-off; needs nightly + -Zsanitizer=thread (see doc comment)"]
+    fn focus_accept_thread_is_race_free() {
+        use eframe::egui;
+        use std::thread;
+
+        let dir = tmp();
+        let key = instance_key(&dir.join("vault.pmv"));
+
+        // Bind the real focus socket and start the real accept thread on a live
+        // Context — exactly what the GUI does in the eframe creation closure.
+        let server = serve_socket(&dir, &key);
+        let ctx = egui::Context::default();
+        server.serve(ctx.clone());
+
+        // Several threads hammer the accept loop with connections; every accepted
+        // connection makes the accept thread call `ctx.send_viewport_cmd` +
+        // `ctx.request_repaint`. Meanwhile the main thread touches the SAME Context,
+        // so any unsynchronized sharing in our usage would surface under TSan.
+        let pingers: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                let key = key.clone();
+                thread::spawn(move || {
+                    for _ in 0..50 {
+                        request_focus(&dir, &key);
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..400 {
+            ctx.request_repaint();
+        }
+
+        for p in pingers {
+            p.join().unwrap();
+        }
+        // The accept thread is detached by design (torn down at process exit); TSan
+        // evaluates the interleavings observed during the contention above.
+    }
+
     #[test]
     fn flag_truthiness_rule() {
         // "on": any non-empty value other than "0".
