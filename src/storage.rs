@@ -1266,6 +1266,24 @@ mod tests {
     }
 
     #[test]
+    fn manifest_seq_advances_on_each_committed_change() {
+        // The per-partition manifest sequence counter advances on every committed put
+        // and remove (locks the format invariant; kills `seq += 1` -> `seq *= 1`).
+        let dir = tmp_dir("seq");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"one", 1, &key).unwrap();
+        let after_put = s.manifests[0].seq;
+        s.put("a", "/a", b"two", 2, &key).unwrap(); // update the same id
+        let after_update = s.manifests[0].seq;
+        s.remove("a", &key).unwrap();
+        let after_remove = s.manifests[0].seq;
+        assert!(after_update > after_put, "seq advances on update ({after_put} -> {after_update})");
+        assert!(after_remove > after_update, "seq advances on remove ({after_update} -> {after_remove})");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_manifest_on_higher_partition_is_rebuilt() {
         // Kills the `&&` -> `||` mutant in the partition scan: a partition with a
         // present volume but missing manifest must still be loaded (rebuilt).

@@ -2218,6 +2218,21 @@ mod tests {
     }
 
     #[test]
+    fn add_and_read_a_moderately_large_document() {
+        // A ~256 KiB document must round-trip — well under MAX_DOC_SIZE (64 MiB) but
+        // far above the trivial test docs, so it also catches a mutation that shrinks
+        // the size cap to a tiny value (which would then wrongly reject it).
+        let path = tmp_path("biggish");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let body = vec![0x5Au8; 256 * 1024];
+        let src = write_src("big", &body);
+        let id = v.add_document("/d", "big.bin", &src).unwrap();
+        assert_eq!(&*v.read_document(&id).unwrap(), &body[..], "large doc round-trips intact");
+        let _ = fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
     fn import_tree_rejects_unsafe_vault_id() {
         let src = tmp_src("badid");
         let mut vault = Vault::default();

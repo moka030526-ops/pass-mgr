@@ -218,13 +218,14 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
 }
 
 fn env_flag(name: &str) -> bool {
-    match std::env::var_os(name) {
-        Some(v) => {
-            let s = v.to_string_lossy();
-            !s.is_empty() && s != "0"
-        }
-        None => false,
-    }
+    std::env::var_os(name).is_some_and(|v| flag_is_truthy(&v.to_string_lossy()))
+}
+
+/// A flag env var is "on" when set to a non-empty value other than `"0"`. Split out so
+/// the truthiness rule is unit-testable without setting a (process-global, and in
+/// edition 2024 `unsafe`) environment variable.
+fn flag_is_truthy(s: &str) -> bool {
+    !s.is_empty() && s != "0"
 }
 
 // --- Unix focus socket -------------------------------------------------------
@@ -347,5 +348,17 @@ mod tests {
     #[test]
     fn env_flag_reads_truthy_values() {
         assert!(!env_flag("PMVAULT_DEFINITELY_UNSET_VAR_XYZ"));
+    }
+
+    #[test]
+    fn flag_truthiness_rule() {
+        // "on": any non-empty value other than "0".
+        assert!(flag_is_truthy("1"));
+        assert!(flag_is_truthy("true"));
+        assert!(flag_is_truthy("yes"));
+        assert!(flag_is_truthy(" ")); // a space is non-empty and not "0"
+        // "off": empty or exactly "0".
+        assert!(!flag_is_truthy(""));
+        assert!(!flag_is_truthy("0"));
     }
 }
