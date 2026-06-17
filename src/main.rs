@@ -68,8 +68,14 @@ pass-mgr — standalone, offline, two-password encrypted estate vault
 DIR is the vault DIRECTORY (it holds vault.pmv, manifest/, and volume/).
 If omitted, the per-user default directory is used.
 
+This is the console build. The graphical app is a separate binary, `pass-mgr-gui`
+(`pass-mgr-gui[.exe]`), which is identical to `pass-mgr [DIR]` but opens with no
+console window on Windows. Use `pass-mgr-gui` for the GUI; use this binary for the
+commands below and the terminal UI.
+
 USAGE:
     pass-mgr [DIR]                  Launch the graphical UI (read-only by default)
+                                    (prefer `pass-mgr-gui` — no console window)
     pass-mgr --write [DIR]          Launch writable (allow creating/editing/deleting)
     pass-mgr --tui [DIR]            Launch the terminal UI instead (add --write to edit)
     pass-mgr decrypt [DIR]          Decrypt the vault and print its JSON to stdout

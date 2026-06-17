@@ -22,8 +22,9 @@ Conventions in this doc: `path/to/file.rs` is a source file; `Type` /
 src/
 ├── lib.rs            Library crate root (`pass_mgr`). Declares every module below
 │                     as `pub mod`, and sets `#![forbid(unsafe_code)]` crate-wide.
-│                     The binary (main.rs) and the fuzz targets both link this
-│                     library, so all data/crypto logic lives here and is shared.
+│                     Both binaries (main.rs, bin/pass-mgr-gui.rs) and the fuzz
+│                     targets link this library, so all data/crypto logic lives
+│                     here and is shared.
 ├── crypto.rs         The cryptographic core: the chained two-password Argon2id KDF
 │                     and the XChaCha20-Poly1305 AEAD wrappers. The derived `Key`
 │                     lives in mlock'd/VirtualLock'd heap pages (swap mitigation)
@@ -569,10 +570,11 @@ cargo mutants --file src/storage.rs ...       # mutation testing (see below)
 sudo tests/dmflakey_powerloss.sh              # real power-loss test (dm-flakey; root)
 ```
 
-**Test counts (current).** `cargo test` runs **176 library tests + 17 binary
-(CLI) tests** by default; `cargo test --features fault-injection` adds the
+**Test counts (current).** `cargo test` runs **182 library tests + 19 binary
+(CLI) tests** by default (plus one `#[ignore]`d ThreadSanitizer reproducer, run
+separately — see below); `cargo test --features fault-injection` adds the
 feature-gated fault tests and the **18** `tests/crash_recovery.rs` integration
-tests (a force-kill harness — see below) for **185 + 17 + 18**. The whole suite is
+tests (a force-kill harness — see below) for **191 + 19 + 18**. The whole suite is
 green, clippy is clean with `-D warnings`, the Windows cross-compile checks pass,
 a short 4-target `cargo-fuzz` campaign (~42M executions) runs crash-free, and
 `cargo audit` reports 0 advisories across 567 dependencies.
