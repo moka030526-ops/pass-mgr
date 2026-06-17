@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=pass-mgr (Edit)
+GenericName=Encrypted estate vault
+Comment=Open the vault in edit mode (unlocked vault icon)
+# Filled in by install-shortcuts.sh. Note the `--write` that selects edit mode;
+# Icon points at the unlocked-vault PNG.
+Exec=__BIN__ --write
+Icon=__ICONDIR__/pass-mgr-unlocked.png
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true

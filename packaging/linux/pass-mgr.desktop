@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=pass-mgr (View)
+GenericName=Encrypted estate vault
+Comment=Open the vault read-only (locked vault icon)
+# The Exec= and Icon= paths below are filled in by install-shortcuts.sh. To set
+# them by hand, point Exec at your pass-mgr-gui and Icon at the locked-vault PNG.
+Exec=__BIN__
+Icon=__ICONDIR__/pass-mgr-locked.png
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true
