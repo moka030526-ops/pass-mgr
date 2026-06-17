@@ -50,6 +50,21 @@ replacing `__BIN__` with the path to `pass-mgr-gui` and `__ICONDIR__` with the f
 holding the PNGs, then copy both files to `~/Desktop` and `~/.local/share/applications/`
 and `chmod +x` them.
 
+**Two things to know on Linux:**
+
+- **First double-click.** On GNOME a brand-new desktop launcher may need a one-time
+  right-click → **Allow Launching** before it will run, even though the installer
+  marks it trusted (`gio set … metadata::trusted true`).
+- **Point at a stable binary.** The shortcuts store the *absolute path* to
+  `pass-mgr-gui`. If you pass a path inside a build tree (`target/release/…`), a later
+  `cargo clean` or moving the repo breaks them. For a permanent setup, copy the binary
+  somewhere lasting and install against that:
+
+  ```bash
+  install -Dm755 target/release/pass-mgr-gui ~/.local/bin/pass-mgr-gui
+  packaging/linux/install-shortcuts.sh ~/.local/bin/pass-mgr-gui
+  ```
+
 ## Windows
 
 1. Put `pass-mgr-gui.exe` somewhere stable (e.g. `C:\Program Files\pass-mgr\`) and
