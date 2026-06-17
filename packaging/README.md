@@ -67,17 +67,37 @@ and `chmod +x` them.
 
 ## Windows
 
-1. Put `pass-mgr-gui.exe` somewhere stable (e.g. `C:\Program Files\pass-mgr\`) and
-   copy the `icons` folder (with the two `.ico` files) next to it.
-2. In PowerShell:
+> **First build the app.** `pass-mgr-gui.exe` is a build artifact — it is **not**
+> committed to the repo, so it will not be in `packaging\windows\`. Produce it with
+> `cargo build --release` (→ `target\release\pass-mgr-gui.exe`), or copy a prebuilt
+> exe somewhere and point the script at it.
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File packaging\windows\make-shortcuts.ps1 `
-       -InstallDir "C:\Program Files\pass-mgr"
-   ```
+**Simplest — right after building in the repo.** The script auto-finds the exe
+(`target\release`, then `target\debug`, then the windows-gnu cross target, then your
+`PATH`) and the committed icons in `packaging\icons`:
 
-   This creates **pass-mgr (View)** and **pass-mgr (Edit)** on your Desktop, with the
-   locked and unlocked icons respectively.
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\make-shortcuts.ps1
+```
+
+**Point at the exe explicitly** (e.g. a prebuilt one you copied):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\make-shortcuts.ps1 `
+    -Exe "C:\apps\pass-mgr\pass-mgr-gui.exe"
+```
+
+**Deployed install** — for a permanent setup, copy `pass-mgr-gui.exe` **and** the
+`packaging\icons` folder into one stable directory (so the shortcuts don't point into
+a build tree), then:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\make-shortcuts.ps1 `
+    -InstallDir "C:\Program Files\pass-mgr"
+```
+
+Any of these creates **pass-mgr (View)** and **pass-mgr (Edit)** on your Desktop, with
+the locked and unlocked icons respectively.
 
 ### Or by hand
 
