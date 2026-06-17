@@ -53,10 +53,12 @@ To **create** a vault or **change** anything, the program must be started in
 **Edit mode**. The easiest way is to make an "Edit" shortcut once:
 
 **On Windows:**
-1. Right-click **`pass-mgr.exe`** → **Show more options** → **Create shortcut**.
+1. Right-click **`pass-mgr-gui.exe`** → **Show more options** → **Create shortcut**.
+   (Use `pass-mgr-gui.exe`, not `pass-mgr.exe`, so edit mode also opens with no
+   console window.)
 2. Right-click the new shortcut → **Properties**.
 3. In the **Target** box, go to the very end, add a space, then type `--write`.
-   It should end with `...\pass-mgr.exe --write`.
+   It should end with `...\pass-mgr-gui.exe --write`.
 4. Click **OK**. Rename the shortcut to **"pass-mgr (Edit)"**.
 
 Now: **double-click "pass-mgr (Edit)" when you want to add or change things**, and
@@ -329,8 +331,12 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Command-line options (advanced)
 
+These are commands of the **console** `pass-mgr` build. For the graphical app, use
+**`pass-mgr-gui`** instead (same as `pass-mgr [VAULT]`, but with no console window on
+Windows); the `--tui` terminal UI and the subcommands below need the console build.
+
 ```text
-pass-mgr [VAULT]              Launch the graphical UI (READ-ONLY by default)
+pass-mgr [VAULT]              Launch the graphical UI (READ-ONLY; or use pass-mgr-gui)
 pass-mgr --write [VAULT]      Launch in edit mode (create / edit / delete / upload)
 pass-mgr --tui [VAULT]        Launch the terminal UI instead (add --write to edit)
 pass-mgr --vol PATH ...       Use PATH as the document archive instead of <VAULT>.vol

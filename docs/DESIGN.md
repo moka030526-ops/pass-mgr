@@ -750,12 +750,14 @@ disk full-disk-encrypted, and the vault closed when unattended.
 
 ### 9.15 Distributing the binary — integrity is the user's responsibility
 The build is reproducible from source, but the project does not ship a signed
-binary. If you distribute `pass-mgr`/`pass-mgr.exe`, recipients should verify
-what they run: publish a SHA-256 checksum alongside the binary
-(`sha256sum target/release/pass-mgr` on Linux, `Get-FileHash` on Windows) and,
-ideally, **code-sign** the Windows `.exe` with your own Authenticode certificate
-(`signtool sign /fd SHA256 /a pass-mgr.exe`) so SmartScreen and AV trust it.
-Without that, a tampered download cannot be distinguished from a genuine one.
+binary. The build produces **two** executables on Windows — `pass-mgr-gui.exe` (the
+windowed app end users run, §13.3) and `pass-mgr.exe` (the console/CLI build) — and
+recipients should verify whichever they run: publish a SHA-256 checksum alongside
+each (`sha256sum target/release/pass-mgr*` on Linux, `Get-FileHash` on Windows) and,
+ideally, **code-sign** the Windows `.exe`s with your own Authenticode certificate
+(`signtool sign /fd SHA256 /a pass-mgr-gui.exe`, and likewise `pass-mgr.exe`) so
+SmartScreen and AV trust them. Without that, a tampered download cannot be
+distinguished from a genuine one.
 
 ### 9.16 Concurrency is single-writer, best-effort for readers
 A writable open takes an OS advisory lock on `mypath/pass-mgr.lock` (via
