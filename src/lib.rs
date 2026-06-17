@@ -34,6 +34,7 @@
 pub mod crypto; // security-critical: key derivation + authenticated encryption
 pub mod fault; // crash-safety fault-injection hooks (no-op without the feature)
 pub mod gui; // graphical front-end (drives the same vault API as `ui`)
+pub mod launch; // vault-path/flag resolution shared by the console + windowed binaries
 pub mod password; // random password generator
 pub mod records; // the secret records stored in the vault
 pub mod single_instance; // GUI single-instance guard (coalesces repeated launches)

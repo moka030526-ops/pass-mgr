@@ -69,15 +69,23 @@ src/
 │                     it uses a deferred-action pattern (§6.1).
 ├── ui.rs             The ratatui terminal UI (`--tui`). The same four screens, with
 │                     field-based edit forms rebuilt by index (§6.2).
-└── main.rs           The binary crate: CLI dispatch (`--write`/`--tui`/`--part`/
-                      compact flags), vault-directory selection, terminal raw-mode
-                      setup/teardown, the no-echo password reader, and the
-                      decrypt/manifest/extract/backup/export-tree/import-tree/compact
-                      subcommands.
+├── launch.rs         Vault-path/flag resolution (`default_vault_path`, `vault_file`,
+│                     `resolve_interactive`) shared by both binaries so they open the
+│                     same vault.
+├── main.rs           The console binary `pass-mgr`: CLI dispatch (`--write`/`--tui`/
+│                     `--part`/compact flags), vault-directory selection, terminal
+│                     raw-mode setup/teardown, the no-echo password reader, and the
+│                     decrypt/manifest/extract/backup/export-tree/import-tree/compact
+│                     subcommands.
+└── bin/
+    └── pass-mgr-gui.rs  The windowed binary `pass-mgr-gui`: a thin GUI-subsystem
+                      launcher (`#![windows_subsystem = "windows"]` on Windows ⇒ no
+                      console window) that resolves args via `launch` and calls
+                      `gui::run` (§13.3 of DESIGN).
 ```
 
 **Why a library + binary split.** Everything substantive is in the `pass_mgr`
-library; `main.rs` is a thin CLI veneer. This lets the `cargo-fuzz` targets under
+library; the two binaries (`main.rs` and `bin/pass-mgr-gui.rs`) are thin veneers. This lets the `cargo-fuzz` targets under
 `fuzz/` link the untrusted-input parsers directly, and it keeps a single source of
 truth for all crypto/data logic that **both** front-ends drive through the one
 `OpenVault` API. The security-critical core is `crypto.rs` + `storage.rs` +

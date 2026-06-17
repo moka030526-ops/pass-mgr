@@ -57,7 +57,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --target x86_64-pc-windows-gnu
+      # --bins checks both the console `pass-mgr` and the GUI-subsystem `pass-mgr-gui`,
+      # so the Windows `windows_subsystem` build can't regress.
+      - run: cargo check --target x86_64-pc-windows-gnu --bins
 
   fuzz-smoke:
     name: fuzz smoke (parsers)

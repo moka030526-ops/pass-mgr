@@ -48,25 +48,16 @@ use std::path::{Path, PathBuf};
 // `ExitCode` is the process exit status this `main` returns to the OS.
 use std::process::ExitCode;
 
-use directories::ProjectDirs;
 // `Zeroize` (trait providing `.zeroize()`) and `Zeroizing` (a wrapper that wipes
 // its contents on drop) — used to scrub passwords/plaintext from memory.
 use zeroize::{Zeroize, Zeroizing};
 
+// The vault-path helpers live in the library so the windowed `pass-mgr-gui`
+// binary resolves the vault identically; importing them keeps every call site
+// below unqualified.
+use pass_mgr::launch::{default_vault_path, vault_file};
 use pass_mgr::vault::OpenVault;
 use pass_mgr::{gui, ui, vault};
-
-/// Default vault location: the per-user data directory for this app
-/// (`~/.local/share/pass-mgr/` on Linux, `%APPDATA%\pass-mgr\` on Windows).
-fn default_vault_path() -> PathBuf {
-    // `match` is like a `switch` that must cover every case. `ProjectDirs::from`
-    // returns an `Option`: `Some(dirs)` if a platform data dir was found, else
-    // `None`. Each arm binds the inner value and produces the resulting path.
-    match ProjectDirs::from("dev", "passmgr", "pass-mgr") {
-        Some(dirs) => dirs.data_dir().join("vault.pmv"),
-        None => PathBuf::from("vault.pmv"),
-    }
-}
 
 // `const` is a compile-time constant. `&str` is a borrowed string slice (a view
 // into text); this one points at a string literal baked into the binary. The
@@ -111,13 +102,6 @@ The vault is protected by two passwords entered in sequence. The interactive UI
 opens READ-ONLY unless --write is given (a writable session takes a single-writer
 lock, so a second --write instance fails fast). The category dropdown lists are
 stored inside the encrypted vault — there are no external configuration files.";
-
-/// The vault file inside a user-supplied vault directory.
-// Takes `dir` by shared borrow (`&str`): it only reads the text, so the caller
-// keeps ownership of the original string.
-fn vault_file(dir: &str) -> PathBuf {
-    PathBuf::from(dir).join("vault.pmv")
-}
 
 /// Pull an optional `--part N` / `--part=N` flag out of the argument list,
 /// returning the parsed partition index plus the remaining arguments. Errors if
@@ -1100,10 +1084,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
-    #[test]
-    fn default_vault_path_ends_with_vault_pmv() {
-        assert!(super::default_vault_path().ends_with("vault.pmv"));
-    }
+    // (path-helper tests moved to `pass_mgr::launch`, which now owns them.)
 
     // ---- compact CLI flag parsing & guards ---------------------------------
 
