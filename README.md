@@ -67,6 +67,12 @@ the plain program when you only want to look.
 > The everyday program stays view-only on purpose. Keep the Edit shortcut for
 > when you actually need to make changes.
 
+> **Ready-made shortcuts with icons.** The [`packaging/`](packaging/) folder has
+> both shortcuts done for you — **pass-mgr (View)** with a **locked-vault** icon and
+> **pass-mgr (Edit)** with an **unlocked-vault** icon. On Linux run
+> `packaging/linux/install-shortcuts.sh`; on Windows run
+> `packaging\windows\make-shortcuts.ps1`. See [`packaging/README.md`](packaging/README.md).
+
 ## Creating your vault the first time (step by step)
 
 1. Start the program using the **Edit** shortcut (above).
