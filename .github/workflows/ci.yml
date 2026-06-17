@@ -1,0 +1,77 @@
+name: CI
+
+# Runs the full verification suite on every push to main and every PR, so the
+# hardening (tests, crash/full-disk recovery, lints, dependency advisories, Windows
+# portability, and a parser fuzz smoke) can't silently regress. The project is
+# deliberately hand-formatted, so there is NO `cargo fmt` check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # eframe/arboard link X11/xcb/xkb libs on Linux even though the tests never open
+      # a window, so the test binaries need these to LINK.
+      - name: Install GUI link deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test (default)
+        run: cargo test --all-targets
+      - name: Test (fault-injection — crash / full-disk recovery)
+        run: cargo test --features fault-injection
+
+  audit:
+    name: cargo-audit (dependency CVEs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  windows-cross:
+    name: windows cross-compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target x86_64-pc-windows-gnu
+
+  fuzz-smoke:
+    name: fuzz smoke (parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      # Build all targets, then a short run of each untrusted-input parser fuzzer. A
+      # crash leaves an artifact and fails the job.
+      - name: Build + short-run the parser fuzzers
+        run: |
+          cargo +nightly fuzz build
+          for t in parse_header parse_frame parse_manifest scan_volume; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=30 -print_final_stats=1
+          done
