@@ -1,0 +1,39 @@
+[package]
+name = "pass-mgr-core"
+version = "0.1.0"
+edition = "2024"
+# The headless, security-critical core: data model, on-disk format, crypto, and
+# the OpenVault API. No UI / OS front-end deps, so it is reused unchanged by the
+# desktop binaries (`pass-mgr`) and the mobile FFI (`pass-mgr-ffi`).
+
+[lib]
+name = "pass_mgr_core"
+
+[dependencies]
+argon2 = "0.5.3"
+chacha20poly1305 = "0.10.1"
+getrandom = "0.4.2"
+region = "3.0.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+# Unix-only: the `O_NOFOLLOW` open flag, used to make the volume-append open
+# atomically refuse a symlink (closing a TOCTOU window the pre-open stat cannot).
+# Used only through the safe `OpenOptionsExt::custom_flags` API. No effect on
+# Windows builds.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Compiles the crash-safety fault-injection hooks (src/fault.rs) into the storage
+# and vault commit paths. OFF by default (and in every release build), where the
+# hooks are zero-cost no-ops. Enable for crash/full-disk tests:
+#   cargo test -p pass-mgr-core --features fault-injection
+fault-injection = []
+
+[dev-dependencies]
+# Property-based testing for the parsers, the store invariants, and path
+# normalization.
+proptest = "1"

@@ -5,5 +5,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    pass_mgr::storage::fuzz::manifest(data);
+    pass_mgr_core::storage::fuzz::manifest(data);
 });

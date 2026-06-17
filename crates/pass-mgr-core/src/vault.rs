@@ -1075,7 +1075,7 @@ fn parent_dir(vault_file: &Path) -> PathBuf {
 /// Exposed to the UIs so they can validate path length against
 /// [`storage::MAX_PATH_LEN`] with the exact string the core will store.
 // `pub(crate)` = visible to the rest of this crate but not external callers.
-pub(crate) fn virtual_path(location: &str, filename: &str) -> String {
+pub fn virtual_path(location: &str, filename: &str) -> String {
     let loc = normalize_dir(location);
     // `if ... { } else { }` is an *expression* here: the chosen branch's value is
     // returned. `format!` builds a `String` (like sprintf); `{filename}` inlines it.

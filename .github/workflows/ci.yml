@@ -31,11 +31,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test (default)
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
       - name: Test (fault-injection — crash / full-disk recovery)
-        run: cargo test --features fault-injection
+        # fault-injection lives on pass-mgr-core; the desktop crate forwards it so the
+        # `__crashop` binary + tests/crash_recovery.rs exercise the real fault points.
+        run: cargo test -p pass-mgr-core -p pass-mgr --features pass-mgr/fault-injection
 
   audit:
     name: cargo-audit (dependency CVEs)

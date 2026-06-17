@@ -10,8 +10,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.pass-mgr]
-path = ".."
+[dependencies.pass-mgr-core]
+path = "../crates/pass-mgr-core"
 
 # Each target is one libfuzzer binary. They feed random bytes into the
 # untrusted-input parsers and assert the code never panics/over-allocates.
@@ -43,5 +43,5 @@ test = false
 doc = false
 bench = false
 
-# Keep the fuzz crate out of the parent package's build; it is its own package.
+# Keep the fuzz crate out of the parent workspace; it is its own package.
 [workspace]

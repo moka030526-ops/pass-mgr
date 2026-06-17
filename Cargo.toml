@@ -1,48 +1,16 @@
-[package]
-name = "pass-mgr"
-version = "0.1.0"
-edition = "2024"
-# Two binaries are built: the console `pass-mgr` (src/main.rs — CLI + --tui) and the
-# windowed `pass-mgr-gui` (src/bin/pass-mgr-gui.rs — Windows GUI subsystem, no console
-# window). `default-run` keeps `cargo run`/`cargo install` pointed at the console one.
-default-run = "pass-mgr"
-
-[dependencies]
-anyhow = "1.0.102"
-# Clipboard only; disable the default `image-data` feature (pulls a PNG/deflate
-# image stack we never use) to shrink the dependency/attack surface.
-arboard = { version = "3.6.1", default-features = false }
-argon2 = "0.5.3"
-chacha20poly1305 = "0.10.1"
-directories = "6.0.0"
-eframe = "0.34.3"
-getrandom = "0.4.2"
-ratatui = "0.30.1"
-region = "3.0.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
-zeroize = { version = "1.9.0", features = ["derive"] }
-
-# Unix-only: the `O_NOFOLLOW` open flag, used to make the volume-append open
-# atomically refuse a symlink (closing a TOCTOU window the pre-open stat cannot).
-# Already present transitively; named here so it can be used directly, through the
-# safe `OpenOptionsExt::custom_flags` API only. No effect on Windows builds.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[features]
-# Compiles the crash-safety fault-injection hooks (src/fault.rs) into the storage
-# and vault commit paths. OFF by default (and in every release build), where the
-# hooks are zero-cost no-ops. Enable for crash/full-disk tests:
-#   cargo test --features fault-injection
-fault-injection = []
-
-[dev-dependencies]
-# Property-based testing for the parsers, the store invariants, and path
-# normalization (§13.4).
-proptest = "1"
+# Virtual workspace root. The single `pass-mgr` package was split into:
+#   crates/pass-mgr-core    — headless, audited vault core (no UI/OS deps)
+#   crates/pass-mgr-desktop — the CLI + ratatui TUI + egui GUI binaries
+#   crates/pass-mgr-ffi     — UniFFI wrapper for the Android/iOS apps (added later)
+# The `fuzz/` crate is its own (detached) workspace and links pass-mgr-core directly.
+[workspace]
+resolver = "2"
+members = [
+    "crates/pass-mgr-core",
+    "crates/pass-mgr-desktop",
+    "crates/pass-mgr-ffi",
+]
 
 [profile.release]
-# Strip symbols and debug info from the release binary (smaller distributable).
+# Strip symbols and debug info from release binaries (smaller distributable).
 strip = true
