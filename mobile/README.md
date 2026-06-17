@@ -135,10 +135,10 @@ briefly live and OS guarantees the desktop has that phones don't:
   Kotlin/Swift string into the managed heap, where `ZeroizeOnDrop` can't reach
   and the GC/ARC may duplicate it. The app minimizes copies and fetches edit
   history (which can embed old/new passwords) only on demand.
-- **No swap-locking (`mlock`).** Android grants no `mlock` budget and iOS none to
-  apps, so the derived key can't be pinned out of swap. Mitigated by: Android has
-  no swap by default, iOS encrypts its swap, and the key is still zeroized on
-  drop.
+- **No swap-locking (`mlock`).** The mobile build compiles with the `mlock`
+  feature **off** (phones grant apps no `mlock` budget), so the derived key isn't
+  pinned out of swap — `region` isn't even linked. Mitigated by: Android has no
+  swap by default, iOS encrypts its swap, and the key is still zeroized on drop.
 - **No cross-process single-writer lock.** The desktop's `pass-mgr.lock` is
   dropped; a single app process doesn't need it, and the FFI serializes all calls
   behind one mutex.
@@ -157,5 +157,6 @@ briefly live and OS guarantees the desktop has that phones don't:
 Editing (`upsert`/`delete`), the password generator, category dropdowns, theme,
 biometric/Keychain/Keystore unlock gating, in-app encrypted import/export via the
 document picker, and then documents (attach/export), rekey, backup, and
-compaction. None require core changes beyond a byte-buffer document API and the
-already-planned `mlock`/single-writer feature gates.
+compaction. The `mlock`/single-writer-lock feature gates are already in place (the
+mobile build compiles without either); the main remaining core change is a
+byte-buffer document API for attach/export from the platform document picker.

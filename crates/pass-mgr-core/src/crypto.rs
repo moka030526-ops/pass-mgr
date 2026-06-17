@@ -109,6 +109,8 @@ pub struct Key {
     // `Option<T>` is either `Some(value)` or `None` (Rust's null-free "maybe").
     // The leading `_` in `_lock` tells the compiler we never read this field; we
     // keep it only so its cleanup (unlocking the page) runs when `Key` is dropped.
+    // Gated behind the `mlock` feature; absent in the mobile build (no swap budget).
+    #[cfg(feature = "mlock")]
     _lock: Option<region::LockGuard>,
 }
 
@@ -122,10 +124,17 @@ impl Key {
         // RLIMIT_MEMLOCK) leaves the key working but unprotected from swap.
         // `region::lock(...)` returns a `Result`; `.ok()` converts it to an
         // `Option` (discarding the error), so a failed lock just yields `None`.
-        let lock = region::lock(boxed.as_ref().as_ptr(), KEY_LEN).ok();
+        // Gated behind `mlock`: in the mobile build there is no lock to take (the
+        // OS grants apps no mlock budget), so the field and this call disappear.
+        #[cfg(feature = "mlock")]
+        let _lock = region::lock(boxed.as_ref().as_ptr(), KEY_LEN).ok();
         // Construct and return the struct (last expression with no `;` is the
         // return value in Rust).
-        Key { bytes: boxed, _lock: lock }
+        Key {
+            bytes: boxed,
+            #[cfg(feature = "mlock")]
+            _lock,
+        }
     }
 
     // `&self` = a shared (read-only) borrow of this Key; the method can read the

@@ -13,7 +13,9 @@ name = "pass_mgr_core"
 argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 getrandom = "0.4.2"
-region = "3.0.2"
+# mlock/VirtualLock the derived key out of swap. Optional so the mobile FFI build
+# can drop it (phones grant apps no mlock budget anyway — see the `mlock` feature).
+region = { version = "3.0.2", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
@@ -27,6 +29,16 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 libc = "0.2"
 
 [features]
+# On by default (the desktop binaries get both). The mobile FFI build depends on
+# this crate with `default-features = false`, so both are off there: phones grant
+# apps no mlock budget (Android has no swap by default; iOS encrypts its swap), and
+# a single app process — which serializes all access behind one mutex — needs no
+# cross-process single-writer file lock.
+default = ["mlock", "single-writer-lock"]
+# Lock the derived key's pages out of swap (mlock/VirtualLock via the `region` crate).
+mlock = ["dep:region"]
+# Take an advisory single-writer file lock (pass-mgr.lock) for writable sessions.
+single-writer-lock = []
 # Compiles the crash-safety fault-injection hooks (src/fault.rs) into the storage
 # and vault commit paths. OFF by default (and in every release build), where the
 # hooks are zero-cost no-ops. Enable for crash/full-disk tests:
