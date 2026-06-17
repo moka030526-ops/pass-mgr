@@ -1399,3 +1399,39 @@ and `main::dest_inside_catches_dot_slash_relative_child`; plus the single-instan
 lock-arbitration tests in `single_instance`. The persist-gating fixes are covered
 by the existing crash/fault-injection suite (§12.5), which already exercises failed
 writes.
+
+### 13.3 Windows GUI subsystem — the two-binary split
+
+**Symptom.** On Windows, launching the app showed **two windows**: a command/console
+window *and* the GUI. The cause is the subsystem a Windows executable is linked
+against. A normal Rust binary is a **console-subsystem** program, so when it is
+started from Explorer or a shortcut the OS allocates a console window for it before
+the GUI's window appears on top.
+
+**Constraint.** The fix is to link the GUI as a **GUI-subsystem** program
+(`#![windows_subsystem = "windows"]`), which suppresses the console. But the subsystem
+is fixed at link time — a single executable cannot be a console app for the CLI
+subcommands (`decrypt`, `extract`, `compact`, …) and the `--tui` terminal UI *and* a
+windowless GUI app. The usual single-binary escape — link as a GUI app and call
+`AttachConsole`/`FreeConsole` at runtime to borrow the parent terminal when needed —
+requires Win32 FFI, i.e. an `unsafe` block, which the crate forbids
+(`#![forbid(unsafe_code)]`).
+
+**Mechanism.** The project therefore builds **two binaries** (the `python.exe` /
+`pythonw.exe` pattern):
+
+- **`pass-mgr`** (`src/main.rs`) — the existing **console** binary: all CLI
+  subcommands plus the `--tui` terminal UI, unchanged.
+- **`pass-mgr-gui`** (`src/bin/pass-mgr-gui.rs`) — a thin **GUI-subsystem** launcher
+  carrying `#![cfg_attr(windows, windows_subsystem = "windows")]`. It parses only an
+  interactive launch (optional vault `DIR` + `--write`) and calls `gui::run`. The
+  `cfg_attr` makes the attribute inert off Windows, so elsewhere `pass-mgr-gui` is
+  simply "the GUI".
+
+To guarantee both binaries resolve the vault path identically, the shared path/flag
+logic (`default_vault_path`, `vault_file`, `resolve_interactive`) moved out of
+`main.rs` into a small library module, `pass_mgr::launch`; `main.rs` imports it, so
+its call sites are unchanged. `default-run = "pass-mgr"` keeps `cargo run` /
+`cargo install` pointed at the console binary, and the Windows cross-compile CI job
+(§12.5/IMPLEMENTATION) now builds `--bins`, so the GUI-subsystem build is checked on
+every push. No new dependencies, no `unsafe`.

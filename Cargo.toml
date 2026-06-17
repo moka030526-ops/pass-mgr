@@ -2,6 +2,10 @@
 name = "pass-mgr"
 version = "0.1.0"
 edition = "2024"
+# Two binaries are built: the console `pass-mgr` (src/main.rs — CLI + --tui) and the
+# windowed `pass-mgr-gui` (src/bin/pass-mgr-gui.rs — Windows GUI subsystem, no console
+# window). `default-run` keeps `cargo run`/`cargo install` pointed at the console one.
+default-run = "pass-mgr"
 
 [dependencies]
 anyhow = "1.0.102"

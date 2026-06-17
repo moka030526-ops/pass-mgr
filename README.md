@@ -35,9 +35,12 @@ isn't, see **Part 2** (or ask whoever set it up for you).
 
 ## Starting the program
 
-- **Windows:** double-click **`pass-mgr.exe`**. A window opens.
-- **Mac/Linux:** double-click the **`pass-mgr`** program, or open it the way the
-  person who set it up showed you.
+- **Windows:** double-click **`pass-mgr-gui.exe`**. A window opens, with no
+  command/console window alongside it. (There is also a `pass-mgr.exe` — that one is
+  the command-line version and *does* show a console; it's only for the advanced
+  commands further down. For everyday use, always launch `pass-mgr-gui.exe`.)
+- **Mac/Linux:** double-click the **`pass-mgr-gui`** program (or `pass-mgr`), or open
+  it the way the person who set it up showed you.
 
 When it opens it is in **View-only mode** (a 🔒 READ-ONLY badge shows at the
 bottom). You can look at everything but not change anything. This is a safety
@@ -270,9 +273,15 @@ don't have it, then build:
 
 ```bash
 cargo build --release
-./target/release/pass-mgr            # graphical window
-./target/release/pass-mgr --tui      # terminal version (works over SSH)
+./target/release/pass-mgr-gui         # graphical window
+./target/release/pass-mgr --tui       # terminal version (works over SSH)
+./target/release/pass-mgr decrypt …   # command-line tools (see "advanced" below)
 ```
+
+The build produces **two programs**: `pass-mgr-gui` (the graphical app) and
+`pass-mgr` (the command-line/terminal version). On Linux/Mac they behave the same
+way; the split matters on Windows (next), where the GUI build avoids popping a
+console window.
 
 If the build complains about missing system libraries, install the dev headers:
 
@@ -284,13 +293,29 @@ sudo apt install libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0
 
 ```powershell
 cargo build --release
-.\target\release\pass-mgr.exe
+.\target\release\pass-mgr-gui.exe        # the graphical app — no console window
+.\target\release\pass-mgr.exe --help     # the command-line version
 ```
 
-`target\release\pass-mgr.exe` is a **single self-contained file** (the C runtime
-is linked statically via `.cargo/config.toml`). Copy it to any **Windows 10 or 11
-(x64)** machine and it runs with nothing to install. Hand this `.exe` to the
-non-technical user along with the "Edit shortcut" steps in Part 1.
+The build produces **two `.exe` files**:
+
+- **`pass-mgr-gui.exe`** — the graphical app, built as a Windows *GUI-subsystem*
+  program so launching it opens **only** the window, with no command/console window
+  beside it. **This is the one to hand to a non-technical user** (along with the
+  "Edit shortcut" steps in Part 1).
+- **`pass-mgr.exe`** — the *console* version, for the advanced command-line tools
+  (`decrypt`, `extract`, `compact`, …) and the `--tui` terminal UI, which need a
+  console to show their output.
+
+Each is a **single self-contained file** (the C runtime is linked statically via
+`.cargo/config.toml`). Copy them to any **Windows 10 or 11 (x64)** machine and they
+run with nothing to install.
+
+> Why two files? A Windows executable is fixed at build time as either a console or
+> a GUI program; one file can't be both. So, exactly like Python ships `python.exe`
+> (console) and `pythonw.exe` (windowed), pass-mgr ships a console and a windowed
+> build. (The crate forbids `unsafe` code, which rules out the alternative of one
+> executable that attaches/detaches a console at runtime.)
 
 ### Cross-compiling a Windows `.exe` from Linux (optional)
 
@@ -298,7 +323,8 @@ non-technical user along with the "Edit shortcut" steps in Part 1.
 rustup target add x86_64-pc-windows-gnu      # one-time
 sudo apt install mingw-w64                    # one-time: the cross-linker
 cargo build --release --target x86_64-pc-windows-gnu
-# -> target/x86_64-pc-windows-gnu/release/pass-mgr.exe
+# -> target/x86_64-pc-windows-gnu/release/pass-mgr-gui.exe  (graphical, no console)
+# -> target/x86_64-pc-windows-gnu/release/pass-mgr.exe      (command-line / --tui)
 ```
 
 ## Command-line options (advanced)
