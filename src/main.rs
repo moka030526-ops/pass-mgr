@@ -1187,6 +1187,53 @@ mod tests {
     }
 
     #[test]
+    fn compact_flags_any_detects_each_flag() {
+        use super::CompactFlags;
+        assert!(!CompactFlags::default().any(), "no flags set -> any() is false");
+        // Each flag ALONE makes any() true. (Kills the `||`->`&&` mutants: with `&&`,
+        // a single set flag would yield false.)
+        assert!(CompactFlags { volume: true, ..Default::default() }.any());
+        assert!(CompactFlags { json: true, ..Default::default() }.any());
+        assert!(CompactFlags { history_before: Some("2025-01-01".into()), ..Default::default() }.any());
+        assert!(CompactFlags { history_all: true, ..Default::default() }.any());
+        assert!(CompactFlags { no_backup: true, ..Default::default() }.any());
+        assert!(CompactFlags { backup_dest: Some("/tmp/x".into()), ..Default::default() }.any());
+        assert!(CompactFlags { dry_run: true, ..Default::default() }.any());
+    }
+
+    #[test]
+    fn safe_path_drops_dot_and_dotdot_components() {
+        // A location or filename component that is exactly "." or ".." must be dropped,
+        // never kept as a path component (kills the `||`->`&&` mutant in clean's
+        // empty/"."/".." guard, which would otherwise admit traversal).
+        let traversal = |p: &Path| {
+            p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_)))
+        };
+        for (loc, name) in [("..", "f.txt"), (".", "f.txt"), ("ok", ".."), ("ok", "."), ("..", "..")] {
+            let p = safe_relative_path(loc, name, "fallbackid");
+            assert!(!traversal(&p), "({loc:?},{name:?}) produced a traversal component: {p:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dest_inside_resolves_a_symlinked_dest_via_canonical() {
+        // A dest that is a SYMLINK pointing into the vault dir must be detected as
+        // inside — the canonical-both arm resolves it; a purely lexical check would
+        // miss it. (Kills the deletion of the `(Some(v), Some(d))` arm in dest_inside.)
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let vault = std::env::temp_dir().join(format!("pmdi-sym-{nanos}"));
+        std::fs::create_dir_all(vault.join("sub")).unwrap();
+        let link = std::env::temp_dir().join(format!("pmdi-symlink-{nanos}"));
+        std::os::unix::fs::symlink(vault.join("sub"), &link).unwrap();
+        assert!(super::dest_inside(&vault, &link), "a symlink into the vault resolves to inside");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
     fn cli_compact_rejects_missing_vault_then_bad_flag_combos() {
         use super::CompactFlags;
         // Missing vault: bails before any prompt/validation.
