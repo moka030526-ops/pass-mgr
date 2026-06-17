@@ -577,6 +577,16 @@ fault-injection`), `audit` (`cargo audit`), `windows-cross` (`cargo check
 run of each parser target). This turns the one-time verification above into a standing
 guarantee — the crash-safety and portability properties cannot silently regress.
 
+**Data-race check (ThreadSanitizer).** The single cross-thread hand-off — the detached
+focus accept loop sharing the `egui::Context` with the render thread — was exercised
+once under nightly ThreadSanitizer via the `#[ignore]`d
+`single_instance::tests::focus_accept_thread_is_race_free` reproducer (built with
+`-Zsanitizer=thread -Zbuild-std`, instrumenting `std` and the whole dependency tree).
+It drives the real accept thread on a live `Context` under concurrent pings while the
+main thread touches the same `Context`; TSan reported **no data races**. Consistent with
+the design (`#![forbid(unsafe_code)]`; the only shared object is a `Sync` type used
+through its safe API), now confirmed empirically.
+
 **Property-based tests (`proptest`).** Beyond the parser/path proptests, randomized
 invariants cover: the in-place redundancy ring (any depth × any save sequence ⇒ the
 vault opens, the mirror is the current generation, the retained generations decode
