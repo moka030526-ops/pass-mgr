@@ -569,6 +569,14 @@ green, clippy is clean with `-D warnings`, the Windows cross-compile checks pass
 a short 4-target `cargo-fuzz` campaign (~42M executions) runs crash-free, and
 `cargo audit` reports 0 advisories across 567 dependencies.
 
+**Continuous integration.** `.github/workflows/ci.yml` re-runs all of the above on
+every push to `main` and every pull request, across four jobs: `test` (clippy with
+`-D warnings`, then `cargo test --all-targets` and `cargo test --features
+fault-injection`), `audit` (`cargo audit`), `windows-cross` (`cargo check
+--target x86_64-pc-windows-gnu`), and `fuzz-smoke` (`cargo fuzz build` plus a 30 s
+run of each parser target). This turns the one-time verification above into a standing
+guarantee — the crash-safety and portability properties cannot silently regress.
+
 **Property-based tests (`proptest`).** Beyond the parser/path proptests, randomized
 invariants cover: the in-place redundancy ring (any depth × any save sequence ⇒ the
 vault opens, the mirror is the current generation, the retained generations decode

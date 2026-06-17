@@ -427,3 +427,8 @@ not part of `cargo test`; run it manually with `sudo tests/dmflakey_powerloss.sh
 
 Property-based (`proptest`) and `cargo-fuzz` targets additionally hammer the parsers,
 the redundancy-ring invariants, the calendar math, and the password generator.
+
+A GitHub Actions workflow (`.github/workflows/ci.yml`) runs the whole suite on every
+push and pull request — clippy (warnings denied), the default and `--features
+fault-injection` test passes, `cargo audit`, a Windows cross-compile check, and a short
+parser fuzz smoke — so the hardening can't silently regress.
