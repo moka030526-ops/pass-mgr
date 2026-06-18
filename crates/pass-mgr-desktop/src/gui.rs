@@ -2559,6 +2559,63 @@ mod tests {
     }
 
     #[test]
+    fn gui_real_estate_document_upload_export_remove() {
+        let (mut app, path) = app_unlocked("guiredoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut re = RealEstate::new().unwrap();
+        re.address = "1 Main".into();
+        app.edit_realestate = Some(re);
+
+        // --- upload ---
+        let src = dir.join("deed.txt");
+        std::fs::write(&src, b"the deed").unwrap();
+        app.doc_filename = "deed.txt".into();
+        app.doc_source = src.to_string_lossy().into();
+        app.handle_re_doc(ReDocReq::Upload);
+        assert_eq!(app.edit_realestate.as_ref().unwrap().documents.len(), 1, "uploaded one doc");
+        assert_eq!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.len(), 1, "persisted");
+
+        // --- export ---
+        let dest = dir.join("deed-out.txt");
+        app.doc_dest = dest.to_string_lossy().into();
+        app.handle_re_doc(ReDocReq::Export(0));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the deed", "exported bytes round-trip");
+
+        // --- remove ---
+        app.handle_re_doc(ReDocReq::Remove(0));
+        assert!(app.edit_realestate.as_ref().unwrap().documents.is_empty(), "removed the doc");
+        assert!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.is_empty(), "unlinked");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn gui_tax_document_upload_export_remove() {
+        let (mut app, path) = app_unlocked("guitaxdoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut tf = TaxFiling::new().unwrap();
+        tf.year = "2024".into();
+        app.edit_taxfiling = Some(tf);
+
+        let src = dir.join("w2.txt");
+        std::fs::write(&src, b"taxable income").unwrap();
+        app.doc_filename = "w2.txt".into();
+        app.doc_source = src.to_string_lossy().into();
+        app.handle_tax_doc(TaxDocReq::Upload);
+        assert_eq!(app.edit_taxfiling.as_ref().unwrap().documents.len(), 1, "uploaded one doc");
+        assert_eq!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.len(), 1, "persisted");
+
+        let dest = dir.join("out.txt");
+        app.doc_dest = dest.to_string_lossy().into();
+        app.handle_tax_doc(TaxDocReq::Export(0));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"taxable income", "exported bytes round-trip");
+
+        app.handle_tax_doc(TaxDocReq::Remove(0));
+        assert!(app.edit_taxfiling.as_ref().unwrap().documents.is_empty(), "removed the doc");
+        assert!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.is_empty(), "unlinked");
+        cleanup(&path);
+    }
+
+    #[test]
     fn load_theme_from_round_trips_and_is_bounded_and_symlink_safe() {
         let dir = std::env::temp_dir().join(format!("pmprefs-{}", nanos()));
         std::fs::create_dir_all(&dir).unwrap();
