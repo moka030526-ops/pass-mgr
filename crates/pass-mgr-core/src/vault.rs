@@ -3031,6 +3031,7 @@ mod tests {
 
     // ---- Phase 5: single-writer lock + partition-filtered export -----------
 
+    #[cfg(feature = "single-writer-lock")]
     #[test]
     fn single_writer_lock_blocks_second_writable_open() {
         let path = tmp_path("lock");
@@ -3041,6 +3042,23 @@ mod tests {
         assert!(OpenVault::open_read_only(path.clone(), b"a", b"b").is_ok());
         drop(v); // releasing the writer frees the lock (no stale lock file)
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
+        cleanup(&path);
+    }
+
+    /// Complement of the test above for the `single-writer-lock`-off build (the
+    /// mobile/FFI configuration): `WriteLock::acquire` is a no-op, so a second
+    /// writable open must succeed rather than fail with `Locked`. This pins the no-op
+    /// `acquire` under that config (run with `--no-default-features`), and documents
+    /// that the cargo-mutants survivor on that `#[cfg(not(...))]` line is a phantom —
+    /// it is dead code in the default (feature-on) build cargo-mutants compiles.
+    #[cfg(not(feature = "single-writer-lock"))]
+    #[test]
+    fn no_op_lock_allows_a_second_writable_open() {
+        let path = tmp_path("noop_lock");
+        let v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // No cross-process lock is taken, so a second writable open is allowed.
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
+        drop(v);
         cleanup(&path);
     }
 
