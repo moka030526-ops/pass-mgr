@@ -94,9 +94,9 @@ Choose passwords that are long and memorable to you but hard for others to guess
 
 If a password is wrong it simply says so — try again, checking the order.
 
-## The five sections (tabs)
+## The six sections (tabs)
 
-Across the top are five tabs. Click a tab to switch:
+Across the top are six tabs. Click a tab to switch:
 
 1. **Instructions** — notes and instructions for your family/executor (funeral
    wishes, who to contact, where to find things).
@@ -106,6 +106,9 @@ Across the top are five tabs. Click a tab to switch:
 4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with
    usernames and passwords.
 5. **Real Estate** — properties: address, ownership, taxes, mortgage/financing.
+6. **Taxes** — one entry per **filing year**, holding that year's tax documents
+   (W-2s, 1099s, the return, receipts). Each entry can hold **several** uploaded
+   documents, all kept together in that year's own folder inside the vault.
 
 ## Adding or changing an entry (step by step)
 
@@ -131,6 +134,11 @@ along with everything else.
 
 To get a document back out later, open the entry and use **Export** to save a copy
 to your computer.
+
+On the **Taxes** tab it works the same way, but each filing year can hold
+**several** documents: open (or create) the year, then upload as many files as you
+like — they are all stored together in that year's folder inside the vault. Use
+**Export** or **Remove** on any individual document.
 
 ## Showing or copying a password
 
