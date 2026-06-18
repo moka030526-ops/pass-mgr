@@ -33,7 +33,7 @@ use eframe::egui;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::password::{self, GenOptions};
-use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TrustWill};
+use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TaxFiling, TrustWill};
 use crate::ui::format_time;
 use crate::vault::{self, OpenVault, VaultError};
 use crate::crypto::KdfParams;
@@ -308,6 +308,7 @@ enum Tab {
     Assets,
     Accounts,
     RealEstate,
+    Taxes,
 }
 
 /// Deferred form action gathered during rendering, applied afterwards.
@@ -325,6 +326,16 @@ enum DocReq {
     Attach,
     Export,
     Remove,
+}
+
+/// Deferred Taxes-tab document action gathered during rendering. `Export`/`Remove`
+/// carry the index of the document within the filing's `documents` list.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TaxDocReq {
+    None,
+    Upload,
+    Export(usize),
+    Remove(usize),
 }
 
 // `struct` is a record of named fields — the whole application state lives here.
@@ -355,6 +366,7 @@ struct GuiApp {
     edit_asset: Option<AssetLiability>,
     edit_account: Option<Account>,
     edit_realestate: Option<RealEstate>,
+    edit_taxfiling: Option<TaxFiling>,
     reveal_pw: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
@@ -448,6 +460,7 @@ impl GuiApp {
             edit_asset: None,
             edit_account: None,
             edit_realestate: None,
+            edit_taxfiling: None,
             reveal_pw: false,
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
@@ -759,6 +772,7 @@ impl GuiApp {
             tab_button(ui, &mut self.tab, Tab::Assets, "Assets and Liabilities");
             tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
             tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
+            tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
             ui.separator();
             // Change-password is a write; only offer it when writable.
             // `&&` short-circuits: the button is only drawn/evaluated when
@@ -1571,6 +1585,105 @@ impl GuiApp {
         }
     }
 
+    // --- Tab: Taxes ----------------------------------------------------------
+
+    fn tab_taxes(&mut self, ui: &mut egui::Ui) {
+        let labels = label_list(&self.vault_ref().vault.tax_filings);
+        let cur = self.edit_taxfiling.as_ref().map(|r| r.id.clone());
+        // Pre-compute each attached document's "location/filename" label (needs an
+        // immutable borrow of the vault, so it can't happen inside the edit form).
+        let doc_labels: Vec<String> = match self.edit_taxfiling.as_ref() {
+            Some(r) => r
+                .documents
+                .iter()
+                .map(|id| self.vault_ref().doc_path(id).unwrap_or_else(|| id.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let writable = self.writable;
+        let mut new = false;
+        let mut select = None;
+        let mut action = FormAction::None;
+        let mut docreq = TaxDocReq::None;
+
+        ui.columns(2, |c| {
+            (new, select) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable);
+            let ui = &mut c[1];
+            if let Some(r) = self.edit_taxfiling.as_mut() {
+                egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    text_row(ui, "Filing year", &mut r.year);
+                });
+                ui.label("Notes");
+                ui.add(egui::TextEdit::multiline(&mut r.notes).desired_rows(4).desired_width(f32::INFINITY));
+                ui.separator();
+
+                // Attached documents — all live under taxes/<year>/.
+                ui.label(format!("Documents ({}) — saved to {}/", r.documents.len(), records::tax_doc_location(&r.year)));
+                for (i, label) in doc_labels.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("• {label}"));
+                        if ui.button("Export").clicked() {
+                            docreq = TaxDocReq::Export(i);
+                        }
+                        if writable && ui.button("Remove").clicked() {
+                            docreq = TaxDocReq::Remove(i);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Export to");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.doc_dest)
+                            .desired_width(360.0)
+                            .hint_text("folder or file path to save into"),
+                    );
+                });
+
+                if writable {
+                    ui.separator();
+                    ui.label("Upload a document into this year's folder:");
+                    egui::Grid::new("tax_upload").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        text_row(ui, "Filename", &mut self.doc_filename);
+                        text_row(ui, "Upload from", &mut self.doc_source);
+                    });
+                    if ui.button("⬆ Upload").clicked() {
+                        docreq = TaxDocReq::Upload;
+                    }
+                }
+
+                action = form_buttons(ui, writable);
+                history_view(ui, &r.history);
+            } else {
+                ui.label("Select a tax year or click “New”.");
+            }
+        });
+
+        if new {
+            self.edit_taxfiling = TaxFiling::new().ok();
+            self.clear_doc_inputs();
+        }
+        if let Some(i) = select {
+            self.edit_taxfiling = self.vault_ref().vault.tax_filings.get(i).cloned();
+            self.clear_doc_inputs();
+        }
+        self.handle_tax_doc(docreq);
+        match action {
+            FormAction::Save => {
+                if let Some(r) = self.edit_taxfiling.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.tax_filings, r);
+                }
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
+            }
+            FormAction::Delete => self.delete_current(Tab::Taxes),
+            _ => {}
+        }
+    }
+
     // --- Shared deferred operations -----------------------------------------
 
     /// Human-readable "location/filename" of an attached volume file id.
@@ -1733,6 +1846,101 @@ impl GuiApp {
         }
     }
 
+    // Performs a Taxes-tab document action (upload to taxes/<year>/, export, or
+    // remove). Like `handle_doc`, the vault is borrowed mutably here, not while
+    // drawing, and the persist-then-reclaim ordering keeps a crash from leaving a
+    // dangling reference.
+    fn handle_tax_doc(&mut self, req: TaxDocReq) {
+        match req {
+            TaxDocReq::None => {}
+            TaxDocReq::Upload => {
+                let name = self.doc_filename.trim().to_string();
+                let src = self.doc_source.trim().to_string();
+                if name.is_empty() || src.is_empty() {
+                    self.status = "Filename and 'upload from' path are required.".into();
+                    return;
+                }
+                // The folder is derived from the filing year, NOT user-entered.
+                let year = self.edit_taxfiling.as_ref().map(|r| r.year.clone()).unwrap_or_default();
+                let loc = records::tax_doc_location(&year);
+                let vpath = vault::virtual_path(&loc, &name);
+                if vpath.len() > crate::storage::MAX_PATH_LEN {
+                    self.status = format!(
+                        "Path too long: {} bytes (max {}). Shorten the filename.",
+                        vpath.len(),
+                        crate::storage::MAX_PATH_LEN
+                    );
+                    return;
+                }
+                let id = match self.vault.as_mut() {
+                    Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status = format!("Upload failed: {e}");
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                if let Some(r) = self.edit_taxfiling.as_mut() {
+                    r.documents.push(id);
+                }
+                // Persist the record→document link immediately so the manifest entry
+                // is referenced (no orphan if the user navigates away).
+                if let Some(r) = self.edit_taxfiling.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.tax_filings, r);
+                }
+                self.clear_doc_inputs();
+                if self.persist() {
+                    self.status = "Document uploaded to the encrypted volume.".into();
+                }
+                // On failure persist() has already set the "Save failed: …" status.
+            }
+            TaxDocReq::Export(i) => {
+                let dest = self.doc_dest.trim().to_string();
+                if dest.is_empty() {
+                    self.status = "Enter an 'export to' path first.".into();
+                    return;
+                }
+                let id = self.edit_taxfiling.as_ref().and_then(|r| r.documents.get(i).cloned());
+                if let (Some(id), Some(ov)) = (id, self.vault.as_ref()) {
+                    match ov.export_document(&id, Path::new(&dest)) {
+                        Ok(()) => self.status = format!("Exported to {dest}"),
+                        Err(e) => self.status = format!("Export failed: {e}"),
+                    }
+                }
+            }
+            TaxDocReq::Remove(i) => {
+                // Unlink from the record, persist, THEN reclaim the blob — same
+                // crash-safe ordering as handle_doc's Remove.
+                let id = self.edit_taxfiling.as_ref().and_then(|r| r.documents.get(i).cloned());
+                if let Some(r) = self.edit_taxfiling.as_mut()
+                    && i < r.documents.len()
+                {
+                    r.documents.remove(i);
+                }
+                if let Some(r) = self.edit_taxfiling.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.tax_filings, r);
+                }
+                if !self.persist() {
+                    return; // persist() already set the "Save failed" status
+                }
+                if let Some(id) = id
+                    && let Some(ov) = self.vault.as_mut()
+                    && let Err(e) = ov.remove_document(&id)
+                {
+                    self.status = format!("Unlinked, but blob cleanup failed: {e}");
+                    return;
+                }
+                self.status = "Removed document from the vault.".into();
+            }
+        }
+    }
+
     fn delete_current(&mut self, tab: Tab) {
         // Collect any attached document ids to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
@@ -1773,6 +1981,15 @@ impl GuiApp {
                 Tab::RealEstate => {
                     if let Some(r) = self.edit_realestate.take() {
                         records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate");
+                    }
+                }
+                Tab::Taxes => {
+                    if let Some(r) = self.edit_taxfiling.take() {
+                        // Reclaim every document attached to this filing year.
+                        for f in &r.documents {
+                            doc_ids.push(f.clone());
+                        }
+                        records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing");
                     }
                 }
             }
@@ -1855,6 +2072,7 @@ impl eframe::App for GuiApp {
             Tab::Assets => self.tab_assets(ui),
             Tab::Accounts => self.tab_accounts(ui),
             Tab::RealEstate => self.tab_realestate(ui),
+            Tab::Taxes => self.tab_taxes(ui),
         });
     }
 }

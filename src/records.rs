@@ -69,6 +69,15 @@ pub fn random_id() -> Result<String, CryptoError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The virtual folder a tax year's documents live in: `taxes/<sanitized-year>`.
+/// Non-alphanumeric characters in the year are dropped so the folder name is
+/// always safe; an empty/blank year falls back to `taxes/unspecified`. Shared by
+/// the GUI and TUI so both store a given year's documents in the same place.
+pub fn tax_doc_location(year: &str) -> String {
+    let y: String = year.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if y.is_empty() { "taxes/unspecified".to_string() } else { format!("taxes/{y}") }
+}
+
 /// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
 /// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
 /// to the epoch. Shared by the human and filename timestamp formatters so the
@@ -152,13 +161,14 @@ pub fn parse_ymd_utc(s: &str) -> Option<i64> {
 /// of history entries removed. Removed `Change`s are `ZeroizeOnDrop`, so their
 /// (possibly secret-bearing) before/after detail strings are wiped from RAM.
 pub fn compact_history(vault: &mut Vault, cutoff: Option<i64>, drop_all: bool) -> usize {
-    // Each of the five record collections shares the generic `Record` interface,
+    // Each of the six record collections shares the generic `Record` interface,
     // so one helper trims them all.
     trim_histories(&mut vault.instructions, cutoff, drop_all)
         + trim_histories(&mut vault.trust_wills, cutoff, drop_all)
         + trim_histories(&mut vault.assets, cutoff, drop_all)
         + trim_histories(&mut vault.accounts, cutoff, drop_all)
         + trim_histories(&mut vault.real_estate, cutoff, drop_all)
+        + trim_histories(&mut vault.tax_filings, cutoff, drop_all)
 }
 
 /// How many history entries `compact_history` would remove for the same
@@ -188,6 +198,9 @@ pub fn history_stats(vault: &Vault, cutoff: Option<i64>, drop_all: bool) -> usiz
         n += count(&r.history);
     }
     for r in &vault.real_estate {
+        n += count(&r.history);
+    }
+    for r in &vault.tax_filings {
         n += count(&r.history);
     }
     n
@@ -432,6 +445,23 @@ pub struct RealEstate {
     pub history: Vec<Change>,
 }
 
+/// Tab 6 — a tax filing for a given year, holding its uploaded documents.
+/// Every document attached to a filing is stored together under the
+/// `taxes/<year>/` virtual folder in the encrypted volume.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
+pub struct TaxFiling {
+    pub id: String,
+    /// The filing/tax year, e.g. "2024". Also names the document folder.
+    pub year: String,
+    pub notes: String,
+    /// Volume file ids of the documents attached to this filing year (all stored
+    /// under `taxes/<year>/`). An entry can hold several documents.
+    pub documents: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub history: Vec<Change>,
+}
+
 /// Stamp a freshly-built record with an id and creation/update timestamps.
 // `macro_rules!` defines a compile-time code template (a macro), expanded inline
 // wherever it's invoked — used here to avoid repeating identical constructor code
@@ -482,6 +512,11 @@ impl Account {
 impl RealEstate {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(RealEstate))
+    }
+}
+impl TaxFiling {
+    pub fn new() -> Result<Self, CryptoError> {
+        Ok(new_record!(TaxFiling))
     }
 }
 
@@ -622,6 +657,23 @@ impl_record!(
     |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() }
 );
 
+impl_record!(
+    TaxFiling,
+    |s: &TaxFiling, n: &TaxFiling, at: i64, out: &mut Vec<Change>| {
+        track(out, at, "year", &s.year, &n.year);
+        track(out, at, "notes", &s.notes, &n.notes);
+        // Log document-count changes without exposing the volume file ids.
+        if s.documents != n.documents {
+            out.push(Change {
+                at,
+                action: "updated".into(),
+                detail: format!("documents: {} -> {}", s.documents.len(), n.documents.len()),
+            });
+        }
+    },
+    |l: &TaxFiling| if l.year.is_empty() { "(no year)".to_string() } else { format!("Taxes {}", l.year) }
+);
+
 // --- Vault settings ----------------------------------------------------------
 
 /// User-configurable vault settings, stored (encrypted) inside the vault.
@@ -653,7 +705,7 @@ impl Default for VaultSettings {
     }
 }
 
-/// The decrypted contents of a vault: all five record collections plus the
+/// The decrypted contents of a vault: all six record collections plus the
 /// volume manifest, access time, and vault-level audit log. Wipes on drop.
 // This is the top-level in-memory object; `ZeroizeOnDrop` means the entire vault
 // (and every record inside it) is securely erased when it leaves scope.
@@ -680,6 +732,9 @@ pub struct Vault {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub real_estate: Vec<RealEstate>,
+    /// Tax filings (the Taxes tab); each year's documents live under `taxes/<year>/`.
+    #[serde(default)]
+    pub tax_filings: Vec<TaxFiling>,
     /// Stable random id binding the document volumes/manifests to this vault (so a
     /// foreign or swapped volume/manifest fails authentication). Set on create.
     #[serde(default)]
@@ -816,6 +871,41 @@ mod tests {
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn tax_filing_new_diff_label_and_folder() {
+        let mut t = TaxFiling::new().unwrap();
+        assert!(t.year.is_empty() && t.documents.is_empty());
+        assert_eq!(t.label(), "(no year)");
+        t.year = "2024".into();
+        assert_eq!(t.label(), "Taxes 2024");
+
+        let mut edited = t.clone();
+        edited.notes = "filed late".into();
+        edited.documents.push("blobid".into());
+        let changes = t.diff(&edited, unix_now());
+        assert!(changes.iter().any(|c| c.detail.contains("notes")));
+        assert!(changes.iter().any(|c| c.detail.contains("documents") && c.detail.contains("0 -> 1")));
+        assert!(t.diff(&t.clone(), unix_now()).is_empty(), "unchanged record yields no diff");
+
+        // Folder convention: taxes/<sanitized-year>, with a safe fallback.
+        assert_eq!(tax_doc_location("2024"), "taxes/2024");
+        assert_eq!(tax_doc_location(" 2023/ "), "taxes/2023");
+        assert_eq!(tax_doc_location(""), "taxes/unspecified");
+    }
+
+    #[test]
+    fn compact_history_includes_tax_filings() {
+        // The Taxes collection must be trimmed by compact_history and counted by
+        // history_stats like the other five record types.
+        let mut vault = Vault::default();
+        let mut t = TaxFiling::default();
+        t.history = vec![Change { at: 1, action: "u".into(), detail: String::new() }];
+        vault.tax_filings.push(t);
+        assert_eq!(history_stats(&vault, None, true), 1);
+        assert_eq!(compact_history(&mut vault, None, true), 1);
+        assert!(vault.tax_filings[0].history.is_empty());
     }
 
     #[test]

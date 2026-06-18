@@ -38,7 +38,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::crypto::KdfParams;
 use crate::password::{self, GenOptions};
 use crate::records::{
-    self, Account, AssetLiability, Change, Instruction, RealEstate, Record, TrustWill,
+    self, Account, AssetLiability, Change, Instruction, RealEstate, Record, TaxFiling, TrustWill,
 };
 use crate::vault::{self, OpenVault, VaultError};
 
@@ -104,14 +104,15 @@ enum Tab {
     Assets,
     Accounts,
     RealEstate,
+    Taxes,
 }
 
 // `impl Tab { ... }` attaches methods/constants to the `Tab` type.
 impl Tab {
-    // `[Tab; 5]` is a fixed-size array of 5 `Tab` values. `const` = a
+    // `[Tab; 6]` is a fixed-size array of 6 `Tab` values. `const` = a
     // compile-time constant.
-    const ALL: [Tab; 5] =
-        [Tab::Instructions, Tab::TrustWill, Tab::Assets, Tab::Accounts, Tab::RealEstate];
+    const ALL: [Tab; 6] =
+        [Tab::Instructions, Tab::TrustWill, Tab::Assets, Tab::Accounts, Tab::RealEstate, Tab::Taxes];
 
     // Methods take `self`; because `Tab` is `Copy`, taking `self` by value here is
     // cheap and does not consume the caller's copy. The return type
@@ -124,6 +125,7 @@ impl Tab {
             Tab::Assets => "Assets & Liabilities",
             Tab::Accounts => "Accounts",
             Tab::RealEstate => "Real Estate",
+            Tab::Taxes => "Taxes",
         }
     }
 
@@ -288,6 +290,10 @@ struct EditState {
     record_fields: usize,
     focus: usize,
     attached_file_id: Option<String>,
+    /// Document file ids for the Taxes tab, which manages several documents per
+    /// filing year. Empty/unused for the single-document tabs (TrustWill, Assets),
+    /// which carry their one document in `attached_file_id`.
+    tax_docs: Vec<String>,
     reveal: bool,
     history: Vec<Change>,
 }
@@ -459,6 +465,7 @@ impl App {
                 .map(|a| (a.id.clone(), a.label()))
                 .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
+            Tab::Taxes => label_list(&v.tax_filings),
         }
     }
 
@@ -745,10 +752,10 @@ impl App {
                 self.tab = self.tab.shifted(-1);
                 self.selected = 0;
             }
-            // `c @ '1'..='5'` is a range pattern that also binds the matched char
-            // to `c`: a digit key 1-5 jumps straight to that tab. `c as usize -
+            // `c @ '1'..='6'` is a range pattern that also binds the matched char
+            // to `c`: a digit key 1-6 jumps straight to that tab. `c as usize -
             // '1' as usize` converts the char to its 0-based tab index.
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
                 self.selected = 0;
             }
@@ -1149,18 +1156,51 @@ impl App {
                     r.history.clone(),
                 )
             }
+            Tab::Taxes => {
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.tax_filings.iter().find(|r| &r.id == id).cloned())
+                    .unwrap_or_else(|| TaxFiling::new().unwrap_or_default());
+                let id = if existing { Some(r.id.clone()) } else { None };
+                (
+                    id,
+                    r.created_at,
+                    vec![
+                        Field::text("Filing year", r.year.clone()),
+                        Field::multiline("Notes", r.notes.clone()),
+                    ],
+                    None,
+                    r.history.clone(),
+                )
+            }
         };
 
         // Remember how many fields belong to the record itself, before appending
         // the extra doc-upload inputs (so the two groups can be told apart later).
         let record_fields = fields.len();
-        // Append document-upload inputs for the doc-bearing tabs.
+        // Append document-upload inputs for the single-document tabs.
         if tab_has_docs(tab) {
             fields.push(Field::text("Doc location", String::new()));
             fields.push(Field::text("Doc filename", String::new()));
             fields.push(Field::text("Upload from", String::new()));
             fields.push(Field::text("Export to", String::new()));
         }
+        // The Taxes tab manages several documents per year. There is no manual
+        // "Doc location" (it is always taxes/<year>); a "Doc #" instead selects
+        // which listed document Ctrl+E / Ctrl+K act on. `tax_docs` is loaded from
+        // the record (and stays empty for every other tab).
+        let tax_docs: Vec<String> = if tab == Tab::Taxes {
+            fields.push(Field::text("Doc filename", String::new()));
+            fields.push(Field::text("Upload from", String::new()));
+            fields.push(Field::text("Export to", String::new()));
+            fields.push(Field::text("Doc # (export/remove)", String::new()));
+            sel_id
+                .as_ref()
+                .and_then(|id| v.tax_filings.iter().find(|r| &r.id == id).map(|r| r.documents.clone()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         self.edit = Some(EditState {
             tab,
@@ -1170,6 +1210,7 @@ impl App {
             record_fields,
             focus: 0,
             attached_file_id: attached,
+            tax_docs,
             reveal: false,
             history,
         });
@@ -1229,13 +1270,27 @@ impl App {
             }
             KeyCode::Char('u') if ctrl => {
                 if self.require_writable() {
-                    self.attach_document();
+                    if self.tab == Tab::Taxes {
+                        self.attach_tax_document();
+                    } else {
+                        self.attach_document();
+                    }
                 }
             }
-            KeyCode::Char('e') if ctrl => self.export_document(),
+            KeyCode::Char('e') if ctrl => {
+                if self.tab == Tab::Taxes {
+                    self.export_tax_document();
+                } else {
+                    self.export_document();
+                }
+            }
             KeyCode::Char('k') if ctrl => {
                 if self.require_writable() {
-                    self.detach_document();
+                    if self.tab == Tab::Taxes {
+                        self.remove_tax_document();
+                    } else {
+                        self.detach_document();
+                    }
                 }
             }
             KeyCode::Tab | KeyCode::Down => {
@@ -1444,6 +1499,123 @@ impl App {
         }
     }
 
+    /// Upload a document into the current tax filing's `taxes/<year>/` folder and
+    /// append it to the filing's document list. Same persist discipline as
+    /// `attach_document` (there is no previous blob to reclaim — this only adds).
+    fn attach_tax_document(&mut self) {
+        let Some(mut es) = self.edit.take() else { return };
+        if es.tab != Tab::Taxes {
+            self.edit = Some(es);
+            return;
+        }
+        let rc = es.record_fields;
+        let year = es.fields[0].value.clone();
+        let filename = es.fields[rc].value.clone();
+        let source = es.fields[rc + 1].value.clone();
+        if filename.trim().is_empty() || source.trim().is_empty() {
+            self.status = "Doc filename and 'upload from' are required.".into();
+            self.edit = Some(es);
+            return;
+        }
+        let location = records::tax_doc_location(&year);
+        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        if vpath_len > crate::storage::MAX_PATH_LEN {
+            self.status =
+                format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
+            self.edit = Some(es);
+            return;
+        }
+        let id = match self.vault.as_mut() {
+            Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Upload failed: {e}");
+                    self.edit = Some(es);
+                    return;
+                }
+            },
+            None => {
+                self.edit = Some(es);
+                return;
+            }
+        };
+        es.tax_docs.push(id);
+        es.fields[rc].value.clear(); // filename
+        es.fields[rc + 1].value.clear(); // upload-from
+        if let Err(e) = Self::ensure_id(&mut es) {
+            self.status = e;
+            self.edit = Some(es);
+            return;
+        }
+        self.commit_edit_record(&es);
+        if self.persist() {
+            self.status = "Document uploaded to the encrypted volume.".into();
+        }
+        self.edit = Some(es);
+    }
+
+    /// Export the tax document whose 1-based number is in the "Doc #" field.
+    fn export_tax_document(&mut self) {
+        let Some(es) = self.edit.as_ref() else { return };
+        if es.tab != Tab::Taxes {
+            return;
+        }
+        let rc = es.record_fields;
+        let dest = es.fields[rc + 2].value.clone();
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
+            self.status = format!("Enter a document # between 1 and {}.", es.tax_docs.len());
+            return;
+        };
+        if dest.trim().is_empty() {
+            self.status = "Enter an 'export to' path first.".into();
+            return;
+        }
+        let id = es.tax_docs[idx].clone();
+        if let Some(ov) = self.vault.as_ref() {
+            match ov.export_document(&id, Path::new(&dest)) {
+                Ok(()) => self.status = format!("Exported to {dest}"),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Remove (and reclaim) the tax document whose 1-based number is in "Doc #".
+    /// Persists the unlink before reclaiming the blob, like `detach_document`.
+    fn remove_tax_document(&mut self) {
+        let Some(mut es) = self.edit.take() else { return };
+        if es.tab != Tab::Taxes {
+            self.edit = Some(es);
+            return;
+        }
+        let rc = es.record_fields;
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
+            self.status = format!("Enter a document # between 1 and {} to remove.", es.tax_docs.len());
+            self.edit = Some(es);
+            return;
+        };
+        let id = es.tax_docs.remove(idx);
+        es.fields[rc + 3].value.clear();
+        if let Err(e) = Self::ensure_id(&mut es) {
+            self.status = e;
+            self.edit = Some(es);
+            return;
+        }
+        self.commit_edit_record(&es);
+        if !self.persist() {
+            self.edit = Some(es); // persist() already set the "Save failed" status
+            return;
+        }
+        if let Some(ov) = self.vault.as_mut()
+            && let Err(e) = ov.remove_document(&id)
+        {
+            self.status = format!("Unlinked, but blob cleanup failed: {e}");
+            self.edit = Some(es);
+            return;
+        }
+        self.status = "Removed document from the vault.".into();
+        self.edit = Some(es);
+    }
+
     /// Rebuild the typed record from the edit fields (using the buffer's stable
     /// id, which must already be set) and upsert it into the vault.
     // `es: &EditState` is a shared borrow — this reads the edit buffer and writes
@@ -1522,6 +1694,15 @@ impl App {
                 r.payment_account = f(6);
                 records::upsert(&mut v.real_estate, r);
             }
+            Tab::Taxes => {
+                let mut r = TaxFiling::default();
+                r.id = id;
+                r.created_at = es.created_at;
+                r.year = f(0);
+                r.notes = f(1);
+                r.documents = es.tax_docs.clone();
+                records::upsert(&mut v.tax_filings, r);
+            }
         }
     }
 
@@ -1582,6 +1763,15 @@ impl App {
                 }
                 Tab::RealEstate => {
                     records::remove(&mut v.real_estate, &id, &mut v.audit, "Real Estate");
+                }
+                Tab::Taxes => {
+                    // Reclaim every document attached to this filing year.
+                    if let Some(r) = v.tax_filings.iter().find(|r| r.id == id) {
+                        for f in &r.documents {
+                            doc_ids.push(f.clone());
+                        }
+                    }
+                    records::remove(&mut v.tax_filings, &id, &mut v.audit, "Tax filing");
                 }
             }
         }
@@ -1869,6 +2059,26 @@ impl App {
                 Style::default().fg(Color::Cyan),
             )));
         }
+        if es.tab == Tab::Taxes {
+            // List the filing's documents with their 1-based numbers (used by the
+            // "Doc #" field for Ctrl+E export / Ctrl+K remove).
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Documents ({}) — saved to {}/",
+                    es.tax_docs.len(),
+                    records::tax_doc_location(&es.fields[0].value)
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+            for (i, id) in es.tax_docs.iter().enumerate() {
+                let label = self.vault_ref().doc_path(id).unwrap_or_else(|| id.clone());
+                lines.push(Line::from(Span::styled(
+                    format!("  #{}  {label}", i + 1),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
         if !es.history.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("History:", Style::default().add_modifier(Modifier::BOLD))));
@@ -1889,7 +2099,9 @@ impl App {
             chunks[0],
         );
 
-        let hints = if es.has_docs() {
+        let hints = if es.tab == Tab::Taxes {
+            "Tab/↑↓ field · Ctrl+S save · Ctrl+U upload · Ctrl+E export(Doc#) · Ctrl+K remove(Doc#) · Esc cancel"
+        } else if es.has_docs() {
             "Tab/↑↓ field · ←/→ choice · Ctrl+S save · Ctrl+U upload · Ctrl+E export · Ctrl+K detach · Esc cancel"
         } else {
             "Tab/↑↓ field · ←/→ choice · Ctrl+S save · Ctrl+G gen · Ctrl+R reveal · Ctrl+Y copy · Esc cancel"
@@ -1927,6 +2139,13 @@ fn yes_no() -> Vec<String> {
 /// The yes/no choice value for a boolean.
 fn bool_choice(b: bool) -> String {
     if b { "Yes" } else { "No" }.to_string()
+}
+
+/// Parse a user-entered 1-based document number into a 0-based index, returning
+/// `None` if it is not a number in `1..=len` (so the caller can show a hint).
+fn parse_doc_index(s: &str, len: usize) -> Option<usize> {
+    let n: usize = s.trim().parse().ok()?;
+    if n >= 1 && n <= len { Some(n - 1) } else { None }
 }
 
 /// Advance a filter through: None → opts[0] → opts[1] → … → None (wrap to off).
