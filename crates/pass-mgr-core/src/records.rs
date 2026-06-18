@@ -798,18 +798,22 @@ impl_record!(
         track_bool(out, at, "review", s.review, n.review);
     },
     |l: &Account| {
-        // A set title is the entry's display name; fall back to the
-        // "type: username/owner" form when no title is given.
+        // List display: "Title - Account Type - Username", joined by " - ", with the
+        // title omitted when blank. The third part is the username, falling back to
+        // the owner when there is no username. Empty parts are dropped (no dangling
+        // separators); a wholly-empty record shows "(account)".
+        let who = if l.username.trim().is_empty() { l.owner.trim() } else { l.username.trim() };
+        let mut parts: Vec<&str> = Vec::new();
         if !l.title.trim().is_empty() {
-            return l.title.clone();
+            parts.push(l.title.trim());
         }
-        // Prefer username, fall back to owner; `.clone()` makes an owned String
-        // either way so `who` owns its text.
-        let who = if l.username.is_empty() { l.owner.clone() } else { l.username.clone() };
-        let label =
-            if l.account_type.is_empty() { who } else { format!("{}: {who}", l.account_type) };
-        // `.trim()` strips surrounding whitespace just for the emptiness check.
-        if label.trim().is_empty() { "(account)".to_string() } else { label }
+        if !l.account_type.trim().is_empty() {
+            parts.push(l.account_type.trim());
+        }
+        if !who.is_empty() {
+            parts.push(who);
+        }
+        if parts.is_empty() { "(account)".to_string() } else { parts.join(" - ") }
     }
 );
 
@@ -1065,12 +1069,17 @@ mod tests {
         let mut acc = Account::new().unwrap();
         acc.account_type = "Financial".into();
         acc.username = "jane".into();
-        assert_eq!(acc.label(), "Financial: jane");
-        // A set title becomes the display name; clearing it falls back again.
+        // "Title - Account Type - Username", title omitted when blank.
+        assert_eq!(acc.label(), "Financial - jane");
         acc.title = "Joint brokerage".into();
-        assert_eq!(acc.label(), "Joint brokerage");
+        assert_eq!(acc.label(), "Joint brokerage - Financial - jane");
         acc.title = "   ".into();
-        assert_eq!(acc.label(), "Financial: jane", "blank title falls back");
+        assert_eq!(acc.label(), "Financial - jane", "blank title is dropped");
+        // Owner stands in for a missing username; an empty record shows a placeholder.
+        let mut bare = Account::new().unwrap();
+        bare.owner = "Bob".into();
+        assert_eq!(bare.label(), "Bob");
+        assert_eq!(Account::new().unwrap().label(), "(account)");
 
         let mut al = AssetLiability::new().unwrap();
         al.kind = "Liability".into();

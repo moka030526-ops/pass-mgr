@@ -624,7 +624,7 @@ mod tests {
             (RecordKind::Instruction, &ids.ins, "Funeral wishes"),
             (RecordKind::TrustWill, &ids.tw, "Living Trust"),
             (RecordKind::AssetLiability, &ids.asset, "[Liability] Mortgage"),
-            (RecordKind::Account, &ids.acc, "Financial: alice"),
+            (RecordKind::Account, &ids.acc, "Financial - alice"),
             (RecordKind::RealEstate, &ids.re, "123 Main St"),
         ] {
             let rows = v.list_records(kind);
@@ -1089,7 +1089,7 @@ mod tests {
 
         let accounts = v.list_records(RecordKind::Account);
         assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].label, "Financial: alice");
+        assert_eq!(accounts[0].label, "Financial - alice");
 
         let acc = v.get_account(accounts[0].id.clone()).unwrap();
         assert_eq!(acc.username, "alice");
