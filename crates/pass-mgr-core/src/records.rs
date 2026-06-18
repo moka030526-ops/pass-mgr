@@ -1707,7 +1707,9 @@ mod tests {
     #[test]
     fn doc_filename_is_user_controlled_but_safe() {
         assert_eq!(doc_filename("return.pdf"), "return.pdf"); // extension preserved
-        assert_eq!(doc_filename("a/b/c.pdf"), "a_b_c.pdf"); // separators neutralized
+        assert_eq!(doc_filename("a/b/c.pdf"), "a_b_c.pdf"); // forward slashes neutralized
+        assert_eq!(doc_filename("a\\b.pdf"), "a_b.pdf"); // BACKslashes too (no extra path level)
+        assert_eq!(doc_filename("a\u{7}b.pdf"), "a_b.pdf"); // control chars (bell) neutralized
         assert_eq!(doc_filename("my report.pdf"), "my-report.pdf"); // spaces -> '-'
         assert_eq!(doc_filename("  spaced  name .pdf"), "spaced--name-.pdf"); // no spaces remain
         assert_eq!(doc_filename("tab\tname.pdf"), "tab-name.pdf"); // tabs are whitespace too
@@ -1716,13 +1718,16 @@ mod tests {
         assert_eq!(doc_filename(""), "file");
         assert!(doc_filename(&"x".repeat(500)).len() <= 120); // capped
         // A multibyte filename whose 120th byte lands mid-character must NOT panic
-        // (a raw String::truncate(120) would). 5-byte ASCII prefix + 50 CJK chars
-        // (3 bytes each) = 155 bytes; the cap falls inside a character.
+        // (a raw String::truncate(120) would), must stay within the cap, AND must
+        // keep a real prefix (not collapse to the "file" fallback — which a broken
+        // truncation loop that ran cut to 0 would produce). 5-byte ASCII prefix + 50
+        // CJK chars (3 bytes each) = 155 bytes; the cap falls inside a character.
         let multibyte = doc_filename(&format!("file_{}", "\u{6570}".repeat(50)));
-        assert!(multibyte.len() <= 120 && !multibyte.is_empty());
-        // Emoji (4-byte) near the boundary likewise truncates safely.
+        assert!(multibyte.len() <= 120, "capped");
+        assert!(multibyte.starts_with("file_"), "prefix preserved, not collapsed to fallback: {multibyte}");
+        // Emoji (4-byte) near the boundary likewise truncates safely on a boundary.
         let emoji = doc_filename(&"\u{1F600}".repeat(40)); // 160 bytes
-        assert!(emoji.len() <= 120);
+        assert!(emoji.len() <= 120 && !emoji.is_empty());
     }
 
     #[test]
@@ -1740,9 +1745,14 @@ mod tests {
         assert!(!c.iter().any(|x| x.detail.contains("deadbeef")), "doc id must not leak into history");
         assert_eq!(a.label(), "Passport");
         assert_eq!(GeneralDocument::default().label(), "(untitled)");
-        // general_doc_location slugs the title.
+        // The per-tab <root>/<auto-group> prefix helpers slug their identifying field,
+        // with a stable fallback for blank input.
         assert_eq!(general_doc_location("My Passport"), "general-documents/my-passport");
         assert_eq!(general_doc_location(""), "general-documents/untitled");
+        assert_eq!(trust_will_doc_location("Living Trust"), "trust-will/living-trust");
+        assert_eq!(trust_will_doc_location(""), "trust-will/document");
+        assert_eq!(asset_doc_location("Brokerage #1"), "assets/brokerage-1");
+        assert_eq!(asset_doc_location(""), "assets/asset");
     }
 
     #[test]
