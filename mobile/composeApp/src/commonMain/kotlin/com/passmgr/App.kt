@@ -308,6 +308,7 @@ private fun DetailScreen(vault: Vault, kind: RecordKind, id: String, onCopy: (St
                     Field("Username", r.username)
                     PasswordField(r.password, onCopy)
                     Field("URL", r.url)
+                    Field("Closed as of", r.closedAsOf)
                     Field("Description", r.description)
                 }
             }

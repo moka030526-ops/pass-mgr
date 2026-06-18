@@ -593,6 +593,11 @@ pub struct Account {
     pub password: String,
     pub description: String,
     pub url: String,
+    /// Date the account was closed, as `YYYY-MM-DD`. Blank while the account is
+    /// open; the UIs hint the format but store it as free text (like the other
+    /// date fields), so legacy/partial values are never rejected.
+    #[serde(default)]
+    pub closed_as_of: String,
     /// Flagged for review.
     #[serde(default)]
     pub review: bool,
@@ -854,6 +859,7 @@ impl_record!(
         track(out, at, "password", &s.password, &n.password);
         track(out, at, "description", &s.description, &n.description);
         track(out, at, "url", &s.url, &n.url);
+        track(out, at, "closed_as_of", &s.closed_as_of, &n.closed_as_of);
         track_bool(out, at, "review", s.review, n.review);
     },
     |l: &Account| {
@@ -1100,10 +1106,12 @@ mod tests {
         let mut new = old.clone();
         new.account_subtype = "IRA".into();
         new.review = true;
+        new.closed_as_of = "2026-06-18".into();
         let now = unix_now();
         let changes = old.diff(&new, now);
         assert!(changes.iter().any(|c| c.detail.contains("subtype") && c.detail.contains("IRA")));
         assert!(changes.iter().any(|c| c.detail.contains("review") && c.detail.contains("true")));
+        assert!(changes.iter().any(|c| c.detail.contains("closed_as_of") && c.detail.contains("2026-06-18")));
         // Unchanged record yields no changes.
         assert!(old.diff(&old.clone(), now).is_empty());
     }
@@ -1169,6 +1177,7 @@ mod tests {
         });
         let acc: Account = serde_json::from_value(old).expect("old account without title must load");
         assert_eq!(acc.title, "", "missing title defaults to empty");
+        assert_eq!(acc.closed_as_of, "", "missing closed_as_of defaults to empty");
         assert_eq!(acc.username, "jane", "old fields preserved");
     }
 

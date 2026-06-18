@@ -1619,6 +1619,9 @@ impl GuiApp {
                     ui.label("URL");
                     ui.add(egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
                     ui.end_row();
+                    ui.label("Closed as of");
+                    ui.add(egui::TextEdit::singleline(&mut r.closed_as_of).hint_text("YYYY-MM-DD").desired_width(420.0));
+                    ui.end_row();
                     ui.label("Review");
                     ui.checkbox(&mut r.review, "flag for review");
                     ui.end_row();

@@ -193,6 +193,8 @@ pub struct Account {
     pub password: String,
     pub description: String,
     pub url: String,
+    /// Date the account was closed (`YYYY-MM-DD`); blank while open.
+    pub closed_as_of: String,
     pub review: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -269,6 +271,7 @@ fn map_account(r: &records::Account) -> Account {
         password: r.password.clone(),
         description: r.description.clone(),
         url: r.url.clone(),
+        closed_as_of: r.closed_as_of.clone(),
         review: r.review,
         created_at: r.created_at,
         updated_at: r.updated_at,
@@ -541,6 +544,7 @@ mod tests {
         acc.password = "s3cret".into();
         acc.description = "Retirement".into();
         acc.url = "https://broker.example".into();
+        acc.closed_as_of = "2026-06-18".into();
         acc.review = true;
         let acc_id = acc.id.clone();
         records::upsert(&mut ov.vault.accounts, acc);
@@ -700,6 +704,7 @@ mod tests {
         assert_eq!(r.password, "s3cret");
         assert_eq!(r.description, "Retirement");
         assert_eq!(r.url, "https://broker.example");
+        assert_eq!(r.closed_as_of, "2026-06-18");
         assert!(r.review);
         std::fs::remove_dir_all(&dir).ok();
     }

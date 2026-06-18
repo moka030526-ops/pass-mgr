@@ -1200,6 +1200,7 @@ impl App {
                         Field::text("Username", r.username.clone()),
                         Field::password("Password", r.password.clone()),
                         Field::text("URL", r.url.clone()),
+                        Field::text("Closed as of", r.closed_as_of.clone()),
                         Field::multiline("Description", r.description.clone()),
                         Field::choice("Review", bool_choice(r.review), yes_no()),
                     ],
@@ -1944,8 +1945,9 @@ impl App {
                 r.username = f(4);
                 r.password = f(5);
                 r.url = f(6);
-                r.description = f(7);
-                r.review = f(8) == "Yes";
+                r.closed_as_of = f(7);
+                r.description = f(8);
+                r.review = f(9) == "Yes";
                 records::upsert(&mut v.accounts, r);
             }
             Tab::RealEstate => {
@@ -3156,7 +3158,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Edit);
 
         // Field order: 0 title 1 type(choice) 2 subtype(choice) 3 owner 4 username
-        // 5 password 6 url 7 description 8 review(choice).
+        // 5 password 6 url 7 closed_as_of 8 description 9 review(choice).
         let typ = |app: &mut App, c: char| app.handle_key(key(KeyCode::Char(c)));
         // owner (focus 3)
         app.handle_key(key(KeyCode::Down)); // 0->1
@@ -3167,15 +3169,19 @@ mod tests {
         for c in "jane".chars() { typ(&mut app, c); }
         app.handle_key(key(KeyCode::Down)); // password
         for c in "pw".chars() { typ(&mut app, c); }
+        app.handle_key(key(KeyCode::Down)); // url
+        app.handle_key(key(KeyCode::Down)); // closed_as_of (focus 7)
+        for c in "2026-06-18".chars() { typ(&mut app, c); }
         app.handle_key(ctrl('s')); // save
 
         assert_eq!(app.screen, Screen::Browse);
         let v = &app.vault.as_ref().unwrap().vault;
         assert_eq!(v.accounts.len(), 1);
-        // Verify field-index mapping: owner/username/password landed correctly.
+        // Verify field-index mapping: owner/username/password/closed_as_of landed correctly.
         assert_eq!(v.accounts[0].owner, "Jane");
         assert_eq!(v.accounts[0].username, "jane");
         assert_eq!(v.accounts[0].password, "pw");
+        assert_eq!(v.accounts[0].closed_as_of, "2026-06-18");
         cleanup(&path);
     }
 
@@ -3184,8 +3190,8 @@ mod tests {
         let (mut app, path) = app_unlocked("review");
         app.handle_key(key(KeyCode::Char('4'))); // Accounts
         app.handle_key(key(KeyCode::Char('n')));
-        // focus 8 = review choice (Title is now field 0); cycle to "Yes".
-        for _ in 0..8 {
+        // focus 9 = review choice (0 title .. 7 closed_as_of, 8 description); cycle to "Yes".
+        for _ in 0..9 {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Right)); // cycle choice No -> Yes

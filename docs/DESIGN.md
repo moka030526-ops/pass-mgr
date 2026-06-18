@@ -114,7 +114,7 @@ Vault
 ├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
 │                                     //         institution, type, statement (doc id)
-├── accounts:      Vec<Account>       // Tab 4: title, account_type, subtype, owner, username, password, url, description, review
+├── accounts:      Vec<Account>       // Tab 4: title, account_type, subtype, owner, username, password, url, closed_as_of, description, review
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
 │                                     //   financing_balance, 3 portal logins (mgmt/insurance/HOA: url+username+password),
 │                                     //   comments, documents (doc ids; folder real-estate/<address>/)
