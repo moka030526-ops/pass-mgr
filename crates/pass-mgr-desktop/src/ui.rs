@@ -40,7 +40,7 @@ use crate::password::{self, GenOptions};
 use crate::records::{
     self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
 };
-use crate::vault::{self, OpenVault, VaultError};
+use crate::vault::{OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits. `writable` enables mutations;
 /// when false the vault is opened read-only and write keys are inert.
@@ -1036,8 +1036,10 @@ impl App {
                 let dest = self.cfg_backup_dest.trim().to_string();
                 if dest.is_empty() {
                     self.status = "Enter a backup destination directory.".into();
-                } else {
-                    match vault::backup(&self.path, Path::new(&dest)) {
+                } else if let Some(ov) = self.vault.as_ref() {
+                    // Use the OPEN handle's backup (reuses this session's write lock);
+                    // the free `vault::backup` would self-deadlock re-acquiring the lock.
+                    match ov.backup(Path::new(&dest)) {
                         Ok(p) => self.status = format!("Backed up to {}", p.display()),
                         Err(e) => self.status = format!("Backup failed: {e}"),
                     }

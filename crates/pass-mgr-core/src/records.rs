@@ -213,14 +213,28 @@ pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String 
 /// extra path levels or `..` traversal), strip surrounding dots, and cap the length.
 /// Falls back to `"file"` when nothing usable remains. Dots inside the name are kept
 /// so extensions like `return.pdf` survive.
+/// A Unicode formatting/bidi/zero-width char that `char::is_control` (Cc-only) does
+/// NOT catch but which can still spoof how a name/path DISPLAYS — most dangerously
+/// the right-to-left override U+202E, which renders `report\u{202e}txt.exe` as
+/// `report exe.txt`. Rejected/neutralized in document names and untrusted paths.
+pub(crate) fn is_spoofy_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // zero-width space/joiners + LRM/RLM
+        | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO override
+        | '\u{2060}'              // word joiner
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{FEFF}'              // zero-width no-break space / BOM
+    )
+}
+
 pub fn doc_filename(name: &str) -> String {
     let mut out: String = name
         .chars()
         .map(|c| {
             if c.is_whitespace() {
                 '-' // no spaces (or tabs/newlines) anywhere in a volume path
-            } else if c == '/' || c == '\\' || c.is_control() {
-                '_'
+            } else if c == '/' || c == '\\' || c.is_control() || is_spoofy_format_char(c) {
+                '_' // neutralize separators, control, AND bidi/zero-width spoof chars
             } else {
                 c
             }
@@ -1096,6 +1110,17 @@ pub struct Vault {
     pub settings: VaultSettings,
     #[serde(default)]
     pub audit: Vec<Change>,
+    /// Tombstones: blob ids explicitly removed via `remove_document`. A lazy delete
+    /// only drops the manifest entry, leaving the encrypted frame as garbage until the
+    /// next volume rewrite — so a manifest-loss rebuild (which re-scans the volume)
+    /// would otherwise RESURRECT a deleted document, and a later compact would bake it
+    /// in permanently (audit R-2). Recording the id here (authenticated inside
+    /// vault.pmv) lets the doc readers suppress a resurrected frame and lets a volume
+    /// rewrite drop it for good. Cleared by `staged_rewrite` once the volume has been
+    /// fully re-encrypted (the tombstoned frames then no longer exist on disk). These
+    /// are non-secret random hex ids.
+    #[serde(default)]
+    pub deleted_docs: Vec<String>,
     /// The editable category lists for the dropdowns, stored in the vault itself
     /// (not in external files). A vault that predates this field falls back to
     /// the built-in defaults. Category names are not secrets, so they are skipped

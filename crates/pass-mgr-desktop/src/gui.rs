@@ -1059,9 +1059,11 @@ impl GuiApp {
             let dest = self.backup_dest.trim().to_string();
             if dest.is_empty() {
                 self.status = "Enter a backup destination directory.".into();
-            } else {
-                // `Path::new(&dest)` makes a borrowed `&Path` view of the string.
-                match vault::backup(&self.path, Path::new(&dest)) {
+            } else if let Some(ov) = self.vault.as_ref() {
+                // Use the OPEN handle's backup (reuses this session's write lock).
+                // Calling the free `vault::backup` here would self-deadlock: it tries
+                // to re-acquire the per-fd flock this session already holds → Locked.
+                match ov.backup(Path::new(&dest)) {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
                     Err(e) => self.status = format!("Backup failed: {e}"),
                 }
@@ -1647,6 +1649,15 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         // Masked unless the per-record reveal OR the global "reveal all" is on.
                         let revealed = self.reveal_pw || self.reveal_all;
+                        // KNOWN RESIDUAL (audit R-7, accepted): egui's stock `TextEdit`
+                        // keeps un-zeroized snapshots of the edited string in its
+                        // in-memory undo buffer, and a REVEALED field's built-in Ctrl+C
+                        // copies via eframe→arboard WITHOUT the Linux exclude_from_history
+                        // hint. Both are LOW (they need local process-memory or
+                        // clipboard-history access, which already compromises the user).
+                        // The hardened path is the 📋 button below (self-wiping +
+                        // history-excluded). A full fix needs a custom password widget;
+                        // deferred as it requires interactive GUI verification.
                         ui.add(egui::TextEdit::singleline(&mut r.password).password(!revealed).desired_width(280.0));
                         ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
                         // Generate is only useful when you can save; copy is a read.

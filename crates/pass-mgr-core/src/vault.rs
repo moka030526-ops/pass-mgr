@@ -585,6 +585,13 @@ impl OpenVault {
         let mut store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         let man_dir = src.join("manifest");
         let vol_root = src.join("volume");
+        // Reject a mirror that lists the same blob id more than once (across ALL
+        // partitions). A duplicate id makes `store.put` append a SECOND frame for one
+        // id while only one manifest entry survives — and a later manifest-loss rebuild
+        // + volume truncation could then resurrect the OLDER frame, silently rolling
+        // the document back to a superseded version (audit R-8). Genuine exports never
+        // reuse an id (each is a fresh random hex), so this only rejects crafted mirrors.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut p = 0u32;
         loop {
             let man_path = man_dir.join(format!("manifest.{p}.json"));
@@ -599,6 +606,9 @@ impl OpenVault {
                 // `..` would traverse out of the mirror. Require a plain filename.
                 if !is_safe_blob_id(&e.id) {
                     return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document id in mirror: {:?}", e.id))));
+                }
+                if !seen_ids.insert(e.id.clone()) {
+                    return Err(VaultError::Storage(StorageError::Corrupt(format!("duplicate document id in mirror: {:?}", e.id))));
                 }
                 // The mirror also supplies the virtual path verbatim; reject control
                 // bytes so a crafted mirror can't store a path that injects terminal
@@ -737,6 +747,28 @@ impl OpenVault {
         self.recovery_notice.as_deref()
     }
 
+    /// Snapshot this OPEN vault's on-disk tree into `dest_dir` (the last-saved state;
+    /// encrypted files copied as-is). Use this from an open session instead of the
+    /// free [`backup`] function: a writable session already holds the single-writer
+    /// lock, and re-acquiring it (as the free function does) would self-deadlock —
+    /// flock binds to the open file description, so a second in-process acquire returns
+    /// `Locked`. A read-only session holds no lock, so this acquires one for the
+    /// duration of the snapshot (to exclude a concurrent writer in another process).
+    pub fn backup(&self, dest_dir: &Path) -> Result<PathBuf, VaultError> {
+        if !self.path.exists() {
+            return Err(VaultError::NotFound(self.path.clone()));
+        }
+        let src_dir = parent_dir(&self.path);
+        if self.read_only {
+            // No write lock held by this session — take one for the snapshot.
+            let _lock = WriteLock::acquire(&src_dir)?;
+            backup_snapshot(&self.path, &src_dir, dest_dir)
+        } else {
+            // Writable session already holds the lock; reuse it (do NOT re-acquire).
+            backup_snapshot(&self.path, &src_dir, dest_dir)
+        }
+    }
+
     /// Re-key under two new passwords via a **full re-encryption** of the vault and
     /// the entire document store, staged then rolled forward so a crash leaves
     /// either the old or the new tree fully working (never a mix).
@@ -798,12 +830,18 @@ impl OpenVault {
         };
 
         // Re-encrypt every LIVE document into the fresh staged store. Iterating
-        // `self.storage.ids()` yields only manifest-referenced (live) blobs, so the
-        // dead frames left by updates/deletes are dropped here — this is exactly
-        // what makes the rewrite double as a volume compaction.
+        // `self.storage.ids()` yields the manifest-referenced blobs (dead frames from
+        // updates/deletes are dropped here — this is what makes the rewrite double as a
+        // volume compaction), EXCEPT any id carrying a deletion tombstone. A tombstoned
+        // id can only be present because a manifest-loss rebuild re-admitted a deleted
+        // frame; excluding it here means a delete stays deleted instead of being baked
+        // in permanently (audit R-2). Unreferenced-but-not-deleted orphans (e.g. a doc
+        // added but not yet linked) are deliberately KEPT, preserving the "compaction
+        // never silently drops a not-yet-reclaimed blob" guarantee.
         let mut new_store =
             VolumeStore::open(&staging, write_key, &self.vault.id, self.vault.settings.volume_max_size)?;
-        let ids: Vec<String> = self.storage.ids().map(|s| s.to_string()).collect();
+        let ids: Vec<String> =
+            self.storage.ids().filter(|id| !self.vault.deleted_docs.iter().any(|d| d == id)).map(|s| s.to_string()).collect();
         for id in &ids {
             let bytes = self.storage.read(id, &self.key)?; // decrypt under the CURRENT key
             let (path, uploaded_at) = self
@@ -832,6 +870,10 @@ impl OpenVault {
         // caller's transform, write it, then mark the staging complete with READY.
         let mut staged_vault = self.vault.clone();
         staged_vault.generation = staged_vault.generation.saturating_add(1);
+        // The staged volume was just re-encrypted from the (tombstone-filtered) live
+        // ids, so no tombstoned frame exists on disk anymore — drop the tombstones so
+        // the set can't grow without bound across rekeys/compactions.
+        staged_vault.deleted_docs.clear();
         transform(&mut staged_vault);
         write_vault_file(&staging.join(VAULT_FILE), &staged_vault, write_key, write_salt, self.params)?;
         write_new_bytes(&staging.join(REKEY_READY), b"ready")?;
@@ -1013,11 +1055,29 @@ impl OpenVault {
             return Err(VaultError::ReadOnly);
         }
         self.storage.remove(file_id, &self.key)?;
+        // Tombstone the id so that, if a later manifest-loss rebuild re-admits the
+        // still-physically-present frame, the readers below suppress it and the next
+        // volume rewrite drops it for good — a lazy delete can't be resurrected
+        // (audit R-2). Deduplicated; cleared by `staged_rewrite` after the rewrite.
+        let id = file_id.to_string();
+        if !self.vault.deleted_docs.contains(&id) {
+            self.vault.deleted_docs.push(id);
+        }
         Ok(())
+    }
+
+    /// True if `file_id` has been tombstoned by `remove_document` — used to suppress
+    /// a frame that a manifest-loss rebuild may have resurrected.
+    fn is_tombstoned(&self, file_id: &str) -> bool {
+        self.vault.deleted_docs.iter().any(|d| d == file_id)
     }
 
     /// Decrypt and return one stored document.
     pub fn read_document(&self, file_id: &str) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        // A tombstoned id is treated as absent even if a rebuild resurrected its frame.
+        if self.is_tombstoned(file_id) {
+            return Err(VaultError::Storage(StorageError::NotFound(file_id.to_string())));
+        }
         Ok(self.storage.read(file_id, &self.key)?)
     }
 
@@ -1032,14 +1092,17 @@ impl OpenVault {
     // `&str` is a borrowed string slice (read-only view); `String` is owned. The
     // `Option<String>` return is `Some(path)` if the id exists, else `None`.
     pub fn doc_path(&self, file_id: &str) -> Option<String> {
+        if self.is_tombstoned(file_id) {
+            return None;
+        }
         // `.map(|e| e.path.clone())` transforms a `Some(entry)` into `Some(owned_path)`,
         // leaving `None` as `None`. We `.clone()` because `e` is only a borrow.
         self.storage.entry(file_id).map(|e| e.path.clone())
     }
 
-    /// Whether a document id is present in the store.
+    /// Whether a document id is present in the store (and not tombstoned).
     pub fn has_document(&self, file_id: &str) -> bool {
-        self.storage.contains(file_id)
+        self.storage.contains(file_id) && !self.is_tombstoned(file_id)
     }
 
     // --- Category lists (stored in the vault) --------------------------------
@@ -1135,15 +1198,20 @@ fn is_safe_blob_id(id: &str) -> bool {
     // device names (NUL/CON/COM1 — they contain non-hex letters), control bytes,
     // trailing dot/space, and `.`/`..`. The id is later used as a real filename on
     // both import-read (`vol.<p>/<id>`) and export-write, so this must hold.
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+    // LOWERCASE hex only: `records::random_id` emits lowercase, and accepting
+    // uppercase too would let an import-planted `AA..` and a real `aa..` coexist on
+    // Linux but COLLIDE on a case-insensitive filesystem (APFS/NTFS), breaking a
+    // later `export_tree`/backup-via-mirror with an EEXIST mid-walk.
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// True if an untrusted mirror's virtual document path is safe to store. The path
 /// is display-oriented (e.g. `trust-wills/auto/ts/deed.pdf`); reject control bytes
-/// (NUL, newlines, terminal-escape injection) outright. Length is enforced
-/// separately by `VolumeStore::put` (<= MAX_PATH_LEN).
+/// (NUL, newlines, terminal-escape injection) AND Unicode bidi/format/zero-width
+/// chars (display-spoofing — see `records::is_spoofy_format_char`). Length is
+/// enforced separately by `VolumeStore::put`.
 fn is_safe_doc_path(path: &str) -> bool {
-    !path.contains(|c: char| c.is_control())
+    !path.contains(|c: char| c.is_control() || records::is_spoofy_format_char(c))
 }
 
 /// Read a file from an UNTRUSTED import mirror with a size ceiling, rejecting a
@@ -1167,6 +1235,19 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
 /// allocating beyond the ceiling, regardless of a concurrent grow-after-stat.
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
     use std::io::Read;
+    // Open WITHOUT following a final-component symlink. `read_capped` pre-checks with
+    // `symlink_metadata`, but that is a SEPARATE syscall from this open — a TOCTOU an
+    // attacker who controls the (untrusted) mirror directory can win by swapping a
+    // regular file for a symlink in between, redirecting the read to an arbitrary file
+    // (e.g. /etc/shadow) and laundering its bytes into the importer's vault. O_NOFOLLOW
+    // closes the race at the open itself, matching `storage::append_frame` and the
+    // single-instance lock open. (On non-unix the pre-check remains the guard.)
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?
+    };
+    #[cfg(not(unix))]
     let f = fs::File::open(path)?;
     let mut buf = Vec::new();
     f.take(max.saturating_add(1)).read_to_end(&mut buf)?;
@@ -1383,21 +1464,23 @@ fn decrypt_with_redundancy(
         for i in 0..keys.len() {
             if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[i]) {
                 let key = keys.swap_remove(i); // take ownership of the matching key
-                // The mirror is normally the same generation as the lost primary, but
-                // a crash *between* the primary commit and the (best-effort) mirror
-                // write can leave the mirror one generation stale — so we do NOT
-                // promise "no data lost", only that it is usually the latest. A
-                // generation is definitely older (a surfaced rollback). Either way the
-                // user should re-save and refresh backups.
+                // Wording is keyed on the SOURCE only as a coarse hint — NOT a
+                // generation claim. After a rekey/compact, `refresh_redundancy_copies`
+                // rewrites the mirror AND bak1 at the CURRENT generation, so a bak is
+                // frequently the same generation as the lost primary; asserting it is an
+                // "earlier generation — data lost" cried wolf (audit R-12). Both notices
+                // now say only that the latest change *may* be missing (true in both
+                // cases — we recovered the newest readable copy, but cannot know whether
+                // an interrupted save left the unreadable primary newer).
                 let notice = if *c == mirror {
                     "The main vault file was unreadable and was recovered from its mirror copy \
                      (normally the latest state — but if a save was interrupted before the \
                      mirror was written, the most recent change may be missing). Re-save, and \
                      refresh your off-device backups.".to_string()
                 } else {
-                    "The main vault file AND its mirror were unreadable; recovered from an \
-                     earlier generation — your most recent change(s) may be lost. Re-save, \
-                     and refresh your off-device backups.".to_string()
+                    "The main vault file and its mirror were unreadable; recovered from a \
+                     redundant copy. If a recent save was interrupted, the most recent \
+                     change(s) may be missing. Re-save, and refresh your off-device backups.".to_string()
                 };
                 return Ok((vault, hdr, key, Some(notice)));
             }
@@ -1717,28 +1800,40 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
         return Err(VaultError::NotFound(vault_path.to_path_buf()));
     }
     let src_dir = parent_dir(vault_path);
-    // Hold the single-writer lock for the WHOLE snapshot. backup() is a multi-file
-    // copy (vault.pmv + manifest/ + volume/); without exclusion a concurrent writer —
-    // especially a change_password/compact rekey that swaps volume → manifest →
-    // vault.pmv — can run inside the copy window and leave the backup pairing an
-    // old-key vault.pmv with a new-key store, i.e. silently unopenable. If a writable
-    // session already holds the lock, fail `Locked` (close it and retry) rather than
-    // risk a corrupt backup. On the mobile build (no single-writer-lock feature) this
-    // is a no-op — that build serializes all vault access behind one process mutex.
+    // CLI/standalone path: no open session holds the lock, so acquire it for the WHOLE
+    // snapshot. An ALREADY-OPEN session must instead use `OpenVault::backup` — calling
+    // this free function from a session that already holds the lock self-deadlocks,
+    // because flock binds to the open file description and a second in-process
+    // acquire returns `WouldBlock` → `Locked`. Holding the lock makes the multi-file
+    // copy atomic vs. a concurrent rekey (which would otherwise pair an old-key
+    // vault.pmv with a new-key store). On the mobile build (no single-writer-lock
+    // feature) this is a no-op — that build serializes all access behind one mutex.
     let _lock = WriteLock::acquire(&src_dir)?;
+    backup_snapshot(vault_path, &src_dir, dest_dir)
+}
+
+/// The lock-free body of a backup snapshot: copy `vault.pmv` + `manifest/` +
+/// `volume/` into a fresh timestamped dir under `dest_dir` as a consistent set
+/// (encrypted files as-is, nothing decrypted). The CALLER must already hold the
+/// single-writer lock for `src_dir` — the free `backup` acquires it; an open
+/// session's `OpenVault::backup` reuses (or, when read-only, acquires) its own.
+fn backup_snapshot(vault_path: &Path, src_dir: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError> {
     // Don't snapshot a tree mid-rekey: the volume/manifest may be the new key while
-    // vault.pmv is still the old one, yielding an unopenable backup. Under the lock a
-    // present `.rekey` means a *crashed* rekey (not a live writer); finish (or discard)
-    // it by opening with --write first.
+    // vault.pmv is still the old one, yielding an unopenable backup. With the lock
+    // held a present `.rekey` means a *crashed* rekey; finish/discard it via --write.
     if src_dir.join(REKEY_DIR).exists() {
         return Err(VaultError::RekeyPending);
     }
+    // Refuse a symlink at the SOURCE vault.pmv: `fs::copy` below FOLLOWS it, which
+    // would copy an arbitrary file's bytes (whatever the link targets) into the
+    // backup set — the same exfiltration F-14 closed for `copy_dir`, here for the
+    // top-level file. `symlink_metadata` inspects the link itself, not its target.
+    if fs::symlink_metadata(vault_path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err(VaultError::Storage(StorageError::Corrupt("vault file is a symlink".to_string())));
+    }
     // Refuse a symlinked destination directory: an attacker who can write the vault
     // dir could otherwise point the backup into the very tree we are reading, or at
-    // arbitrary files the user can write. `symlink_metadata` inspects the link
-    // itself (does not follow it). The CLI also validates the dest is outside the
-    // vault dir; this is defense-in-depth at the library boundary so every caller is
-    // covered. (A non-existent dest is fine — it is created below as a real dir.)
+    // arbitrary files the user can write. (A non-existent dest is fine — created below.)
     if let Ok(meta) = fs::symlink_metadata(dest_dir)
         && meta.file_type().is_symlink()
     {
@@ -2741,7 +2836,12 @@ mod tests {
     fn generation_recovery_with_unreadable_mirror_reports_loss_not_mirror() {
         // Regression: when the mirror's READ fails (so it drops out of the candidate
         // blobs), recovery from a prior generation must NOT be mislabeled as a
-        // lossless mirror recovery — the notice must warn of a possible rollback.
+        // lossless mirror recovery — the notice must warn that the latest change may be
+        // missing. (The notice intentionally hedges with "may be missing" rather than
+        // asserting a definite "earlier generation": at recovery time we cannot read
+        // the lost primary's generation, and after a rekey a bak is often the CURRENT
+        // generation — asserting loss there cried wolf, audit R-12. The non-mirror
+        // wording still prompts the user to re-save and refresh backups.)
         let path = tmp_path("redmislabel");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
         v.set_redundancy(1).unwrap();
@@ -2759,8 +2859,8 @@ mod tests {
         let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         let notice = v2.recovery_notice().unwrap_or("");
         assert!(
-            notice.contains("earlier generation") || notice.contains("may be lost"),
-            "must report a rollback, got: {notice:?}"
+            notice.contains("may be missing") && !notice.contains("its mirror copy"),
+            "must warn of possible loss and NOT claim a lossless mirror recovery, got: {notice:?}"
         );
         assert!(!notice.contains("no data lost"), "must NOT claim no data lost, got: {notice:?}");
         let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
@@ -2816,6 +2916,7 @@ mod tests {
             "NUL", "CON", "COM1", "LPT1",          // Windows reserved device names
             "foo.", "foo ", " foo",                // trailing dot / spaces
             "deadbeefg",                            // non-hex letter
+            "DEADBEEF", "AAbb",                     // UPPERCASE hex (R-11: case-insensitive-FS collision)
             &"a".repeat(65),                        // over-length
         ] {
             assert!(!is_safe_blob_id(bad), "must reject {bad:?}");
@@ -2823,11 +2924,16 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_doc_path_rejects_control_bytes() {
+    fn is_safe_doc_path_rejects_control_and_bidi() {
         assert!(is_safe_doc_path("trust-wills/auto/ts/deed.pdf"));
         assert!(!is_safe_doc_path("a\nb"));
         assert!(!is_safe_doc_path("a\x1b[2Jb")); // terminal escape
         assert!(!is_safe_doc_path("a\0b"));
+        // R-5: Unicode bidi/format/zero-width chars (NOT caught by is_control).
+        assert!(!is_safe_doc_path("invoice\u{202e}fdp.scr"), "RLO override rejected");
+        assert!(!is_safe_doc_path("a\u{200b}b"), "zero-width space rejected");
+        assert!(!is_safe_doc_path("a\u{2066}b"), "bidi isolate rejected");
+        assert!(!is_safe_doc_path("\u{feff}name"), "BOM rejected");
     }
 
     #[test]
@@ -4090,6 +4196,90 @@ mod tests {
         let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         assert!(re.has_document(&referenced) && re.has_document(&orphan));
         cleanup(&path);
+    }
+
+    #[test]
+    fn deleted_document_stays_deleted_after_manifest_loss_and_compact() {
+        // R-2: a `remove_document`'d blob must not be resurrected by a manifest-loss
+        // rebuild (which re-scans the volume) and must not be baked back in by compact.
+        let path = tmp_path("r2tomb");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("r2", &vec![7u8; 300]);
+        let id = v.add_document("/secret", "will.pdf", &src).unwrap();
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.file = Some(id.clone());
+        let tw_id = tw.id.clone();
+        records::upsert(&mut v.vault.trust_wills, tw);
+        v.save().unwrap();
+        // Delete it the way the UI does: detach from the record AND remove the blob.
+        if let Some(t) = v.vault.trust_wills.iter_mut().find(|t| t.id == tw_id) {
+            t.file = None;
+        }
+        v.remove_document(&id).unwrap();
+        v.save().unwrap();
+        assert!(!v.has_document(&id), "deleted");
+        // Attacker deletes the partition manifest (encrypted `manifest.0`, no
+        // extension), forcing a volume-scan rebuild on the next open.
+        fs::remove_file(parent_dir(&path).join("manifest").join("manifest.0")).unwrap();
+        drop(v);
+        let mut v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(!v2.has_document(&id), "tombstone suppresses the resurrected frame");
+        assert!(v2.read_document(&id).is_err(), "resurrected deleted doc is not readable");
+        v2.compact(&volume_opts()).unwrap();
+        assert!(!v2.has_document(&id), "compact dropped the tombstoned frame for good");
+        drop(v2);
+        // After the rewrite the tombstone set is cleared (the frame is physically gone).
+        let v3 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v3.vault.deleted_docs.is_empty(), "tombstones cleared after volume rewrite");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn import_tree_rejects_duplicate_blob_id_in_mirror() {
+        // R-8: a mirror listing the same id twice would leave two frames for one id,
+        // enabling a later truncation to roll the document back to a stale version.
+        let src = tmp_src("dupid");
+        fs::create_dir_all(src.join("manifest")).unwrap();
+        fs::create_dir_all(src.join("volume").join("vol.0")).unwrap();
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = "abcd1234".into();
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let id = "aa".repeat(16); // 32 lowercase hex
+        let entries = serde_json::json!([
+            {"id": id, "path": "x/a", "size": 1, "offset": 0, "length": 1, "uploaded_at": 0},
+            {"id": id, "path": "x/b", "size": 1, "offset": 1, "length": 1, "uploaded_at": 0},
+        ]);
+        fs::write(src.join("manifest").join("manifest.0.json"), serde_json::to_vec(&entries).unwrap()).unwrap();
+        fs::write(src.join("volume").join("vol.0").join(&id), b"x").unwrap();
+        let dest = tmp_path("impdup");
+        let res = OpenVault::import_tree(&src, &dest, b"a", b"b", fast());
+        assert!(res.is_err(), "duplicate blob id in the mirror manifest must be rejected");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(parent_dir(&dest));
+    }
+
+    #[test]
+    fn open_writable_session_can_back_up_without_self_deadlock() {
+        // R-9 regression: an OPEN writable session backs up via OpenVault::backup
+        // (reusing its held lock). The free `backup` would self-deadlock here because
+        // flock binds to the open file description (a second in-process acquire blocks).
+        let path = tmp_path("r9backup");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("u", "p"));
+        v.save().unwrap();
+        let dest = std::env::temp_dir().join(format!("pmbk-r9-{}", nanos()));
+        // The method works while the session is open...
+        let bp = v.backup(&dest).expect("OpenVault::backup succeeds while the session holds the lock");
+        assert!(bp.exists());
+        // ...whereas the free function self-deadlocks (the regression we fixed).
+        assert!(matches!(backup(&path, &dest), Err(VaultError::Locked)), "free backup is Locked while a session is open");
+        // The produced backup actually opens.
+        OpenVault::open(bp.clone(), b"a", b"b").expect("backup is a valid, openable vault");
+        drop(v);
+        cleanup(&path);
+        let _ = fs::remove_dir_all(&dest);
     }
 
     #[cfg(unix)]

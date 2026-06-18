@@ -15,6 +15,13 @@ struct ComposeView: UIViewControllerRepresentable {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try? dir.setResourceValues(values)
+        // Apply Data Protection so the (already password-encrypted) vault files are
+        // ALSO unreadable while the device is locked, instead of inheriting the weaker
+        // default (CompleteUntilFirstUserAuthentication). The old Info.plist
+        // `NSFileProtectionComplete` key was a no-op (audit R-13); set it as a real
+        // file attribute here. For app-wide coverage also add the Data Protection
+        // entitlement (see Info.plist note). Verify on a Mac.
+        try? fm.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: dir.path)
 
         return MainViewControllerKt.MainViewController(vaultDir: dir.path)
     }

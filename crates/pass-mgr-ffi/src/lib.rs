@@ -74,10 +74,6 @@ pub enum VaultError {
     /// writable (desktop) open before the vault can be read here.
     #[error("an interrupted password change is pending; finish it on desktop (--write)")]
     RekeyPending,
-    /// A document referenced by the vault is missing from the store — possible
-    /// tampering or a rollback to an older snapshot.
-    #[error("a referenced document is missing (possible tampering or rollback)")]
-    ArchiveMismatch,
     /// Another writable session holds the vault (should not occur for read-only).
     #[error("the vault is open in another session")]
     Locked,
@@ -97,19 +93,25 @@ impl From<CoreVaultError> for VaultError {
         match e {
             CoreVaultError::NotFound(_) => VaultError::NotFound,
             CoreVaultError::RekeyPending => VaultError::RekeyPending,
-            CoreVaultError::ArchiveMismatch => VaultError::ArchiveMismatch,
             CoreVaultError::Locked => VaultError::Locked,
             CoreVaultError::Io(_) => VaultError::Io,
             // Everything that could discriminate a wrong password from a damaged
-            // vault — the AEAD decrypt failure, bad magic/version/params, a
-            // truncated file, a JSON/storage decode failure — collapses to ONE
-            // generic variant so there is no correct-password oracle.
+            // vault collapses to ONE generic variant so there is no correct-password
+            // oracle: the AEAD decrypt failure, bad magic/version/params, a truncated
+            // file, a JSON/storage decode failure — AND `ArchiveMismatch`. The latter
+            // is only reachable AFTER decrypt_with_redundancy succeeds (i.e. only with
+            // the CORRECT passwords), so giving it a distinct variant let a
+            // dir-write attacker turn the open into a binary correct-password oracle by
+            // pre-deleting a referenced blob (audit R-3). Folding it here restores the
+            // no-oracle contract. (RekeyPending is fine: it is returned BEFORE any
+            // decryption, so it fires for any password and leaks nothing.)
             CoreVaultError::Crypto(_)
             | CoreVaultError::BadMagic
             | CoreVaultError::BadVersion(_)
             | CoreVaultError::Truncated
             | CoreVaultError::BadParams
             | CoreVaultError::Json(_)
+            | CoreVaultError::ArchiveMismatch
             | CoreVaultError::Storage(_) => VaultError::WrongPasswordOrCorrupt,
             // Not reachable on a read-only open, but map defensively.
             CoreVaultError::AlreadyExists(_)

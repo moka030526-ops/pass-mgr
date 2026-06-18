@@ -31,8 +31,14 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<!-- Keep the vault out of device backups at the file level too. -->
-	<key>NSFileProtectionComplete</key>
-	<true/>
+	<!--
+	  NOTE (audit R-13): `NSFileProtectionComplete` is NOT a valid Info.plist key — it
+	  is a file attribute / entitlement value, so the entry that used to live here was a
+	  silent no-op. Data protection is now applied per-file in ContentView.swift
+	  (FileProtectionType.complete on the vault directory). For app-wide protection also
+	  add the Data Protection capability (the
+	  `com.apple.developer.default-data-protection = NSFileProtectionComplete`
+	  entitlement) in an .entitlements file — verify on a Mac.
+	-->
 </dict>
 </plist>

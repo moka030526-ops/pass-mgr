@@ -17,17 +17,19 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 
 | Layer | Result |
 | --- | --- |
-| Adversarial security review (3 rounds incl. a 152-agent deep hunt) | **15 real defects found and fixed** (F-1…F-15: 1 HIGH this round + 4 earlier HIGH, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
+| Adversarial security review (4 rounds incl. a 152- and a 159-agent deep hunt) | **26 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14; 5 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
 | Mutation testing (`cargo-mutants --in-diff`, 194 mutants) | **56 survivors killed** (106→50 missed); `core`/`ffi` clean (only a `cfg` phantom); the 50 remaining are all in the thin desktop UI (rendering / keyboard / cosmetic) — see §4 |
 | Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M executions, 0 crashes** (latest extended run) |
 | Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 212 · ffi 31 · compat 4 · desktop 61 + 20 · crash-recovery 18 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 215 · ffi 31 · compat 4 · desktop 61 + 20 · crash-recovery 18 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
-The cryptographic envelope was never broken: no finding lets an attacker read a vault
-they could not already open. The fixes harden secret hygiene (plaintext password
-lifetime / display), open-time DoS resistance, untrusted-import path safety, backup
-integrity, and a destructive-CLI footgun — see §3.1/§3.1b/§3.1c.
+The cryptographic envelope was never broken: across four rounds no finding lets an
+attacker read a vault they could not already open. The fixes harden secret hygiene
+(plaintext password lifetime / display), open-time DoS resistance, untrusted-import
+path safety (incl. a symlink-TOCTOU arbitrary-file read), deletion durability, backup
+integrity, an FFI no-oracle regression, iOS clipboard/snapshot parity, and a
+destructive-CLI footgun — see §3.1 / §3.1b / §3.1c / §3.1d.
 
 ## 2. Assurance layers applied
 
@@ -143,6 +145,26 @@ fixed; the synthesizer's flagged false-positives are listed in §3.2.
 | F-14 | Low | **`copy_dir` (backup) followed source symlinks** (`is_dir`/`fs::copy` dereference). Now uses `read_dir` file-type and refuses symlink entries. |
 | F-15 | Low | **Single-instance lock degraded to unguarded on a planted symlink** (ELOOP). `acquire_in` now removes the junk entry and retries once. |
 | — | Low | **CI/policy hardening:** `overflow-checks = true` in `[profile.release]` (fail-closed on overflow), `wildcards = "deny"` (+ `allow-wildcard-paths`) in `deny.toml`, a release-mode test job, and `cargo deny` + the `doc_paths` fuzzer made standing CI checks. |
+
+### 3.1d Fourth round — 159-agent HARDCORE hunt (bypass-the-fixes + 12 lenses → exploit-PoC → 3-skeptic verify → loop)
+
+The meanest pass yet: a dedicated **bypass phase** attacking the round-3 fixes, then 12 deeper lenses (FFI-focused) where every candidate had to ship a concrete PoC that an exploit-validation agent traced line-by-line before three skeptics voted (default-refute, "not-already-fixed" + "gain over the dir-write baseline" required). **20 findings survived → 14 root causes**, all exploit-validated. The honest verdict was "the codebase is hardened, but here are real, non-obvious wins." All confirmed items fixed:
+
+| # | Sev | Fix |
+| --- | --- | --- |
+| R-1 | **High** | **`import_tree` symlink TOCTOU.** `read_capped` stat-checked for a symlink, then `read_bounded` did a separate `File::open` that FOLLOWS links — a winnable race laundering an arbitrary file (e.g. `/etc/shadow`) into the importer's vault. `read_bounded` now opens with `O_NOFOLLOW` (unix), closing the race at the open (matching `append_frame`). |
+| R-2 | **High** | **Deleted-document resurrection made permanent.** A lazy delete left the frame; a manifest-loss rebuild re-admitted it and `compact` baked it in. Added an authenticated **deletion tombstone** (`Vault::deleted_docs`, `serde(default)`): `remove_document` records the id; the doc readers suppress a resurrected frame; `staged_rewrite` drops tombstoned frames and clears the set. (Compatible with the deliberate "compaction never silently drops a not-yet-reclaimed orphan" guarantee — it keys on `remove_document`, not on record-references.) |
+| R-3 | Med | **FFI correct-password oracle.** `ArchiveMismatch` had a distinct variant reachable only AFTER a correct-password decrypt, so it discriminated correct vs wrong passwords. Folded into `WrongPasswordOrCorrupt`; variant removed. |
+| R-4 | Med | **`backup()` followed a symlinked source `vault.pmv`** (F-14 only guarded `copy_dir`). The snapshot now rejects a symlink at the source file. |
+| R-5 | Med | **Unicode bidi/zero-width bypass** of `is_safe_doc_path`/`doc_filename` (`is_control` is Cc-only). New `is_spoofy_format_char` rejects U+200B–200F / 202A–202E / 2060 / 2066–2069 / FEFF (RLO label spoofing). |
+| R-8 | Med | **Volume-truncation version rollback.** A mirror listing one id twice left two frames for it (the rollback precondition). `import_tree` now rejects duplicate ids across the whole mirror. |
+| R-9 | regression | **In-app Backup self-deadlocked** on the session's own `WriteLock` (my F-7). Added `OpenVault::backup` that reuses the held lock (read-only opens acquire one); the free `backup` keeps acquiring for the CLI. GUI/TUI call the method. |
+| R-11 | Low | **`is_safe_blob_id` accepted UPPERCASE hex** → case-insensitive-FS export collision. Now lowercase-hex only. |
+| R-12 | Low | **`recovery_notice` false "data lost" alarm** after a rekey/compact `bak1` (which is current-gen). Reworded to the honest "the most recent change may be missing" for both mirror and bak recoveries. |
+| R-6/R-13/R-14 | Med/Low | **iOS parity** (committed source; build-verify on a Mac): `copySecret` → `UIPasteboard.setItems` with `LocalOnly`+15 s expiry (no Universal-Clipboard broadcast); SwiftUI `scenePhase` opaque overlay (no app-switcher snapshot of secrets); real per-file `FileProtectionType.complete` + removed the no-op `NSFileProtectionComplete` Info.plist key. |
+| R-7 | Low | **egui secret residue — ACCEPTED RESIDUAL (documented).** Stock `TextEdit` keeps un-zeroized undo snapshots and a revealed field's built-in Ctrl+C bypasses the clipboard hint. Both need local process-memory / clipboard-history access. A full fix needs a custom password widget + interactive GUI verification; mitigations in place (hardened 📋 copy button, `ZeroizeOnDrop`, reveal re-masks on tab switch). |
+
+Dropped as non-security: `extract --part` swallowed-positional footgun (operator-only, needs the operator's own passwords; `cli_extract` already echoes the target).
 
 ### 3.2 Investigated and refuted (no change needed)
 
