@@ -202,8 +202,11 @@ impl AuthState {
             // Iterator pipeline: `.iter()` borrows each label, `.map(closure)`
             // transforms each into an `AuthField`, `.collect()` gathers the
             // results into the `Vec<AuthField>` the field's type demands.
-            // `String::new()` makes an empty owned string.
-            fields: labels.iter().map(|l| AuthField { label: l, value: String::new() }).collect(),
+            // `with_capacity(256)` pre-sizes the buffer so typing a master password
+            // never grows (and so reallocates) it — a realloc frees the old buffer
+            // WITHOUT zeroizing, stranding plaintext password fragments in freed
+            // heap. Same mitigation as the GUI's pw fields (gui.rs).
+            fields: labels.iter().map(|l| AuthField { label: l, value: String::with_capacity(256) }).collect(),
             focus: 0,
             error: None,
         }
@@ -766,12 +769,15 @@ impl App {
                 self.tab = self.tab.shifted(-1);
                 self.selected = 0;
             }
-            // `c @ '1'..='6'` is a range pattern that also binds the matched char
-            // to `c`: a digit key 1-6 jumps straight to that tab. `c as usize -
-            // '1' as usize` converts the char to its 0-based tab index.
-            KeyCode::Char(c @ '1'..='6') => {
-                self.tab = Tab::ALL[c as usize - '1' as usize];
-                self.selected = 0;
+            // `c @ '1'..='9'` is a range pattern that also binds the matched char to
+            // `c`: a digit key jumps straight to that tab. `Tab::ALL.get(...)` keys
+            // off the actual tab count, so this covers every tab (now 7) and never
+            // panics on a digit past the end (it just does nothing).
+            KeyCode::Char(c @ '1'..='9') => {
+                if let Some(&t) = Tab::ALL.get(c as usize - '1' as usize) {
+                    self.tab = t;
+                    self.selected = 0;
+                }
             }
             KeyCode::Down => {
                 let n = self.current_labels().len();
@@ -1496,12 +1502,17 @@ impl App {
             return;
         }
         self.commit_edit_record(&es);
-        // Persist the new link BEFORE reclaiming the replaced blob, AND only
-        // reclaim if the save succeeded — a failed save leaves vault.pmv pointing
-        // at `old`, so dropping it would make the vault unopenable.
-        // `let _ = expr` discards the best-effort reclaim result.
-        if self.persist()
-            && let Some(old) = previous
+        // Persist the new link BEFORE reclaiming the replaced blob. Bail on a failed
+        // save (full disk, poisoned handle, …): the link never reached vault.pmv, so
+        // report the failure rather than a false "uploaded" — and do NOT reclaim
+        // `old`, which the on-disk vault still references (dropping it would make the
+        // vault unopenable). persist() already set the "Save failed: …" status.
+        if !self.persist() {
+            self.edit = Some(es);
+            return;
+        }
+        // The new link is durable; reclaim the replaced blob (best-effort).
+        if let Some(old) = previous
             && let Some(ov) = self.vault.as_mut()
         {
             let _ = ov.remove_document(&old);
@@ -2828,6 +2839,45 @@ mod tests {
         assert!(app.edit.as_ref().unwrap().attached_file_id.is_none(), "detached");
         assert!(!app.vault.as_ref().unwrap().has_document(&id), "blob reclaimed");
         assert!(app.vault.as_ref().unwrap().vault.general_documents[0].file.is_none(), "unlinked + persisted");
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn attach_document_reports_failure_when_save_fails_in_tui() {
+        // Regression (deep-search HIGH): attach_document set "Document uploaded"
+        // unconditionally even when persist() failed — a false success that lost the
+        // record→document link. With the disk full at the vault write, the status
+        // must report the failure and the link must NOT be persisted.
+        let (mut app, path) = app_unlocked("uifailattach");
+        let dir = path.parent().unwrap().to_path_buf();
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.general_documents, GeneralDocument::new().unwrap());
+        }
+        app.vault.as_mut().unwrap().save().unwrap(); // persist the seed cleanly first
+        app.tab = Tab::GeneralDocuments;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+        app.edit.as_mut().unwrap().fields[0].value = "Passport".into();
+        let src = dir.join("p.pdf");
+        std::fs::write(&src, b"bytes").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc].value = "p.pdf".into();
+            es.fields[rc + 1].value = src.to_string_lossy().into();
+        }
+        // Fail the vault.pmv write (add_document's blob write still succeeds first).
+        crate::fault::fail_at("vault.write", 1);
+        app.attach_document();
+        crate::fault::clear();
+        assert!(app.status.contains("Save failed"), "must report failure, not success; was: {}", app.status);
+        drop(app); // release the lock
+        // The link never reached disk: reopening shows no attached file (no false link).
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.vault.general_documents[0].file.is_none(), "no false link persisted");
+        let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }
 

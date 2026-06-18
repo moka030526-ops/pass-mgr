@@ -25,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -211,6 +212,24 @@ private fun VaultScreen(vault: Vault, onCopy: (String) -> Unit, onLock: () -> Un
             val id = selectedId
             if (id == null) {
                 Column(Modifier.fillMaxSize()) {
+                    // Surface the core's rollback/recovery notice (e.g. the vault was
+                    // recovered from its mirror, or its generation went backwards),
+                    // matching the desktop apps — so a tampered/rolled-back vault does
+                    // not open silently on mobile. Computed once per unlock.
+                    val notice = remember { vault.recoveryNotice() }
+                    if (notice != null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                "⚠ $notice",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(12.dp),
+                            )
+                        }
+                    }
                     ScrollableTabRow(selectedTabIndex = section.ordinal, edgePadding = 8.dp) {
                         Section.entries.forEach { s ->
                             Tab(

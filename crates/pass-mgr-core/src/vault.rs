@@ -1591,11 +1591,17 @@ fn commit_rekey(dir: &Path, staging: &Path) -> Result<(), VaultError> {
 
 /// Replace `live` with `staged` (a directory) if `staged` still exists.
 fn replace_dir(live: &Path, staged: &Path) -> Result<(), VaultError> {
+    let old = sibling_old(live); // a temporary ".<name>.old" path next to `live`
+    // Sweep any leftover ".<name>.old" FIRST — before the early return below. A
+    // crash AFTER `rename(staged, live)` but BEFORE the trailing cleanup leaves the
+    // OLD-key-encrypted dir behind; recovery re-enters here with `staged` already
+    // gone, so cleaning up only after the `staged.exists()` guard would leak that
+    // old-key ciphertext on disk forever (defeating change_password's forward
+    // secrecy). Doing it here makes the cleanup unconditional and idempotent.
+    let _ = fs::remove_dir_all(&old);
     if !staged.exists() {
         return Ok(());
     }
-    let old = sibling_old(live); // a temporary ".<name>.old" path next to `live`
-    let _ = fs::remove_dir_all(&old); // clear any leftover from a prior crash (best-effort)
     if live.exists() {
         fs::rename(live, &old)?; // move the current dir aside...
     }
@@ -3396,6 +3402,31 @@ mod tests {
         assert!(staging.exists(), "staging still present at this crash point");
         assert_rolled_forward(&path, (b"o1", b"o2"), (b"n1", b"n2"), &docs);
         cleanup(&path);
+    }
+
+    #[test]
+    fn replace_dir_sweeps_leftover_old_when_staged_already_gone() {
+        // Regression: a crash AFTER `rename(staged, live)` but BEFORE the `.old`
+        // cleanup leaves the OLD-key-encrypted dir behind. Recovery re-enters
+        // replace_dir with `staged` already gone; it must still sweep `.<name>.old`
+        // (not skip cleanup via the early return) or that old-key ciphertext leaks
+        // on disk forever, defeating change_password's forward secrecy.
+        let base = std::env::temp_dir().join(format!("pmreplace-{}", nanos()));
+        let live = base.join("volume");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("current"), b"new-key data").unwrap();
+        // Simulate the leaked old-key dir from the crash window.
+        let old = sibling_old(&live);
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("blob"), b"OLD-KEY CIPHERTEXT").unwrap();
+        // `staged` does not exist (it was already renamed into place before the crash).
+        let staged = base.join(".rekey").join("volume");
+
+        replace_dir(&live, &staged).unwrap();
+
+        assert!(!old.exists(), "leftover .volume.old (old-key data) must be swept on recovery");
+        assert!(live.exists() && live.join("current").exists(), "live dir is left intact");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
