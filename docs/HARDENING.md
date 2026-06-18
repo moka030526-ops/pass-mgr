@@ -77,6 +77,47 @@ or clipboard access could recover a password.
   clipboard is **wiped immediately on lock**. Threaded a single `onCopy` callback
   through `VaultScreen → DetailScreen → PasswordField`, removing the per-field timer.
 
+### 3.1b Second round — a follow-up adversarial bug hunt over the feature surface
+
+A second multi-agent hunt (6 finders × 3 skeptics per finding, default-refute) over the
+least-audited code found two more **confirmed HIGH** defects (one false positive was
+filtered out). Both are fixed, with a sweep confirming neither pattern recurs elsewhere.
+
+#### F-3 (High) — TUI Ctrl+Y / Ctrl+G acted on the *first* password field, not the focused one
+
+* **Where:** `crates/pass-mgr-desktop/src/ui.rs` (edit-key handler).
+* **What:** Copy-password (`Ctrl+Y`) and generate-password (`Ctrl+G`) located the field
+  with `fields.iter().find(|f| matches!(f.kind, Password))` — the **first** password
+  field, ignoring the focused field. Harmless on Accounts (one password), but the Real
+  Estate tab has **three** portal password fields (Property Mgmt / Insurance / HOA). So
+  `Ctrl+Y` while editing the Insurance or HOA login **copied the Property Mgmt password**
+  to the OS clipboard (wrong secret, cross-portal leak), and `Ctrl+G` always regenerated —
+  i.e. silently overwrote — the Property Mgmt password, so the other two could never be
+  generated from the keyboard.
+* **Why it matters:** A real secret reaches the OS clipboard / a different secret is
+  destroyed, both on a documented on-screen keybinding. High.
+* **Fix:** New `target_password_index(fields, focus)` helper — prefer the focused field
+  when it is a password, else fall back to the first. Both handlers use it. The egui GUI
+  was already correct (each portal has its own per-field copy button). Regression test
+  `copy_generate_target_the_focused_password_field`.
+
+#### F-4 (High) — Android config change discarded the clipboard auto-clear timer
+
+* **Where:** `mobile/.../App.kt` + `androidMain/AndroidManifest.xml`.
+* **What:** Even after F-2 lifted the auto-clear to App scope, `clipboardToken` lived in
+  plain `remember` and the timer in a `LaunchedEffect`. The activity declared no
+  `configChanges`, so a routine config change (rotation, dark/light toggle, locale, font
+  or display size, split-screen) **recreates the activity**, discarding the `remember`
+  state and cancelling the wipe coroutine — leaving the copied password on the clipboard
+  with no timer to clear it.
+* **Why it matters:** Same clipboard-exfiltration surface as F-2, re-opened by an everyday
+  UI event. High.
+* **Fix:** `clipboardToken` is now `rememberSaveable` (survives recreation → the fresh
+  composition re-arms the wipe; reset to 0 after wiping / on lock), **and** the activity
+  declares `android:configChanges` for the common triggers so it is not recreated for them
+  in the first place. (The unlock password fields stay on plain `remember` by design —
+  persisting a typed password into the saved-state bundle would itself be a leak.)
+
 ### 3.2 Investigated and refuted (no change needed)
 
 | # | Hypothesis | Why it does not hold |

@@ -10,10 +10,14 @@
         android:label="pass-mgr"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <!-- Handle config changes in-process instead of recreating the Activity.
+             Compose redraws on these without losing state; recreation would
+             otherwise discard the in-flight clipboard auto-clear timer (App.kt). -->
         <activity
             android:name="com.passmgr.MainActivity"
             android:exported="true"
             android:label="pass-mgr"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|locale|layoutDirection|fontScale|density"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
