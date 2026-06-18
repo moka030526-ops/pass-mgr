@@ -38,6 +38,11 @@ jobs:
         # fault-injection lives on pass-mgr-core; the desktop crate forwards it so the
         # `__crashop` binary + tests/crash_recovery.rs exercise the real fault points.
         run: cargo test -p pass-mgr-core -p pass-mgr --features pass-mgr/fault-injection
+      - name: Test (release — overflow-checks on, stripped)
+        # The release profile flips on integer overflow-checks (root Cargo.toml) and
+        # strips symbols; run the suite in release so release-only behavior can't
+        # silently diverge from the debug builds CI otherwise relies on.
+        run: cargo test --workspace --release
 
   audit:
     name: supply chain (cargo-audit + cargo-deny)

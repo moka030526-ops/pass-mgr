@@ -2045,6 +2045,17 @@ impl App {
                 sync(&mut self.acct_filter_type, &es.fields[1].value);
                 sync(&mut self.acct_filter_subtype, &es.fields[2].value);
                 sync(&mut self.acct_filter_owner, &es.fields[3].value);
+                // Relax the NON-facet constraints too, or the saved record can still
+                // vanish: clear review-only if the saved record isn't flagged (field 9),
+                // and clear the username search if it no longer matches (field 4).
+                if self.acct_filter_review && es.fields[9].value != "Yes" {
+                    self.acct_filter_review = false;
+                }
+                if !self.acct_search.is_empty()
+                    && !records::matches_search(&es.fields[4].value, &self.acct_search)
+                {
+                    self.acct_search.clear();
+                }
                 self.narrow_account_filters();
             }
             self.clamp_selection();
@@ -2136,11 +2147,10 @@ impl App {
     // `text: Zeroizing<String>` is taken by value (moved in): this function owns
     // it and it is wiped from memory when it drops at the end of the call.
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
-        // `text` wipes on drop; arboard copies into the OS clipboard (auto-cleared
-        // on the 15s timer and on exit).
-        // `.and_then(closure)` chains two fallible steps: open the clipboard, then
-        // set its text — the whole thing is `Ok` only if both succeed.
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
+        // `text` wipes on drop; the shared helper copies it into the OS clipboard with
+        // the Linux history-exclusion hint so clipboard managers don't retain the
+        // password (auto-cleared on the 15s timer and on exit either way).
+        match crate::copy_secret_to_clipboard(text.as_str()) {
             Ok(()) => {
                 self.clipboard_dirty = true;
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
@@ -2453,7 +2463,11 @@ impl App {
             // `.rev()` walks newest-first, `.take(6)` keeps only the first six —
             // iterators are lazy, so this never materializes the whole history.
             for c in es.history.iter().rev().take(6) {
-                let detail = if c.detail.is_empty() { c.action.clone() } else { c.detail.clone() };
+                // `display_detail` masks password before/after values so the history
+                // pane never leaks a cleartext password (the live field's reveal
+                // toggle deliberately does not extend here).
+                let detail =
+                    if c.detail.is_empty() { c.action.clone() } else { records::display_detail(&c.detail) };
                 lines.push(Line::from(Span::styled(
                     format!("  {}  {detail}", format_time(c.at)),
                     Style::default().fg(Color::DarkGray),
@@ -2749,6 +2763,23 @@ mod tests {
         assert_eq!(app.acct_filter_type.as_deref(), Some("Bank"));
         let labels = app.current_labels();
         assert!(labels.iter().any(|(_, l)| l.contains("newuser")), "saved account is visible: {labels:?}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn saving_account_relaxes_review_and_search_to_keep_it_visible() {
+        let (mut app, path) = app_unlocked("uirelax");
+        app.tab = Tab::Accounts;
+        app.acct_filter_review = true; // review-only active
+        app.acct_search = "alice".into(); // username search active
+        app.start_edit(false); // New (prefills username=alice from the search)
+        app.edit.as_mut().unwrap().fields[4].value = "bob".into(); // username (no longer matches)
+        // review (field 9) stays default "No" — saved record is NOT flagged.
+        app.save_edit();
+        assert!(!app.acct_filter_review, "review-only relaxed so a non-flagged save stays visible");
+        assert_eq!(app.acct_search, "", "username search relaxed when it no longer matches the save");
+        let labels = app.current_labels();
+        assert!(labels.iter().any(|(_, l)| l.contains("bob")), "saved account is visible: {labels:?}");
         cleanup(&path);
     }
 

@@ -443,6 +443,30 @@ fn track_bool(out: &mut Vec<Change>, at: i64, name: &str, old: bool, new: bool) 
     }
 }
 
+/// True if a history `Change.detail` describes a secret (password) field change.
+/// `detail` is formatted `"{field}: {old:?} -> {new:?}"`; the secret fields are
+/// exactly those whose name ends in `password` (the account password and the
+/// three RealEstate portal passwords). The UIs use this to mask secret values in
+/// the history pane.
+pub fn detail_is_secret(detail: &str) -> bool {
+    detail.split_once(':').map(|(name, _)| name).unwrap_or(detail).trim_end().ends_with("password")
+}
+
+/// A history `Change.detail` formatted for display, with the before/after values
+/// of a secret (password) field **masked**. The live edit field has its own reveal
+/// toggle, but the history pane must never show a cleartext password (it can't be
+/// copied from there and is a shoulder-surf/screen-share leak) — so the audit
+/// trail keeps the field name ("the password changed") but hides the values.
+/// Non-secret details pass through unchanged.
+pub fn display_detail(detail: &str) -> String {
+    if detail_is_secret(detail) {
+        let name = detail.split_once(':').map(|(n, _)| n).unwrap_or("password");
+        format!("{name}: <hidden> -> <hidden>")
+    } else {
+        detail.to_string()
+    }
+}
+
 /// Shared behaviour for the five record types so insert/edit/history is generic.
 // A `trait` is like an interface: it lists methods a type must provide. `: Clone`
 // is a *supertrait bound* — anything implementing `Record` must also be cloneable.
@@ -1212,6 +1236,31 @@ mod tests {
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn history_display_detail_masks_password_values_only() {
+        // A real password change entry, as `track` would format it.
+        let pw = "password: \"hunter2\" -> \"Tr0ub4dor&3\"";
+        assert!(detail_is_secret(pw));
+        let shown = display_detail(pw);
+        assert!(!shown.contains("hunter2"), "old password value is masked: {shown}");
+        assert!(!shown.contains("Tr0ub4dor"), "new password value is masked: {shown}");
+        assert!(shown.starts_with("password:"), "field name is kept for the audit trail: {shown}");
+        // The RealEstate portal passwords are masked too.
+        for f in ["property_mgmt_password", "insurance_password", "hoa_password"] {
+            let d = format!("{f}: \"SEKRET1\" -> \"SEKRET2\"");
+            assert!(detail_is_secret(&d), "{f} is secret");
+            let shown = display_detail(&d);
+            assert!(!shown.contains("SEKRET"), "{f} values masked: {shown}");
+            assert!(shown.starts_with(f), "{f} name kept: {shown}");
+        }
+        // Non-secret fields pass through verbatim.
+        let owner = "owner: \"\" -> \"Jane\"";
+        assert!(!detail_is_secret(owner));
+        assert_eq!(display_detail(owner), owner);
+        // A "created" entry whose label happens not to be a password is untouched.
+        assert_eq!(display_detail("Financial - jane"), "Financial - jane");
     }
 
     #[test]

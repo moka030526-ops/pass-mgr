@@ -31,8 +31,15 @@ allow = [
 ]
 
 [bans]
+# Duplicate transitive versions are a benign ecosystem artifact here (e.g. the
+# getrandom triplication), so keep this a warning rather than failing CI.
 multiple-versions = "warn"
-wildcards = "warn"
+# But a wildcard ("*") version requirement on a REGISTRY crate is a supply-chain
+# hazard (any future release is silently accepted), so fail CI if one appears.
+wildcards = "deny"
+# ...except our own intra-workspace `{ path = "..." }` deps, which carry no version
+# and would otherwise be flagged as wildcards. This still denies registry wildcards.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

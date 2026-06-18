@@ -152,7 +152,21 @@ fn acquire_in(dir: &Path, vault_path: &Path) -> io::Result<Instance> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = opts.open(&lock_path)?;
+    let file = match opts.open(&lock_path) {
+        Ok(f) => f,
+        // On Unix, O_NOFOLLOW makes a symlink planted at the lock path fail with
+        // ELOOP. The lock dir is our OWN 0700 dir, so such an entry is junk — a
+        // same-UID prank that would otherwise propagate up and make `acquire` degrade
+        // every launch to an UNGUARDED primary (single-instance coalescing disabled →
+        // window pile-up). Remove the offending entry and retry ONCE; if it still
+        // fails, propagate (acquire then degrades to unguarded, as before).
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            let _ = fs::remove_file(&lock_path); // removes the symlink itself, not its target
+            opts.open(&lock_path)?
+        }
+        Err(e) => return Err(e),
+    };
 
     match file.try_lock() {
         Ok(()) => {

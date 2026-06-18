@@ -1479,6 +1479,15 @@ impl GuiApp {
         if !self.acct_filter_title.is_empty() {
             self.acct_filter_title = a.title.clone();
         }
+        // Also relax the NON-facet constraints, or the just-saved record can still
+        // vanish: clear the review-only filter if the saved record isn't flagged, and
+        // clear the username search if it no longer matches the saved username.
+        if self.acct_filter_review && !a.review {
+            self.acct_filter_review = false;
+        }
+        if !self.acct_search_user.is_empty() && !records::matches_search(&a.username, &self.acct_search_user) {
+            self.acct_search_user.clear();
+        }
     }
 
     /// One-off maintenance: left/right-trim every field on every account, persist,
@@ -2405,12 +2414,10 @@ impl GuiApp {
     }
 
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
-        // `text` is wiped on drop; arboard copies into the OS clipboard (cleared
-        // on the 15s timer and on exit).
-        // `.and_then(|mut c| ...)` on a `Result` runs the closure only if opening
-        // the clipboard succeeded; `mut c` is a mutable clipboard handle, and
-        // `text.as_str()` borrows the secret as `&str` to write it.
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.as_str())) {
+        // `text` is wiped on drop; the shared helper copies it into the OS clipboard
+        // with the Linux history-exclusion hint so clipboard managers don't retain
+        // the password (cleared on the 15s timer and on exit either way).
+        match crate::copy_secret_to_clipboard(text.as_str()) {
             Ok(()) => {
                 self.clipboard_dirty = true;
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
@@ -2713,7 +2720,11 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
         egui::ScrollArea::vertical().max_height(180.0).id_salt("hist").show(ui, |ui| {
             // `.iter().rev()` walks the entries newest-first (reverse order).
             for c in history.iter().rev() {
-                let detail = if c.detail.is_empty() { c.action.clone() } else { c.detail.clone() };
+                // `display_detail` masks password before/after values so the history
+                // pane never leaks a cleartext password (it can't be copied from here
+                // and the live field's reveal toggle deliberately does not extend here).
+                let detail =
+                    if c.detail.is_empty() { c.action.clone() } else { records::display_detail(&c.detail) };
                 ui.label(format!("{}  —  {detail}", format_time(c.at)));
             }
         });
@@ -2814,6 +2825,27 @@ mod tests {
         assert_eq!(app.acct_filter_type, "Bank", "active type filter follows the saved value");
         assert_eq!(app.acct_filter_title, "Savings", "active title filter follows the saved value");
         assert_eq!(app.acct_filter_owner, "", "an inactive filter stays unset");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sync_account_filters_relaxes_review_and_search_in_gui() {
+        let (mut app, path) = app_unlocked("guirelax");
+        app.acct_filter_review = true;
+        app.acct_search_user = "alice".into();
+        let mut a = Account::new().unwrap();
+        a.review = false; // saved record is NOT flagged
+        a.username = "bob".into(); // and does not match the search
+        app.sync_account_filters_to(&a);
+        assert!(!app.acct_filter_review, "review-only filter relaxed so a non-flagged save stays visible");
+        assert_eq!(app.acct_search_user, "", "username search relaxed when it no longer matches the save");
+
+        // A still-matching save leaves the search in place.
+        app.acct_search_user = "bo".into();
+        let mut keep = Account::new().unwrap();
+        keep.username = "bob".into();
+        app.sync_account_filters_to(&keep);
+        assert_eq!(app.acct_search_user, "bo", "a still-matching search is left as-is");
         cleanup(&path);
     }
 

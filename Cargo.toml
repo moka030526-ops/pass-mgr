@@ -14,3 +14,8 @@ members = [
 [profile.release]
 # Strip symbols and debug info from release binaries (smaller distributable).
 strip = true
+# Keep integer-overflow checks ON in release (off by default). The parsers do their
+# own checked arithmetic, but this is cheap defense-in-depth for this security tool:
+# a missed overflow panics (fail-closed) instead of silently wrapping in shipped
+# builds. Verified by the CI release-build step.
+overflow-checks = true

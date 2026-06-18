@@ -17,17 +17,17 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 
 | Layer | Result |
 | --- | --- |
-| Adversarial security review | **2 real defects found and fixed**; 8 candidate findings investigated and refuted |
+| Adversarial security review (3 rounds incl. a 152-agent deep hunt) | **15 real defects found and fixed** (F-1…F-15: 1 HIGH this round + 4 earlier HIGH, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
 | Mutation testing (`cargo-mutants --in-diff`, 194 mutants) | **56 survivors killed** (106→50 missed); `core`/`ffi` clean (only a `cfg` phantom); the 50 remaining are all in the thin desktop UI (rendering / keyboard / cosmetic) — see §4 |
-| Fuzzing (`cargo-fuzz`, 4 targets) | **≈81.6 M executions, 0 crashes** |
-| Supply-chain (`cargo-audit`) | **0 advisories across 595 deps** |
+| Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M executions, 0 crashes** (latest extended run) |
+| Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 192 · ffi 31 · compat 4 · desktop 47 + 19 · crash-recovery 18 — all green** (`--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 212 · ffi 31 · compat 4 · desktop 61 + 20 · crash-recovery 18 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
-Both confirmed defects were **secret-hygiene** issues (plaintext password lifetime),
-not breaks of the cryptographic envelope. Neither lets an attacker read a vault they
-could not already open; both narrow the window in which a local attacker with memory
-or clipboard access could recover a password.
+The cryptographic envelope was never broken: no finding lets an attacker read a vault
+they could not already open. The fixes harden secret hygiene (plaintext password
+lifetime / display), open-time DoS resistance, untrusted-import path safety, backup
+integrity, and a destructive-CLI footgun — see §3.1/§3.1b/§3.1c.
 
 ## 2. Assurance layers applied
 
@@ -118,6 +118,32 @@ filtered out). Both are fixed, with a sweep confirming neither pattern recurs el
   in the first place. (The unlock password fields stay on plain `remember` by design —
   persisting a typed password into the saved-state bundle would itself be a leak.)
 
+### 3.1c Third round — 152-agent deep hunt (9 lenses → 3-skeptic verify → critic → round 2)
+
+The deepest pass yet: 9 parallel finder lenses (crypto, I/O & crash safety, untrusted
+parsers, path traversal, FFI memory, secret hygiene, logic/UI, concurrency, supply chain),
+each finding adversarially verified by 3 independent skeptics (default-refute, survives only
+on ≥2 confirmations), then a completeness critic + a targeted second round. **28 findings
+survived verification; deduplicated to 14 root causes.** A separate dynamic pass corroborated
+the static review: extended fuzzing (~183 M execs across all five parsers, 0 crashes) and a
+fresh `cargo audit` + `cargo deny` (clean). One HIGH and all confirmed MED/LOW items below are
+fixed; the synthesizer's flagged false-positives are listed in §3.2.
+
+| # | Sev | Fix |
+| --- | --- | --- |
+| F-5 | **High** | **Password history shown in cleartext, bypassing the reveal/mask toggle.** The history pane rendered `Change.detail` verbatim — `password: "old" -> "new"` — even with the field masked. New `records::display_detail` masks any password-field history line (`<hidden> -> <hidden>`, field name kept) in BOTH UIs; you cannot copy from history, so values are never needed there. |
+| F-6 | Med | **Redundancy recovery buffered every candidate at once** (up to ~11 × 256 MiB → open-time OOM). `decrypt_with_redundancy` is now two-pass: a header-only salt scan, then one candidate buffer in memory at a time (`read_header_of` + bounded loop). |
+| F-7 | Med | **`backup()` copied the live tree with no write lock** → a concurrent rekey could yield an unopenable backup. It now holds `WriteLock` for the whole snapshot (fails `Locked` rather than risk corruption). |
+| F-8 | Med | **`is_safe_blob_id` allowed Windows ADS / drive-relative / device-name ids** on untrusted-mirror import. Tightened to an ASCII-hex allowlist (real ids are 32-hex), which also rejects `:`, device names, dots/spaces, control bytes. Untrusted `ManifestEntry.path` is now control-byte-validated too (`is_safe_doc_path`). |
+| F-9 | Med | **CLI value-flags (`--backup`/`--history-before`) could swallow the vault-dir positional**, silently retargeting destructive `compact` onto the default vault. New `compact_target` refuses the implicit default when a value-flag is present, and the resolved target is echoed before any prompt. |
+| F-10 | Med | **Clipboard not marked sensitive.** Linux now sets arboard's `exclude_from_history` hint (shared `copy_secret_to_clipboard`); Android marks the clip `EXTRA_IS_SENSITIVE` and the activity sets `FLAG_SECURE` (no plaintext in the 13+ paste preview, screenshots, or recents). |
+| F-11 | Low→Med | **KDF param ceiling too high (pre-auth OOM) + write path didn't validate.** Bounds moved onto `KdfParams::validate()` (m_cost ceiling 1 GiB → 512 MiB, t_cost 64 → 16), now called on BOTH `Header::parse` (read) and `create`/`import_tree` (write) so a vault can't be written that the reader would refuse. |
+| F-12 | Low | **FFI `open_vault` left passwords un-zeroized on a panic-unwind.** pw1/pw2 are now bound in `Zeroizing` on entry (wiped on every exit). The crate disclosure is also expanded to be honest that the UniFFI record DTOs / RustBuffer can't be zeroize-on-drop. |
+| F-13 | Low | **Keep-visible-on-save ignored the review-only and username-search filters** → a just-saved account vanished. Both now relaxed for the saved record (GUI + TUI). |
+| F-14 | Low | **`copy_dir` (backup) followed source symlinks** (`is_dir`/`fs::copy` dereference). Now uses `read_dir` file-type and refuses symlink entries. |
+| F-15 | Low | **Single-instance lock degraded to unguarded on a planted symlink** (ELOOP). `acquire_in` now removes the junk entry and retries once. |
+| — | Low | **CI/policy hardening:** `overflow-checks = true` in `[profile.release]` (fail-closed on overflow), `wildcards = "deny"` (+ `allow-wildcard-paths`) in `deny.toml`, a release-mode test job, and `cargo deny` + the `doc_paths` fuzzer made standing CI checks. |
+
 ### 3.2 Investigated and refuted (no change needed)
 
 | # | Hypothesis | Why it does not hold |
@@ -130,6 +156,10 @@ filtered out). Both are fixed, with a sweep confirming neither pattern recurs el
 | R-6 | Cross-record document leakage | `referenced_doc_ids` are per-record; the volume index does not alias chunks across records. |
 | R-7 | Residual unzeroized secrets elsewhere | Key material and password buffers use `Zeroizing`; F-1 was the only remaining growth-realloc gap on the new surface. |
 | R-8 | Single-writer lock TOCTOU | The advisory `flock` is correct for the stated *single-instance-on-one-host* threat model; it is not claimed to defend against a multi-host shared filesystem, and that limitation is documented. |
+| R-9 | FFI `count()` truncates `usize` → `u32` | Unreachable: needs >4.29 B in-memory records in a single-user offline vault. Cosmetic; left as-is. |
+| R-10 | `scan_volume` (manifest-loss rebuild) adopts an uncommitted trailing frame that a normal reopen would roll back | Concerns only a single *unacknowledged* write after a compound double-fault; standard durability semantics, no integrity/secret/oracle impact. |
+| R-11 | Mobile 15 s clipboard wipe clobbers unrelated content copied meanwhile | WONTFIX: unconditionally wiping is the *secure* default for a password auto-clear; the proposed read-compare-then-clear weakens the guarantee and triggers OS clipboard-access prompts. |
+| R-12 | `ArchiveMismatch`/`RekeyPending` mildly distinguish "password correct but store tampered" from "wrong password" | Reaching either REQUIRES the correct passwords, so it grants no brute-force/oracle capability; left as an intentional, documented post-decrypt state. |
 
 ## 4. Mutation testing
 

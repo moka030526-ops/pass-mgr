@@ -427,15 +427,35 @@ fn cli_backup(path: PathBuf, dest_dir: PathBuf) -> anyhow::Result<()> {
 /// default the encrypted tree is backed up first (`--no-backup` opts out); the
 /// trimmed history and reclaimed bytes are otherwise gone permanently. `--dry-run`
 /// reports what would be reclaimed without writing. Prompts for both passwords.
-fn cli_compact(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
-    // `pos[0]` is "compact"; an optional `pos[1]` is the vault DIR.
-    let path = match pos.len() {
-        1 => default_vault_path(),
-        2 => vault_file(&pos[1]),
+/// Resolve the vault target for `compact`, rejecting the silently-wrong default.
+/// `pos[0]` is "compact"; an optional `pos[1]` is the vault DIR.
+fn compact_target(pos: &[String], f: &CompactFlags) -> anyhow::Result<PathBuf> {
+    // A value-taking flag (`--backup DEST` / `--history-before DATE`) greedily
+    // consumes the NEXT token as its value, so `compact --backup DIR` leaves
+    // pos=["compact"] — which would otherwise fall back to the DEFAULT vault and
+    // run a destructive compaction on the WRONG one. If no DIR was given AND such a
+    // flag is present, refuse rather than guess: demand the DIR explicitly.
+    if pos.len() == 1 && (f.backup_dest.is_some() || f.history_before.is_some()) {
+        anyhow::bail!(
+            "compact: no vault DIR given, but a value-taking flag (--backup/--history-before) is \
+             present and may have consumed the directory you meant. Pass the vault DIR explicitly, \
+             e.g. `pass-mgr compact DIR --backup DEST`."
+        );
+    }
+    match pos.len() {
+        1 => Ok(default_vault_path()),
+        2 => Ok(vault_file(&pos[1])),
         _ => anyhow::bail!(
             "usage: pass-mgr compact [DIR] [--volume] [--json (--history-before YYYY-MM-DD | --history-all)] [--dry-run] [--no-backup] [--backup DEST]"
         ),
-    };
+    }
+}
+
+fn cli_compact(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
+    let path = compact_target(pos, f)?;
+    // Make the target unambiguous before any password prompt or destructive work, so
+    // a swallowed-positional mistake is visible instead of silently hitting a vault.
+    eprintln!("pass-mgr: compact target vault → {}", path.display());
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
@@ -1005,6 +1025,29 @@ mod tests {
         let p = safe_relative_path("/statements/2026", "q1.pdf", "id");
         assert_eq!(p, PathBuf::from("statements/2026/q1.pdf"));
         assert!(contained(&p));
+    }
+
+    #[test]
+    fn compact_target_rejects_implicit_default_when_value_flag_present() {
+        use super::{CompactFlags, compact_target, default_vault_path, vault_file};
+        let s = |v: &str| v.to_string();
+
+        // No DIR + a value-taking flag that may have eaten it → refuse (the footgun).
+        let f = CompactFlags { backup_dest: Some(s("/some/dir")), ..Default::default() };
+        assert!(compact_target(&[s("compact")], &f).is_err(), "swallowed-DIR case must be rejected");
+        let f2 = CompactFlags { history_before: Some(s("2026-01-01")), ..Default::default() };
+        assert!(compact_target(&[s("compact")], &f2).is_err());
+
+        // Explicit DIR alongside the value-flag → unambiguous, accepted.
+        let f = CompactFlags { backup_dest: Some(s("/dest")), ..Default::default() };
+        assert_eq!(
+            compact_target(&[s("compact"), s("/my/vault")], &f).unwrap(),
+            vault_file("/my/vault")
+        );
+
+        // Implicit default with NO value-flag → still allowed (the common case).
+        let none = CompactFlags::default();
+        assert_eq!(compact_target(&[s("compact")], &none).unwrap(), default_vault_path());
     }
 
     #[test]

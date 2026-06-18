@@ -95,6 +95,39 @@ impl Default for KdfParams {
     }
 }
 
+impl KdfParams {
+    /// Memory-cost floor (KiB).
+    pub const MIN_M_COST: u32 = 8;
+    /// Memory-cost ceiling (KiB) = **512 MiB**. The params live in the header and
+    /// must be used to DERIVE the key *before* the AEAD tag can reject a tampered
+    /// header, so an attacker who rewrites the header (or plants a redundancy
+    /// candidate) can force this much memory-hard work per open. The ceiling is set
+    /// well below "OOM the process" so a maxed header is a clean error, not a kill —
+    /// while staying 8× above the 64 MiB default. (Was 1 GiB; lowered per audit.)
+    pub const MAX_M_COST: u32 = 512 * 1024;
+    /// Iteration (time-cost) ceiling. Far above the default of 3.
+    pub const MAX_T_COST: u32 = 16;
+    /// Parallelism (lanes) ceiling.
+    pub const MAX_P_COST: u32 = 16;
+
+    /// Reject parameters outside the sane bounds above. Called on BOTH the read path
+    /// (`Header::parse`, a pre-derivation DoS guard) AND the write paths
+    /// (`create`/`import_tree`) so a vault can never be WRITTEN with params the reader
+    /// would later refuse — which would otherwise make it permanently unopenable.
+    pub fn validate(&self) -> Result<(), CryptoError> {
+        if self.m_cost < Self::MIN_M_COST
+            || self.m_cost > Self::MAX_M_COST
+            || self.t_cost < 1
+            || self.t_cost > Self::MAX_T_COST
+            || self.p_cost < 1
+            || self.p_cost > Self::MAX_P_COST
+        {
+            return Err(CryptoError::KdfParams);
+        }
+        Ok(())
+    }
+}
+
 /// A derived symmetric key. The key bytes live on the heap and their page(s)
 /// are **memory-locked** (`mlock` on Unix, `VirtualLock` on Windows) so the OS
 /// will not page them to swap, where a plaintext copy could survive on disk

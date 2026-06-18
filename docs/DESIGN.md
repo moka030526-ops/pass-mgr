@@ -154,9 +154,14 @@ come from `categories`, which is stored **inside the encrypted vault** (§4.2,
   _within_ the (already integrity-protected) vault.
 - The `detail` string records **field-name + before/after** for every changed
   field, **including the password** (e.g. `password: "old" -> "new"`). This
-  makes the history a complete record and allows recovering a previous password.
-  The security trade-off — the vault retains old passwords forever — is accepted
-  here and noted in §9.4.
+  makes the history a complete record at rest. The security trade-off — the vault
+  retains old passwords forever — is accepted here and noted in §9.4.
+- **Display masking.** The UIs never render a password value from history: both the
+  GUI and TUI history panes pass each entry through `records::display_detail`, which
+  masks any password-field line to `password: <hidden> -> <hidden>` (the field name
+  and timestamp are kept). The live edit field has its own reveal toggle; the history
+  pane deliberately does not extend it — you cannot copy from history, and showing an
+  old cleartext password there defeated the on-screen masking control (audit F-5).
 - Deletions are recorded in the **vault-level** `audit` log (the entry itself is
   gone, so it cannot hold its own tombstone).
 
@@ -309,7 +314,12 @@ Putting §5.1–§5.3 together, this is exactly what happens to your data.
 **Opening the vault**
 
 1. Parse and range-check the header (reject absurd Argon2 params before doing any
-   memory-hard work — a DoS guard).
+   memory-hard work — a DoS guard). The bounds live in `KdfParams::validate()`
+   (m_cost ≤ 512 MiB, t_cost ≤ 16, p_cost ≤ 16) and are enforced on BOTH this read
+   path AND the write paths (`create`/`import_tree`), so the two can never disagree
+   and write a vault that is then unopenable. The ceiling is set below "OOM the
+   process" so a tampered header is a clean error, not a kill — important because the
+   params must be used to derive the key *before* the AEAD tag can reject them (F-11).
 2. Re-derive `key` from the two passwords + the header's salt/params.
 3. AEAD-decrypt, verifying the Poly1305 tag over `(full header, ciphertext)`. A
    wrong password, a corrupted body, or **any** altered header field fails here —

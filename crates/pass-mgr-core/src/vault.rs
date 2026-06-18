@@ -81,11 +81,10 @@ const MAX_REDUNDANCY: u32 = 10;
 const MIN_VOLUME_MAX_SIZE: u64 = 64 * 1024; // 64 KiB
 const MAX_VOLUME_MAX_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
 
-// Sanity bounds for KDF parameters read from an untrusted file header, validated
-// *before* the (expensive, memory-hard) key derivation runs (DoS guard).
-const MAX_M_COST: u32 = 1 << 20; // 1 GiB, in KiB
-const MAX_T_COST: u32 = 64;
-const MAX_P_COST: u32 = 16;
+// Sanity bounds for KDF parameters now live on `KdfParams` (crypto.rs) as
+// `KdfParams::validate()`, so the read path (Header::parse, a pre-derivation DoS
+// guard) and the write paths (create/import_tree) share one definition and can
+// never disagree (which would let a vault be written that can never be reopened).
 
 // An `enum` is a tagged union: a value is exactly ONE of the listed variants,
 // some of which carry data (e.g. `NotFound(PathBuf)`). This is the single error
@@ -187,15 +186,9 @@ impl Header {
             t_cost: u32::from_le_bytes(buf[13..17].try_into().unwrap()),
             p_cost: u32::from_le_bytes(buf[17..21].try_into().unwrap()),
         };
-        if params.m_cost < 8
-            || params.m_cost > MAX_M_COST
-            || params.t_cost < 1
-            || params.t_cost > MAX_T_COST
-            || params.p_cost < 1
-            || params.p_cost > MAX_P_COST
-        {
-            return Err(VaultError::BadParams);
-        }
+        // Reject out-of-range params BEFORE the (expensive, memory-hard) derivation —
+        // a tampered/forged header cannot force an unbounded Argon2 allocation.
+        params.validate().map_err(|_| VaultError::BadParams)?;
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&buf[21..37]);
         let mut nonce = [0u8; NONCE_LEN];
@@ -294,6 +287,10 @@ impl OpenVault {
         if path.exists() {
             return Err(VaultError::AlreadyExists(path));
         }
+        // Validate params on the WRITE path with the same bounds the READ path
+        // (Header::parse) enforces, so we can never write a vault the reader would
+        // later refuse to open (BadParams) — including its mirror/ring copies.
+        params.validate().map_err(|_| VaultError::BadParams)?;
         let dir = parent_dir(&path); // `&path` lends the path without giving it away
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
@@ -548,6 +545,9 @@ impl OpenVault {
         if dest.exists() {
             return Err(VaultError::AlreadyExists(dest.to_path_buf()));
         }
+        // Same write-path param validation as `create` (see there): never build a
+        // vault whose params the reader would later reject.
+        params.validate().map_err(|_| VaultError::BadParams)?;
         // Read + validate the mirror's vault JSON (size-capped, symlink-rejected;
         // wipe the buffer after parsing). The mirror is untrusted input.
         let vault_json = Zeroizing::new(read_capped(&src.join("vault.json"), MAX_VAULT_SIZE)?);
@@ -599,6 +599,13 @@ impl OpenVault {
                 // `..` would traverse out of the mirror. Require a plain filename.
                 if !is_safe_blob_id(&e.id) {
                     return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document id in mirror: {:?}", e.id))));
+                }
+                // The mirror also supplies the virtual path verbatim; reject control
+                // bytes so a crafted mirror can't store a path that injects terminal
+                // escapes or NULs into the UI / future consumers. (Length is bounded
+                // by `store.put`.)
+                if !is_safe_doc_path(&e.path) {
+                    return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document path in mirror: {:?}", e.path))));
                 }
                 // Size-capped + symlink-rejected read (no OOM, no /dev/zero or
                 // arbitrary-file read through a planted symlink).
@@ -1120,7 +1127,23 @@ fn selected_entries(store: &VolumeStore, part: Option<u32>) -> Result<Vec<Manife
 /// and not a `.`/`..` traversal. Real ids are random hex, so this never rejects a
 /// genuine export — it only stops a crafted mirror from escaping its directory.
 fn is_safe_blob_id(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
+    // Blob ids we generate are always 32 lowercase hex chars (`records::random_id`),
+    // so a hex-digit allowlist is both correct and the tightest safe check for an
+    // UNTRUSTED import mirror's ids. Crucially it rejects every filesystem-escape
+    // vector that the old `!contains(['/','\\','\0'])` denylist missed on Windows:
+    // `:` (NTFS alternate-data-stream `foo:bar` / drive-relative `C:evil`), reserved
+    // device names (NUL/CON/COM1 — they contain non-hex letters), control bytes,
+    // trailing dot/space, and `.`/`..`. The id is later used as a real filename on
+    // both import-read (`vol.<p>/<id>`) and export-write, so this must hold.
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True if an untrusted mirror's virtual document path is safe to store. The path
+/// is display-oriented (e.g. `trust-wills/auto/ts/deed.pdf`); reject control bytes
+/// (NUL, newlines, terminal-escape injection) outright. Length is enforced
+/// separately by `VolumeStore::put` (<= MAX_PATH_LEN).
+fn is_safe_doc_path(path: &str) -> bool {
+    !path.contains(|c: char| c.is_control())
 }
 
 /// Read a file from an UNTRUSTED import mirror with a size ceiling, rejecting a
@@ -1318,48 +1341,55 @@ fn decrypt_with_redundancy(
     if candidates.is_empty() {
         return Err(primary_err);
     }
-
-    // Pre-read the candidate bytes (size-capped, small). CRITICAL: the live header is
-    // NOT a trusted key-derivation source — a corruption confined to its salt/params
-    // would defeat recovery even with a perfect mirror. Derive the key from each
-    // DISTINCT *candidate* salt. All same-epoch copies share one salt, so this is ~1
-    // Argon2 in practice (and a wrong password still costs ~1, not N), while a
-    // candidate whose own header is damaged is covered by trying the next salt.
-    // Pair each blob with its SOURCE PATH. `filter_map` drops unreadable candidates,
-    // so a bare index into `candidates` would desync (e.g. an unreadable mirror would
-    // make a generation-recovery falsely report as a lossless "mirror" recovery). The
-    // paired path keeps the mirror-vs-generation label honest.
-    let blobs: Vec<(&PathBuf, Vec<u8>)> = candidates.iter().filter_map(|c| read_capped_vault(c).ok().map(|b| (c, b))).collect();
     let mirror = mirror_path(path);
-    // Bound the number of DISTINCT candidate salts we derive a key for. Legitimately
-    // this is 1 (all live copies share the current salt) or at most 2 (an older
-    // generation kept under a pre-rekey salt). Without this cap an attacker who can
-    // write the vault dir could plant up to (mirror + MAX_REDUNDANCY) candidates each
-    // with a distinct salt + maxed Argon2 params, forcing one expensive chained
-    // derivation per salt on EVERY open (an amplified open-DoS). Capping at 3 keeps
-    // honest recovery working while bounding the attacker's forced work.
+
+    // PASS 1 — collect up to MAX_RECOVERY_SALTS distinct candidate salts by reading
+    // ONLY each candidate's fixed-size header (cheap), then derive one key per distinct
+    // salt. CRITICAL: the live header is NOT a trusted key-derivation source — a
+    // corruption confined to its salt/params would defeat recovery even with a perfect
+    // mirror — so we derive from each *candidate* salt. All same-epoch copies share one
+    // salt, so this is ~1 Argon2 in practice (an older generation adds at most one
+    // more). The cap bounds an attacker who plants many distinct-salt + maxed-param
+    // candidates from forcing one expensive chained derivation per salt on every open.
     const MAX_RECOVERY_SALTS: usize = 3;
+    let mut keys: Vec<Key> = Vec::new();
     let mut tried_salts: Vec<[u8; SALT_LEN]> = Vec::new();
-    for (_, src) in &blobs {
-        let Ok(header) = Header::parse(src) else { continue };
-        if tried_salts.contains(&header.salt) {
-            continue; // already derived a key for this salt
-        }
+    for c in &candidates {
         if tried_salts.len() >= MAX_RECOVERY_SALTS {
             break; // refuse to derive past the bound (planted distinct-salt DoS guard)
         }
+        let Ok(header) = read_header_of(c) else { continue };
+        if tried_salts.contains(&header.salt) {
+            continue; // already derived a key for this salt
+        }
         tried_salts.push(header.salt);
-        let Ok(key) = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) else { continue };
-        // Try this key against every candidate (mirror first, then generations).
-        for (cand_path, raw) in &blobs {
-            if let Ok((vault, hdr)) = decode_vault_with_key(raw, &key) {
+        if let Ok(key) = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(primary_err); // no candidate header parsed / wrong password
+    }
+
+    // PASS 2 — try the derived keys against each candidate, holding AT MOST ONE
+    // candidate buffer in memory at a time. The previous version collected EVERY
+    // candidate into RAM up front, so an attacker who planted many max-size (256 MiB)
+    // copies could exhaust memory and OOM-kill the process on every open. Candidates
+    // are mirror-first then older generations, keeping the recovery notice honest; a
+    // candidate whose own header salt is damaged still recovers here if its body
+    // decrypts under a sibling's salt-derived key.
+    for c in &candidates {
+        let Ok(raw) = read_capped_vault(c) else { continue };
+        for i in 0..keys.len() {
+            if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[i]) {
+                let key = keys.swap_remove(i); // take ownership of the matching key
                 // The mirror is normally the same generation as the lost primary, but
                 // a crash *between* the primary commit and the (best-effort) mirror
                 // write can leave the mirror one generation stale — so we do NOT
                 // promise "no data lost", only that it is usually the latest. A
                 // generation is definitely older (a surfaced rollback). Either way the
                 // user should re-save and refresh backups.
-                let notice = if **cand_path == mirror {
+                let notice = if *c == mirror {
                     "The main vault file was unreadable and was recovered from its mirror copy \
                      (normally the latest state — but if a save was interrupted before the \
                      mirror was written, the most recent change may be missing). Re-save, and \
@@ -1372,10 +1402,22 @@ fn decrypt_with_redundancy(
                 return Ok((vault, hdr, key, Some(notice)));
             }
         }
+        // `raw` is dropped here before the next candidate is read (bounded memory).
     }
     // No copy decrypted under any candidate-derived key — wrong password, or every
     // copy is also corrupt. Return the live file's original error.
     Err(primary_err)
+}
+
+/// Read and parse ONLY the fixed-size header of a vault file. Used by redundancy
+/// recovery to learn a candidate's salt/params without pulling the whole (possibly
+/// attacker-inflated) file into memory.
+fn read_header_of(path: &Path) -> Result<Header, VaultError> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    let mut buf = [0u8; HEADER_LEN];
+    f.read_exact(&mut buf)?;
+    Header::parse(&buf)
 }
 
 // --- In-place redundancy file management (§12.8) -----------------------------
@@ -1675,9 +1717,19 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
         return Err(VaultError::NotFound(vault_path.to_path_buf()));
     }
     let src_dir = parent_dir(vault_path);
+    // Hold the single-writer lock for the WHOLE snapshot. backup() is a multi-file
+    // copy (vault.pmv + manifest/ + volume/); without exclusion a concurrent writer —
+    // especially a change_password/compact rekey that swaps volume → manifest →
+    // vault.pmv — can run inside the copy window and leave the backup pairing an
+    // old-key vault.pmv with a new-key store, i.e. silently unopenable. If a writable
+    // session already holds the lock, fail `Locked` (close it and retry) rather than
+    // risk a corrupt backup. On the mobile build (no single-writer-lock feature) this
+    // is a no-op — that build serializes all vault access behind one process mutex.
+    let _lock = WriteLock::acquire(&src_dir)?;
     // Don't snapshot a tree mid-rekey: the volume/manifest may be the new key while
-    // vault.pmv is still the old one, yielding an unopenable backup. Finish (or
-    // discard) the pending rekey by opening with --write first.
+    // vault.pmv is still the old one, yielding an unopenable backup. Under the lock a
+    // present `.rekey` means a *crashed* rekey (not a live writer); finish (or discard)
+    // it by opening with --write first.
     if src_dir.join(REKEY_DIR).exists() {
         return Err(VaultError::RekeyPending);
     }
@@ -1715,12 +1767,9 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
             copy_dir(&s, &target.join(sub))?;
         }
     }
-    // The initial `.rekey` check is a TOCTOU: a concurrent writer may have STARTED a
-    // rekey during the copy window above, so the snapshot could mix an old vault.pmv
-    // with partially-swapped volume/manifest dirs. If `.rekey` appeared, discard the
-    // partial backup and ask the caller to retry. Best-effort — readers are not
-    // lock-isolated from a concurrent writer (§9.16); a rekey that both started and
-    // finished within the window is the rare residual case.
+    // Belt-and-suspenders for the lock-less (mobile) build: re-check `.rekey`. With the
+    // write lock held (desktop) no writer can have started a rekey during the copy, so
+    // this can only fire on the lock-less build; harmless to keep on both.
     if src_dir.join(REKEY_DIR).exists() {
         let _ = fs::remove_dir_all(&target);
         return Err(VaultError::RekeyPending);
@@ -1738,8 +1787,19 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), VaultError> {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir(&from, &to)?; // recurse into subdirectories
+        // `entry.file_type()` reflects the directory entry itself and does NOT follow
+        // symlinks — unlike `Path::is_dir` and `fs::copy`, which both dereference. A
+        // same-UID attacker who plants a symlink in the vault tree (e.g.
+        // `volume/vol.7 -> /etc/passwd`, or a dir symlink for runaway recursion) would
+        // otherwise have its target copied into the backup. Refuse symlink entries.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            return Err(VaultError::Storage(StorageError::Corrupt(format!(
+                "refusing to back up a symlink in the vault tree: {}",
+                from.display()
+            ))));
+        } else if ft.is_dir() {
+            copy_dir(&from, &to)?; // recurse into real subdirectories
         } else {
             fs::copy(&from, &to)?;
             harden_file(&to)?;
@@ -2745,6 +2805,44 @@ mod tests {
     }
 
     #[test]
+    fn is_safe_blob_id_allows_only_hex_and_blocks_escapes() {
+        // Real ids: 32 lowercase hex chars.
+        assert!(is_safe_blob_id(&records::random_id().unwrap()));
+        assert!(is_safe_blob_id("00ff"));
+        // Filesystem-escape / device vectors that the old denylist missed:
+        for bad in [
+            "", "..", ".", "a/b", "a\\b", "a\0b", // separators / dot / nul
+            "C:evil", "secret:hidden",            // Windows drive-relative / NTFS ADS
+            "NUL", "CON", "COM1", "LPT1",          // Windows reserved device names
+            "foo.", "foo ", " foo",                // trailing dot / spaces
+            "deadbeefg",                            // non-hex letter
+            &"a".repeat(65),                        // over-length
+        ] {
+            assert!(!is_safe_blob_id(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_safe_doc_path_rejects_control_bytes() {
+        assert!(is_safe_doc_path("trust-wills/auto/ts/deed.pdf"));
+        assert!(!is_safe_doc_path("a\nb"));
+        assert!(!is_safe_doc_path("a\x1b[2Jb")); // terminal escape
+        assert!(!is_safe_doc_path("a\0b"));
+    }
+
+    #[test]
+    fn create_rejects_kdf_params_the_reader_would_refuse() {
+        // Write path must enforce the same bounds as Header::parse, so a vault can
+        // never be written that is then permanently unopenable (BadParams).
+        let path = tmp_path("createbadparams");
+        let bad = KdfParams { m_cost: KdfParams::MAX_M_COST + 1, t_cost: 3, p_cost: 1 };
+        let res = OpenVault::create(path.clone(), b"a", b"b", bad);
+        assert!(matches!(res, Err(VaultError::BadParams)), "create must reject out-of-range params");
+        assert!(!path.exists(), "no vault file is written when params are rejected");
+        let _ = fs::remove_dir_all(parent_dir(&path));
+    }
+
+    #[test]
     fn import_tree_clamps_absurd_volume_size() {
         let src = tmp_src("bigvol");
         let mut vault = Vault::default();
@@ -2939,15 +3037,17 @@ mod tests {
         }
         // Exactly at each bound: accepted (kills `< ` -> `<=`, `>` -> `>=`).
         assert!(Header::parse(&header_bytes(8, 1, 1)).is_ok());
-        assert!(Header::parse(&header_bytes(MAX_M_COST, MAX_T_COST, MAX_P_COST)).is_ok());
+        assert!(
+            Header::parse(&header_bytes(KdfParams::MAX_M_COST, KdfParams::MAX_T_COST, KdfParams::MAX_P_COST)).is_ok()
+        );
         // One step outside each bound: rejected (kills the `||` and comparison mutants).
         for h in [
             header_bytes(7, 1, 1),
-            header_bytes(MAX_M_COST + 1, 1, 1),
+            header_bytes(KdfParams::MAX_M_COST + 1, 1, 1),
             header_bytes(8, 0, 1),
-            header_bytes(8, MAX_T_COST + 1, 1),
+            header_bytes(8, KdfParams::MAX_T_COST + 1, 1),
             header_bytes(8, 1, 0),
-            header_bytes(8, 1, MAX_P_COST + 1),
+            header_bytes(8, 1, KdfParams::MAX_P_COST + 1),
         ] {
             assert!(matches!(Header::parse(&h), Err(VaultError::BadParams)), "params should be rejected");
         }

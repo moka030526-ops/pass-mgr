@@ -65,9 +65,14 @@ private enum class Section(val title: String, val kind: RecordKind) {
  * Root composable. Shared verbatim by Android and iOS. Holds the locked/unlocked
  * state; the opaque [Vault] handle is destroyed when locking so the Rust side
  * zeroizes the key.
+ *
+ * [copySecret] is an optional platform copy-to-clipboard hook for SECRETS. Android
+ * passes one that marks the clip `EXTRA_IS_SENSITIVE` (so the Android 13+ paste
+ * preview and history keyboards don't expose the password); when `null` (iOS) the
+ * shared Compose clipboard is used. The 15 s + on-lock wipe is platform-agnostic.
  */
 @Composable
-fun App(vaultDir: String) {
+fun App(vaultDir: String, copySecret: ((String) -> Unit)? = null) {
     MaterialTheme {
         var vault by remember { mutableStateOf<Vault?>(null) }
         val clipboard = LocalClipboardManager.current
@@ -92,7 +97,9 @@ fun App(vaultDir: String) {
             clipboardToken = 0 // mark wiped
         }
         val copyToClipboard: (String) -> Unit = { secret ->
-            clipboard.setText(AnnotatedString(secret))
+            // Prefer the platform secret-copy hook (Android marks the clip sensitive);
+            // fall back to the shared Compose clipboard (iOS).
+            if (copySecret != null) copySecret(secret) else clipboard.setText(AnnotatedString(secret))
             clipboardToken++
         }
 
