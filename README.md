@@ -105,9 +105,13 @@ Across the top are seven tabs. Click a tab to switch:
    property, vehicles, loans), with values, owners, and beneficiaries.
 4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with a
    **title**, usernames, and passwords. You can filter the list by title, type,
-   subtype, or owner (and search by username); clicking **New** while a filter is
-   active pre-fills the matching fields on the new entry (nothing is saved until you
-   click Save).
+   subtype, or owner (and search by username). The filters **narrow each other**:
+   pick a type and the other dropdowns only show values that exist for that type
+   (and so on for any combination); a choice that no longer fits is cleared
+   automatically. Clicking **New** while a filter is active pre-fills the matching
+   fields on the new entry, and when you save, an active filter follows the entry so
+   it stays in view (nothing is saved until you click Save). A **reveal** checkbox on
+   the Accounts screen shows every account password at once.
 5. **Real Estate** — properties: address, ownership, taxes, financing (account +
    balance), and per-property **portal logins** (property management, insurance,
    HOA — each with URL, username, password). Each property can also hold uploaded

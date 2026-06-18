@@ -382,6 +382,9 @@ struct GuiApp {
     edit_taxfiling: Option<TaxFiling>,
     edit_general: Option<GeneralDocument>,
     reveal_pw: bool,
+    // Global "reveal" toggle on the Accounts screen: when on, account passwords are
+    // shown regardless of the per-record `reveal_pw` (it overrides it).
+    reveal_all: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
     acct_filter_subtype: String,
@@ -480,6 +483,7 @@ impl GuiApp {
             edit_taxfiling: None,
             edit_general: None,
             reveal_pw: false,
+            reveal_all: false,
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
@@ -1459,47 +1463,76 @@ impl GuiApp {
         Some(a)
     }
 
+    /// After saving an account, move any ACTIVE field filter to the saved record's
+    /// value so the entry stays visible in the filtered list (changing a filtered
+    /// field follows the entry rather than hiding it). Unset filters stay unset.
+    fn sync_account_filters_to(&mut self, a: &Account) {
+        if !self.acct_filter_type.is_empty() {
+            self.acct_filter_type = a.account_type.clone();
+        }
+        if !self.acct_filter_subtype.is_empty() {
+            self.acct_filter_subtype = a.account_subtype.clone();
+        }
+        if !self.acct_filter_owner.is_empty() {
+            self.acct_filter_owner = a.owner.clone();
+        }
+        if !self.acct_filter_title.is_empty() {
+            self.acct_filter_title = a.title.clone();
+        }
+    }
+
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
+        // Configured account types for the EDIT form's type dropdown (offers every
+        // configured type, not just the ones currently in use).
         let type_names = self.vault_ref().categories().account_type_names();
-        let owners_present =
-            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.owner.clone()));
-        let titles_present =
-            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.title.clone()));
-        // When a type filter is chosen, offer that type's configured subtypes
-        // UNION any free-text subtypes actually present on its accounts (so a
-        // hand-typed subtype is still selectable as a filter); otherwise offer the
-        // distinct subtypes present across all accounts.
-        let subtype_opts: Vec<String> = if self.acct_filter_type.is_empty() {
-            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.account_subtype.clone()))
-        } else {
-            let ft = self.acct_filter_type.clone();
-            // `&ft` passes a shared borrow; the callee reads but does not own it.
-            let mut opts = self.vault_ref().categories().subtypes_for(&ft);
-            for a in &self.vault_ref().vault.accounts {
-                if a.account_type == ft
-                    && !a.account_subtype.is_empty()
-                    && !opts.contains(&a.account_subtype)
-                {
-                    opts.push(a.account_subtype.clone());
-                }
+        // Cross-filtered (faceted) options: each dropdown offers only values present
+        // on accounts matching ALL the OTHER active filters. Recompute to a fixpoint,
+        // auto-clearing any selection that is no longer one of its narrowed options
+        // (so a stale pick never leaves the list silently empty).
+        let facets = loop {
+            let f = records::account_facets(
+                &self.vault_ref().vault.accounts,
+                &self.acct_filter_type,
+                &self.acct_filter_subtype,
+                &self.acct_filter_owner,
+                &self.acct_filter_title,
+                &self.acct_search_user,
+                self.acct_filter_review,
+            );
+            let mut changed = false;
+            if !self.acct_filter_type.is_empty() && !f.types.contains(&self.acct_filter_type) {
+                self.acct_filter_type.clear();
+                changed = true;
             }
-            opts
+            if !self.acct_filter_subtype.is_empty() && !f.subtypes.contains(&self.acct_filter_subtype) {
+                self.acct_filter_subtype.clear();
+                changed = true;
+            }
+            if !self.acct_filter_owner.is_empty() && !f.owners.contains(&self.acct_filter_owner) {
+                self.acct_filter_owner.clear();
+                changed = true;
+            }
+            if !self.acct_filter_title.is_empty() && !f.titles.contains(&self.acct_filter_title) {
+                self.acct_filter_title.clear();
+                changed = true;
+            }
+            if !changed {
+                break f;
+            }
         };
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter — type:");
-            let prev_type = self.acct_filter_type.clone();
-            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &type_names);
-            if self.acct_filter_type != prev_type {
-                self.acct_filter_subtype.clear(); // subtypes are type-specific
-            }
+            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &facets.types);
             ui.label("subtype:");
-            filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &subtype_opts);
+            filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &facets.subtypes);
             ui.label("owner:");
-            filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &owners_present);
+            filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &facets.owners);
             ui.label("title:");
-            filter_combo(ui, "acct_ftitle", &mut self.acct_filter_title, &titles_present);
+            filter_combo(ui, "acct_ftitle", &mut self.acct_filter_title, &facets.titles);
             ui.checkbox(&mut self.acct_filter_review, "review only");
+            // Global reveal: overrides the per-record "reveal" toggle below.
+            ui.checkbox(&mut self.reveal_all, "reveal all");
             ui.label("username:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.acct_search_user)
@@ -1569,8 +1602,10 @@ impl GuiApp {
                     ui.end_row();
                     ui.label("Password");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut r.password).password(!self.reveal_pw).desired_width(280.0));
-                        ui.checkbox(&mut self.reveal_pw, "reveal");
+                        // Masked unless the per-record reveal OR the global "reveal all" is on.
+                        let revealed = self.reveal_pw || self.reveal_all;
+                        ui.add(egui::TextEdit::singleline(&mut r.password).password(!revealed).desired_width(280.0));
+                        ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
                         // Generate is only useful when you can save; copy is a read.
                         if self.writable && ui.button("🎲").on_hover_text("Generate").clicked() {
                             generate = true;
@@ -1639,7 +1674,11 @@ impl GuiApp {
                 if let Some(r) = self.edit_account.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
-                    records::upsert(&mut ov.vault.accounts, r);
+                    records::upsert(&mut ov.vault.accounts, r.clone());
+                    // Keep the just-saved entry visible: move any ACTIVE filter to the
+                    // saved record's value (so changing a filtered field doesn't make
+                    // the entry vanish from the filtered list).
+                    self.sync_account_filters_to(&r);
                 }
                 if self.persist() {
                     self.status = "Saved.".into();
@@ -2503,13 +2542,6 @@ fn portal_section(
 // `impl Iterator<Item = String>` is a generic parameter: accept *any* iterator
 // yielding `String`s (the caller decides the concrete type). `.dedup()` removes
 // *consecutive* duplicates, which is why it follows `.sort()`.
-fn distinct_values(values: impl Iterator<Item = String>) -> Vec<String> {
-    let mut v: Vec<String> = values.filter(|s| !s.is_empty()).collect();
-    v.sort();
-    v.dedup();
-    v
-}
-
 /// A filter dropdown: "All" (empty value) plus each option.
 fn filter_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {
     let text = if value.is_empty() { "All".to_string() } else { value.clone() };
@@ -2724,6 +2756,23 @@ mod tests {
         for t in Theme::ALL {
             let _ = visuals_for(t);
         }
+    }
+
+    #[test]
+    fn sync_account_filters_to_follows_only_active_filters() {
+        let (mut app, path) = app_unlocked("guifsync");
+        app.acct_filter_type = "Email".into(); // active
+        app.acct_filter_title = "Personal".into(); // active
+        app.acct_filter_owner = String::new(); // inactive
+        let mut a = Account::new().unwrap();
+        a.account_type = "Bank".into();
+        a.title = "Savings".into();
+        a.owner = "Bob".into();
+        app.sync_account_filters_to(&a);
+        assert_eq!(app.acct_filter_type, "Bank", "active type filter follows the saved value");
+        assert_eq!(app.acct_filter_title, "Savings", "active title filter follows the saved value");
+        assert_eq!(app.acct_filter_owner, "", "an inactive filter stays unset");
+        cleanup(&path);
     }
 
     #[test]

@@ -57,6 +57,65 @@ pub fn matches_search(haystack: &str, query: &str) -> bool {
     q.is_empty() || haystack.to_lowercase().contains(&q)
 }
 
+/// The cross-filtered (faceted) options for the Accounts filters. For each field,
+/// the distinct values present among accounts matching **every other** active
+/// selection — so each dropdown only offers values that would actually yield
+/// results given the rest of the filters.
+pub struct AccountFacets {
+    pub types: Vec<String>,
+    pub subtypes: Vec<String>,
+    pub owners: Vec<String>,
+    pub titles: Vec<String>,
+}
+
+/// Does `a` match the given selections? An empty string for a field means "no
+/// filter on that field"; `query` is the case-insensitive username substring;
+/// `review_only` keeps only review-flagged accounts when true.
+fn acct_match(a: &Account, t: &str, st: &str, o: &str, ti: &str, query: &str, review_only: bool) -> bool {
+    (t.is_empty() || a.account_type == t)
+        && (st.is_empty() || a.account_subtype == st)
+        && (o.is_empty() || a.owner == o)
+        && (ti.is_empty() || a.title == ti)
+        && (!review_only || a.review)
+        && matches_search(&a.username, query)
+}
+
+/// Distinct, sorted, non-empty values of `field` over the accounts that pass
+/// `keep` — the building block for one facet.
+fn facet<F: Fn(&Account) -> &str, K: Fn(&Account) -> bool>(accounts: &[Account], field: F, keep: K) -> Vec<String> {
+    let mut v: Vec<String> = accounts
+        .iter()
+        .filter(|a| keep(a))
+        .map(|a| field(a).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Compute the faceted Accounts filter options: each field's distinct values among
+/// accounts matching all the OTHER current selections (its own selection is ignored
+/// when building its own list, so the user can still switch to another compatible
+/// value). Empty selection strings mean "unset". The username `query` participates
+/// as a constraint on every facet.
+pub fn account_facets(
+    accounts: &[Account],
+    t: &str,
+    st: &str,
+    o: &str,
+    ti: &str,
+    query: &str,
+    review_only: bool,
+) -> AccountFacets {
+    AccountFacets {
+        types: facet(accounts, |a| &a.account_type, |a| acct_match(a, "", st, o, ti, query, review_only)),
+        subtypes: facet(accounts, |a| &a.account_subtype, |a| acct_match(a, t, "", o, ti, query, review_only)),
+        owners: facet(accounts, |a| &a.owner, |a| acct_match(a, t, st, "", ti, query, review_only)),
+        titles: facet(accounts, |a| &a.title, |a| acct_match(a, t, st, o, "", query, review_only)),
+    }
+}
+
 /// A random 128-bit hex id, used for records and volume blobs.
 // Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
@@ -1111,6 +1170,41 @@ mod tests {
         let acc: Account = serde_json::from_value(old).expect("old account without title must load");
         assert_eq!(acc.title, "", "missing title defaults to empty");
         assert_eq!(acc.username, "jane", "old fields preserved");
+    }
+
+    #[test]
+    fn account_facets_cross_filter() {
+        let mk = |t: &str, o: &str, ti: &str| {
+            let mut a = Account::new().unwrap();
+            a.account_type = t.into();
+            a.owner = o.into();
+            a.title = ti.into();
+            a
+        };
+        let accts = vec![mk("Email", "Alice", "Personal"), mk("Email", "Bob", "Work"), mk("Bank", "Alice", "Savings")];
+
+        // No filters: every distinct value (sorted).
+        let f = account_facets(&accts, "", "", "", "", "", false);
+        assert_eq!(f.types, vec!["Bank", "Email"]);
+        assert_eq!(f.owners, vec!["Alice", "Bob"]);
+        assert_eq!(f.titles, vec!["Personal", "Savings", "Work"]);
+
+        // type=Email narrows owners + titles to Email accounts; the TYPE list itself
+        // still shows both (its own selection is ignored when building its options).
+        let f = account_facets(&accts, "Email", "", "", "", "", false);
+        assert_eq!(f.owners, vec!["Alice", "Bob"]);
+        assert_eq!(f.titles, vec!["Personal", "Work"]);
+        assert_eq!(f.types, vec!["Bank", "Email"], "type's own facet ignores the type selection");
+
+        // owner=Alice narrows types + titles to Alice's accounts.
+        let f = account_facets(&accts, "", "", "Alice", "", "", false);
+        assert_eq!(f.types, vec!["Bank", "Email"]);
+        assert_eq!(f.titles, vec!["Personal", "Savings"]);
+
+        // Combined type=Email + owner=Bob -> only the matching title.
+        let f = account_facets(&accts, "Email", "", "Bob", "", "", false);
+        assert_eq!(f.titles, vec!["Work"]);
+        assert_eq!(f.types, vec!["Email"], "owner=Bob means only Email has a Bob account");
     }
 
     #[test]

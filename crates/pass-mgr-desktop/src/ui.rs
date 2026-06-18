@@ -351,6 +351,9 @@ struct App {
     // substring) query; `search_active` is true while typing it (entered with '/').
     acct_search: String,
     search_active: bool,
+    // Global "reveal" toggle for the Accounts tab: when on, account passwords are
+    // shown regardless of the per-record reveal (it overrides Ctrl+R).
+    reveal_all: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -405,6 +408,7 @@ impl App {
             acct_filter_review: false,
             acct_search: String::new(),
             search_active: false,
+            reveal_all: false,
             asset_filter_review: false,
             cfg_focus: 0,
             cfg_asset_type: String::new(),
@@ -489,26 +493,55 @@ impl App {
         }
     }
 
-    /// Distinct, sorted, non-empty values of an account field (for filter cycling).
-    // `field: impl Fn(&Account) -> &str` is a generic parameter: the caller passes
-    // ANY closure/function that takes `&Account` and returns a `&str` (e.g.
-    // `|a| &a.owner`). This lets one method extract whichever field is wanted.
-    fn account_values(&self, field: impl Fn(&Account) -> &str) -> Vec<String> {
-        // Build owned strings (`.to_string()`), drop empties, collect to a Vec,
-        // then sort and `dedup` (remove adjacent duplicates — effective after
-        // sorting) to get distinct values. The final bare `v` is the return value
-        // (Rust returns the last expression of a block; no `return` keyword needed).
-        let mut v: Vec<String> = self
-            .vault_ref()
-            .vault
-            .accounts
-            .iter()
-            .map(|a| field(a).to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        v.sort();
-        v.dedup();
-        v
+    /// Cross-filtered (faceted) Accounts filter options for the current selections:
+    /// each field's distinct values among accounts matching all the OTHER filters.
+    fn account_facets(&self) -> records::AccountFacets {
+        records::account_facets(
+            &self.vault_ref().vault.accounts,
+            self.acct_filter_type.as_deref().unwrap_or(""),
+            self.acct_filter_subtype.as_deref().unwrap_or(""),
+            self.acct_filter_owner.as_deref().unwrap_or(""),
+            self.acct_filter_title.as_deref().unwrap_or(""),
+            &self.acct_search,
+            self.acct_filter_review,
+        )
+    }
+
+    /// Drop any Accounts filter selection that is no longer one of its cross-filtered
+    /// options (to a fixpoint — clearing one filter can free up another). Keeps the
+    /// list from going silently empty after a filter/search change.
+    fn narrow_account_filters(&mut self) {
+        loop {
+            let f = self.account_facets();
+            let mut changed = false;
+            if let Some(v) = self.acct_filter_type.clone()
+                && !f.types.contains(&v)
+            {
+                self.acct_filter_type = None;
+                changed = true;
+            }
+            if let Some(v) = self.acct_filter_subtype.clone()
+                && !f.subtypes.contains(&v)
+            {
+                self.acct_filter_subtype = None;
+                changed = true;
+            }
+            if let Some(v) = self.acct_filter_owner.clone()
+                && !f.owners.contains(&v)
+            {
+                self.acct_filter_owner = None;
+                changed = true;
+            }
+            if let Some(v) = self.acct_filter_title.clone()
+                && !f.titles.contains(&v)
+            {
+                self.acct_filter_title = None;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -752,10 +785,12 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.acct_search.pop();
+                    self.narrow_account_filters(); // search is a facet too
                     self.selected = 0;
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.acct_search.push(c);
+                    self.narrow_account_filters(); // narrowing search may invalidate a dropdown pick
                     self.selected = 0;
                 }
                 _ => {}
@@ -810,50 +845,37 @@ impl App {
             // Accounts-only display filters: cycle by type / subtype / owner.
             // Guarded arms (`if self.tab == Tab::Accounts`): the same key does
             // nothing on other tabs (falls through to the `_ => {}` arm).
+            // The four filter cycles all use the CROSS-FILTERED options (values
+            // present among accounts matching the OTHER active filters), and then
+            // `narrow_account_filters` drops any other selection that is no longer a
+            // valid option — full faceted filtering, auto-clearing stale picks.
             KeyCode::Char('t') if self.tab == Tab::Accounts => {
-                // `|a| &a.account_type` is a closure selecting which field to list.
-                let opts = self.account_values(|a| &a.account_type);
+                let opts = self.account_facets().types;
                 self.acct_filter_type = cycle_filter(&self.acct_filter_type, &opts);
-                self.acct_filter_subtype = None; // subtypes are type-specific
+                self.narrow_account_filters();
                 self.selected = 0;
             }
             KeyCode::Char('s') if self.tab == Tab::Accounts => {
-                // When a type filter is set, offer that type's configured subtypes
-                // UNION any free-text subtypes actually present on its accounts;
-                // otherwise cycle the subtypes present across all accounts.
-                let opts = match self.acct_filter_type.clone() {
-                    // A type filter is active: start with that type's configured
-                    // subtypes, then add any free-text subtypes actually used.
-                    Some(t) => {
-                        let mut opts = self.vault_ref().categories().subtypes_for(&t);
-                        for a in &self.vault_ref().vault.accounts {
-                            // `&&` chains the conditions; `.contains(&x)` checks
-                            // membership (takes a borrow to compare).
-                            if a.account_type == t
-                                && !a.account_subtype.is_empty()
-                                && !opts.contains(&a.account_subtype)
-                            {
-                                opts.push(a.account_subtype.clone());
-                            }
-                        }
-                        opts.sort();
-                        opts.dedup();
-                        opts
-                    }
-                    None => self.account_values(|a| &a.account_subtype),
-                };
+                let opts = self.account_facets().subtypes;
                 self.acct_filter_subtype = cycle_filter(&self.acct_filter_subtype, &opts);
+                self.narrow_account_filters();
                 self.selected = 0;
             }
             KeyCode::Char('o') if self.tab == Tab::Accounts => {
-                let opts = self.account_values(|a| &a.owner);
+                let opts = self.account_facets().owners;
                 self.acct_filter_owner = cycle_filter(&self.acct_filter_owner, &opts);
+                self.narrow_account_filters();
                 self.selected = 0;
             }
             KeyCode::Char('l') if self.tab == Tab::Accounts => {
-                let opts = self.account_values(|a| &a.title);
+                let opts = self.account_facets().titles;
                 self.acct_filter_title = cycle_filter(&self.acct_filter_title, &opts);
+                self.narrow_account_filters();
                 self.selected = 0;
+            }
+            // Global reveal toggle (Accounts tab): overrides the per-record Ctrl+R.
+            KeyCode::Char('r') if self.tab == Tab::Accounts => {
+                self.reveal_all = !self.reveal_all;
             }
             // Enter username-search input mode (Accounts tab).
             KeyCode::Char('/') if self.tab == Tab::Accounts => {
@@ -862,6 +884,7 @@ impl App {
             // Review-only filter toggle (Accounts and Assets tabs).
             KeyCode::Char('v') if self.tab == Tab::Accounts => {
                 self.acct_filter_review = !self.acct_filter_review;
+                self.narrow_account_filters(); // review-only is a facet too
                 self.selected = 0;
             }
             KeyCode::Char('v') if self.tab == Tab::Assets => {
@@ -1985,6 +2008,21 @@ impl App {
         if self.persist() {
             self.status = "Saved.".into();
             self.screen = Screen::Browse;
+            // Keep the just-saved account visible: move any ACTIVE field filter to the
+            // saved record's value (Account fields: 0 title, 1 type, 2 subtype, 3 owner)
+            // so changing a filtered field follows the entry instead of hiding it.
+            if es.tab == Tab::Accounts {
+                let sync = |f: &mut Option<String>, v: &str| {
+                    if f.is_some() {
+                        *f = (!v.is_empty()).then(|| v.to_string());
+                    }
+                };
+                sync(&mut self.acct_filter_title, &es.fields[0].value);
+                sync(&mut self.acct_filter_type, &es.fields[1].value);
+                sync(&mut self.acct_filter_subtype, &es.fields[2].value);
+                sync(&mut self.acct_filter_owner, &es.fields[3].value);
+                self.narrow_account_filters();
+            }
             self.clamp_selection();
         } else {
             // persist() already set "Save failed: …". Keep the edit buffer open so the
@@ -2246,14 +2284,18 @@ impl App {
             && (self.acct_filter_type.is_some()
                 || self.acct_filter_subtype.is_some()
                 || self.acct_filter_owner.is_some()
+                || self.acct_filter_title.is_some()
                 || self.acct_filter_review
                 || !self.acct_search.is_empty()
-                || self.search_active)
+                || self.search_active
+                || self.reveal_all)
         {
             let t = self.acct_filter_type.as_deref().unwrap_or("any");
             let s = self.acct_filter_subtype.as_deref().unwrap_or("any");
             let o = self.acct_filter_owner.as_deref().unwrap_or("any");
+            let ti = self.acct_filter_title.as_deref().unwrap_or("any");
             let r = if self.acct_filter_review { " · review" } else { "" };
+            let rev = if self.reveal_all { " · 🔓reveal-all" } else { "" };
             // Username search: show the query, with a trailing caret while typing.
             let u = if self.search_active {
                 format!(" · user~\"{}_\"", self.acct_search)
@@ -2262,7 +2304,7 @@ impl App {
             } else {
                 String::new()
             };
-            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o}{r}{u}] ")
+            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o} · title={ti}{r}{u}{rev}] ")
         } else if self.tab == Tab::Assets && self.asset_filter_review {
             format!(" Assets & Liabilities ({count})  [review only] ")
         } else {
@@ -2286,7 +2328,7 @@ impl App {
         } else {
             match self.tab {
                 Tab::Accounts => {
-                    "↑↓ · Enter edit · n new · d del · t/s/o filter · v review · / search user · ←→ tab · c config · p pw · q quit"
+                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · / search · ←→ tab · c config · p pw · q quit"
                 }
                 Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
                 _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
@@ -2309,8 +2351,10 @@ impl App {
             // Decide what to display per field kind: a hidden password shows bullets
             // (unless `reveal` is on); a Choice shows arrows around the value; others
             // show their text verbatim. `&field.kind` matches by borrow.
+            // Masked unless the per-record reveal (Ctrl+R) OR the global "reveal all"
+            // (Accounts 'r' toggle) is on — the latter overrides the former.
             let shown = match &field.kind {
-                FieldKind::Password if !es.reveal => "•".repeat(field.value.chars().count()),
+                FieldKind::Password if !(es.reveal || self.reveal_all) => "•".repeat(field.value.chars().count()),
                 FieldKind::Choice(_) => format!("◄ {} ►", field.value),
                 _ => field.value.clone(),
             };
@@ -2657,6 +2701,51 @@ mod tests {
         assert_eq!(es.fields[0].value, "", "title blank");
         assert_eq!(es.fields[1].value, "", "type blank");
         assert_eq!(es.fields[4].value, "", "username blank");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn saving_account_moves_active_filter_to_keep_it_visible() {
+        let (mut app, path) = app_unlocked("uifsync");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.account_type = "Email".into();
+            a.username = "existing".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.acct_filter_type = Some("Email".into()); // active filter
+        app.start_edit(false); // New (prefills type=Email from the filter)
+        // Change the type to something else and give it a username.
+        app.edit.as_mut().unwrap().fields[1].value = "Bank".into(); // type (field 1)
+        app.edit.as_mut().unwrap().fields[4].value = "newuser".into(); // username (field 4)
+        app.save_edit();
+        // The active type filter followed the saved entry instead of hiding it.
+        assert_eq!(app.acct_filter_type.as_deref(), Some("Bank"));
+        let labels = app.current_labels();
+        assert!(labels.iter().any(|(_, l)| l.contains("newuser")), "saved account is visible: {labels:?}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reveal_all_overrides_per_account_masking_in_tui() {
+        let (mut app, path) = app_unlocked("uirevealall");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.username = "u".into();
+            a.password = "SECRETPW".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.selected = 0;
+        app.start_edit(true);
+        // Masked by default (per-record reveal is off).
+        assert!(!render_to_string(&app).contains("SECRETPW"), "password masked by default");
+        // The global reveal-all overrides the per-record reveal.
+        app.reveal_all = true;
+        assert!(render_to_string(&app).contains("SECRETPW"), "reveal-all shows the password");
         cleanup(&path);
     }
 

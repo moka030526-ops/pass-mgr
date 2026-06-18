@@ -543,10 +543,18 @@ currently exposes the first five record types.) The four screens are:
    driven by the in-vault category lists, plus a free-text **username search** on
    the Accounts tab (case-insensitive substring; the GUI has a search box, the TUI
    enters it with `/`). Selection resolves **by record id**, so a filtered or
-   searched list never edits the wrong record. Clicking **New** on the Accounts tab
-   while a filter/search is active **pre-populates** the matching fields (title,
-   type, subtype, owner, username) on the new entry — a convenience only; nothing is
-   written until the record is saved.
+   searched list never edits the wrong record. The Accounts filters are
+   **cross-filtered (faceted)**: each dropdown offers only values present on accounts
+   matching *all the other* active filters (`records::account_facets`), and a
+   selection that a change makes invalid is **auto-cleared** (a fixpoint sweep), so
+   the list never silently goes empty. Two conveniences keep the entry you're working
+   on in view: clicking **New** while a filter/search is active **pre-populates** the
+   matching fields (title/type/subtype/owner/username) on the new record, and on
+   **save** any active field filter is **moved to the saved record's value** so
+   changing a filtered field follows the entry instead of hiding it. A global
+   **reveal** toggle on the Accounts screen shows every account password at once,
+   overriding the per-record reveal. All of this only affects the view/edit buffer;
+   nothing is written until the record is saved.
 3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
    a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
    to the record's history (req. 4, 5), shown in a History pane. Document-bearing

@@ -484,10 +484,21 @@ Selection resolves **by id** so filtered/sorted lists never act on the wrong
 record. Accounts can be filtered by title/type/subtype/owner/review and a free-text
 **username search** (case-insensitive substring via `records::matches_search`; the
 GUI has a search box, the TUI enters search with `/`, Enter keeps / Esc clears);
-Assets filter by review. Clicking **New** on the Accounts tab while a filter/search
-is active pre-populates the matching fields (title/type/subtype/owner/username) on
-the fresh record (TUI `start_edit` for a new record; GUI `new_account_from_filters`)
-— a convenience that seeds the edit buffer only; nothing is persisted until save. A password copied to the clipboard is auto-cleared after
+Assets filter by review. The Accounts filters are **cross-filtered (faceted)** via
+`records::account_facets`: each dropdown lists only the distinct values present on
+accounts matching *all the other* active selections (incl. the review toggle + the
+username search). After any filter change both UIs run a fixpoint sweep that
+**auto-clears** a selection no longer among its narrowed options (GUI: a loop each
+frame in `tab_accounts`; TUI: `narrow_account_filters`). Two conveniences keep the
+worked-on entry visible: clicking **New** while a filter/search is active
+pre-populates the matching fields (title/type/subtype/owner/username) on the fresh
+record (TUI `start_edit` for a new record; GUI `new_account_from_filters`), and on
+**save** any active field filter is moved to the saved record's value (TUI
+`save_edit`; GUI `sync_account_filters_to`) so a changed filtered field follows the
+entry rather than hiding it. A global **reveal** toggle on the Accounts screen
+(GUI `reveal_all` checkbox; TUI `r`) shows all account passwords, overriding the
+per-record reveal. These only seed/adjust the in-memory view; nothing is persisted
+except on an explicit save. A password copied to the clipboard is auto-cleared after
 15 s (a deadline the event loop polls for — the GUI schedules a repaint so it fires
 even when idle) and again on exit. The write `generation` is shown on unlock so a
 rollback is noticeable. Both UIs validate a document's virtual path against
