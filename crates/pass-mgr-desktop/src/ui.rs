@@ -345,6 +345,7 @@ struct App {
     acct_filter_type: Option<String>,
     acct_filter_subtype: Option<String>,
     acct_filter_owner: Option<String>,
+    acct_filter_title: Option<String>,
     acct_filter_review: bool,
     // Accounts-tab username search: `acct_search` is the active (case-insensitive
     // substring) query; `search_active` is true while typing it (entered with '/').
@@ -400,6 +401,7 @@ impl App {
             acct_filter_type: None,
             acct_filter_subtype: None,
             acct_filter_owner: None,
+            acct_filter_title: None,
             acct_filter_review: false,
             acct_search: String::new(),
             search_active: false,
@@ -475,6 +477,7 @@ impl App {
                 .filter(|a| self.acct_filter_type.as_deref().is_none_or(|t| a.account_type == t))
                 .filter(|a| self.acct_filter_subtype.as_deref().is_none_or(|s| a.account_subtype == s))
                 .filter(|a| self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o))
+                .filter(|a| self.acct_filter_title.as_deref().is_none_or(|t| a.title == t))
                 .filter(|a| !self.acct_filter_review || a.review)
                 // Username search: case-insensitive substring (empty = no filter).
                 .filter(|a| records::matches_search(&a.username, &self.acct_search))
@@ -847,6 +850,11 @@ impl App {
                 self.acct_filter_owner = cycle_filter(&self.acct_filter_owner, &opts);
                 self.selected = 0;
             }
+            KeyCode::Char('l') if self.tab == Tab::Accounts => {
+                let opts = self.account_values(|a| &a.title);
+                self.acct_filter_title = cycle_filter(&self.acct_filter_title, &opts);
+                self.selected = 0;
+            }
             // Enter username-search input mode (Accounts tab).
             KeyCode::Char('/') if self.tab == Tab::Accounts => {
                 self.search_active = true;
@@ -1121,6 +1129,9 @@ impl App {
                 // Accounts filters / username search, so the entry starts in the
                 // bucket the user is viewing. Nothing is saved until they hit save.
                 if !existing {
+                    if let Some(t) = &self.acct_filter_title {
+                        r.title = t.clone();
+                    }
                     if let Some(t) = &self.acct_filter_type {
                         r.account_type = t.clone();
                     }
@@ -1140,6 +1151,7 @@ impl App {
                     id,
                     r.created_at,
                     vec![
+                        Field::text("Title", r.title.clone()),
                         Field::choice(
                             "Account type",
                             r.account_type.clone(),
@@ -1902,14 +1914,15 @@ impl App {
                 let mut r = Account::default();
                 r.id = id;
                 r.created_at = es.created_at;
-                r.account_type = f(0);
-                r.account_subtype = f(1);
-                r.owner = f(2);
-                r.username = f(3);
-                r.password = f(4);
-                r.url = f(5);
-                r.description = f(6);
-                r.review = f(7) == "Yes";
+                r.title = f(0);
+                r.account_type = f(1);
+                r.account_subtype = f(2);
+                r.owner = f(3);
+                r.username = f(4);
+                r.password = f(5);
+                r.url = f(6);
+                r.description = f(7);
+                r.review = f(8) == "Yes";
                 records::upsert(&mut v.accounts, r);
             }
             Tab::RealEstate => {
@@ -2617,30 +2630,33 @@ mod tests {
     fn new_account_prepopulates_from_active_filters() {
         let (mut app, path) = app_unlocked("uifilterprefill");
         app.tab = Tab::Accounts;
+        app.acct_filter_title = Some("Bank login".into());
         app.acct_filter_type = Some("Financial".into());
         app.acct_filter_subtype = Some("IRA".into());
         app.acct_filter_owner = Some("Alice".into());
         app.acct_search = "alice99".into();
         app.start_edit(false); // "New"
         let es = app.edit.as_ref().unwrap();
-        // Account fields: [0] type, [1] subtype, [2] owner, [3] username.
-        assert_eq!(es.fields[0].value, "Financial", "type prefilled from filter");
-        assert_eq!(es.fields[1].value, "IRA", "subtype prefilled from filter");
-        assert_eq!(es.fields[2].value, "Alice", "owner prefilled from filter");
-        assert_eq!(es.fields[3].value, "alice99", "username prefilled from search");
+        // Account fields: [0] title, [1] type, [2] subtype, [3] owner, [4] username.
+        assert_eq!(es.fields[0].value, "Bank login", "title prefilled from filter");
+        assert_eq!(es.fields[1].value, "Financial", "type prefilled from filter");
+        assert_eq!(es.fields[2].value, "IRA", "subtype prefilled from filter");
+        assert_eq!(es.fields[3].value, "Alice", "owner prefilled from filter");
+        assert_eq!(es.fields[4].value, "alice99", "username prefilled from search");
         assert!(es.id.is_none(), "still a new (unsaved) record");
         assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing persisted yet");
 
         // With no filters/search active, a new account starts blank.
+        app.acct_filter_title = None;
         app.acct_filter_type = None;
         app.acct_filter_subtype = None;
         app.acct_filter_owner = None;
         app.acct_search.clear();
         app.start_edit(false);
         let es = app.edit.as_ref().unwrap();
-        assert_eq!(es.fields[0].value, "");
-        assert_eq!(es.fields[2].value, "");
-        assert_eq!(es.fields[3].value, "");
+        assert_eq!(es.fields[0].value, "", "title blank");
+        assert_eq!(es.fields[1].value, "", "type blank");
+        assert_eq!(es.fields[4].value, "", "username blank");
         cleanup(&path);
     }
 
@@ -3050,12 +3066,13 @@ mod tests {
         app.handle_key(key(KeyCode::Char('n'))); // new -> Edit screen
         assert_eq!(app.screen, Screen::Edit);
 
-        // Field order: 0 type(choice) 1 subtype(choice) 2 owner 3 username
-        // 4 password 5 url 6 description 7 review(choice).
+        // Field order: 0 title 1 type(choice) 2 subtype(choice) 3 owner 4 username
+        // 5 password 6 url 7 description 8 review(choice).
         let typ = |app: &mut App, c: char| app.handle_key(key(KeyCode::Char(c)));
-        // owner (focus 2)
+        // owner (focus 3)
         app.handle_key(key(KeyCode::Down)); // 0->1
-        app.handle_key(key(KeyCode::Down)); // 1->2 owner
+        app.handle_key(key(KeyCode::Down)); // 1->2
+        app.handle_key(key(KeyCode::Down)); // 2->3 owner
         for c in "Jane".chars() { typ(&mut app, c); }
         app.handle_key(key(KeyCode::Down)); // username
         for c in "jane".chars() { typ(&mut app, c); }
@@ -3078,8 +3095,8 @@ mod tests {
         let (mut app, path) = app_unlocked("review");
         app.handle_key(key(KeyCode::Char('4'))); // Accounts
         app.handle_key(key(KeyCode::Char('n')));
-        // focus 7 = review choice; cycle to "Yes".
-        for _ in 0..7 {
+        // focus 8 = review choice (Title is now field 0); cycle to "Yes".
+        for _ in 0..8 {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Right)); // cycle choice No -> Yes
@@ -3170,16 +3187,19 @@ mod tests {
         assert_eq!(app.screen, Screen::Edit);
         {
             let es = app.edit.as_ref().unwrap();
-            assert_eq!(es.fields[0].label, "Account type");
-            assert_eq!(es.fields[1].label, "Subtype");
+            // Field 0 is now Title; type/subtype follow.
+            assert_eq!(es.fields[0].label, "Title");
+            assert_eq!(es.fields[1].label, "Account type");
+            assert_eq!(es.fields[2].label, "Subtype");
         }
-        // Focus starts on the account-type field; cycling it must reconstrain the
-        // dependent subtype field's options to the newly-selected type.
+        // Move focus to the account-type field, then cycle it; this must reconstrain
+        // the dependent subtype field's options to the newly-selected type.
+        app.handle_key(key(KeyCode::Down)); // Title -> Account type
         app.handle_key(key(KeyCode::Right));
         let es = app.edit.as_ref().unwrap();
-        let chosen_type = es.fields[0].value.clone();
+        let chosen_type = es.fields[1].value.clone();
         let expected = app.vault.as_ref().unwrap().categories().subtypes_for(&chosen_type);
-        match &es.fields[1].kind {
+        match &es.fields[2].kind {
             FieldKind::Choice(opts) => assert_eq!(opts, &expected),
             _ => panic!("subtype field is not a Choice"),
         }

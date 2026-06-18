@@ -520,6 +520,10 @@ pub struct AssetLiability {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
 pub struct Account {
     pub id: String,
+    /// Short human title/name for this account entry. Shown in the list (when set)
+    /// and filterable, like type/subtype/owner.
+    #[serde(default)]
+    pub title: String,
     /// Category taken from the external account-types list.
     pub account_type: String,
     /// Subtype connected to the account type (e.g. type "Financial" -> "IRA").
@@ -782,6 +786,7 @@ impl_record!(
 impl_record!(
     Account,
     |s: &Account, n: &Account, at: i64, out: &mut Vec<Change>| {
+        track(out, at, "title", &s.title, &n.title);
         track(out, at, "type", &s.account_type, &n.account_type);
         track(out, at, "subtype", &s.account_subtype, &n.account_subtype);
         track(out, at, "owner", &s.owner, &n.owner);
@@ -793,6 +798,11 @@ impl_record!(
         track_bool(out, at, "review", s.review, n.review);
     },
     |l: &Account| {
+        // A set title is the entry's display name; fall back to the
+        // "type: username/owner" form when no title is given.
+        if !l.title.trim().is_empty() {
+            return l.title.clone();
+        }
         // Prefer username, fall back to owner; `.clone()` makes an owned String
         // either way so `who` owns its text.
         let who = if l.username.is_empty() { l.owner.clone() } else { l.username.clone() };
@@ -1056,6 +1066,11 @@ mod tests {
         acc.account_type = "Financial".into();
         acc.username = "jane".into();
         assert_eq!(acc.label(), "Financial: jane");
+        // A set title becomes the display name; clearing it falls back again.
+        acc.title = "Joint brokerage".into();
+        assert_eq!(acc.label(), "Joint brokerage");
+        acc.title = "   ".into();
+        assert_eq!(acc.label(), "Financial: jane", "blank title falls back");
 
         let mut al = AssetLiability::new().unwrap();
         al.kind = "Liability".into();
@@ -1066,6 +1081,27 @@ mod tests {
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn account_title_diffs_and_is_serde_backward_compatible() {
+        // The new title field is tracked in the history diff.
+        let mut a = Account::new().unwrap();
+        a.account_type = "Financial".into();
+        let mut b = a.clone();
+        b.title = "Brokerage".into();
+        let c = a.diff(&b, 100);
+        assert!(c.iter().any(|x| x.detail.contains("title") && x.detail.contains("Brokerage")));
+        // An older account JSON that predates `title` still deserializes (the field
+        // is #[serde(default)]), with title defaulting to "".
+        let old = serde_json::json!({
+            "id": "acc1", "account_type": "Financial", "account_subtype": "", "owner": "Jane",
+            "username": "jane", "password": "pw", "description": "", "url": "",
+            "review": false, "created_at": 1, "updated_at": 1, "history": []
+        });
+        let acc: Account = serde_json::from_value(old).expect("old account without title must load");
+        assert_eq!(acc.title, "", "missing title defaults to empty");
+        assert_eq!(acc.username, "jane", "old fields preserved");
     }
 
     #[test]

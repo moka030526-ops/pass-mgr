@@ -103,8 +103,11 @@ Across the top are seven tabs. Click a tab to switch:
 2. **Trust and Will** — your will and trust details, and where the originals are.
 3. **Assets and Liabilities** — what you own and what you owe (accounts,
    property, vehicles, loans), with values, owners, and beneficiaries.
-4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with
-   usernames and passwords.
+4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with a
+   **title**, usernames, and passwords. You can filter the list by title, type,
+   subtype, or owner (and search by username); clicking **New** while a filter is
+   active pre-fills the matching fields on the new entry (nothing is saved until you
+   click Save).
 5. **Real Estate** — properties: address, ownership, taxes, financing (account +
    balance), and per-property **portal logins** (property management, insurance,
    HOA — each with URL, username, password). Each property can also hold uploaded

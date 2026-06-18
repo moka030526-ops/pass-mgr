@@ -184,6 +184,7 @@ pub struct AssetLiability {
 #[derive(uniffi::Record)]
 pub struct Account {
     pub id: String,
+    pub title: String,
     pub account_type: String,
     pub account_subtype: String,
     pub owner: String,
@@ -260,6 +261,7 @@ fn map_asset(r: &records::AssetLiability) -> AssetLiability {
 fn map_account(r: &records::Account) -> Account {
     Account {
         id: r.id.clone(),
+        title: r.title.clone(),
         account_type: r.account_type.clone(),
         account_subtype: r.account_subtype.clone(),
         owner: r.owner.clone(),

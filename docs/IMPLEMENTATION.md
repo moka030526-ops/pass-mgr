@@ -100,7 +100,7 @@ Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 | Instructions | `Instruction` | title, description |
 | Trust and Will | `TrustWill` | document, usage, `file` (doc id) |
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id) |
-| Accounts | `Account` | account_type, account_subtype, owner, username, password, url, description, review |
+| Accounts | `Account` | title, account_type, account_subtype, owner, username, password, url, description, review |
 | Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, three portal logins (property-management / insurance / HOA — each url + username + password), comments, `documents` (doc ids) |
 | Taxes | `TaxFiling` | year, notes, `documents` (doc ids) |
 | General Documents | `GeneralDocument` | title, description, `file` (one doc id) |
@@ -481,10 +481,13 @@ recovery notice. Every TUI screen is rendered to a ratatui `TestBackend` in test
 ### 6.3 Shared behaviour
 
 Selection resolves **by id** so filtered/sorted lists never act on the wrong
-record. Accounts can be filtered by type/subtype/owner/review and a free-text
+record. Accounts can be filtered by title/type/subtype/owner/review and a free-text
 **username search** (case-insensitive substring via `records::matches_search`; the
 GUI has a search box, the TUI enters search with `/`, Enter keeps / Esc clears);
-Assets filter by review. A password copied to the clipboard is auto-cleared after
+Assets filter by review. Clicking **New** on the Accounts tab while a filter/search
+is active pre-populates the matching fields (title/type/subtype/owner/username) on
+the fresh record (TUI `start_edit` for a new record; GUI `new_account_from_filters`)
+— a convenience that seeds the edit buffer only; nothing is persisted until save. A password copied to the clipboard is auto-cleared after
 15 s (a deadline the event loop polls for — the GUI schedules a repaint so it fires
 even when idle) and again on exit. The write `generation` is shown on unlock so a
 rollback is noticeable. Both UIs validate a document's virtual path against

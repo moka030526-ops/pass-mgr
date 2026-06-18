@@ -114,7 +114,7 @@ Vault
 ├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
 │                                     //         institution, type, statement (doc id)
-├── accounts:      Vec<Account>       // Tab 4: account_type, owner, username, password, url, description
+├── accounts:      Vec<Account>       // Tab 4: title, account_type, subtype, owner, username, password, url, description, review
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
 │                                     //   financing_balance, 3 portal logins (mgmt/insurance/HOA: url+username+password),
 │                                     //   comments, documents (doc ids; folder real-estate/<address>/)
@@ -539,11 +539,14 @@ currently exposes the first five record types.) The four screens are:
    §9.12). The same screen drives **change-password** (re-key), which calls
    `OpenVault::change_password`.
 2. **Browse.** The selected tab's records as a list, with per-tab **filters**
-   (Accounts by type/subtype/owner/"needs review"; Assets by "needs review")
+   (Accounts by title/type/subtype/owner/"needs review"; Assets by "needs review")
    driven by the in-vault category lists, plus a free-text **username search** on
    the Accounts tab (case-insensitive substring; the GUI has a search box, the TUI
    enters it with `/`). Selection resolves **by record id**, so a filtered or
-   searched list never edits the wrong record.
+   searched list never edits the wrong record. Clicking **New** on the Accounts tab
+   while a filter/search is active **pre-populates** the matching fields (title,
+   type, subtype, owner, username) on the new entry — a convenience only; nothing is
+   written until the record is saved.
 3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
    a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
    to the record's history (req. 4, 5), shown in a History pane. Document-bearing

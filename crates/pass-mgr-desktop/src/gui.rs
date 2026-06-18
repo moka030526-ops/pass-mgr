@@ -386,6 +386,7 @@ struct GuiApp {
     acct_filter_type: String,
     acct_filter_subtype: String,
     acct_filter_owner: String,
+    acct_filter_title: String,
     acct_filter_review: bool,
     // Free-text, case-insensitive substring search over account usernames.
     acct_search_user: String,
@@ -482,6 +483,7 @@ impl GuiApp {
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
+            acct_filter_title: String::new(),
             acct_filter_review: false,
             acct_search_user: String::new(),
             asset_filter_review: false,
@@ -1436,6 +1438,7 @@ impl GuiApp {
             .filter(|a| self.acct_filter_type.is_empty() || a.account_type == self.acct_filter_type)
             .filter(|a| self.acct_filter_subtype.is_empty() || a.account_subtype == self.acct_filter_subtype)
             .filter(|a| self.acct_filter_owner.is_empty() || a.owner == self.acct_filter_owner)
+            .filter(|a| self.acct_filter_title.is_empty() || a.title == self.acct_filter_title)
             .filter(|a| !self.acct_filter_review || a.review)
             .filter(|a| records::matches_search(&a.username, &self.acct_search_user))
             .map(|a| (a.id.clone(), a.label()))
@@ -1448,6 +1451,7 @@ impl GuiApp {
     /// Nothing is persisted — this only seeds the edit buffer.
     fn new_account_from_filters(&self) -> Option<Account> {
         let mut a = Account::new().ok()?;
+        a.title = self.acct_filter_title.clone();
         a.account_type = self.acct_filter_type.clone();
         a.account_subtype = self.acct_filter_subtype.clone();
         a.owner = self.acct_filter_owner.clone();
@@ -1459,6 +1463,8 @@ impl GuiApp {
         let type_names = self.vault_ref().categories().account_type_names();
         let owners_present =
             distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.owner.clone()));
+        let titles_present =
+            distinct_values(self.vault_ref().vault.accounts.iter().map(|a| a.title.clone()));
         // When a type filter is chosen, offer that type's configured subtypes
         // UNION any free-text subtypes actually present on its accounts (so a
         // hand-typed subtype is still selectable as a filter); otherwise offer the
@@ -1491,6 +1497,8 @@ impl GuiApp {
             filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &subtype_opts);
             ui.label("owner:");
             filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &owners_present);
+            ui.label("title:");
+            filter_combo(ui, "acct_ftitle", &mut self.acct_filter_title, &titles_present);
             ui.checkbox(&mut self.acct_filter_review, "review only");
             ui.label("username:");
             ui.add(
@@ -1502,6 +1510,7 @@ impl GuiApp {
                 self.acct_filter_type.clear();
                 self.acct_filter_subtype.clear();
                 self.acct_filter_owner.clear();
+                self.acct_filter_title.clear();
                 self.acct_filter_review = false;
                 self.acct_search_user.clear();
             }
@@ -1540,6 +1549,7 @@ impl GuiApp {
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    text_row(ui, "Title", &mut r.title);
                     ui.label("Account type");
                     let prev_type = r.account_type.clone();
                     combo(ui, "acct_type", &mut r.account_type, &type_names);
@@ -2719,22 +2729,26 @@ mod tests {
     #[test]
     fn new_account_from_filters_prepopulates() {
         let (mut app, path) = app_unlocked("guifilterprefill");
+        app.acct_filter_title = "Bank login".into();
         app.acct_filter_type = "Financial".into();
         app.acct_filter_subtype = "IRA".into();
         app.acct_filter_owner = "Alice".into();
         app.acct_search_user = "alice99".into();
         let a = app.new_account_from_filters().unwrap();
+        assert_eq!(a.title, "Bank login");
         assert_eq!(a.account_type, "Financial");
         assert_eq!(a.account_subtype, "IRA");
         assert_eq!(a.owner, "Alice");
         assert_eq!(a.username, "alice99");
         assert!(a.password.is_empty(), "no secret invented");
         // Empty filters -> blank new account.
+        app.acct_filter_title.clear();
         app.acct_filter_type.clear();
         app.acct_filter_subtype.clear();
         app.acct_filter_owner.clear();
         app.acct_search_user.clear();
         let b = app.new_account_from_filters().unwrap();
+        assert_eq!(b.title, "");
         assert_eq!(b.account_type, "");
         assert_eq!(b.owner, "");
         assert_eq!(b.username, "");
