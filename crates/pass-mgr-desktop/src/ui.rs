@@ -1268,15 +1268,18 @@ impl App {
                 }
             }
             KeyCode::Char('g') if ctrl => {
-                // Let-chain: only if writable AND there is a password field.
-                // `.iter_mut()` yields exclusive borrows; `.find(...)` returns the
-                // first whose kind matches `FieldKind::Password` (via `matches!`).
+                // Generate into the FOCUSED password field, not just the first one.
+                // The Real Estate tab has three independent portal password fields,
+                // so a blind "first password" would always regenerate Property Mgmt
+                // (silently overwriting it) and could never reach Insurance/HOA.
+                let pw_idx = target_password_index(&es.fields, es.focus);
                 if self.writable
-                    && let Some(f) = es.fields.iter_mut().find(|f| matches!(f.kind, FieldKind::Password))
+                    && let Some(i) = pw_idx
                 {
                     // Wipe the previous value before replacing it: a plain `String`
                     // reassignment frees the old buffer without zeroizing, leaving the
                     // prior password in freed heap.
+                    let f = &mut es.fields[i];
                     f.value.zeroize();
                     f.value = password::generate(&GenOptions::default()).unwrap_or_default();
                     es.reveal = true;
@@ -1288,11 +1291,13 @@ impl App {
             // Toggle reveal: `!` flips the bool.
             KeyCode::Char('r') if ctrl => es.reveal = !es.reveal,
             KeyCode::Char('y') if ctrl => {
-                // `.iter()` (shared borrows) to find the password and copy it.
-                if let Some(f) = es.fields.iter().find(|f| matches!(f.kind, FieldKind::Password)) {
+                // Copy the FOCUSED password field (not just the first), so each Real
+                // Estate portal password can be copied independently — otherwise
+                // Ctrl+Y on Insurance/HOA would leak the Property Mgmt password.
+                if let Some(i) = target_password_index(&es.fields, es.focus) {
                     // Clone into a `Zeroizing<String>` so the temporary copy is
                     // wiped from memory as soon as `pw` drops.
-                    let pw = Zeroizing::new(f.value.clone());
+                    let pw = Zeroizing::new(es.fields[i].value.clone());
                     self.copy_to_clipboard(pw);
                 }
             }
@@ -2330,6 +2335,19 @@ fn bool_choice(b: bool) -> String {
     if b { "Yes" } else { "No" }.to_string()
 }
 
+/// The password field a copy (Ctrl+Y) or generate (Ctrl+G) action should target:
+/// the currently-focused field if it is a password, otherwise the first password
+/// field. The focus-first rule matters on the Real Estate tab, which has three
+/// independent portal password fields — a blind "first password" would always act
+/// on Property Mgmt and so copy/overwrite the wrong secret.
+fn target_password_index(fields: &[Field], focus: usize) -> Option<usize> {
+    if matches!(fields.get(focus).map(|f| &f.kind), Some(FieldKind::Password)) {
+        Some(focus)
+    } else {
+        fields.iter().position(|f| matches!(f.kind, FieldKind::Password))
+    }
+}
+
 /// Parse a user-entered 1-based document number into a 0-based index, returning
 /// `None` if it is not a number in `1..=len` (so the caller can show a hint).
 fn parse_doc_index(s: &str, len: usize) -> Option<usize> {
@@ -2498,6 +2516,32 @@ mod tests {
         assert_eq!(bool_choice(true), "Yes");
         assert_eq!(bool_choice(false), "No");
         assert_eq!(yes_no(), vec!["No".to_string(), "Yes".to_string()]);
+    }
+
+    #[test]
+    fn copy_generate_target_the_focused_password_field() {
+        // Mirrors the Real Estate edit form: text fields interleaved with THREE
+        // independent portal password fields. The FOCUSED password must be the one
+        // copied/generated — not always the first (which would leak/overwrite the
+        // Property Mgmt password regardless of which portal the user is editing).
+        let fields = vec![
+            Field::text("Address", String::new()),
+            Field::password("Property Mgmt password", "pm".into()), // index 1
+            Field::text("Insurance URL", String::new()),
+            Field::password("Insurance password", "ins".into()), // index 3
+            Field::password("HOA password", "hoa".into()),       // index 4
+        ];
+        // Focused on a specific portal password → that exact field.
+        assert_eq!(target_password_index(&fields, 3), Some(3), "Insurance focused → Insurance");
+        assert_eq!(target_password_index(&fields, 4), Some(4), "HOA focused → HOA");
+        // Focused on a non-password field → fall back to the first password.
+        assert_eq!(target_password_index(&fields, 0), Some(1));
+        assert_eq!(target_password_index(&fields, 2), Some(1));
+        // Out-of-range focus → first password (no panic).
+        assert_eq!(target_password_index(&fields, 99), Some(1));
+        // No password fields at all → None.
+        let no_pw = vec![Field::text("a", String::new()), Field::text("b", String::new())];
+        assert_eq!(target_password_index(&no_pw, 0), None);
     }
 
     #[test]
