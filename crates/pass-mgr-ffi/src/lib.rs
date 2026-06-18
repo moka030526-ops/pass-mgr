@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use pass_mgr_core::records::{self, Record};
 use pass_mgr_core::vault::{OpenVault, VaultError as CoreVaultError};
+use zeroize::Zeroize;
 
 uniffi::setup_scaffolding!();
 
@@ -305,13 +306,20 @@ pub struct Vault {
 ///
 /// `dir` is the app-private directory that holds `vault.pmv` (+ `manifest/`,
 /// `volume/`) — the host hands in its sandbox path; arbitrary user paths are not
-/// accepted. `pw1`/`pw2` are the raw password bytes; the host should overwrite
-/// its copies afterwards (Rust only borrows them and never stores them).
+/// accepted. `pw1`/`pw2` are the raw password bytes. UniFFI lowers the host's
+/// ByteArray/Data into Rust-OWNED `Vec<u8>` copies, so this function zeroizes them
+/// before returning (on both success and failure); the host should still overwrite
+/// its own copies afterwards.
 #[uniffi::export]
-pub fn open_vault(dir: String, pw1: Vec<u8>, pw2: Vec<u8>) -> Result<Arc<Vault>, VaultError> {
+pub fn open_vault(dir: String, mut pw1: Vec<u8>, mut pw2: Vec<u8>) -> Result<Arc<Vault>, VaultError> {
     let path = PathBuf::from(dir).join("vault.pmv");
-    let ov = OpenVault::open_read_only(path, &pw1, &pw2)?;
-    Ok(Arc::new(Vault { inner: Mutex::new(ov) }))
+    let opened = OpenVault::open_read_only(path, &pw1, &pw2);
+    // Wipe our owned plaintext copies before they are freed, so password bytes do
+    // not linger in the heap after open returns (the desktop binary is equally
+    // careful via Zeroizing). Done on the error path too.
+    pw1.zeroize();
+    pw2.zeroize();
+    Ok(Arc::new(Vault { inner: Mutex::new(opened?) }))
 }
 
 #[uniffi::export]

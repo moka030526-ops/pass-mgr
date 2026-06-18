@@ -25,3 +25,6 @@ pass-mgr-core = { path = "../pass-mgr-core", default-features = false }
 # bindgen must match the metadata baked into this cdylib, so keep them in lockstep.
 uniffi = "0.29.4"
 thiserror = "2.0.18"
+# UniFFI lowers the host's ByteArray/Data password args into Rust-OWNED Vec<u8>, so
+# this crate must wipe them itself before they are freed.
+zeroize = "1.9.0"

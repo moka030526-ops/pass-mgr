@@ -3043,6 +3043,7 @@ dependencies = [
  "pass-mgr-core",
  "thiserror 2.0.18",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

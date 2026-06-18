@@ -783,6 +783,12 @@ impl GuiApp {
     // --- Main: top bar + active tab -----------------------------------------
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
+        // Remember the active tab so a tab switch can reset the password-reveal flag
+        // below: `reveal_pw` is a single global toggle, so without this, revealing
+        // an Account password then switching to Real Estate would immediately show
+        // that property's portal passwords unmasked (the TUI scopes reveal per edit
+        // buffer; this keeps the GUI from leaking more than the user asked for).
+        let prev_tab = self.tab;
         ui.horizontal(|ui| {
             tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
             tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
@@ -822,6 +828,10 @@ impl GuiApp {
                 );
             }
         });
+        // Re-mask passwords when the user switches tabs (see prev_tab above).
+        if self.tab != prev_tab {
+            self.reveal_pw = false;
+        }
     }
 
     // --- Config screen -------------------------------------------------------

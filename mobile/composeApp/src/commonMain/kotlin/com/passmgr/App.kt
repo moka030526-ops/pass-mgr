@@ -36,7 +36,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -77,19 +76,20 @@ fun App(vaultDir: String) {
         // navigating back to the list or locking the vault (the timer is no longer
         // tied to the detail screen's lifecycle, which would cancel it on dispose).
         //
-        // `rememberSaveable` (NOT plain `remember`): on Android a config change
-        // (rotation, dark/light toggle, locale, font/display size, split-screen)
-        // recreates the Activity and discards `remember` state, which would cancel
-        // the in-flight wipe coroutine and reset the token to 0 — leaving the copied
-        // password on the system clipboard forever. Saving the token across
-        // recreation means the fresh composition re-arms the 15s wipe (and the
-        // manifest also declares android:configChanges to avoid most recreations).
-        var clipboardToken by rememberSaveable { mutableStateOf(0) }
+        // Plain `remember`, NOT `rememberSaveable`: the realistic Activity-recreation
+        // triggers (rotation, dark/light, locale, font/display size, split-screen) are
+        // already prevented by the android:configChanges manifest list, so the wipe
+        // coroutine survives them in-process. We deliberately do NOT persist the token
+        // across PROCESS DEATH: a restored token would, 15 s after a later relaunch,
+        // wipe whatever UNRELATED content the user copied meanwhile (the original copy
+        // time is long gone, and the vault restarts locked). True process death inside
+        // the 15 s window falls under the documented best-effort clipboard caveat.
+        var clipboardToken by remember { mutableStateOf(0) }
         LaunchedEffect(clipboardToken) {
             if (clipboardToken == 0) return@LaunchedEffect // nothing pending / already wiped
             delay(15_000)
             clipboard.setText(AnnotatedString(""))
-            clipboardToken = 0 // mark wiped so a later recreation doesn't re-arm
+            clipboardToken = 0 // mark wiped
         }
         val copyToClipboard: (String) -> Unit = { secret ->
             clipboard.setText(AnnotatedString(secret))
