@@ -1994,5 +1994,38 @@ mod tests {
             let (cy, cmo, cd, ..) = civil_from_unix(ta);
             prop_assert_eq!((cy, cmo, cd), (y1, m1, d1));
         }
+
+        /// doc_slug yields a safe single path component for ANY input: ASCII
+        /// [a-z0-9-] only, no edge dash, <=40, never empty.
+        #[test]
+        fn prop_doc_slug_is_safe(s in ".*") {
+            let slug = doc_slug(&s, "fb");
+            prop_assert!(!slug.is_empty());
+            prop_assert!(slug.len() <= 40);
+            prop_assert!(!slug.starts_with('-') && !slug.ends_with('-'));
+            prop_assert!(slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        }
+
+        /// doc_filename never yields a path separator, control char, whitespace, an
+        /// edge dot, an empty name, or an over-long one — for ANY input.
+        #[test]
+        fn prop_doc_filename_is_safe(s in ".*") {
+            let f = doc_filename(&s);
+            prop_assert!(!f.is_empty());
+            prop_assert!(f.len() <= 120);
+            prop_assert!(!f.chars().any(|c| c == '/' || c == '\\' || c.is_control() || c.is_whitespace()));
+            prop_assert!(!f.starts_with('.') && !f.ends_with('.'));
+        }
+
+        /// doc_upload_dir keeps the trusted root/timestamp prefix and never introduces
+        /// a space, traversal segment, or empty component — for ANY user subfolder.
+        #[test]
+        fn prop_doc_upload_dir_is_safe(sub in ".*") {
+            let dir = doc_upload_dir("taxes/2024", "20240102-030405", &sub);
+            prop_assert!(dir.starts_with("taxes/2024/20240102-030405"));
+            prop_assert!(!dir.contains(' '));
+            prop_assert!(!dir.contains("/../") && !dir.contains("/./") && !dir.ends_with("/.."));
+            prop_assert!(dir.split('/').all(|c| !c.is_empty()));
+        }
     }
 }
