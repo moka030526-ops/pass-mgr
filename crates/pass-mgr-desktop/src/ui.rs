@@ -2665,6 +2665,98 @@ mod tests {
     }
 
     #[test]
+    fn start_edit_loads_the_selected_taxes_record() {
+        let (mut app, path) = app_unlocked("uitaxsel");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            for y in ["2020", "2021", "2022"] {
+                let mut tf = TaxFiling::new().unwrap();
+                tf.year = y.into();
+                records::upsert(&mut v.tax_filings, tf);
+            }
+        }
+        app.tab = Tab::Taxes;
+        let labels = app.current_labels();
+        assert_eq!(labels.len(), 3);
+        let target_id = labels[1].0.clone();
+        app.selected = 1;
+        app.start_edit(true);
+        let es = app.edit.as_ref().unwrap();
+        // Must edit the *selected* record, not a different one (kills the id-lookup
+        // `==`→`!=` mutant, which would resolve to the wrong filing).
+        assert_eq!(es.id.as_deref(), Some(target_id.as_str()));
+        let expected =
+            app.vault.as_ref().unwrap().vault.tax_filings.iter().find(|r| r.id == target_id).unwrap().year.clone();
+        assert_eq!(es.fields[0].value, expected, "loads the selected record's fields");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn start_edit_loads_the_selected_real_estate_record() {
+        let (mut app, path) = app_unlocked("uiresel");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            for a in ["1 First St", "2 Second St", "3 Third St"] {
+                let mut re = RealEstate::new().unwrap();
+                re.address = a.into();
+                records::upsert(&mut v.real_estate, re);
+            }
+        }
+        app.tab = Tab::RealEstate;
+        let labels = app.current_labels();
+        assert_eq!(labels.len(), 3);
+        let target_id = labels[1].0.clone();
+        app.selected = 1;
+        app.start_edit(true);
+        let es = app.edit.as_ref().unwrap();
+        assert_eq!(es.id.as_deref(), Some(target_id.as_str()));
+        let expected =
+            app.vault.as_ref().unwrap().vault.real_estate.iter().find(|r| r.id == target_id).unwrap().address.clone();
+        assert_eq!(es.fields[0].value, expected, "loads the selected property's fields");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tax_attach_requires_filename_and_source() {
+        let (mut app, path) = app_unlocked("uitaxreq");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.tax_filings, TaxFiling::new().unwrap());
+        }
+        app.tab = Tab::Taxes;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+        // Filename present, source empty → rejected as missing input, nothing attached
+        // (kills the `||`→`&&` mutant, which would let a one-sided-empty input through).
+        app.edit.as_mut().unwrap().fields[rc].value = "w2.txt".into();
+        app.edit.as_mut().unwrap().fields[rc + 1].value = String::new();
+        app.attach_tax_document();
+        assert!(app.edit.as_ref().unwrap().tax_docs.is_empty(), "missing source → no upload");
+        assert!(app.status.contains("required"), "rejected as a missing-input error");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn re_attach_requires_filename_and_source() {
+        let (mut app, path) = app_unlocked("uirereq");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.real_estate, RealEstate::new().unwrap());
+        }
+        app.tab = Tab::RealEstate;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+        app.edit.as_mut().unwrap().fields[rc].value = String::new();
+        app.edit.as_mut().unwrap().fields[rc + 1].value = "/some/path".into();
+        app.attach_re_document();
+        assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "missing filename → no upload");
+        assert!(app.status.contains("required"), "rejected as a missing-input error");
+        cleanup(&path);
+    }
+
+    #[test]
     fn formats_timestamps() {
         assert_eq!(format_time(0), "never");
         assert_eq!(format_time(-5), "never");
