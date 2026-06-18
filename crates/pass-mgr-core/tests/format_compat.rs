@@ -211,8 +211,9 @@ fn old_vault_json_without_new_fields_still_deserializes() {
     assert_eq!(vault.id, "abc123");
     assert_eq!(vault.real_estate.len(), 1);
 
-    // New top-level collection defaults to empty.
+    // New top-level collections default to empty.
     assert!(vault.tax_filings.is_empty(), "missing tax_filings defaults to empty");
+    assert!(vault.general_documents.is_empty(), "missing general_documents defaults to empty");
 
     // New RealEstate fields default to empty.
     let re = &vault.real_estate[0];
@@ -331,6 +332,12 @@ fn fully_populated_vault_round_trips_through_json() {
     re.documents = vec!["d1".into(), "d2".into(), "d3".into()];
     vault.real_estate.push(re);
 
+    let mut g = records::GeneralDocument::new().unwrap();
+    g.title = "Passport".into();
+    g.description = "scanned copy".into();
+    g.file = Some("g1".into());
+    vault.general_documents.push(g);
+
     // Serialize, then deserialize back.
     let json = serde_json::to_string(&vault).unwrap();
     let back: Vault = serde_json::from_str(&json).unwrap();
@@ -359,6 +366,12 @@ fn fully_populated_vault_round_trips_through_json() {
     assert_eq!(r.hoa_username, "hoau");
     assert_eq!(r.hoa_password, "hoap");
     assert_eq!(r.documents, vec!["d1".to_string(), "d2".to_string(), "d3".to_string()]);
+
+    assert_eq!(back.general_documents.len(), 1);
+    let gd = &back.general_documents[0];
+    assert_eq!(gd.title, "Passport");
+    assert_eq!(gd.description, "scanned copy");
+    assert_eq!(gd.file.as_deref(), Some("g1"));
 
     // Whole-vault value equality: every field (new and old) survives the trip.
     let before = serde_json::to_value(&vault).unwrap();

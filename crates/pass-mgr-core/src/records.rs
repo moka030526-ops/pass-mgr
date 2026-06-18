@@ -87,6 +87,91 @@ pub fn real_estate_doc_location(address: &str) -> String {
     if a.is_empty() { "real-estate/property".to_string() } else { format!("real-estate/{a}") }
 }
 
+/// Slugify one virtual-path component: lowercase, keep ASCII alphanumerics, turn
+/// every other run into a single '-', trim leading/trailing '-', and cap the
+/// length at 40. An empty result falls back to `fallback`. Used for the auto-group
+/// level (document/description/title) and the optional user subfolder so the
+/// volume path is always filesystem-safe and free of separators or traversal.
+pub fn doc_slug(s: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.truncate(40);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() { fallback.to_string() } else { out }
+}
+
+/// The `<root>/<auto-group>` prefix for the Trust & Will, Assets, and General
+/// Documents tabs (the multi-doc Taxes/Real-Estate tabs have their own prefix
+/// helpers above). The group is slugged from the record's identifying field.
+pub fn trust_will_doc_location(document: &str) -> String {
+    format!("trust-will/{}", doc_slug(document, "document"))
+}
+pub fn asset_doc_location(description: &str) -> String {
+    format!("assets/{}", doc_slug(description, "asset"))
+}
+pub fn general_doc_location(title: &str) -> String {
+    format!("general-documents/{}", doc_slug(title, "untitled"))
+}
+
+/// A compact UTC timestamp `YYYYMMDD-HHMMSS` for the per-upload folder level, from
+/// Unix seconds. Sortable, fixed-width, and filesystem-safe.
+pub fn compact_utc(unix_secs: i64) -> String {
+    let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
+    format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
+}
+
+/// Build the virtual *directory* a freshly-uploaded document is stored under, the
+/// uniform layout shared by every document tab:
+///   `<root>/<auto-group>/<timestamp>[/<subfolder>]`
+/// `prefix` is the `<root>/<auto-group>` from one of the `*_doc_location` helpers,
+/// `timestamp` is [`compact_utc`], and `subfolder` is the optional user level
+/// (slugged, omitted when blank). The caller appends the (user-controlled)
+/// filename via `vault::virtual_path`.
+pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String {
+    let mut dir = format!("{prefix}/{timestamp}");
+    let sub = subfolder.trim();
+    if !sub.is_empty() {
+        dir.push('/');
+        dir.push_str(&doc_slug(sub, "subfolder"));
+    }
+    dir
+}
+
+/// Sanitize a user-supplied filename for the volume path: drop path separators and
+/// control characters (so the user controls the name without injecting extra path
+/// levels or `..` traversal), strip surrounding whitespace and dots, and cap the
+/// length. Falls back to `"file"` when nothing usable remains. Dots inside the name
+/// are kept so extensions like `return.pdf` survive.
+pub fn doc_filename(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c })
+        .collect();
+    // Cap at 120 bytes, truncating on a UTF-8 char boundary. A raw `truncate(120)`
+    // PANICS when byte 120 lands mid-character (multibyte name: accented Latin, CJK,
+    // emoji, …), so step the cut back to the nearest boundary first.
+    if out.len() > 120 {
+        let mut cut = 120;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    let trimmed = out.trim().trim_matches('.').trim();
+    if trimmed.is_empty() { "file".to_string() } else { trimmed.to_string() }
+}
+
 /// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
 /// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
 /// to the epoch. Shared by the human and filename timestamp formatters so the
@@ -178,6 +263,7 @@ pub fn compact_history(vault: &mut Vault, cutoff: Option<i64>, drop_all: bool) -
         + trim_histories(&mut vault.accounts, cutoff, drop_all)
         + trim_histories(&mut vault.real_estate, cutoff, drop_all)
         + trim_histories(&mut vault.tax_filings, cutoff, drop_all)
+        + trim_histories(&mut vault.general_documents, cutoff, drop_all)
 }
 
 /// How many history entries `compact_history` would remove for the same
@@ -210,6 +296,9 @@ pub fn history_stats(vault: &Vault, cutoff: Option<i64>, drop_all: bool) -> usiz
         n += count(&r.history);
     }
     for r in &vault.tax_filings {
+        n += count(&r.history);
+    }
+    for r in &vault.general_documents {
         n += count(&r.history);
     }
     n
@@ -502,6 +591,21 @@ pub struct TaxFiling {
     pub history: Vec<Change>,
 }
 
+/// Tab 7 — a general document: a title, a free-form description, and a single
+/// uploaded file. Its file is stored under `general-documents/<title>/<timestamp>/
+/// [subfolder]/<filename>` in the encrypted volume.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
+pub struct GeneralDocument {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    /// Volume file id of the attached document, if any (single file per entry).
+    pub file: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub history: Vec<Change>,
+}
+
 /// Stamp a freshly-built record with an id and creation/update timestamps.
 // `macro_rules!` defines a compile-time code template (a macro), expanded inline
 // wherever it's invoked — used here to avoid repeating identical constructor code
@@ -557,6 +661,11 @@ impl RealEstate {
 impl TaxFiling {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(TaxFiling))
+    }
+}
+impl GeneralDocument {
+    pub fn new() -> Result<Self, CryptoError> {
+        Ok(new_record!(GeneralDocument))
     }
 }
 
@@ -732,6 +841,19 @@ impl_record!(
     |l: &TaxFiling| if l.year.is_empty() { "(no year)".to_string() } else { format!("Taxes {}", l.year) }
 );
 
+impl_record!(
+    GeneralDocument,
+    |s: &GeneralDocument, n: &GeneralDocument, at: i64, out: &mut Vec<Change>| {
+        track(out, at, "title", &s.title, &n.title);
+        track(out, at, "description", &s.description, &n.description);
+        // `file` is an Option holding a volume id; log changes without exposing it.
+        if s.file != n.file {
+            out.push(Change { at, action: "updated".into(), detail: "attached file changed".into() });
+        }
+    },
+    |l: &GeneralDocument| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() }
+);
+
 // --- Vault settings ----------------------------------------------------------
 
 /// User-configurable vault settings, stored (encrypted) inside the vault.
@@ -793,6 +915,10 @@ pub struct Vault {
     /// Tax filings (the Taxes tab); each year's documents live under `taxes/<year>/`.
     #[serde(default)]
     pub tax_filings: Vec<TaxFiling>,
+    /// General documents (the General Documents tab); each entry's single file lives
+    /// under `general-documents/<title>/<timestamp>/[subfolder]/`.
+    #[serde(default)]
+    pub general_documents: Vec<GeneralDocument>,
     /// Stable random id binding the document volumes/manifests to this vault (so a
     /// foreign or swapped volume/manifest fails authentication). Set on create.
     #[serde(default)]
@@ -1525,6 +1651,94 @@ mod tests {
         let seg = &f["real-estate/".len()..];
         assert_eq!(seg.len(), 40);
         assert_eq!(seg, format!("{}{}", "a".repeat(30), "b".repeat(10)));
+    }
+
+    // --- uniform document layout helpers (General Documents + new path scheme) ---
+
+    #[test]
+    fn doc_slug_is_safe_and_bounded() {
+        assert_eq!(doc_slug("Federal 2024", "fb"), "federal-2024");
+        assert_eq!(doc_slug("  My Docs!! ", "fb"), "my-docs");
+        assert_eq!(doc_slug("a//b\\c", "fb"), "a-b-c");
+        assert_eq!(doc_slug("../../etc/passwd", "fb"), "etc-passwd"); // no traversal survives
+        assert_eq!(doc_slug("", "fb"), "fb"); // empty -> fallback
+        assert_eq!(doc_slug("！！！", "fb"), "fb"); // all non-ascii -> fallback
+        assert_eq!(doc_slug("---", "fb"), "fb"); // separators-only -> fallback
+        // Length is capped at 40 with no trailing dash.
+        let long = doc_slug(&"a ".repeat(60), "fb");
+        assert!(long.len() <= 40 && !long.ends_with('-'));
+    }
+
+    #[test]
+    fn compact_utc_is_fixed_width_sortable() {
+        // 2024-01-02 03:04:05 UTC = 1704164645.
+        assert_eq!(compact_utc(1_704_164_645), "20240102-030405");
+        assert_eq!(compact_utc(0), "19700101-000000");
+        // Always 15 chars (YYYYMMDD-HHMMSS); lexical order == chronological order.
+        assert_eq!(compact_utc(1_704_164_645).len(), 15);
+        assert!(compact_utc(1_000) < compact_utc(2_000_000_000));
+    }
+
+    #[test]
+    fn doc_upload_dir_builds_the_uniform_layout() {
+        // <root>/<auto-group>/<timestamp>[/<subfolder>] — auto-group above timestamp.
+        let prefix = tax_doc_location("2024"); // "taxes/2024"
+        assert_eq!(doc_upload_dir(&prefix, "20240102-030405", "federal"), "taxes/2024/20240102-030405/federal");
+        // Blank subfolder is omitted entirely.
+        assert_eq!(doc_upload_dir(&prefix, "20240102-030405", "   "), "taxes/2024/20240102-030405");
+        // Subfolder is slugged (no separators/traversal leak into the path).
+        assert_eq!(
+            doc_upload_dir("general-documents/passport", "20240102-030405", "../ids"),
+            "general-documents/passport/20240102-030405/ids"
+        );
+    }
+
+    #[test]
+    fn doc_filename_is_user_controlled_but_safe() {
+        assert_eq!(doc_filename("return.pdf"), "return.pdf"); // extension preserved
+        assert_eq!(doc_filename("a/b/c.pdf"), "a_b_c.pdf"); // separators neutralized
+        assert_eq!(doc_filename("  ..  "), "file"); // dot/space-only -> fallback
+        assert_eq!(doc_filename(""), "file");
+        assert!(doc_filename(&"x".repeat(500)).len() <= 120); // capped
+        // A multibyte filename whose 120th byte lands mid-character must NOT panic
+        // (a raw String::truncate(120) would). 5-byte ASCII prefix + 50 CJK chars
+        // (3 bytes each) = 155 bytes; the cap falls inside a character.
+        let multibyte = doc_filename(&format!("file_{}", "\u{6570}".repeat(50)));
+        assert!(multibyte.len() <= 120 && !multibyte.is_empty());
+        // Emoji (4-byte) near the boundary likewise truncates safely.
+        let emoji = doc_filename(&"\u{1F600}".repeat(40)); // 160 bytes
+        assert!(emoji.len() <= 120);
+    }
+
+    #[test]
+    fn general_document_diff_and_label() {
+        let mut a = GeneralDocument::new().unwrap();
+        a.title = "Passport".into();
+        a.description = "scan".into();
+        let mut b = a.clone();
+        b.description = "scan v2".into();
+        b.file = Some("deadbeef".into());
+        let c = a.diff(&b, 100);
+        assert!(c.iter().any(|x| x.detail.contains("description")));
+        // The file id itself must never appear in the history detail.
+        assert!(c.iter().any(|x| x.detail.contains("attached file changed")));
+        assert!(!c.iter().any(|x| x.detail.contains("deadbeef")), "doc id must not leak into history");
+        assert_eq!(a.label(), "Passport");
+        assert_eq!(GeneralDocument::default().label(), "(untitled)");
+        // general_doc_location slugs the title.
+        assert_eq!(general_doc_location("My Passport"), "general-documents/my-passport");
+        assert_eq!(general_doc_location(""), "general-documents/untitled");
+    }
+
+    #[test]
+    fn compact_history_includes_general_documents() {
+        let mut vault = Vault::default();
+        let mut g = GeneralDocument::default();
+        g.history = vec![Change::new("created", String::new()), Change::new("updated", "title".into())];
+        vault.general_documents.push(g);
+        assert_eq!(history_stats(&vault, None, true), 2);
+        assert_eq!(compact_history(&mut vault, None, true), 2);
+        assert!(vault.general_documents[0].history.is_empty());
     }
 
     // --- compact_history / history_stats include tax_filings & real_estate ---

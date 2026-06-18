@@ -32,11 +32,12 @@ crates/
 │       │                 The derived `Key` zeroizes on drop; its pages are mlock'd
 │       │                 (swap mitigation) only when the `mlock` feature is on (default
 │       │                 for desktop, OFF in the mobile build). CSPRNG `random_bytes`.
-│       ├── records.rs    The data model: the SIX record types, `Change`/history, the
+│       ├── records.rs    The data model: the SEVEN record types, `Change`/history, the
 │       │                 `Record` trait + generic `upsert`/`remove`, the `Vault`
 │       │                 aggregate, and shared helpers (`unix_now`, `random_id`, the
-│       │                 civil-date math, history compaction, and the document-folder
-│       │                 helpers `tax_doc_location` / `real_estate_doc_location`).
+│       │                 civil-date math, history compaction, and the uniform document
+│       │                 path helpers `doc_slug`/`compact_utc`/`doc_upload_dir`/
+│       │                 `doc_filename` + per-tab `*_doc_location` prefixes).
 │       ├── storage.rs    The partitioned document engine (on-disk format v4):
 │       │                 `Manifest`/`VolumeStore`, fully bounds-checked frame parsers,
 │       │                 atomic commits, lazy reads, the crash-safe protocol, and the
@@ -55,8 +56,8 @@ crates/
 │   │                 which re-exports the core modules so `pass_mgr::…`/`crate::…`
 │   │                 paths resolve unchanged). Builds two binaries.
 │   └── src/
-│       ├── gui.rs           egui/eframe GUI — six tabs incl. multi-document Taxes & RE.
-│       ├── ui.rs            ratatui TUI (`--tui`) — the same six tabs.
+│       ├── gui.rs           egui/eframe GUI — seven tabs incl. multi-document Taxes & RE.
+│       ├── ui.rs            ratatui TUI (`--tui`) — the same seven tabs.
 │       ├── single_instance.rs  GUI single-instance guard (§6.4).
 │       ├── launch.rs        Vault-path/flag resolution shared by both binaries.
 │       ├── main.rs          Console binary `pass-mgr` (CLI + `--tui` + subcommands).
@@ -90,7 +91,7 @@ in the generated UniFFI scaffolding inside `pass-mgr-ffi`.
 
 ## 2. Data model (`records.rs`)
 
-Six record types, one per UI tab. Each carries an `id` (128-bit hex, from
+Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 `random_id`), `created_at`/`updated_at` timestamps, and an append-only
 `history: Vec<Change>`:
 
@@ -102,20 +103,28 @@ Six record types, one per UI tab. Each carries an `id` (128-bit hex, from
 | Accounts | `Account` | account_type, account_subtype, owner, username, password, url, description, review |
 | Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, three portal logins (property-management / insurance / HOA — each url + username + password), comments, `documents` (doc ids) |
 | Taxes | `TaxFiling` | year, notes, `documents` (doc ids) |
+| General Documents | `GeneralDocument` | title, description, `file` (one doc id) |
 
-**Multi-document records & per-record folders.** Trust&Will and Assets hold a
-*single* attached document (`file`/`statement`); the Taxes and Real Estate tabs hold
-*many* (`documents: Vec<String>`). Each multi-doc record's uploads share a virtual
-folder derived from the record — `taxes/<year>/` (`tax_doc_location`) and
-`real-estate/<address>/` (`real_estate_doc_location`). Both helpers reduce the input
-to ASCII-alphanumeric (RE: lower-cased, ≤40 chars) before building the path, so a
-crafted year/address cannot inject path separators or `..` traversal — they are the
-sole sanitisation barrier (`normalize_dir` downstream does not strip `..`), and this
-is pinned by adversarial tests. Document bytes still live in the encrypted volume;
-records hold only opaque doc-id references. `vault::referenced_doc_ids` collects the
-ids from all of `TrustWill.file`, `Asset.statement`, and every `Taxes`/`RealEstate`
-`documents`, so compaction never reclaims a live document and deletes reclaim all of
-a record's blobs.
+**Multi-document records & the uniform path layout.** Trust&Will, Assets, and General
+Documents hold a *single* attached document (`file`/`statement`); the Taxes and Real
+Estate tabs hold *many* (`documents: Vec<String>`). Every tab files its uploads under
+one scheme — `<root>/<auto-group>/<timestamp>/[subfolder]/<filename>` — built by
+`records::doc_upload_dir(prefix, compact_utc(unix_now()), subfolder)` where `prefix`
+is the `<root>/<auto-group>` from a per-tab helper (`tax_doc_location` →
+`taxes/<year>`, `real_estate_doc_location` → `real-estate/<address>`,
+`trust_will_doc_location`, `asset_doc_location`, `general_doc_location`). The
+auto-group keeps a record's documents clustered; the per-upload `compact_utc`
+timestamp makes each path unique; the user controls only the optional `subfolder` and
+the `filename`. `doc_slug` (auto-group + subfolder: lowercased ASCII-alphanumeric,
+`-`-separated, ≤40) and `doc_filename` (separators/control chars neutralized, ≤120,
+no `.`/`..`-only) are the sanitisation barrier — so no crafted year/address/title or
+user input can inject path separators or `..` traversal (`normalize_dir` downstream
+does not strip `..`); pinned by adversarial tests. Document bytes live in the
+encrypted volume; records hold only opaque doc-id references.
+`vault::referenced_doc_ids` collects the ids from all of `TrustWill.file`,
+`Asset.statement`, every `Taxes`/`RealEstate` `documents`, and each
+`GeneralDocument.file`, so compaction never reclaims a live document and deletes
+reclaim all of a record's blobs.
 
 **The `Record` trait + generic CRUD.** Rather than repeat insert/edit/history
 logic five times, each type implements a small `Record` trait supplying only its
@@ -139,7 +148,7 @@ trimmed by `compact --json` (§3.6); the audit log is always preserved and gets 
 *history*, and document bytes held in memory — are overwritten with zeros when
 they leave scope. Category names are not secrets and are `#[zeroize(skip)]`.
 
-**The `Vault` aggregate.** `Vault` owns the six record `Vec`s plus: `categories`
+**The `Vault` aggregate.** `Vault` owns the seven record `Vec`s plus: `categories`
 (`TypeLists`, §5); a `settings` block (`VaultSettings { volume_max_size,
 redundancy }`); a stable random `id` that binds the volumes/manifests to this vault
 (a foreign or swapped volume/manifest then fails AEAD authentication); a `version`;
@@ -148,10 +157,11 @@ whole-file rollback is noticeable — `DESIGN.md` §9.12); `last_opened_at`; and
 `audit` log. **Every field is `#[serde(default)]`**, which is what lets a vault
 written by an older build load under a newer one (a missing field decodes to its
 type default) — this is how `VaultSettings.redundancy` (new in §3.7) was added
-without a format bump. The Taxes collection (`tax_filings`) and every new
-`RealEstate` field (the three portal logins, `financing_balance`, `comments`,
-`documents`) were added the same way — all `#[serde(default)]` — so the on-disk
-format version stays **v4** and a vault written before these features still opens.
+without a format bump. The Taxes collection (`tax_filings`), the General Documents
+collection (`general_documents`), and every new `RealEstate` field (the three portal
+logins, `financing_balance`, `comments`, `documents`) were added the same way — all
+`#[serde(default)]` — so the on-disk format version stays **v4** and a vault written
+before these features still opens.
 
 ---
 
