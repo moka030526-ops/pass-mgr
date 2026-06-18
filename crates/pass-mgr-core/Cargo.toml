@@ -2,6 +2,7 @@
 name = "pass-mgr-core"
 version = "0.1.0"
 edition = "2024"
+publish = false # private application crate — never published to a registry
 # The headless, security-critical core: data model, on-disk format, crypto, and
 # the OpenVault API. No UI / OS front-end deps, so it is reused unchanged by the
 # desktop binaries (`pass-mgr`) and the mobile FFI (`pass-mgr-ffi`).

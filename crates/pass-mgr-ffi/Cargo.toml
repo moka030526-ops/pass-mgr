@@ -2,6 +2,7 @@
 name = "pass-mgr-ffi"
 version = "0.1.0"
 edition = "2024"
+publish = false # private application crate — never published to a registry
 # Thin UniFFI wrapper around the audited pass-mgr-core, consumed by the
 # Compose Multiplatform mobile app via Gobley (Kotlin/Android JNI + Kotlin/Native
 # iOS cinterop). This crate is the ONLY one allowed `unsafe` (the UniFFI

@@ -2,6 +2,7 @@
 name = "pass-mgr"
 version = "0.1.0"
 edition = "2024"
+publish = false # private application crate — never published to a registry
 # Two binaries are built: the console `pass-mgr` (src/main.rs — CLI + --tui) and
 # the windowed `pass-mgr-gui` (src/bin/pass-mgr-gui.rs — Windows GUI subsystem,
 # no console window). `default-run` keeps `cargo run`/`cargo install` pointed at
