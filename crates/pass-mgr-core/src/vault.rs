@@ -4030,6 +4030,54 @@ mod tests {
             prop_assert!(!n1.contains("//"), "no empty segments: {n1:?}");
             prop_assert!(n1.is_empty() || n1.starts_with('/'));
         }
+
+        /// referenced_doc_ids surfaces EVERY attached blob id across all record kinds
+        /// (TrustWill.file, Asset.statement, Taxes/RealEstate documents, and
+        /// GeneralDocument.file) and nothing extra — the invariant compaction relies
+        /// on so a live document is never reclaimed and a delete reclaims exactly a
+        /// record's own blobs. (Pure: builds a Vault in memory, no crypto/IO.)
+        #[test]
+        fn prop_referenced_doc_ids_covers_every_attachment(
+            tw in proptest::collection::vec("[a-f0-9]{4}", 0..4),
+            asset in proptest::collection::vec("[a-f0-9]{4}", 0..4),
+            tax in proptest::collection::vec("[a-f0-9]{4}", 0..6),
+            re in proptest::collection::vec("[a-f0-9]{4}", 0..6),
+            gen_docs in proptest::collection::vec("[a-f0-9]{4}", 0..4),
+        ) {
+            let mut v = Vault::default();
+            let mut want: Vec<String> = Vec::new();
+            for f in &tw {
+                let mut r = records::TrustWill::default();
+                r.file = Some(f.clone());
+                v.trust_wills.push(r);
+                want.push(f.clone());
+            }
+            for f in &asset {
+                let mut r = records::AssetLiability::default();
+                r.statement = Some(f.clone());
+                v.assets.push(r);
+                want.push(f.clone());
+            }
+            let mut tf = records::TaxFiling::default();
+            tf.documents = tax.clone();
+            v.tax_filings.push(tf);
+            want.extend(tax.iter().cloned());
+            let mut rp = records::RealEstate::default();
+            rp.documents = re.clone();
+            v.real_estate.push(rp);
+            want.extend(re.iter().cloned());
+            for f in &gen_docs {
+                let mut r = records::GeneralDocument::default();
+                r.file = Some(f.clone());
+                v.general_documents.push(r);
+                want.push(f.clone());
+            }
+            let got = referenced_doc_ids(&v);
+            for id in &want {
+                prop_assert!(got.contains(id), "referenced_doc_ids missing {id}");
+            }
+            prop_assert_eq!(got.len(), want.len(), "no extra or dropped ids");
+        }
     }
 
     proptest! {

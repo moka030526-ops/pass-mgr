@@ -43,5 +43,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "doc_paths"
+path = "fuzz_targets/doc_paths.rs"
+test = false
+doc = false
+bench = false
+
 # Keep the fuzz crate out of the parent workspace; it is its own package.
 [workspace]
