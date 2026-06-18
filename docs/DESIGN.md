@@ -38,7 +38,7 @@ Each numbered requirement from the brief maps to a concrete design element.
 |---|-------------|----------------|
 | 1 | Standalone, no internet | No network/async crates in `Cargo.toml`; offline by construction (§3) |
 | 2 | Filter screens + custom category types | Per-tab filters (account type/subtype/owner/review; asset review); editable `categories` stored in-vault (§4.2, §4.3) |
-| 3 | Rich records (accounts, assets, real estate, trust/will, instructions) | Five record types, one per tab (§4.1) |
+| 3 | Rich records (accounts, assets, real estate, trust/will, instructions, taxes) | Six record types, one per tab (§4.1) |
 | 4 | Each change logged with timestamp | Per-record `history: Vec<Change>` + vault-level `audit` (§4.2) |
 | 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2); trimmable on demand via `compact --json` (§11.1) |
 | 6 | Last access maintained | `Vault.last_opened_at` + a monotonic `generation`, surfaced on unlock (§4.2) |
@@ -98,7 +98,7 @@ dependency tried.
 
 ## 4. Data model
 
-The model lives in `records.rs` and serializes to JSON. The app is a five-tab
+The model lives in `records.rs` and serializes to JSON. The app is a six-tab
 estate vault: each tab is a `Vec` of one record type. Every record shares an
 `id` (128-bit random hex, stable across edits), `created_at`/`updated_at`, and an
 append-only `history: Vec<Change>` (req. 4, 5). The shared insert/edit/diff logic
@@ -115,10 +115,17 @@ Vault
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
 │                                     //         institution, type, statement (doc id)
 ├── accounts:      Vec<Account>       // Tab 4: account_type, owner, username, password, url, description
-├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account
+├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
+│                                     //   financing_balance, 3 portal logins (mgmt/insurance/HOA: url+username+password),
+│                                     //   comments, documents (doc ids; folder real-estate/<address>/)
+├── tax_filings:   Vec<TaxFiling>     // Tab 6: year, notes, documents (doc ids; folder taxes/<year>/)
 ├── categories: TypeLists        // the editable dropdown lists (in-vault, §5/§4.2)
-├── settings: VaultSettings      // { volume_max_size }  (Config screen, §4.3)
+├── settings: VaultSettings      // { volume_max_size, redundancy }  (Config screen, §4.3)
 └── audit: Vec<Change>           // vault-level log: created, password changed, deletions, uploads
+
+// The Taxes collection and the new Real Estate fields were all added as
+// #[serde(default)] fields, so the on-disk schema version stays 4 and a vault
+// written before them still loads (a missing field decodes to its default).
 
 Change
 ├── at: i64                      // unix-seconds timestamp
@@ -497,8 +504,10 @@ UI-independent. Adding or changing a front-end touches no security-critical code
 - **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
   headless. Key bindings are shown on-screen at all times; no mouse required.
 
-Both present the estate vault as **five tabs**, one per record type — Instructions,
-Trust & Will, Assets & Liabilities, Accounts, Real Estate — over four screens:
+The desktop front-ends present the estate vault as **six tabs**, one per record
+type — Instructions, Trust & Will, Assets & Liabilities, Accounts, Real Estate,
+and Taxes — over four screens. (The read-only mobile viewer, §8, currently exposes
+the first five record types.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
    On a missing vault it switches to a create flow that asks for each password
@@ -515,11 +524,13 @@ Trust & Will, Assets & Liabilities, Accounts, Real Estate — over four screens:
 3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
    a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
    to the record's history (req. 4, 5), shown in a History pane. Document-bearing
-   tabs (Trust & Will, Assets) can **attach / detach / replace / export** a
-   supporting document; the attach path enforces the 256-byte virtual-path limit
-   (the GUI disables the button with an inline error, the TUI rejects the upload
-   key) and persists the record→document link before reclaiming any old blob
-   (crash-safe ordering, §11).
+   tabs can **attach / detach / replace / export** supporting documents: Trust &
+   Will and Assets hold a single document each, while Real Estate and Taxes hold a
+   **folder of multiple documents** (`real_estate/<id>/…`, `taxes/<year>/…`) tracked
+   per record by `referenced_doc_ids`. The attach path enforces the 256-byte
+   virtual-path limit (the GUI disables the button with an inline error, the TUI
+   rejects the upload key) and persists the record→document link before reclaiming
+   any old blob (crash-safe ordering, §11).
 4. **Config (write mode only).** Edit the category lists (asset types, account
    types + subtypes) and the **volume size** (`volume_max_size`), and run a
    `backup`. All edits persist into the encrypted vault — there are no external
@@ -581,6 +592,31 @@ trustworthy *while the vault is unlocked* (host compromise is out of scope, belo
 - **Plaintext the user exports.** `decrypt`/`extract`/`export-tree` deliberately
   write secrets in the clear; protecting that output is the user's job (§9.10,
   §9.17).
+
+### 8.1 Mobile viewer and the FFI boundary
+
+The Compose Multiplatform app (`mobile/`) is a **read-only viewer** that drives the
+same audited core through a UniFFI boundary (`crates/pass-mgr-ffi`). It widens the
+attack surface in three specific, bounded ways:
+
+- **It never writes vaults.** It calls only the open/read path, so it inherits every
+  at-rest confidentiality and integrity guarantee above and adds no new write or
+  recovery code to audit. It does **not** take the single-writer lock and does not
+  mutate the document volume.
+- **The clipboard.** Copying a credential on mobile crosses into a shared, cross-app
+  surface. The viewer clears the clipboard automatically 15 s after a copy and
+  immediately on lock; the auto-clear is owned at app scope so it survives navigation
+  (hardening finding F-2, see `docs/HARDENING.md`). The §9.3 caveat — the OS may have
+  captured the value before the clear — still applies.
+- **Feature gates are off on mobile.** The FFI crate builds the core with
+  `default-features = false`, so the desktop-only `mlock` (swap-locking key pages) and
+  `single-writer-lock` (advisory `flock`) features are **not** compiled in. On mobile
+  the OS process sandbox provides the isolation those features target on a shared
+  desktop, and `mlockall`-style locking is neither portable nor useful inside an app
+  sandbox. The cryptographic core is otherwise identical.
+
+The FFI crate (`pass-mgr-ffi`) is the **only** crate permitted `unsafe`, confined to
+the generated UniFFI scaffolding; `pass-mgr-core` keeps `#![forbid(unsafe_code)]`.
 
 ## 9. Security caveats & known limitations
 
@@ -773,6 +809,12 @@ narrow same-moment race, not corruption. The intended model is single-user,
 single-active-session; don't back up or extract while actively editing in another
 window.
 
+The lock is compiled in behind the **`single-writer-lock`** Cargo feature (default-on
+for the desktop build, alongside the **`mlock`** key-page locking feature of §9.6).
+Both are switched **off** in the mobile FFI build, which is read-only and relies on the
+OS app sandbox instead (§8.1); a desktop build with `--no-default-features` likewise
+drops them, trading the writer-collision guard for portability.
+
 ### 9.17 Plaintext export writes secrets to disk
 `export-tree` (§6.3) — like `decrypt` and `extract` — writes **unencrypted** data
 to disk: the full vault JSON (every password, in the clear), the document index,
@@ -818,7 +860,8 @@ redundancy.)
 
 - Browser integration / autofill.
 - Cloud sync, multi-device, sharing.
-- Mobile clients.
+- A **writable** mobile client. (A read-only mobile *viewer* over the same core now
+  exists, §8.1; editing/creating vaults remains desktop-only.)
 - Plugin system.
 
 These are deliberately excluded to keep the attack surface and the codebase

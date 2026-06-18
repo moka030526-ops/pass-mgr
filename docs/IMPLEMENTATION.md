@@ -18,90 +18,79 @@ Conventions in this doc: `path/to/file.rs` is a source file; `Type` /
 
 ## 1. Module map
 
+The project is a Cargo **workspace** with three Rust crates plus a mobile app:
+
 ```
-src/
-├── lib.rs            Library crate root (`pass_mgr`). Declares every module below
-│                     as `pub mod`, and sets `#![forbid(unsafe_code)]` crate-wide.
-│                     Both binaries (main.rs, bin/pass-mgr-gui.rs) and the fuzz
-│                     targets link this library, so all data/crypto logic lives
-│                     here and is shared.
-├── crypto.rs         The cryptographic core: the chained two-password Argon2id KDF
-│                     and the XChaCha20-Poly1305 AEAD wrappers. The derived `Key`
-│                     lives in mlock'd/VirtualLock'd heap pages (swap mitigation)
-│                     and zeroizes on drop. Also the CSPRNG helper `random_bytes`.
-├── records.rs        The data model: the five record types, the `Change`/history
-│                     log, the `Record` trait + generic `upsert`/`remove`, the
-│                     top-level `Vault` (records + category lists + `VaultSettings`
-│                     + audit + id/version/generation), and shared helpers
-│                     (`unix_now`, `random_id`, the civil-date math, history compaction).
-│                     The id→document-location map is NOT here — it lives in the
-│                     manifests; records hold only opaque document-id references.
-├── storage.rs        The partitioned document engine (on-disk format v4):
-│                     `Manifest`/`ManifestEntry`/`VolumeStore`; the frame
-│                     encode/decode with fully bounds-checked parsers; atomic
-│                     manifest commits; lazy open and single-frame reads; partition
-│                     placement; the ordered crash-safe commit protocol; and the
-│                     scan-rebuild of a lost/corrupt manifest. `pub mod fuzz`
-│                     re-exports the parsers to the fuzz targets.
-├── vault.rs          The vault file (`vault.pmv` = header + AEAD'd JSON) and the
-│                     orchestration layer over `storage`: `OpenVault`
-│                     open/create/save, document add/read/export/remove, the staged
-│                     full-re-encryption shared by `change_password` and `compact`,
-│                     the single-writer lock, the in-vault category/volume-size/
-│                     redundancy mutators, the plaintext export/import round-trip,
-│                     `backup`, and the opt-in in-place `vault.pmv` redundancy
-│                     (mirror + retained generations, §3.7).
-├── single_instance.rs  GUI single-instance guard: a per-vault OS advisory lock
-│                     decides primary-vs-secondary at launch, and on Unix a tiny
-│                     local socket lets a second launch raise the first window
-│                     instead of stacking a new one (§6.4).
-├── types.rs          The editable category lists: a flat `asset: Vec<String>` and a
-│                     hierarchical `account: Vec<AccountType{name, subtypes}>`. Pure
-│                     in-memory data, persisted INSIDE the encrypted vault — there
-│                     are no external config files.
-├── password.rs       The bias-free random password generator: OS CSPRNG, rejection
-│                     sampling (`uniform`), per-class guarantees, Fisher–Yates shuffle.
-├── fault.rs          The crash-safety fault-injection hook (`fault::point`). A
-│                     zero-cost no-op unless the `fault-injection` feature is on;
-│                     then a named commit step can return `ENOSPC` (full-disk tests)
-│                     or `abort()` (force-kill tests). Compiled out of release builds.
-├── gui.rs            The egui/eframe graphical UI (the default front-end). Tabbed
-│                     estate vault + lock screen + Config screen. Immediate-mode, so
-│                     it uses a deferred-action pattern (§6.1).
-├── ui.rs             The ratatui terminal UI (`--tui`). The same four screens, with
-│                     field-based edit forms rebuilt by index (§6.2).
-├── launch.rs         Vault-path/flag resolution (`default_vault_path`, `vault_file`,
-│                     `resolve_interactive`) shared by both binaries so they open the
-│                     same vault.
-├── main.rs           The console binary `pass-mgr`: CLI dispatch (`--write`/`--tui`/
-│                     `--part`/compact flags), vault-directory selection, terminal
-│                     raw-mode setup/teardown, the no-echo password reader, and the
-│                     decrypt/manifest/extract/backup/export-tree/import-tree/compact
-│                     subcommands.
-└── bin/
-    └── pass-mgr-gui.rs  The windowed binary `pass-mgr-gui`: a thin GUI-subsystem
-                      launcher (`#![windows_subsystem = "windows"]` on Windows ⇒ no
-                      console window) that resolves args via `launch` and calls
-                      `gui::run` (§13.3 of DESIGN).
+crates/
+├── pass-mgr-core/    The headless, security-critical core (lib `pass_mgr_core`).
+│   │                 `#![forbid(unsafe_code)]`; NO UI/OS deps. Reused UNCHANGED by
+│   │                 the desktop binaries AND the mobile FFI; the fuzz targets link
+│   │                 it directly. Holds all crypto/data/storage logic.
+│   └── src/
+│       ├── lib.rs        Declares the modules below as `pub mod`.
+│       ├── crypto.rs     Chained two-password Argon2id KDF + XChaCha20-Poly1305 AEAD.
+│       │                 The derived `Key` zeroizes on drop; its pages are mlock'd
+│       │                 (swap mitigation) only when the `mlock` feature is on (default
+│       │                 for desktop, OFF in the mobile build). CSPRNG `random_bytes`.
+│       ├── records.rs    The data model: the SIX record types, `Change`/history, the
+│       │                 `Record` trait + generic `upsert`/`remove`, the `Vault`
+│       │                 aggregate, and shared helpers (`unix_now`, `random_id`, the
+│       │                 civil-date math, history compaction, and the document-folder
+│       │                 helpers `tax_doc_location` / `real_estate_doc_location`).
+│       ├── storage.rs    The partitioned document engine (on-disk format v4):
+│       │                 `Manifest`/`VolumeStore`, fully bounds-checked frame parsers,
+│       │                 atomic commits, lazy reads, the crash-safe protocol, and the
+│       │                 scan-rebuild of a lost/corrupt manifest. `pub mod fuzz`.
+│       ├── vault.rs      `OpenVault` orchestration over `storage` (open/create/save,
+│       │                 document add/read/export/remove, staged re-encryption for
+│       │                 change_password+compact, in-place redundancy, backup, the
+│       │                 plaintext round-trip). The single-writer advisory lock is now
+│       │                 gated by the `single-writer-lock` feature (default desktop;
+│       │                 no-op in the mobile build).
+│       ├── types.rs      Editable category lists (stored inside the encrypted vault).
+│       ├── password.rs   Bias-free random password generator.
+│       └── fault.rs      Crash-safety fault-injection hook (feature-gated, no-op in release).
+│
+├── pass-mgr-desktop/ The desktop shell (package `pass-mgr`, lib name kept as `pass_mgr`,
+│   │                 which re-exports the core modules so `pass_mgr::…`/`crate::…`
+│   │                 paths resolve unchanged). Builds two binaries.
+│   └── src/
+│       ├── gui.rs           egui/eframe GUI — six tabs incl. multi-document Taxes & RE.
+│       ├── ui.rs            ratatui TUI (`--tui`) — the same six tabs.
+│       ├── single_instance.rs  GUI single-instance guard (§6.4).
+│       ├── launch.rs        Vault-path/flag resolution shared by both binaries.
+│       ├── main.rs          Console binary `pass-mgr` (CLI + `--tui` + subcommands).
+│       └── bin/pass-mgr-gui.rs  Windowed binary `pass-mgr-gui` (no console window).
+│
+└── pass-mgr-ffi/     Thin UniFFI wrapper (cdylib+staticlib) consumed by the mobile app.
+                      The ONLY crate that permits `unsafe` (the UniFFI scaffolding); it
+                      does NOT inherit the core's `forbid`. v1 surface is READ-ONLY
+                      (open + browse + view + history) behind an opaque `Vault` handle,
+                      with a no-leak error map (wrong-password ≡ corrupt). Depends on the
+                      core with `default-features = false`, so the Android/iOS build links
+                      no `region` (mlock) and uses a no-op writer lock.
+
+mobile/               Compose Multiplatform app — one shared Kotlin UI for Android + iOS
+                      over the FFI, with bindings generated by Gobley. See
+                      `mobile/README.md`. (Android builds anywhere; iOS needs a Mac.)
 ```
 
-**Why a library + binary split.** Everything substantive is in the `pass_mgr`
-library; the two binaries (`main.rs` and `bin/pass-mgr-gui.rs`) are thin veneers. This lets the `cargo-fuzz` targets under
-`fuzz/` link the untrusted-input parsers directly, and it keeps a single source of
-truth for all crypto/data logic that **both** front-ends drive through the one
-`OpenVault` API. The security-critical core is `crypto.rs` + `storage.rs` +
-`vault.rs` + `records.rs`. The dependency direction is one-way: `crypto` knows
-nothing of `storage`/`vault`; `storage` depends on `crypto`; `vault` ties
-`crypto` + `storage` + `records` together; the UIs and CLI sit on top of `vault`.
-Even the one privileged operation (locking the key's pages out of swap) goes
-through the `region` crate's safe API, so `#![forbid(unsafe_code)]` holds with no
-exceptions.
+**Why the split.** The `pass-mgr-core` crate is the audited island: all crypto/data
+logic, no UI or OS-front-end dependencies, `#![forbid(unsafe_code)]`. The desktop
+shell, the mobile FFI, and the `cargo-fuzz` targets all sit on top of it and drive
+the one `OpenVault` API, so there is a single source of truth. The dependency
+direction is one-way: `crypto` knows nothing of `storage`/`vault`; `storage`
+depends on `crypto`; `vault` ties `crypto` + `storage` + `records` together; the
+UIs/CLI/FFI sit on top of `vault`. The only privileged operation (locking the key's
+pages out of swap) goes through the `region` crate's safe API and is feature-gated,
+so the core's `forbid(unsafe_code)` holds with no exceptions; `unsafe` exists only
+in the generated UniFFI scaffolding inside `pass-mgr-ffi`.
 
 ---
 
 ## 2. Data model (`records.rs`)
 
-Five record types, one per UI tab. Each carries an `id` (128-bit hex, from
+Six record types, one per UI tab. Each carries an `id` (128-bit hex, from
 `random_id`), `created_at`/`updated_at` timestamps, and an append-only
 `history: Vec<Change>`:
 
@@ -111,7 +100,22 @@ Five record types, one per UI tab. Each carries an `id` (128-bit hex, from
 | Trust and Will | `TrustWill` | document, usage, `file` (doc id) |
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id) |
 | Accounts | `Account` | account_type, account_subtype, owner, username, password, url, description, review |
-| Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account |
+| Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, three portal logins (property-management / insurance / HOA — each url + username + password), comments, `documents` (doc ids) |
+| Taxes | `TaxFiling` | year, notes, `documents` (doc ids) |
+
+**Multi-document records & per-record folders.** Trust&Will and Assets hold a
+*single* attached document (`file`/`statement`); the Taxes and Real Estate tabs hold
+*many* (`documents: Vec<String>`). Each multi-doc record's uploads share a virtual
+folder derived from the record — `taxes/<year>/` (`tax_doc_location`) and
+`real-estate/<address>/` (`real_estate_doc_location`). Both helpers reduce the input
+to ASCII-alphanumeric (RE: lower-cased, ≤40 chars) before building the path, so a
+crafted year/address cannot inject path separators or `..` traversal — they are the
+sole sanitisation barrier (`normalize_dir` downstream does not strip `..`), and this
+is pinned by adversarial tests. Document bytes still live in the encrypted volume;
+records hold only opaque doc-id references. `vault::referenced_doc_ids` collects the
+ids from all of `TrustWill.file`, `Asset.statement`, and every `Taxes`/`RealEstate`
+`documents`, so compaction never reclaims a live document and deletes reclaim all of
+a record's blobs.
 
 **The `Record` trait + generic CRUD.** Rather than repeat insert/edit/history
 logic five times, each type implements a small `Record` trait supplying only its
@@ -135,7 +139,7 @@ trimmed by `compact --json` (§3.6); the audit log is always preserved and gets 
 *history*, and document bytes held in memory — are overwritten with zeros when
 they leave scope. Category names are not secrets and are `#[zeroize(skip)]`.
 
-**The `Vault` aggregate.** `Vault` owns the five `Vec`s plus: `categories`
+**The `Vault` aggregate.** `Vault` owns the six record `Vec`s plus: `categories`
 (`TypeLists`, §5); a `settings` block (`VaultSettings { volume_max_size,
 redundancy }`); a stable random `id` that binds the volumes/manifests to this vault
 (a foreign or swapped volume/manifest then fails AEAD authentication); a `version`;
@@ -144,7 +148,10 @@ whole-file rollback is noticeable — `DESIGN.md` §9.12); `last_opened_at`; and
 `audit` log. **Every field is `#[serde(default)]`**, which is what lets a vault
 written by an older build load under a newer one (a missing field decodes to its
 type default) — this is how `VaultSettings.redundancy` (new in §3.7) was added
-without a format bump.
+without a format bump. The Taxes collection (`tax_filings`) and every new
+`RealEstate` field (the three portal logins, `financing_balance`, `comments`,
+`documents`) were added the same way — all `#[serde(default)]` — so the on-disk
+format version stays **v4** and a vault written before these features still opens.
 
 ---
 
@@ -570,14 +577,18 @@ cargo mutants --file src/storage.rs ...       # mutation testing (see below)
 sudo tests/dmflakey_powerloss.sh              # real power-loss test (dm-flakey; root)
 ```
 
-**Test counts (current).** `cargo test` runs **182 library tests + 19 binary
-(CLI) tests** by default (plus one `#[ignore]`d ThreadSanitizer reproducer, run
-separately — see below); `cargo test --features fault-injection` adds the
-feature-gated fault tests and the **18** `tests/crash_recovery.rs` integration
-tests (a force-kill harness — see below) for **191 + 19 + 18**. The whole suite is
-green, clippy is clean with `-D warnings`, the Windows cross-compile checks pass,
-a short 4-target `cargo-fuzz` campaign (~42M executions) runs crash-free, and
-`cargo audit` reports 0 advisories across 567 dependencies.
+**Test counts (current).** `cargo test --workspace` runs, by default, **192**
+`pass-mgr-core` library tests + **4** core integration tests + **31**
+`pass-mgr-ffi` tests + the desktop crate's **35** library tests and **19** binary
+(CLI) tests (plus one `#[ignore]`d ThreadSanitizer reproducer, run separately — see
+below). `cargo test --features fault-injection` adds the feature-gated fault tests
+and the **18** `tests/crash_recovery.rs` integration tests (a force-kill harness —
+see below). The whole suite is green, clippy is clean with `-D warnings` across all
+targets and features, the Windows cross-compile checks pass, the 4-target
+`cargo-fuzz` campaign runs crash-free, and `cargo audit` reports **0 advisories
+across 595 dependencies**. The dedicated hardening pass (adversarial review +
+mutation testing + fuzzing + supply-chain) is written up in
+[`HARDENING.md`](HARDENING.md).
 
 **Continuous integration.** `.github/workflows/ci.yml` re-runs all of the above on
 every push to `main` and every pull request, across four jobs: `test` (clippy with

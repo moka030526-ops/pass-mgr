@@ -449,7 +449,9 @@ after 15s and on exit) · `Ctrl+U` upload document · `Ctrl+E` export document �
 
 For the full architecture, encryption scheme, and security caveats, see
 [`docs/DESIGN.md`](docs/DESIGN.md); for how the code is organized, see
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md); for the adversarial security
+review, mutation testing, fuzzing, and supply-chain results, see
+[`docs/HARDENING.md`](docs/HARDENING.md).
 
 ## Mobile apps (Android & iOS)
 
@@ -466,9 +468,12 @@ storage logic is reimplemented. The repo is a Cargo workspace:
   Kotlin bindings).
 - `mobile/` — the Compose Multiplatform Gradle project.
 
-v1 of the apps is a **read-only viewer** (unlock → browse the five tabs → view an
-entry → reveal/copy a password). Build/usage details, the offline import model,
-and the disclosed mobile security trade-offs are in
+v1 of the apps is a **read-only viewer** (unlock → browse the records → view an
+entry → reveal/copy a password). It currently surfaces the first five record types
+(Instructions, Trust & Will, Assets, Accounts, Real Estate); the Taxes tab is
+desktop-only for now. Copied passwords are auto-cleared from the clipboard after
+15 s and immediately on lock. Build/usage details, the offline import model, and the
+disclosed mobile security trade-offs are in
 [`mobile/README.md`](mobile/README.md). Android builds on Linux/macOS/Windows;
 iOS requires a Mac with Xcode.
 
