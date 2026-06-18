@@ -93,7 +93,7 @@ pub fn real_estate_doc_location(address: &str) -> String {
 /// (fiddly) calendar math lives in exactly one place.
 // `pub(crate)` = visible anywhere in this crate but not to outside users.
 // The return type `(i64, i64, ...)` is a *tuple*: several values bundled together.
-pub(crate) fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
+pub fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
     // `let ts = ...` here *shadows* the parameter `ts`: a new binding reusing the
     // name. `.max(0)` clamps negatives to 0 (so pre-epoch times become the epoch).
     let ts = ts.max(0);

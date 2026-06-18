@@ -1,0 +1,4 @@
+# UniFFI binding config consumed by Gobley's gobley-uniffi-bindgen when it
+# generates the Kotlin Multiplatform bindings for the mobile app.
+package_name = "com.passmgr.ffi"
+cdylib_name = "pass_mgr_ffi"

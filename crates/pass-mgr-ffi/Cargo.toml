@@ -1,0 +1,22 @@
+[package]
+name = "pass-mgr-ffi"
+version = "0.1.0"
+edition = "2024"
+# Thin UniFFI wrapper around the audited pass-mgr-core, consumed by the
+# Compose Multiplatform mobile app via Gobley (Kotlin/Android JNI + Kotlin/Native
+# iOS cinterop). This crate is the ONLY one allowed `unsafe` (the UniFFI
+# scaffolding) — it does NOT inherit the core's `#![forbid(unsafe_code)]`.
+# v1 surface is READ-ONLY: open + browse + view + history.
+
+[lib]
+name = "pass_mgr_ffi"
+# cdylib -> libpass_mgr_ffi.so for Android (per-ABI via cargo-ndk / Gobley);
+# staticlib -> linked into the iOS XCFramework; lib (rlib) -> host-side unit tests.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+pass-mgr-core = { path = "../pass-mgr-core" }
+# Version is coupled to Gobley 0.3.7's gobley-uniffi-bindgen (UniFFI 0.29.x): the
+# bindgen must match the metadata baked into this cdylib, so keep them in lockstep.
+uniffi = "0.29.4"
+thiserror = "2.0.18"

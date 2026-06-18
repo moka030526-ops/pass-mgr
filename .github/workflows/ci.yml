@@ -31,11 +31,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test (default)
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
       - name: Test (fault-injection — crash / full-disk recovery)
-        run: cargo test --features fault-injection
+        # fault-injection lives on pass-mgr-core; the desktop crate forwards it so the
+        # `__crashop` binary + tests/crash_recovery.rs exercise the real fault points.
+        run: cargo test -p pass-mgr-core -p pass-mgr --features pass-mgr/fault-injection
 
   audit:
     name: cargo-audit (dependency CVEs)
@@ -77,3 +79,32 @@ jobs:
           for t in parse_header parse_frame parse_manifest scan_volume; do
             cargo +nightly fuzz run "$t" -- -max_total_time=30 -print_final_stats=1
           done
+
+  android:
+    name: android apk build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      # Match the NDK pinned in mobile/composeApp/build.gradle.kts (ndkVersion).
+      - name: Install SDK packages + NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;34.0.0" "ndk;30.0.14904198"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      # Gobley cross-builds the Rust cdylib for each ABI, generates the Kotlin
+      # UniFFI bindings, and assembles the APK. Reuses the audited pass-mgr-core.
+      - name: Build the debug APK
+        run: mobile/gradlew -p mobile :composeApp:assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: composeApp-debug-apk
+          path: mobile/composeApp/build/outputs/apk/debug/composeApp-debug.apk
+          if-no-files-found: error

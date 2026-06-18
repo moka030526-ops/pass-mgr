@@ -451,6 +451,27 @@ For the full architecture, encryption scheme, and security caveats, see
 [`docs/DESIGN.md`](docs/DESIGN.md); for how the code is organized, see
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
+## Mobile apps (Android & iOS)
+
+There are now native **Android** and **iOS** apps, built as one **Compose
+Multiplatform** (Kotlin) UI on top of the *same audited Rust core* — no crypto or
+storage logic is reimplemented. The repo is a Cargo workspace:
+
+- `crates/pass-mgr-core` — the headless, audited vault (crypto + storage + records
+  + `OpenVault`), reused by every front-end; `#![forbid(unsafe_code)]`.
+- `crates/pass-mgr-desktop` — the desktop CLI/TUI/GUI binaries (`pass-mgr`,
+  `pass-mgr-gui`) — unchanged behaviour.
+- `crates/pass-mgr-ffi` — a thin [UniFFI](https://mozilla.github.io/uniffi-rs/)
+  wrapper the mobile apps call through ([Gobley](https://gobley.dev) generates the
+  Kotlin bindings).
+- `mobile/` — the Compose Multiplatform Gradle project.
+
+v1 of the apps is a **read-only viewer** (unlock → browse the five tabs → view an
+entry → reveal/copy a password). Build/usage details, the offline import model,
+and the disclosed mobile security trade-offs are in
+[`mobile/README.md`](mobile/README.md). Android builds on Linux/macOS/Windows;
+iOS requires a Mac with Xcode.
+
 ## Development
 
 ```bash

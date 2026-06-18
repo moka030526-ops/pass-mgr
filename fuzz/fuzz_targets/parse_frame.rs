@@ -7,5 +7,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    pass_mgr::storage::fuzz::frame(data);
+    pass_mgr_core::storage::fuzz::frame(data);
 });

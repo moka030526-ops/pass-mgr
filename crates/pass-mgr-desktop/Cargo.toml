@@ -1,0 +1,35 @@
+[package]
+name = "pass-mgr"
+version = "0.1.0"
+edition = "2024"
+# Two binaries are built: the console `pass-mgr` (src/main.rs — CLI + --tui) and
+# the windowed `pass-mgr-gui` (src/bin/pass-mgr-gui.rs — Windows GUI subsystem,
+# no console window). `default-run` keeps `cargo run`/`cargo install` pointed at
+# the console one. All vault logic lives in `pass-mgr-core`; this crate is the
+# desktop shell (CLI + ratatui TUI + egui GUI) over it.
+default-run = "pass-mgr"
+
+[dependencies]
+pass-mgr-core = { path = "../pass-mgr-core" }
+anyhow = "1.0.102"
+# Clipboard only; disable the default `image-data` feature (pulls a PNG/deflate
+# image stack we never use) to shrink the dependency/attack surface.
+arboard = { version = "3.6.1", default-features = false }
+directories = "6.0.0"
+eframe = "0.34.3"
+ratatui = "0.30.1"
+serde_json = "1.0.150"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+# Unix-only: `O_NOFOLLOW` for the single-instance lock file open (refuses a
+# symlink atomically). Used only through the safe `OpenOptionsExt::custom_flags`
+# API. No effect on Windows builds.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Forward crash-safety fault injection down into pass-mgr-core so the hidden
+# `__crashop` subcommand (and tests/crash_recovery.rs) exercise the real fault
+# points. OFF by default. Enable with:
+#   cargo test -p pass-mgr -p pass-mgr-core --features pass-mgr/fault-injection
+fault-injection = ["pass-mgr-core/fault-injection"]
