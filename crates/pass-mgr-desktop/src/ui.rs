@@ -1113,10 +1113,28 @@ impl App {
                 )
             }
             Tab::Accounts => {
-                let r = sel_id
+                let mut r = sel_id
                     .as_ref()
                     .and_then(|id| v.accounts.iter().find(|r| &r.id == id).cloned())
                     .unwrap_or_else(|| Account::new().unwrap_or_default());
+                // For a NEW account, pre-populate the editable fields from the active
+                // Accounts filters / username search, so the entry starts in the
+                // bucket the user is viewing. Nothing is saved until they hit save.
+                if !existing {
+                    if let Some(t) = &self.acct_filter_type {
+                        r.account_type = t.clone();
+                    }
+                    if let Some(st) = &self.acct_filter_subtype {
+                        r.account_subtype = st.clone();
+                    }
+                    if let Some(o) = &self.acct_filter_owner {
+                        r.owner = o.clone();
+                    }
+                    let q = self.acct_search.trim();
+                    if !q.is_empty() {
+                        r.username = q.to_string();
+                    }
+                }
                 let id = if existing { Some(r.id.clone()) } else { None };
                 (
                     id,
@@ -2593,6 +2611,37 @@ mod tests {
         assert_eq!(bool_choice(true), "Yes");
         assert_eq!(bool_choice(false), "No");
         assert_eq!(yes_no(), vec!["No".to_string(), "Yes".to_string()]);
+    }
+
+    #[test]
+    fn new_account_prepopulates_from_active_filters() {
+        let (mut app, path) = app_unlocked("uifilterprefill");
+        app.tab = Tab::Accounts;
+        app.acct_filter_type = Some("Financial".into());
+        app.acct_filter_subtype = Some("IRA".into());
+        app.acct_filter_owner = Some("Alice".into());
+        app.acct_search = "alice99".into();
+        app.start_edit(false); // "New"
+        let es = app.edit.as_ref().unwrap();
+        // Account fields: [0] type, [1] subtype, [2] owner, [3] username.
+        assert_eq!(es.fields[0].value, "Financial", "type prefilled from filter");
+        assert_eq!(es.fields[1].value, "IRA", "subtype prefilled from filter");
+        assert_eq!(es.fields[2].value, "Alice", "owner prefilled from filter");
+        assert_eq!(es.fields[3].value, "alice99", "username prefilled from search");
+        assert!(es.id.is_none(), "still a new (unsaved) record");
+        assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing persisted yet");
+
+        // With no filters/search active, a new account starts blank.
+        app.acct_filter_type = None;
+        app.acct_filter_subtype = None;
+        app.acct_filter_owner = None;
+        app.acct_search.clear();
+        app.start_edit(false);
+        let es = app.edit.as_ref().unwrap();
+        assert_eq!(es.fields[0].value, "");
+        assert_eq!(es.fields[2].value, "");
+        assert_eq!(es.fields[3].value, "");
+        cleanup(&path);
     }
 
     #[test]

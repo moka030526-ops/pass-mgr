@@ -1442,6 +1442,19 @@ impl GuiApp {
             .collect()
     }
 
+    /// Build a fresh Account for the "New" button, pre-populated from the active
+    /// Accounts filters / username search so the entry starts in the bucket the user
+    /// is viewing. The filter fields are "" when unset, leaving those fields blank.
+    /// Nothing is persisted — this only seeds the edit buffer.
+    fn new_account_from_filters(&self) -> Option<Account> {
+        let mut a = Account::new().ok()?;
+        a.account_type = self.acct_filter_type.clone();
+        a.account_subtype = self.acct_filter_subtype.clone();
+        a.owner = self.acct_filter_owner.clone();
+        a.username = self.acct_search_user.clone();
+        Some(a)
+    }
+
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
         let type_names = self.vault_ref().categories().account_type_names();
         let owners_present =
@@ -1575,7 +1588,7 @@ impl GuiApp {
         });
 
         if new {
-            self.edit_account = Account::new().ok();
+            self.edit_account = self.new_account_from_filters();
             self.reveal_pw = false;
         }
         if let Some(i) = select {
@@ -2701,6 +2714,31 @@ mod tests {
         for t in Theme::ALL {
             let _ = visuals_for(t);
         }
+    }
+
+    #[test]
+    fn new_account_from_filters_prepopulates() {
+        let (mut app, path) = app_unlocked("guifilterprefill");
+        app.acct_filter_type = "Financial".into();
+        app.acct_filter_subtype = "IRA".into();
+        app.acct_filter_owner = "Alice".into();
+        app.acct_search_user = "alice99".into();
+        let a = app.new_account_from_filters().unwrap();
+        assert_eq!(a.account_type, "Financial");
+        assert_eq!(a.account_subtype, "IRA");
+        assert_eq!(a.owner, "Alice");
+        assert_eq!(a.username, "alice99");
+        assert!(a.password.is_empty(), "no secret invented");
+        // Empty filters -> blank new account.
+        app.acct_filter_type.clear();
+        app.acct_filter_subtype.clear();
+        app.acct_filter_owner.clear();
+        app.acct_search_user.clear();
+        let b = app.new_account_from_filters().unwrap();
+        assert_eq!(b.account_type, "");
+        assert_eq!(b.owner, "");
+        assert_eq!(b.username, "");
+        cleanup(&path);
     }
 
     #[test]
