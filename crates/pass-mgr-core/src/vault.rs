@@ -1825,6 +1825,402 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*; // pull every item from the parent module (this file) into the tests
+
+    // ---- Documents: taxes + real estate (hardening) ------------------------
+
+    #[test]
+    fn referenced_doc_ids_spans_all_four_record_kinds() {
+        // referenced_doc_ids must surface ids from Trust&Will.file, Asset.statement,
+        // every Taxes filing's documents, and every Real Estate property's documents.
+        let path = tmp_path("refids");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("refids", b"x");
+
+        let tw_id = v.add_document("/wills", "will.pdf", &src).unwrap();
+        let asset_id = v.add_document("/assets", "stmt.pdf", &src).unwrap();
+        let tax_id1 = v.add_document("taxes/2024", "w2.pdf", &src).unwrap();
+        let tax_id2 = v.add_document("taxes/2024", "1099.pdf", &src).unwrap();
+        let re_id1 = v.add_document("real-estate/main", "deed.pdf", &src).unwrap();
+        let re_id2 = v.add_document("real-estate/main", "policy.pdf", &src).unwrap();
+
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.file = Some(tw_id.clone());
+        records::upsert(&mut v.vault.trust_wills, tw);
+
+        let mut asset = records::AssetLiability::new().unwrap();
+        asset.statement = Some(asset_id.clone());
+        records::upsert(&mut v.vault.assets, asset);
+
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        tax.documents.push(tax_id1.clone());
+        tax.documents.push(tax_id2.clone());
+        records::upsert(&mut v.vault.tax_filings, tax);
+
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "Main".into();
+        re.documents.push(re_id1.clone());
+        re.documents.push(re_id2.clone());
+        records::upsert(&mut v.vault.real_estate, re);
+
+        let ids = referenced_doc_ids(&v.vault);
+        for want in [&tw_id, &asset_id, &tax_id1, &tax_id2, &re_id1, &re_id2] {
+            assert!(ids.contains(want), "referenced_doc_ids missing {want}; got {ids:?}");
+        }
+        assert_eq!(ids.len(), 6, "exactly the six referenced ids, got {ids:?}");
+
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn referenced_doc_ids_empty_when_no_attachments() {
+        // Records with no attached files contribute nothing.
+        let path = tmp_path("refidsempty");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.trust_wills, records::TrustWill::new().unwrap());
+        records::upsert(&mut v.vault.assets, records::AssetLiability::new().unwrap());
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        records::upsert(&mut v.vault.tax_filings, tax);
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "x".into();
+        records::upsert(&mut v.vault.real_estate, re);
+        assert!(referenced_doc_ids(&v.vault).is_empty(), "no attachments -> no referenced ids");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn add_read_document_under_taxes_and_real_estate_locations() {
+        // add_document under the shared tax/RE virtual folders, then read_document
+        // returns the exact bytes; doc_path reflects the normalized virtual path.
+        let path = tmp_path("addread");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let tax_body = vec![1u8; 500];
+        let re_body = vec![2u8; 600];
+        let tax_src = write_src("addread-tax", &tax_body);
+        let re_src = write_src("addread-re", &re_body);
+
+        let tax_loc = records::tax_doc_location("2024"); // "taxes/2024"
+        let re_loc = records::real_estate_doc_location("123 Main St"); // "real-estate/123mainst"
+        let tax_id = v.add_document(&tax_loc, "w2.pdf", &tax_src).unwrap();
+        let re_id = v.add_document(&re_loc, "deed.pdf", &re_src).unwrap();
+
+        assert_eq!(&*v.read_document(&tax_id).unwrap(), &tax_body[..]);
+        assert_eq!(&*v.read_document(&re_id).unwrap(), &re_body[..]);
+        assert_eq!(v.doc_path(&tax_id).unwrap(), "/taxes/2024/w2.pdf");
+        assert_eq!(v.doc_path(&re_id).unwrap(), "/real-estate/123mainst/deed.pdf");
+        assert!(v.has_document(&tax_id) && v.has_document(&re_id));
+
+        cleanup(&path);
+        fs::remove_file(&tax_src).ok();
+        fs::remove_file(&re_src).ok();
+    }
+
+    #[test]
+    fn export_document_writes_plaintext_for_tax_and_re_docs() {
+        // export_document writes the decrypted bytes out (O_EXCL, 0600); a second
+        // export to the same path must fail (no clobber).
+        let path = tmp_path("expdoc");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let body = vec![7u8; 333];
+        let src = write_src("expdoc", &body);
+        let tax_id = v.add_document("taxes/2023", "1099.pdf", &src).unwrap();
+        let re_id = v.add_document("real-estate/addr", "policy.pdf", &src).unwrap();
+
+        let out_dir = parent_dir(&path).join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let tax_out = out_dir.join("tax.bin");
+        let re_out = out_dir.join("re.bin");
+        v.export_document(&tax_id, &tax_out).unwrap();
+        v.export_document(&re_id, &re_out).unwrap();
+        assert_eq!(fs::read(&tax_out).unwrap(), body);
+        assert_eq!(fs::read(&re_out).unwrap(), body);
+        // O_EXCL: re-exporting onto an existing path is refused.
+        assert!(v.export_document(&tax_id, &tax_out).is_err(), "export must not clobber");
+
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn compact_volume_keeps_tax_and_re_docs_simultaneously() {
+        // Both a tax doc and an RE doc are referenced at once; a single
+        // `compact --volume` reclaims garbage while keeping BOTH present.
+        let path = tmp_path("cvolboth");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let tax_body = vec![3u8; 400];
+        let re_body = vec![4u8; 450];
+        let tax_src = write_src("cvolboth-tax", &tax_body);
+        let re_src = write_src("cvolboth-re", &re_body);
+
+        let tax_id = v.add_document("taxes/2024", "w2.pdf", &tax_src).unwrap();
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        tax.documents.push(tax_id.clone());
+        records::upsert(&mut v.vault.tax_filings, tax);
+
+        let re_id = v.add_document("real-estate/main", "deed.pdf", &re_src).unwrap();
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "Main".into();
+        re.documents.push(re_id.clone());
+        records::upsert(&mut v.vault.real_estate, re);
+
+        // Dead frames so compaction has reclaimable garbage around the two live docs.
+        for i in 0..4 {
+            let id = v.add_document("/g", &format!("g{i}.bin"), &tax_src).unwrap();
+            v.remove_document(&id).unwrap();
+        }
+        v.save().unwrap();
+
+        let opts = volume_opts();
+        assert!(v.compact_dry_run(&opts).bytes_reclaimed > 0, "garbage should be reclaimable");
+        v.compact(&opts).unwrap();
+        // Garbage gone, BOTH docs still readable and intact.
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "garbage fully reclaimed");
+        assert_eq!(&*v.read_document(&tax_id).unwrap(), &tax_body[..], "tax doc kept");
+        assert_eq!(&*v.read_document(&re_id).unwrap(), &re_body[..], "RE doc kept");
+        drop(v);
+
+        // Reopens cleanly (referenced subset of stored holds) with both docs intact.
+        let re_open = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re_open.read_document(&tax_id).unwrap(), &tax_body[..]);
+        assert_eq!(&*re_open.read_document(&re_id).unwrap(), &re_body[..]);
+        assert!(!parent_dir(&path).join(REKEY_DIR).exists(), "no staging debris");
+
+        cleanup(&path);
+        fs::remove_file(&tax_src).ok();
+        fs::remove_file(&re_src).ok();
+    }
+
+    #[test]
+    fn deleting_tax_filing_then_reclaiming_docs_and_compacting_frees_all() {
+        // Mirrors the GUI/TUI delete flow: remove the record, save, then
+        // remove_document each attached blob, then `compact --volume` reclaims them.
+        let path = tmp_path("deltax");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("deltax", &vec![6u8; 500]);
+        let mut docs = Vec::new();
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        for i in 0..3 {
+            let id = v.add_document("taxes/2024", &format!("d{i}.pdf"), &src).unwrap();
+            tax.documents.push(id.clone());
+            docs.push(id);
+        }
+        let tax_id = tax.id.clone();
+        records::upsert(&mut v.vault.tax_filings, tax);
+        // Keep one unrelated live doc so the store does not go fully empty.
+        let mut keep_tax = records::TaxFiling::new().unwrap();
+        keep_tax.year = "2025".into();
+        let keep = v.add_document("taxes/2025", "keep.pdf", &src).unwrap();
+        keep_tax.documents.push(keep.clone());
+        records::upsert(&mut v.vault.tax_filings, keep_tax);
+        v.save().unwrap();
+
+        // Delete the 2024 filing record, persist, then reclaim each of its blobs.
+        assert!(records::remove(&mut v.vault.tax_filings, &tax_id, &mut v.vault.audit, "Tax filing"));
+        v.save().unwrap();
+        for id in &docs {
+            v.remove_document(id).unwrap();
+        }
+        // The deleted filing's blobs are now dead frames; compaction reclaims them.
+        let opts = volume_opts();
+        assert!(v.compact_dry_run(&opts).bytes_reclaimed > 0, "deleted-filing blobs are reclaimable");
+        v.compact(&opts).unwrap();
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "all 2024 docs reclaimed");
+        // The deleted docs are gone; the kept one survives.
+        for id in &docs {
+            assert!(!v.has_document(id), "deleted tax doc {id} should be gone");
+        }
+        assert_eq!(&*v.read_document(&keep).unwrap(), &vec![6u8; 500][..], "kept doc survives");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re.read_document(&keep).unwrap(), &vec![6u8; 500][..]);
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn deleting_real_estate_property_then_reclaiming_docs_and_compacting_frees_all() {
+        // Same flow for a Real Estate property holding several documents.
+        let path = tmp_path("delre");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("delre", &vec![8u8; 480]);
+        let mut docs = Vec::new();
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "999 Removed Ave".into();
+        for i in 0..4 {
+            let id = v.add_document("real-estate/999removedave", &format!("d{i}.pdf"), &src).unwrap();
+            re.documents.push(id.clone());
+            docs.push(id);
+        }
+        let re_id = re.id.clone();
+        records::upsert(&mut v.vault.real_estate, re);
+        // An unrelated kept property doc.
+        let mut keep_re = records::RealEstate::new().unwrap();
+        keep_re.address = "1 Keep St".into();
+        let keep = v.add_document("real-estate/1keepst", "keep.pdf", &src).unwrap();
+        keep_re.documents.push(keep.clone());
+        records::upsert(&mut v.vault.real_estate, keep_re);
+        v.save().unwrap();
+
+        assert!(records::remove(&mut v.vault.real_estate, &re_id, &mut v.vault.audit, "Real Estate"));
+        v.save().unwrap();
+        for id in &docs {
+            v.remove_document(id).unwrap();
+        }
+        let opts = volume_opts();
+        assert!(v.compact_dry_run(&opts).bytes_reclaimed > 0);
+        v.compact(&opts).unwrap();
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "all property docs reclaimed");
+        for id in &docs {
+            assert!(!v.has_document(id), "deleted RE doc {id} should be gone");
+        }
+        assert_eq!(&*v.read_document(&keep).unwrap(), &vec![8u8; 480][..]);
+        drop(v);
+        let reopen = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*reopen.read_document(&keep).unwrap(), &vec![8u8; 480][..]);
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn records_remove_alone_leaves_blobs_as_orphans_compaction_keeps_them() {
+        // By design: `records::remove` only drops the record JSON; it does NOT touch
+        // the store. Until the caller also calls remove_document, the blobs are still
+        // LIVE manifest entries, so `compact --volume` conservatively KEEPS them
+        // (regression guard against compaction silently dropping not-yet-reclaimed docs).
+        let path = tmp_path("orphanre");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("orphanre", &vec![5u8; 300]);
+        let id = v.add_document("real-estate/x", "deed.pdf", &src).unwrap();
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "X".into();
+        re.documents.push(id.clone());
+        let re_id = re.id.clone();
+        records::upsert(&mut v.vault.real_estate, re);
+        v.save().unwrap();
+
+        // Remove ONLY the record (forget to reclaim the blob).
+        assert!(records::remove(&mut v.vault.real_estate, &re_id, &mut v.vault.audit, "Real Estate"));
+        v.save().unwrap();
+        // The blob is now unreferenced but still a live store entry, so there is no
+        // reclaimable garbage and compaction keeps it readable.
+        let opts = volume_opts();
+        assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "orphan is still a live frame");
+        v.compact(&opts).unwrap();
+        assert_eq!(&*v.read_document(&id).unwrap(), &vec![5u8; 300][..], "orphan blob preserved");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn many_documents_on_one_record_all_survive_save_reopen_read() {
+        // A single record holding MANY (8) documents: every distinct byte pattern
+        // survives save -> reopen -> read.
+        let path = tmp_path("manydocs");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        let mut ids = Vec::new();
+        for i in 0u8..8 {
+            // Distinct content per doc so a cross-wired id would be caught.
+            let body = vec![i; 200 + i as usize * 13];
+            let src = write_src(&format!("manydocs-{i}"), &body);
+            let id = v.add_document("taxes/2024", &format!("doc{i}.pdf"), &src).unwrap();
+            fs::remove_file(&src).ok();
+            tax.documents.push(id.clone());
+            ids.push((id, body));
+        }
+        records::upsert(&mut v.vault.tax_filings, tax);
+        v.save().unwrap();
+        drop(v);
+
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(reopened.vault.tax_filings[0].documents.len(), 8, "all 8 ids persisted");
+        for (id, body) in &ids {
+            assert_eq!(&*reopened.read_document(id).unwrap(), &body[..], "doc {id} survives reopen");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn removing_one_of_several_docs_leaves_the_others_readable() {
+        // Remove the middle of several documents on a record; the rest stay readable
+        // and the removed one is gone.
+        let path = tmp_path("rmone");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0u8..5 {
+            let body = vec![i + 1; 150];
+            let src = write_src(&format!("rmone-{i}"), &body);
+            let id = v.add_document("taxes/2024", &format!("f{i}.pdf"), &src).unwrap();
+            fs::remove_file(&src).ok();
+            ids.push((id, body));
+        }
+        // Remove index 2.
+        let (gone_id, _) = ids.remove(2);
+        v.remove_document(&gone_id).unwrap();
+        assert!(!v.has_document(&gone_id), "removed doc is gone");
+        assert!(matches!(v.read_document(&gone_id), Err(VaultError::Storage(StorageError::NotFound(_)))));
+        // The rest are intact.
+        for (id, body) in &ids {
+            assert_eq!(&*v.read_document(id).unwrap(), &body[..], "remaining doc {id} readable");
+        }
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        for (id, body) in &ids {
+            assert_eq!(&*re.read_document(id).unwrap(), &body[..]);
+        }
+        assert!(!re.has_document(&gone_id));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn add_document_path_length_boundary() {
+        // virtual_path("", name) == "/" + name. MAX_PATH_LEN (256) bytes is accepted;
+        // one byte over is rejected with PathTooLong.
+        let path = tmp_path("pathlen");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("pathlen", b"body");
+
+        // Exactly MAX_PATH_LEN: "/" + 255 chars = 256 bytes.
+        let at_limit = "x".repeat(storage::MAX_PATH_LEN - 1);
+        assert_eq!(virtual_path("", &at_limit).len(), storage::MAX_PATH_LEN);
+        let id = v.add_document("", &at_limit, &src).unwrap();
+        assert_eq!(&*v.read_document(&id).unwrap(), b"body");
+
+        // One byte over: "/" + 256 chars = 257 bytes -> PathTooLong.
+        let over = "y".repeat(storage::MAX_PATH_LEN);
+        assert_eq!(virtual_path("", &over).len(), storage::MAX_PATH_LEN + 1);
+        let err = v.add_document("", &over, &src).unwrap_err();
+        assert!(matches!(err, VaultError::Storage(StorageError::PathTooLong)), "got {err:?}");
+
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn add_document_path_length_boundary_with_location() {
+        // The boundary holds when the length comes from location + filename together.
+        // virtual_path("/taxes/2024", name) == "/taxes/2024/" + name (12-byte prefix).
+        let path = tmp_path("pathlen2");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("pathlen2", b"body");
+        let prefix = virtual_path("/taxes/2024", ""); // "/taxes/2024/"
+        let fill = storage::MAX_PATH_LEN - prefix.len();
+        let name = "z".repeat(fill);
+        assert_eq!(virtual_path("/taxes/2024", &name).len(), storage::MAX_PATH_LEN);
+        let id = v.add_document("/taxes/2024", &name, &src).unwrap();
+        assert_eq!(&*v.read_document(&id).unwrap(), b"body");
+
+        let over = "z".repeat(fill + 1);
+        let err = v.add_document("/taxes/2024", &over, &src).unwrap_err();
+        assert!(matches!(err, VaultError::Storage(StorageError::PathTooLong)), "got {err:?}");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
     use crate::records::{self, Account};
     use std::time::{SystemTime, UNIX_EPOCH};
 

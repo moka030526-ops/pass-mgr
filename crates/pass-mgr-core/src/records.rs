@@ -1127,6 +1127,565 @@ mod tests {
         assert!(vault.trust_wills[0].history.is_empty());
     }
 
+    // ---- Added: hardening tests for Taxes + expanded Real Estate -------------
+
+    /// `TaxFiling::new()` produces a stamped, empty filing with a 128-bit hex id
+    /// and equal created/updated timestamps (matching the macro's contract).
+    #[test]
+    fn tax_filing_new_is_stamped_and_empty() {
+        let t = TaxFiling::new().unwrap();
+        assert_eq!(t.id.len(), 32, "128-bit hex id");
+        assert!(t.id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(t.created_at > 0 && t.created_at == t.updated_at);
+        assert!(t.year.is_empty() && t.notes.is_empty() && t.documents.is_empty());
+        assert!(t.history.is_empty());
+        let other = TaxFiling::new().unwrap();
+        assert_ne!(t.id, other.id, "ids are distinct");
+    }
+
+    /// `TaxFiling::label()` shows the placeholder when blank and `Taxes <year>`
+    /// otherwise — including odd, non-sanitized year strings (label is verbatim).
+    #[test]
+    fn tax_filing_label_variants() {
+        let mut t = TaxFiling::default();
+        assert_eq!(t.label(), "(no year)");
+        t.year = "2024".into();
+        assert_eq!(t.label(), "Taxes 2024");
+        // The label does NOT sanitize; it echoes the raw year.
+        t.year = "FY-2024 (amended)".into();
+        assert_eq!(t.label(), "Taxes FY-2024 (amended)");
+    }
+
+    /// Every TaxFiling field that the diff tracks, exercised individually.
+    #[test]
+    fn tax_filing_diff_covers_each_field() {
+        let base = TaxFiling::default();
+        let now = unix_now();
+
+        // year
+        let mut n = base.clone();
+        n.year = "2025".into();
+        let c = base.diff(&n, now);
+        assert!(c.iter().any(|x| x.detail.contains("year") && x.detail.contains("2025")));
+        assert!(c.iter().all(|x| x.action == "updated"));
+
+        // notes
+        let mut n = base.clone();
+        n.notes = "extension filed".into();
+        let c = base.diff(&n, now);
+        assert!(c.iter().any(|x| x.detail.contains("notes") && x.detail.contains("extension filed")));
+
+        // documents: count goes up
+        let mut n = base.clone();
+        n.documents = vec!["a".into(), "b".into()];
+        let c = base.diff(&n, now);
+        assert!(c.iter().any(|x| x.detail.contains("documents") && x.detail.contains("0 -> 2")));
+
+        // documents: count goes down (removal)
+        let mut start = base.clone();
+        start.documents = vec!["a".into(), "b".into(), "c".into()];
+        let mut fewer = start.clone();
+        fewer.documents = vec!["a".into()];
+        let c = start.diff(&fewer, now);
+        assert!(c.iter().any(|x| x.detail.contains("documents") && x.detail.contains("3 -> 1")));
+    }
+
+    /// A document set that changes contents but keeps the same length is still a
+    /// diff (the diff compares the Vec, not just its length) — yet the human
+    /// detail reports the (unchanged) count, which is the documented behaviour.
+    #[test]
+    fn tax_filing_diff_detects_swapped_doc_same_count() {
+        let mut old = TaxFiling::default();
+        old.documents = vec!["blob-old".into()];
+        let mut new = old.clone();
+        new.documents = vec!["blob-new".into()];
+        let c = old.diff(&new, unix_now());
+        assert_eq!(c.len(), 1, "a swapped (but equal-count) document is a change");
+        assert!(c[0].detail.contains("documents") && c[0].detail.contains("1 -> 1"));
+    }
+
+    /// The diff must not leak document volume-file ids into the history detail.
+    #[test]
+    fn tax_filing_diff_does_not_expose_doc_ids() {
+        let old = TaxFiling::default();
+        let mut new = old.clone();
+        new.documents = vec!["super-secret-blob-id".into()];
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("documents")));
+        assert!(!c.iter().any(|x| x.detail.contains("super-secret-blob-id")), "doc id must not appear in history");
+    }
+
+    /// An identical TaxFiling produces no diff at all (every field equal).
+    #[test]
+    fn tax_filing_unchanged_yields_no_diff() {
+        let mut t = TaxFiling::default();
+        t.year = "2024".into();
+        t.notes = "n".into();
+        t.documents = vec!["d1".into(), "d2".into()];
+        assert!(t.diff(&t.clone(), unix_now()).is_empty());
+    }
+
+    /// All three TaxFiling text fields changing at once yields three changes.
+    #[test]
+    fn tax_filing_diff_all_fields_at_once() {
+        let old = TaxFiling::default();
+        let mut new = old.clone();
+        new.year = "2026".into();
+        new.notes = "all changed".into();
+        new.documents = vec!["d".into()];
+        let c = old.diff(&new, unix_now());
+        assert_eq!(c.len(), 3, "year + notes + documents");
+    }
+
+    // --- Expanded RealEstate diff: one test per NEW field --------------------
+
+    #[test]
+    fn real_estate_diff_financing_balance() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.financing_balance = "199999.99".into();
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("financing_balance") && x.detail.contains("199999.99")));
+        assert_eq!(c.len(), 1, "only one field changed");
+    }
+
+    #[test]
+    fn real_estate_diff_property_mgmt_portal() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.property_mgmt_url = "https://pm.example".into();
+        new.property_mgmt_username = "pmuser".into();
+        new.property_mgmt_password = "pmpass".into();
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("property_mgmt_url")));
+        assert!(c.iter().any(|x| x.detail.contains("property_mgmt_username") && x.detail.contains("pmuser")));
+        // Full before/after of the portal password is recorded (matches Account).
+        assert!(c.iter().any(|x| x.detail.contains("property_mgmt_password") && x.detail.contains("pmpass")));
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn real_estate_diff_insurance_portal() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.insurance_url = "https://ins.example".into();
+        new.insurance_username = "insuser".into();
+        new.insurance_password = "inspass".into();
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("insurance_url")));
+        assert!(c.iter().any(|x| x.detail.contains("insurance_username") && x.detail.contains("insuser")));
+        assert!(c.iter().any(|x| x.detail.contains("insurance_password") && x.detail.contains("inspass")));
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn real_estate_diff_hoa_portal() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.hoa_url = "https://hoa.example".into();
+        new.hoa_username = "hoauser".into();
+        new.hoa_password = "hoapass".into();
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("hoa_url")));
+        assert!(c.iter().any(|x| x.detail.contains("hoa_username") && x.detail.contains("hoauser")));
+        assert!(c.iter().any(|x| x.detail.contains("hoa_password") && x.detail.contains("hoapass")));
+        assert_eq!(c.len(), 3);
+    }
+
+    /// The plain `hoa` (dues) field and the `hoa_url` portal field are distinct;
+    /// changing one must not be reported as the other.
+    #[test]
+    fn real_estate_diff_distinguishes_hoa_dues_from_hoa_portal() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.hoa = "$300/mo".into();
+        let c = old.diff(&new, unix_now());
+        assert_eq!(c.len(), 1);
+        // The detail starts with the field name "hoa:"; the portal fields are
+        // "hoa_url"/"hoa_username"/"hoa_password" and must not be matched here.
+        assert!(c[0].detail.starts_with("hoa:"), "got {:?}", c[0].detail);
+    }
+
+    #[test]
+    fn real_estate_diff_comments() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.comments = "roof replaced 2025".into();
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("comments") && x.detail.contains("roof replaced 2025")));
+        assert_eq!(c.len(), 1);
+    }
+
+    /// documents count change is reported without exposing ids; both grow and
+    /// shrink are covered, plus a same-count swap.
+    #[test]
+    fn real_estate_diff_documents_count() {
+        let old = RealEstate::default();
+        let mut grow = old.clone();
+        grow.documents = vec!["deed".into(), "policy".into()];
+        let c = old.diff(&grow, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("documents") && x.detail.contains("0 -> 2")));
+        assert!(!c.iter().any(|x| x.detail.contains("deed") || x.detail.contains("policy")), "doc ids not leaked");
+
+        let mut shrink = grow.clone();
+        shrink.documents = vec!["deed".into()];
+        let c2 = grow.diff(&shrink, unix_now());
+        assert!(c2.iter().any(|x| x.detail.contains("2 -> 1")));
+
+        let mut swap = grow.clone();
+        swap.documents = vec!["deed2".into(), "policy2".into()];
+        let c3 = grow.diff(&swap, unix_now());
+        assert_eq!(c3.len(), 1);
+        assert!(c3[0].detail.contains("2 -> 2"), "swap with same count still diffs");
+    }
+
+    /// Every original RealEstate text field is still tracked after the expansion.
+    #[test]
+    fn real_estate_diff_original_fields_still_tracked() {
+        let old = RealEstate::default();
+        let mut new = old.clone();
+        new.address = "1 A St".into();
+        new.ownership = "JT".into();
+        new.taxes = "5000".into();
+        new.income_account = "inc".into();
+        new.financing_account = "fin".into();
+        new.payment_account = "pay".into();
+        let c = old.diff(&new, unix_now());
+        for field in ["address", "ownership", "taxes", "income_account", "financing_account", "payment_account"] {
+            assert!(c.iter().any(|x| x.detail.contains(field)), "missing diff for {field}");
+        }
+    }
+
+    /// Changing EVERY new+old RealEstate field at once yields exactly one change
+    /// per field (no double-counting, no missing field). This pins the diff's
+    /// field count so adding/removing a tracked field is caught.
+    #[test]
+    fn real_estate_diff_all_fields_counts_exactly() {
+        let old = RealEstate::default();
+        let mut n = old.clone();
+        n.address = "a".into();
+        n.ownership = "b".into();
+        n.taxes = "c".into();
+        n.hoa = "d".into();
+        n.income_account = "e".into();
+        n.financing_account = "f".into();
+        n.financing_balance = "g".into();
+        n.payment_account = "h".into();
+        n.property_mgmt_url = "i".into();
+        n.property_mgmt_username = "j".into();
+        n.property_mgmt_password = "k".into();
+        n.insurance_url = "l".into();
+        n.insurance_username = "m".into();
+        n.insurance_password = "n".into();
+        n.hoa_url = "o".into();
+        n.hoa_username = "p".into();
+        n.hoa_password = "q".into();
+        n.comments = "r".into();
+        n.documents = vec!["doc".into()];
+        let c = old.diff(&n, unix_now());
+        // 18 scalar text fields + 1 documents change = 19.
+        assert_eq!(c.len(), 19, "expected one change per tracked field; got {:?}", c.iter().map(|x| x.detail.clone()).collect::<Vec<_>>());
+    }
+
+    /// An identical RealEstate (with every new field populated) yields no diff.
+    #[test]
+    fn real_estate_unchanged_yields_no_diff() {
+        let mut re = RealEstate::default();
+        re.address = "x".into();
+        re.financing_balance = "100".into();
+        re.property_mgmt_password = "p".into();
+        re.insurance_username = "u".into();
+        re.hoa_url = "h".into();
+        re.comments = "c".into();
+        re.documents = vec!["d1".into(), "d2".into()];
+        assert!(re.diff(&re.clone(), unix_now()).is_empty(), "no change -> empty diff");
+    }
+
+    /// RealEstate label: blank address -> placeholder; otherwise the address.
+    #[test]
+    fn real_estate_label_variants() {
+        let mut re = RealEstate::default();
+        assert_eq!(re.label(), "(no address)");
+        re.address = "742 Evergreen Terrace".into();
+        assert_eq!(re.label(), "742 Evergreen Terrace");
+    }
+
+    // --- Folder helpers: adversarial inputs (path-traversal hardening) -------
+
+    /// Internal invariant for any tax folder: exactly `taxes/<one-segment>`,
+    /// no `..`, no extra '/', and the segment is non-empty and ASCII-alnum.
+    fn assert_tax_folder_safe(input: &str) {
+        let f = tax_doc_location(input);
+        assert!(f.starts_with("taxes/"), "{input:?} -> {f:?} lost prefix");
+        let seg = &f["taxes/".len()..];
+        assert!(!seg.is_empty(), "{input:?} -> empty segment");
+        assert!(!seg.contains('/'), "{input:?} -> {f:?} has nested slash");
+        assert!(!f.contains(".."), "{input:?} -> {f:?} contains ..");
+        assert!(!seg.contains('.'), "{input:?} -> {f:?} contains a dot");
+        // Either the safe fallback, or pure ASCII-alphanumeric.
+        assert!(seg == "unspecified" || seg.chars().all(|c| c.is_ascii_alphanumeric()), "{input:?} -> {f:?} not alnum");
+    }
+
+    /// Internal invariant for any real-estate folder: exactly
+    /// `real-estate/<one-segment>`, lowercased, <=40 chars, no traversal.
+    fn assert_re_folder_safe(input: &str) {
+        let f = real_estate_doc_location(input);
+        assert!(f.starts_with("real-estate/"), "{input:?} -> {f:?} lost prefix");
+        let seg = &f["real-estate/".len()..];
+        assert!(!seg.is_empty(), "{input:?} -> empty segment");
+        assert!(!seg.contains('/'), "{input:?} -> {f:?} has nested slash");
+        assert!(!f.contains(".."), "{input:?} -> {f:?} contains ..");
+        assert!(!seg.contains('.'), "{input:?} -> {f:?} contains a dot");
+        assert!(seg.len() <= 40, "{input:?} -> {f:?} segment >40 chars");
+        assert_eq!(seg, seg.to_lowercase(), "{input:?} -> {f:?} not lowercased");
+        assert!(seg == "property" || seg.chars().all(|c| c.is_ascii_alphanumeric()), "{input:?} -> {f:?} not alnum");
+    }
+
+    #[test]
+    fn tax_doc_location_is_always_safe() {
+        let adversarial = [
+            "",
+            "   ",
+            "\t\n  \t",
+            "..",
+            "../",
+            "../../etc/passwd",
+            "....//....//",
+            "taxes/../secret",
+            "/etc/shadow",
+            "2024/../2025",
+            "  ../2024/..  ",
+            "C:\\Windows\\System32",
+            "year\0null",
+            "2024年",          // unicode suffix
+            "二千二十四",        // all-unicode -> fallback
+            "café",            // accented -> "caf"
+            "\u{ff12}\u{ff10}\u{ff12}\u{ff14}", // full-width digits -> dropped -> fallback
+            "FY-2024 #final!",
+            "   2023/   ",
+            &"9".repeat(100),  // very long
+            &("a".repeat(60) + "/../../x"),
+        ];
+        for input in adversarial {
+            assert_tax_folder_safe(input);
+        }
+        // Spot-check exact, documented outputs.
+        assert_eq!(tax_doc_location("2024"), "taxes/2024");
+        assert_eq!(tax_doc_location(" 2023/ "), "taxes/2023");
+        assert_eq!(tax_doc_location("../../etc/passwd"), "taxes/etcpasswd");
+        assert_eq!(tax_doc_location(""), "taxes/unspecified");
+        assert_eq!(tax_doc_location("..."), "taxes/unspecified");
+        // tax_doc_location preserves case (unlike real-estate).
+        assert_eq!(tax_doc_location("FY2024"), "taxes/FY2024");
+    }
+
+    #[test]
+    fn real_estate_doc_location_is_always_safe() {
+        let adversarial = [
+            "",
+            "   ",
+            "\t\n",
+            "..",
+            "../",
+            "../../etc/passwd",
+            "....//....//",
+            "real-estate/../secret",
+            "/etc/shadow",
+            "123 Main St/../../root",
+            "  ../1 main/..  ",
+            "C:\\Users\\victim",
+            "addr\0null",
+            "Champs-Élysées",  // accented chars dropped
+            "東京タワー",        // all-unicode -> fallback
+            "\u{ff11}\u{ff12}", // full-width digits -> dropped -> fallback
+            "Unit #4B, Apt. 12!",
+            &"A".repeat(100),                 // long -> truncated to 40
+            &("X".repeat(50) + "/../../x"),  // long + traversal
+        ];
+        for input in adversarial {
+            assert_re_folder_safe(input);
+        }
+        // Spot-check exact, documented outputs.
+        assert_eq!(real_estate_doc_location("123 Main St"), "real-estate/123mainst");
+        assert_eq!(real_estate_doc_location(""), "real-estate/property");
+        assert_eq!(real_estate_doc_location("..."), "real-estate/property");
+        assert_eq!(real_estate_doc_location("../../etc/passwd"), "real-estate/etcpasswd");
+        // Truncation is to 40 alnum chars, then lowercased.
+        let long = real_estate_doc_location(&"A".repeat(100));
+        assert_eq!(long, format!("real-estate/{}", "a".repeat(40)));
+    }
+
+    /// Long inputs are truncated to 40 chars *of the sanitized form* — and
+    /// separators/junk between alnum runs don't count toward the 40.
+    #[test]
+    fn real_estate_doc_location_truncates_sanitized_length_not_raw() {
+        // 30 'a', then lots of slashes/spaces, then 30 'b': only 40 alnum survive.
+        let raw = format!("{}{}{}", "a".repeat(30), " / / / ".repeat(10), "b".repeat(30));
+        let f = real_estate_doc_location(&raw);
+        let seg = &f["real-estate/".len()..];
+        assert_eq!(seg.len(), 40);
+        assert_eq!(seg, format!("{}{}", "a".repeat(30), "b".repeat(10)));
+    }
+
+    // --- compact_history / history_stats include tax_filings & real_estate ---
+
+    /// `compact_history` and `history_stats` both account for tax_filings under a
+    /// cutoff (not just drop_all), and agree with each other.
+    #[test]
+    fn compact_history_counts_tax_filings_under_cutoff() {
+        let mut vault = Vault::default();
+        let mut t = TaxFiling::default();
+        t.history = vec![
+            Change { at: 100, action: "u".into(), detail: String::new() },
+            Change { at: 200, action: "u".into(), detail: String::new() },
+            Change { at: 300, action: "u".into(), detail: String::new() },
+        ];
+        vault.tax_filings.push(t);
+        // cutoff 250: at=100,200 are older (removed); at=300 kept.
+        assert_eq!(history_stats(&vault, Some(250), false), 2);
+        assert_eq!(compact_history(&mut vault, Some(250), false), 2);
+        assert_eq!(vault.tax_filings[0].history.iter().map(|c| c.at).collect::<Vec<_>>(), vec![300]);
+    }
+
+    /// `compact_history`/`history_stats` count real-estate AND tax histories in
+    /// the same pass as the other record types, and the two functions agree.
+    #[test]
+    fn compact_history_spans_all_six_record_types() {
+        let mut vault = Vault::default();
+        let mk = |at| Change { at, action: "u".into(), detail: String::new() };
+        let mut ins = Instruction::default();
+        ins.history = vec![mk(1)];
+        let mut tw = TrustWill::default();
+        tw.history = vec![mk(1)];
+        let mut al = AssetLiability::default();
+        al.history = vec![mk(1)];
+        let mut ac = Account::default();
+        ac.history = vec![mk(1)];
+        let mut re = RealEstate::default();
+        re.history = vec![mk(1), mk(2)];
+        let mut tx = TaxFiling::default();
+        tx.history = vec![mk(1), mk(2), mk(3)];
+        vault.instructions.push(ins);
+        vault.trust_wills.push(tw);
+        vault.assets.push(al);
+        vault.accounts.push(ac);
+        vault.real_estate.push(re);
+        vault.tax_filings.push(tx);
+        // 1+1+1+1+2+3 = 9
+        assert_eq!(history_stats(&vault, None, true), 9);
+        assert_eq!(compact_history(&mut vault, None, true), 9, "all six types trimmed");
+        assert!(vault.real_estate[0].history.is_empty());
+        assert!(vault.tax_filings[0].history.is_empty());
+        // Idempotent: nothing left to remove.
+        assert_eq!(compact_history(&mut vault, None, true), 0);
+    }
+
+    // --- upsert wiring for the two new record types --------------------------
+
+    /// `upsert` works end-to-end for TaxFiling: insert logs "created", and a
+    /// subsequent edit appends the field diff while keeping id + creation time.
+    #[test]
+    fn upsert_taxfiling_insert_then_edit() {
+        let mut list: Vec<TaxFiling> = Vec::new();
+        let mut t = TaxFiling::new().unwrap();
+        t.year = "2024".into();
+        let id = t.id.clone();
+        let created = t.created_at;
+        upsert(&mut list, t);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].history.len(), 1);
+        assert_eq!(list[0].history[0].action, "created");
+        assert!(list[0].history[0].detail.contains("Taxes 2024"));
+
+        let mut edit = list[0].clone();
+        edit.notes = "amended".into();
+        edit.documents.push("blob".into());
+        upsert(&mut list, edit);
+        assert_eq!(list.len(), 1, "same id replaces");
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].created_at, created, "creation time preserved");
+        assert!(list[0].history.iter().any(|c| c.detail.contains("notes")));
+        assert!(list[0].history.iter().any(|c| c.detail.contains("documents") && c.detail.contains("0 -> 1")));
+    }
+
+    /// `upsert` for RealEstate preserves creation time and appends a portal diff.
+    #[test]
+    fn upsert_real_estate_insert_then_edit() {
+        let mut list: Vec<RealEstate> = Vec::new();
+        let mut re = RealEstate::new().unwrap();
+        re.address = "9 Pine".into();
+        let id = re.id.clone();
+        let created = re.created_at;
+        upsert(&mut list, re);
+        assert_eq!(list[0].history.len(), 1);
+        assert_eq!(list[0].history[0].action, "created");
+
+        let mut edit = list[0].clone();
+        edit.hoa_password = "rotated".into();
+        upsert(&mut list, edit);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].created_at, created);
+        assert!(list[0].history.iter().any(|c| c.detail.contains("hoa_password") && c.detail.contains("rotated")));
+    }
+
+    /// `remove` logs a deletion using the RealEstate/TaxFiling labels.
+    #[test]
+    fn remove_logs_real_estate_and_tax_labels() {
+        let mut re_list: Vec<RealEstate> = Vec::new();
+        let mut re = RealEstate::new().unwrap();
+        re.address = "Lot 7".into();
+        let re_id = re.id.clone();
+        upsert(&mut re_list, re);
+        let mut audit = Vec::new();
+        assert!(remove(&mut re_list, &re_id, &mut audit, "RealEstate"));
+        assert!(audit.iter().any(|c| c.action == "deleted" && c.detail.contains("Lot 7")));
+
+        let mut tx_list: Vec<TaxFiling> = Vec::new();
+        let mut tx = TaxFiling::new().unwrap();
+        tx.year = "2030".into();
+        let tx_id = tx.id.clone();
+        upsert(&mut tx_list, tx);
+        assert!(remove(&mut tx_list, &tx_id, &mut audit, "TaxFiling"));
+        assert!(audit.iter().any(|c| c.action == "deleted" && c.detail.contains("Taxes 2030")));
+    }
+
+    // --- ZeroizeOnDrop coverage of the new secret-bearing fields -------------
+
+    /// The expanded RealEstate's new portal passwords / comments / documents are
+    /// covered by the derived `Zeroize` (no `#[zeroize(skip)]`), so they are
+    /// wiped on drop. We call `zeroize()` directly (drop calls the same impl).
+    #[test]
+    fn real_estate_zeroize_wipes_new_secret_fields() {
+        let mut re = RealEstate::default();
+        re.property_mgmt_password = "pm-secret".into();
+        re.insurance_password = "ins-secret".into();
+        re.hoa_password = "hoa-secret".into();
+        re.property_mgmt_username = "user".into();
+        re.comments = "private note".into();
+        re.documents = vec!["blobA".into(), "blobB".into()];
+        Zeroize::zeroize(&mut re);
+        assert!(re.property_mgmt_password.is_empty());
+        assert!(re.insurance_password.is_empty());
+        assert!(re.hoa_password.is_empty());
+        assert!(re.property_mgmt_username.is_empty());
+        assert!(re.comments.is_empty());
+        assert!(re.documents.is_empty(), "document id list must be wiped");
+    }
+
+    /// TaxFiling notes + document id list are wiped by the derived `Zeroize`.
+    #[test]
+    fn tax_filing_zeroize_wipes_fields() {
+        let mut t = TaxFiling::default();
+        t.year = "2024".into();
+        t.notes = "sensitive".into();
+        t.documents = vec!["doc1".into(), "doc2".into()];
+        Zeroize::zeroize(&mut t);
+        assert!(t.year.is_empty());
+        assert!(t.notes.is_empty());
+        assert!(t.documents.is_empty());
+    }
+
     use proptest::prelude::*;
     proptest! {
         /// `civil_from_unix` and `unix_from_civil` are exact inverses across the whole

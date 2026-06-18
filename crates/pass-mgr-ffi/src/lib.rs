@@ -456,6 +456,586 @@ fn summary<R: Record>(r: &R) -> RecordSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Extended FFI coverage: build a vault with one of EACH of the five record
+    // types via the core, then drive every read-only FFI method. Tax filings and
+    // the new RealEstate portal fields are intentionally NOT surfaced by the v1
+    // FFI — see `full_vault_exposes_only_v1_surface` and
+    // `real_estate_with_new_fields_maps_only_v1_fields`.
+    // -----------------------------------------------------------------------
+
+    struct Ids {
+        ins: String,
+        tw: String,
+        asset: String,
+        acc: String,
+        re: String,
+        tax: String,
+    }
+
+    /// Write a small throwaway source file (so `add_document` can ingest it).
+    fn write_src(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn make_full_vault(dir: &std::path::Path, pw1: &[u8], pw2: &[u8]) -> Ids {
+        let path = dir.join("vault.pmv");
+        let params = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let mut ov = OpenVault::create(path, pw1, pw2, params).unwrap();
+
+        let mut ins = records::Instruction::new().unwrap();
+        ins.title = "Funeral wishes".into();
+        ins.description = "Cremation, no service.".into();
+        let ins_id = ins.id.clone();
+        records::upsert(&mut ov.vault.instructions, ins);
+
+        // Upload real documents so the records' doc-reference fields point at
+        // blobs that actually exist (the open-time referenced⊆stored check
+        // would otherwise fail with ArchiveMismatch).
+        let trust_src = write_src(dir, "trust.pdf", b"trust document bytes");
+        let trust_blob = ov.add_document("trust-wills", "trust.pdf", &trust_src).unwrap();
+
+        let mut tw = records::TrustWill::new().unwrap();
+        tw.document = "Living Trust".into();
+        tw.usage = "Held at the law office.".into();
+        tw.file = Some(trust_blob);
+        let tw_id = tw.id.clone();
+        records::upsert(&mut ov.vault.trust_wills, tw);
+
+        let stmt_src = write_src(dir, "stmt.pdf", b"statement bytes");
+        let stmt_blob = ov.add_document("assets", "stmt.pdf", &stmt_src).unwrap();
+
+        let mut al = records::AssetLiability::new().unwrap();
+        al.kind = "Liability".into();
+        al.description = "Mortgage".into();
+        al.owner = "Jane".into();
+        al.approx_value = "250000".into();
+        al.as_of_date = "2026-01-01".into();
+        al.institution = "Big Bank".into();
+        al.asset_type = "Real Estate Loan".into();
+        al.url = "https://bank.example".into();
+        al.beneficiary = "Spouse".into();
+        al.review = true;
+        al.statement = Some(stmt_blob);
+        let al_id = al.id.clone();
+        records::upsert(&mut ov.vault.assets, al);
+
+        let mut acc = records::Account::new().unwrap();
+        acc.account_type = "Financial".into();
+        acc.account_subtype = "IRA".into();
+        acc.owner = "Jane".into();
+        acc.username = "alice".into();
+        acc.password = "s3cret".into();
+        acc.description = "Retirement".into();
+        acc.url = "https://broker.example".into();
+        acc.review = true;
+        let acc_id = acc.id.clone();
+        records::upsert(&mut ov.vault.accounts, acc);
+
+        // RealEstate with the EXPANDED fields populated (portals, balance,
+        // comments, documents). Only the original fields are mapped by the FFI.
+        let re_loc = records::real_estate_doc_location("123 Main St");
+        let deed_src = write_src(dir, "deed.pdf", b"deed bytes");
+        let deed_blob = ov.add_document(&re_loc, "deed.pdf", &deed_src).unwrap();
+        let policy_src = write_src(dir, "policy.pdf", b"policy bytes");
+        let policy_blob = ov.add_document(&re_loc, "policy.pdf", &policy_src).unwrap();
+
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "123 Main St".into();
+        re.ownership = "Joint".into();
+        re.taxes = "6000/yr".into();
+        re.hoa = "Sunset HOA".into();
+        re.income_account = "rent-acct".into();
+        re.financing_account = "loan-acct".into();
+        re.payment_account = "checking".into();
+        re.financing_balance = "199000".into();
+        re.property_mgmt_url = "https://pm.example".into();
+        re.property_mgmt_username = "pmuser".into();
+        re.property_mgmt_password = "pmpass".into();
+        re.insurance_url = "https://ins.example".into();
+        re.insurance_username = "insuser".into();
+        re.insurance_password = "inspass".into();
+        re.hoa_url = "https://hoa.example".into();
+        re.hoa_username = "hoauser".into();
+        re.hoa_password = "hoapass".into();
+        re.comments = "Tenant occupied.".into();
+        re.documents = vec![deed_blob, policy_blob];
+        let re_id = re.id.clone();
+        records::upsert(&mut ov.vault.real_estate, re);
+
+        // A tax filing — present in the vault, NOT exposed by the FFI.
+        let tax_loc = records::tax_doc_location("2024");
+        let tax_src = write_src(dir, "1040.pdf", b"1040 bytes");
+        let tax_blob = ov.add_document(&tax_loc, "1040.pdf", &tax_src).unwrap();
+
+        let mut tax = records::TaxFiling::new().unwrap();
+        tax.year = "2024".into();
+        tax.notes = "Filed on time.".into();
+        tax.documents = vec![tax_blob];
+        let tax_id = tax.id.clone();
+        records::upsert(&mut ov.vault.tax_filings, tax);
+
+        ov.save().unwrap();
+        Ids { ins: ins_id, tw: tw_id, asset: al_id, acc: acc_id, re: re_id, tax: tax_id }
+    }
+
+    fn open_full(dir: &std::path::Path) -> Arc<Vault> {
+        open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .expect("opens with correct passwords")
+    }
+
+    fn open_full_dir(dir: &std::path::Path, pw1: &[u8], pw2: &[u8]) -> Arc<Vault> {
+        open_vault(dir.to_str().unwrap().to_string(), pw1.to_vec(), pw2.to_vec())
+            .expect("opens with correct passwords")
+    }
+
+    #[test]
+    fn count_for_every_kind() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert_eq!(v.count(RecordKind::Instruction), 1);
+        assert_eq!(v.count(RecordKind::TrustWill), 1);
+        assert_eq!(v.count(RecordKind::AssetLiability), 1);
+        assert_eq!(v.count(RecordKind::Account), 1);
+        assert_eq!(v.count(RecordKind::RealEstate), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_records_for_every_kind_has_labels() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        for (kind, want_id, want_label) in [
+            (RecordKind::Instruction, &ids.ins, "Funeral wishes"),
+            (RecordKind::TrustWill, &ids.tw, "Living Trust"),
+            (RecordKind::AssetLiability, &ids.asset, "[Liability] Mortgage"),
+            (RecordKind::Account, &ids.acc, "Financial: alice"),
+            (RecordKind::RealEstate, &ids.re, "123 Main St"),
+        ] {
+            let rows = v.list_records(kind);
+            assert_eq!(rows.len(), 1, "exactly one row for {kind:?}");
+            assert_eq!(&rows[0].id, want_id, "id matches for {kind:?}");
+            assert_eq!(rows[0].label, want_label, "label matches for {kind:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_instruction_maps_all_fields() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let r = v.get_instruction(ids.ins.clone()).unwrap();
+        assert_eq!(r.id, ids.ins);
+        assert_eq!(r.title, "Funeral wishes");
+        assert_eq!(r.description, "Cremation, no service.");
+        assert!(r.created_at > 0);
+        assert_eq!(r.created_at, r.updated_at, "created on insert == updated");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_trust_will_maps_all_fields_including_file() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let r = v.get_trust_will(ids.tw.clone()).unwrap();
+        assert_eq!(r.id, ids.tw);
+        assert_eq!(r.document, "Living Trust");
+        assert_eq!(r.usage, "Held at the law office.");
+        assert!(r.file.is_some(), "attached file id is surfaced");
+        assert_eq!(r.file.as_ref().unwrap().len(), 32, "blob id is a 128-bit hex id");
+        assert!(r.created_at > 0 && r.updated_at > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_asset_maps_all_fields() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let r = v.get_asset(ids.asset.clone()).unwrap();
+        assert_eq!(r.id, ids.asset);
+        assert_eq!(r.kind, "Liability");
+        assert_eq!(r.description, "Mortgage");
+        assert_eq!(r.owner, "Jane");
+        assert_eq!(r.approx_value, "250000");
+        assert_eq!(r.as_of_date, "2026-01-01");
+        assert_eq!(r.institution, "Big Bank");
+        assert_eq!(r.asset_type, "Real Estate Loan");
+        assert_eq!(r.url, "https://bank.example");
+        assert_eq!(r.beneficiary, "Spouse");
+        assert!(r.review);
+        assert!(r.statement.is_some(), "attached statement id is surfaced");
+        assert_eq!(r.statement.as_ref().unwrap().len(), 32, "blob id is a 128-bit hex id");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_account_maps_all_fields_including_cleartext_password() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let r = v.get_account(ids.acc.clone()).unwrap();
+        assert_eq!(r.id, ids.acc);
+        assert_eq!(r.account_type, "Financial");
+        assert_eq!(r.account_subtype, "IRA");
+        assert_eq!(r.owner, "Jane");
+        assert_eq!(r.username, "alice");
+        assert_eq!(r.password, "s3cret");
+        assert_eq!(r.description, "Retirement");
+        assert_eq!(r.url, "https://broker.example");
+        assert!(r.review);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_real_estate_maps_the_original_v1_fields() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let r = v.get_real_estate(ids.re.clone()).unwrap();
+        assert_eq!(r.id, ids.re);
+        assert_eq!(r.address, "123 Main St");
+        assert_eq!(r.ownership, "Joint");
+        assert_eq!(r.taxes, "6000/yr");
+        assert_eq!(r.hoa, "Sunset HOA");
+        assert_eq!(r.income_account, "rent-acct");
+        assert_eq!(r.financing_account, "loan-acct");
+        assert_eq!(r.payment_account, "checking");
+        assert!(r.created_at > 0 && r.updated_at > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Forward-compat: a RealEstate record whose NEW expanded fields (portals,
+    /// financing_balance, comments, documents) are all populated must still map
+    /// cleanly through the v1 DTO — the FFI maps only the original fields and
+    /// silently ignores the new ones (it does not panic, drop the record, or
+    /// fail to find it).
+    #[test]
+    fn real_estate_with_new_fields_maps_only_v1_fields() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+
+        let rows = v.list_records(RecordKind::RealEstate);
+        assert_eq!(rows.len(), 1);
+        let r = v.get_real_estate(ids.re.clone()).expect("RE with new fields still maps");
+
+        assert_eq!(r.address, "123 Main St");
+        assert_eq!(r.financing_account, "loan-acct");
+        // The DTO's field set is exactly the original ones — constructing this
+        // literal would fail to compile if a new field had leaked in.
+        let _exhaustive_v1_shape = RealEstate {
+            id: r.id.clone(),
+            address: r.address.clone(),
+            ownership: r.ownership.clone(),
+            taxes: r.taxes.clone(),
+            hoa: r.hoa.clone(),
+            income_account: r.income_account.clone(),
+            financing_account: r.financing_account.clone(),
+            payment_account: r.payment_account.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Taxes and the new RealEstate portal fields are intentionally NOT exposed
+    /// by the read-only v1 FFI: there is no RecordKind for taxes and no getter
+    /// for a tax filing, so the tax filing — though present in the vault — is
+    /// unreachable through the FFI surface.
+    #[test]
+    fn full_vault_exposes_only_v1_surface() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+
+        for kind in [
+            RecordKind::Instruction,
+            RecordKind::TrustWill,
+            RecordKind::AssetLiability,
+            RecordKind::Account,
+            RecordKind::RealEstate,
+        ] {
+            assert_eq!(v.count(kind), 1, "{kind:?} present");
+        }
+
+        assert!(matches!(v.get_instruction(ids.tax.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_trust_will(ids.tax.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_asset(ids.tax.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_account(ids.tax.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_real_estate(ids.tax.clone()), Err(VaultError::RecordNotFound)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_history_for_every_kind_has_created_entry() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        for (kind, id) in [
+            (RecordKind::Instruction, &ids.ins),
+            (RecordKind::TrustWill, &ids.tw),
+            (RecordKind::AssetLiability, &ids.asset),
+            (RecordKind::Account, &ids.acc),
+            (RecordKind::RealEstate, &ids.re),
+        ] {
+            let hist = v.get_history(kind, id.clone()).unwrap();
+            assert!(!hist.is_empty(), "history present for {kind:?}");
+            assert!(hist.iter().any(|c| c.action == "created"), "a 'created' entry for {kind:?}");
+            for c in &hist {
+                assert!(c.at > 0, "history entries are timestamped for {kind:?}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_history_records_edits_with_field_detail() {
+        let dir = tmp();
+        let path = dir.join("vault.pmv");
+        let params = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let mut ov = OpenVault::create(path, b"one", b"two", params).unwrap();
+        let mut acc = records::Account::new().unwrap();
+        acc.account_type = "Financial".into();
+        acc.username = "alice".into();
+        acc.password = "old".into();
+        let id = acc.id.clone();
+        records::upsert(&mut ov.vault.accounts, acc);
+        let mut edit = ov.vault.accounts[0].clone();
+        edit.password = "new".into();
+        records::upsert(&mut ov.vault.accounts, edit);
+        ov.save().unwrap();
+        drop(ov);
+
+        let v = open_full_dir(&dir, b"one", b"two");
+        let hist = v.get_history(RecordKind::Account, id).unwrap();
+        assert!(hist.iter().any(|c| c.action == "created"));
+        assert!(
+            hist.iter().any(|c| c.action == "updated" && c.detail.contains("password")),
+            "the password edit is in history"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_history_bogus_id_is_record_not_found() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        for kind in [
+            RecordKind::Instruction,
+            RecordKind::TrustWill,
+            RecordKind::AssetLiability,
+            RecordKind::Account,
+            RecordKind::RealEstate,
+        ] {
+            assert!(matches!(
+                v.get_history(kind, "no-such-id".to_string()),
+                Err(VaultError::RecordNotFound)
+            ));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_typed_getter_rejects_a_bogus_id() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert!(matches!(v.get_instruction("x".into()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_trust_will("x".into()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_asset("x".into()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_account("x".into()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_real_estate("x".into()), Err(VaultError::RecordNotFound)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn typed_getters_are_kind_scoped() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert!(matches!(v.get_instruction(ids.acc.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_trust_will(ids.acc.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_asset(ids.acc.clone()), Err(VaultError::RecordNotFound)));
+        assert!(matches!(v.get_real_estate(ids.acc.clone()), Err(VaultError::RecordNotFound)));
+        assert!(v.get_account(ids.acc.clone()).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audit_log_has_vault_created_and_no_open_event() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        let audit = v.audit_log();
+        assert!(audit.iter().any(|c| c.action == "vault_created"), "vault_created event present");
+        for c in &audit {
+            assert!(c.at > 0, "audit entries are timestamped");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_notice_is_none_on_normal_open() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert!(v.recovery_notice().is_none(), "no recovery on a clean open");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generation_and_previous_access_reflect_the_saved_snapshot() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert!(v.generation() >= 1, "opened generation is the saved counter");
+        assert!(v.previous_access() > 0, "previous access is a real timestamp");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generation_rises_across_saves() {
+        let dir = tmp();
+        let path = dir.join("vault.pmv");
+        let params = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let mut ov = OpenVault::create(path, b"one", b"two", params).unwrap();
+        ov.save().unwrap();
+        ov.save().unwrap();
+        let saved_gen = ov.vault.generation;
+        drop(ov);
+        let v = open_full_dir(&dir, b"one", b"two");
+        assert_eq!(v.generation(), saved_gen, "FFI reports the last-saved generation");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_kinds_list_empty() {
+        let dir = tmp();
+        make_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+        assert_eq!(v.count(RecordKind::TrustWill), 0);
+        assert_eq!(v.count(RecordKind::AssetLiability), 0);
+        assert_eq!(v.count(RecordKind::RealEstate), 0);
+        assert!(v.list_records(RecordKind::TrustWill).is_empty());
+        assert!(v.list_records(RecordKind::AssetLiability).is_empty());
+        assert!(v.list_records(RecordKind::RealEstate).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrong_password_order_is_rejected() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"two".to_vec(), b"one".to_vec())
+            .err()
+            .expect("swapped passwords must fail");
+        assert!(matches!(e, VaultError::WrongPasswordOrCorrupt));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_vault_file_is_indistinguishable_from_wrong_password() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let path = dir.join("vault.pmv");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let i = bytes.len() - 1;
+        bytes[i] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .err()
+            .expect("a corrupt vault must fail to open");
+        assert!(
+            matches!(e, VaultError::WrongPasswordOrCorrupt),
+            "corruption maps to the same no-leak variant as a wrong password, got {e:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncated_vault_file_maps_to_wrong_password_or_corrupt() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let path = dir.join("vault.pmv");
+        std::fs::write(&path, b"PMV").unwrap();
+
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .err()
+            .expect("a truncated vault must fail to open");
+        assert!(matches!(e, VaultError::WrongPasswordOrCorrupt), "got {e:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bad_magic_maps_to_wrong_password_or_corrupt() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let path = dir.join("vault.pmv");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .err()
+            .expect("bad magic must fail to open");
+        assert!(matches!(e, VaultError::WrongPasswordOrCorrupt), "got {e:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_dir_with_other_files_present_still_not_found() {
+        let dir = tmp();
+        std::fs::write(dir.join("unrelated.txt"), b"hi").unwrap();
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .err()
+            .expect("no vault file => error");
+        assert!(matches!(e, VaultError::NotFound), "got {e:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopen_after_close_sees_the_same_records() {
+        let dir = tmp();
+        let ids = make_full_vault(&dir, b"one", b"two");
+        {
+            let v = open_full(&dir);
+            assert_eq!(v.count(RecordKind::Account), 1);
+            drop(v);
+        }
+        let v2 = open_full(&dir);
+        assert_eq!(v2.count(RecordKind::Account), 1);
+        assert_eq!(v2.get_real_estate(ids.re.clone()).unwrap().address, "123 Main St");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_record_ids_match_typed_getters() {
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let v = open_full(&dir);
+
+        let ins_id = v.list_records(RecordKind::Instruction)[0].id.clone();
+        assert_eq!(v.get_instruction(ins_id.clone()).unwrap().id, ins_id);
+        let tw_id = v.list_records(RecordKind::TrustWill)[0].id.clone();
+        assert_eq!(v.get_trust_will(tw_id.clone()).unwrap().id, tw_id);
+        let asset_id = v.list_records(RecordKind::AssetLiability)[0].id.clone();
+        assert_eq!(v.get_asset(asset_id.clone()).unwrap().id, asset_id);
+        let acc_id = v.list_records(RecordKind::Account)[0].id.clone();
+        assert_eq!(v.get_account(acc_id.clone()).unwrap().id, acc_id);
+        let re_id = v.list_records(RecordKind::RealEstate)[0].id.clone();
+        assert_eq!(v.get_real_estate(re_id.clone()).unwrap().id, re_id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use pass_mgr_core::crypto::KdfParams;
 
     /// Build a small vault on disk with the core API, then return its directory.
