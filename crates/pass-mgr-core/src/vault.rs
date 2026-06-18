@@ -1331,11 +1331,22 @@ fn decrypt_with_redundancy(
     // paired path keeps the mirror-vs-generation label honest.
     let blobs: Vec<(&PathBuf, Vec<u8>)> = candidates.iter().filter_map(|c| read_capped_vault(c).ok().map(|b| (c, b))).collect();
     let mirror = mirror_path(path);
+    // Bound the number of DISTINCT candidate salts we derive a key for. Legitimately
+    // this is 1 (all live copies share the current salt) or at most 2 (an older
+    // generation kept under a pre-rekey salt). Without this cap an attacker who can
+    // write the vault dir could plant up to (mirror + MAX_REDUNDANCY) candidates each
+    // with a distinct salt + maxed Argon2 params, forcing one expensive chained
+    // derivation per salt on EVERY open (an amplified open-DoS). Capping at 3 keeps
+    // honest recovery working while bounding the attacker's forced work.
+    const MAX_RECOVERY_SALTS: usize = 3;
     let mut tried_salts: Vec<[u8; SALT_LEN]> = Vec::new();
     for (_, src) in &blobs {
         let Ok(header) = Header::parse(src) else { continue };
         if tried_salts.contains(&header.salt) {
             continue; // already derived a key for this salt
+        }
+        if tried_salts.len() >= MAX_RECOVERY_SALTS {
+            break; // refuse to derive past the bound (planted distinct-salt DoS guard)
         }
         tried_salts.push(header.salt);
         let Ok(key) = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) else { continue };
@@ -2431,6 +2442,49 @@ mod tests {
         let users: Vec<&str> = v2.vault.accounts.iter().map(|a| a.username.as_str()).collect();
         assert!(users.contains(&"keep-me"), "the prior generation's data survives");
         assert!(!users.contains(&"newer"), "the most recent change was rolled back (expected for a generation)");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_caps_distinct_salt_derivations_to_bound_open_dos() {
+        // Red-team finding: an attacker who can write the vault dir plants candidate
+        // copies each with a DISTINCT salt + valid header to force one expensive
+        // Argon2 derivation per salt on every open. decrypt_with_redundancy caps the
+        // number of distinct salts it derives (MAX_RECOVERY_SALTS = 3). Here a VALID
+        // copy is placed only AFTER three distinct junk salts, so the cap is reached
+        // before it and recovery fails closed — proving the bound fires. (Honest 1-2
+        // salt recovery is covered by the recovers_from_* tests above, which still
+        // pass, so the cap does not regress real recovery.)
+        let path = tmp_path("redcap");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p"));
+        v.save().unwrap();
+        drop(v);
+
+        let valid = fs::read(&path).unwrap(); // decryptable under the real (salt_T) key
+        // A candidate that PARSES (valid header) but never decodes: a distinct salt
+        // (bytes 21..37) makes the derived key — and the AAD — wrong, and we also
+        // break a ciphertext byte. The recovery loop derives once per such salt.
+        let junk = |salt_byte: u8| {
+            let mut b = valid.clone();
+            for x in b.iter_mut().take(37).skip(21) {
+                *x = salt_byte; // distinct 16-byte salt
+            }
+            b[HEADER_LEN] ^= 0xff; // corrupt the ciphertext too
+            b
+        };
+        // Candidate order is mirror, bak1, bak2, bak3: put three distinct junk salts
+        // first, then the valid copy at bak3 (the 4th candidate).
+        fs::write(mirror_path(&path), junk(0x11)).unwrap();
+        fs::write(bak_path(&path, 1), junk(0x22)).unwrap();
+        fs::write(bak_path(&path, 2), junk(0x33)).unwrap();
+        fs::write(bak_path(&path, 3), &valid).unwrap();
+        fs::write(&path, b"not a vault").unwrap(); // corrupt the live file -> recovery runs
+
+        assert!(
+            OpenVault::open(path.clone(), b"a", b"b").is_err(),
+            "a valid copy reachable only past the distinct-salt cap is NOT recovered (DoS bound holds)"
+        );
         cleanup(&path);
     }
 

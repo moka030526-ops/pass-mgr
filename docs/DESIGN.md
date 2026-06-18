@@ -799,6 +799,16 @@ for the chained derivation, §5.2) can burn memory/CPU. The parameters are bound
 the user chooses which vault to open; lower the ceilings if you only ever open
 your own vaults. Adjust any of these constants for genuinely larger needs.
 
+The in-place redundancy recovery path (§12.8) would otherwise *multiply* that one
+bounded cost: an attacker who can write the vault dir could plant the mirror plus
+`MAX_REDUNDANCY` generation files, each with a **distinct** salt and maxed
+parameters, forcing one chained derivation per distinct salt on every open. The
+recovery loop derives a key per *distinct candidate salt* (legitimately 1 — all
+live copies share the current salt — or 2 across a rekey), so it is capped at
+`MAX_RECOVERY_SALTS` (= 3) distinct derivations; further distinct-salt candidates
+are not tried. This keeps honest recovery working while bounding the forced work to
+a small constant rather than `mirror + MAX_REDUNDANCY` derivations.
+
 ### 9.14 Trust boundary — host compromise is out of scope
 pass-mgr protects data **at rest** and assumes the machine is trustworthy *while
 the vault is open*. It does **not** defend against a compromised host: malware
