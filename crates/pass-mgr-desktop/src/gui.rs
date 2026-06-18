@@ -1172,7 +1172,8 @@ impl GuiApp {
         // being edited AND it has an attached `file` do we get `Some(id)`. (Using
         // `.map` here would give a nested `Option<Option<…>>`; `and_then`
         // flattens it.)
-        let attached = self.attached_label(self.edit_trustwill.as_ref().and_then(|r| r.file.clone()));
+        let attached: Vec<String> =
+            self.attached_label(self.edit_trustwill.as_ref().and_then(|r| r.file.clone())).into_iter().collect();
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
@@ -1192,15 +1193,14 @@ impl GuiApp {
                 ui.separator();
                 docreq = doc_section(
                     ui,
-                    "File",
-                    r.file.is_some(),
-                    attached.as_deref(),
+                    &attached,
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
                     self.writable,
-                );
+                )
+                .to_single();
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1239,7 +1239,8 @@ impl GuiApp {
     fn tab_general(&mut self, ui: &mut egui::Ui) {
         let labels = label_list(&self.vault_ref().vault.general_documents);
         let cur = self.edit_general.as_ref().map(|r| r.id.clone());
-        let attached = self.attached_label(self.edit_general.as_ref().and_then(|r| r.file.clone()));
+        let attached: Vec<String> =
+            self.attached_label(self.edit_general.as_ref().and_then(|r| r.file.clone())).into_iter().collect();
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
@@ -1260,15 +1261,14 @@ impl GuiApp {
                 ui.separator();
                 docreq = doc_section(
                     ui,
-                    "File",
-                    r.file.is_some(),
-                    attached.as_deref(),
+                    &attached,
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
                     self.writable,
-                );
+                )
+                .to_single();
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1320,7 +1320,8 @@ impl GuiApp {
             .map(|a| (a.id.clone(), a.label()))
             .collect();
         let cur = self.edit_asset.as_ref().map(|r| r.id.clone());
-        let attached = self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone()));
+        let attached: Vec<String> =
+            self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone())).into_iter().collect();
         let asset_types = self.vault_ref().categories().asset.clone();
         let mut new = false;
         let mut select = None;
@@ -1365,15 +1366,14 @@ impl GuiApp {
                 ui.separator();
                 docreq = doc_section(
                     ui,
-                    "Statement",
-                    r.statement.is_some(),
-                    attached.as_deref(),
+                    &attached,
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
                     self.writable,
-                );
+                )
+                .to_single();
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1666,37 +1666,27 @@ impl GuiApp {
                     ui.add(egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY));
 
                     ui.separator();
-                    ui.label(format!("Documents ({}) — saved to {}/", r.documents.len(), records::real_estate_doc_location(&r.address)));
-                    for (i, label) in doc_labels.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("• {label}"));
-                            if ui.button("Export").clicked() {
-                                docreq = ReDocReq::Export(i);
-                            }
-                            if writable && ui.button("Remove").clicked() {
-                                docreq = ReDocReq::Remove(i);
-                            }
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Export to");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.doc_dest)
-                                .desired_width(320.0)
-                                .hint_text("folder or file path to save into"),
-                        );
-                    });
-                    if writable {
-                        ui.separator();
-                        ui.label("Upload a document for this property:");
-                        egui::Grid::new("re_upload").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                            text_row(ui, "Filename", &mut self.doc_filename);
-                            text_row(ui, "Upload from", &mut self.doc_source);
-                        });
-                        if ui.button("⬆ Upload").clicked() {
-                            docreq = ReDocReq::Upload;
-                        }
-                    }
+                    ui.label(format!(
+                        "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                        r.documents.len(),
+                        records::real_estate_doc_location(&r.address)
+                    ));
+                    // Same uniform widget as Trust & Will (multi-document: the list
+                    // holds every attached doc); map its request to ReDocReq.
+                    docreq = match doc_section(
+                        ui,
+                        &doc_labels,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        &mut self.doc_dest,
+                        writable,
+                    ) {
+                        DocSectionReq::Upload => ReDocReq::Upload,
+                        DocSectionReq::Export(i) => ReDocReq::Export(i),
+                        DocSectionReq::Remove(i) => ReDocReq::Remove(i),
+                        DocSectionReq::None => ReDocReq::None,
+                    };
 
                     action = form_buttons(ui, writable);
                     history_view(ui, &r.history);
@@ -1780,39 +1770,27 @@ impl GuiApp {
                 ui.add(egui::TextEdit::multiline(&mut r.notes).desired_rows(4).desired_width(f32::INFINITY));
                 ui.separator();
 
-                // Attached documents — all live under taxes/<year>/.
-                ui.label(format!("Documents ({}) — saved to {}/", r.documents.len(), records::tax_doc_location(&r.year)));
-                for (i, label) in doc_labels.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("• {label}"));
-                        if ui.button("Export").clicked() {
-                            docreq = TaxDocReq::Export(i);
-                        }
-                        if writable && ui.button("Remove").clicked() {
-                            docreq = TaxDocReq::Remove(i);
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Export to");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.doc_dest)
-                            .desired_width(360.0)
-                            .hint_text("folder or file path to save into"),
-                    );
-                });
-
-                if writable {
-                    ui.separator();
-                    ui.label("Upload a document into this year's folder:");
-                    egui::Grid::new("tax_upload").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        text_row(ui, "Filename", &mut self.doc_filename);
-                        text_row(ui, "Upload from", &mut self.doc_source);
-                    });
-                    if ui.button("⬆ Upload").clicked() {
-                        docreq = TaxDocReq::Upload;
-                    }
-                }
+                // Attached documents — all live under taxes/<year>/<timestamp>/…
+                ui.label(format!(
+                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    r.documents.len(),
+                    records::tax_doc_location(&r.year)
+                ));
+                // Same uniform widget as Trust & Will; map its request to TaxDocReq.
+                docreq = match doc_section(
+                    ui,
+                    &doc_labels,
+                    &mut self.doc_subfolder,
+                    &mut self.doc_filename,
+                    &mut self.doc_source,
+                    &mut self.doc_dest,
+                    writable,
+                ) {
+                    DocSectionReq::Upload => TaxDocReq::Upload,
+                    DocSectionReq::Export(i) => TaxDocReq::Export(i),
+                    DocSectionReq::Remove(i) => TaxDocReq::Remove(i),
+                    DocSectionReq::None => TaxDocReq::None,
+                };
 
                 action = form_buttons(ui, writable);
                 history_view(ui, &r.history);
@@ -2526,37 +2504,69 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {
 // `#[allow(...)]` silences a specific lint (here: the linter's "too many
 // arguments" warning) — it does not change behavior. The `&mut String` inputs
 // are the caller's text buffers, edited in place by the widgets below.
-#[allow(clippy::too_many_arguments)]
+/// Outcome of the shared [`doc_section`] widget. Indices refer to the `attached`
+/// slice passed in (single-document tabs pass at most one document).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DocSectionReq {
+    None,
+    Upload,
+    Export(usize),
+    Remove(usize),
+}
+
+impl DocSectionReq {
+    /// Map to the single-document [`DocReq`] (Trust & Will / Assets / General),
+    /// where there is exactly one slot so the index is irrelevant.
+    fn to_single(self) -> DocReq {
+        match self {
+            DocSectionReq::Upload => DocReq::Attach,
+            DocSectionReq::Export(_) => DocReq::Export,
+            DocSectionReq::Remove(_) => DocReq::Remove,
+            DocSectionReq::None => DocReq::None,
+        }
+    }
+}
+
+/// The uniform document widget used by EVERY document tab (modeled on Trust &
+/// Will): it lists the currently-attached documents — each with Export / Remove —
+/// and, when writable, shows the **Subfolder / Filename / Upload-from** inputs and
+/// an Attach button. Single-document tabs pass a 0-or-1-element `attached` slice;
+/// the multi-document tabs pass the full list. The caller maps the returned request
+/// to its own handler (so `self` borrows stay disjoint from the widget).
 fn doc_section(
     ui: &mut egui::Ui,
-    label: &str,
-    attached_present: bool,
-    attached_label: Option<&str>,
+    attached: &[String],
     subfolder: &mut String,
     filename: &mut String,
     source: &mut String,
     dest: &mut String,
     writable: bool,
-) -> DocReq {
-    let mut req = DocReq::None;
-    ui.label(egui::RichText::new(format!("{label} (encrypted volume)")).strong());
-    if attached_present {
-        // `.unwrap_or("(unknown)")` yields the label if present, else a fallback
-        // string — never panics.
-        ui.label(format!("Attached: {}", attached_label.unwrap_or("(unknown)")));
+) -> DocSectionReq {
+    let mut req = DocSectionReq::None;
+    ui.label(egui::RichText::new("Documents (encrypted volume)").strong());
+    if attached.is_empty() {
+        ui.label(egui::RichText::new("(no documents attached)").weak());
+    } else {
+        for (i, label) in attached.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("• {label}"));
+                // Export is a read (always allowed); Remove mutates the vault.
+                if ui.button("Export").clicked() {
+                    req = DocSectionReq::Export(i);
+                }
+                if writable && ui.button("Remove").clicked() {
+                    req = DocSectionReq::Remove(i);
+                }
+            });
+        }
         ui.horizontal(|ui| {
-            // Export is a read and is always allowed; Detach mutates the vault.
             ui.label("Export to:");
             ui.add(egui::TextEdit::singleline(dest).hint_text("/path/to/save/as").desired_width(300.0));
-            if ui.button("Export").clicked() {
-                req = DocReq::Export;
-            }
-            if writable && ui.button("Detach").clicked() {
-                req = DocReq::Remove;
-            }
         });
-    } else if writable {
-        egui::Grid::new(format!("doc_{label}")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+    }
+    if writable {
+        ui.separator();
+        egui::Grid::new("doc_attach").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Subfolder (optional)");
             ui.add(egui::TextEdit::singleline(subfolder).hint_text("statements").desired_width(300.0));
             ui.end_row();
@@ -2569,7 +2579,7 @@ fn doc_section(
         });
         // Approximate the virtual path length: the stored path also includes the
         // auto-group and timestamp levels (~80 bytes, not visible here), so reserve
-        // for them. `handle_doc` does the authoritative check before writing.
+        // for them. `handle_doc`/`handle_*_doc` do the authoritative check on write.
         let vpath_len = vault::virtual_path(subfolder, filename).len() + 80;
         let over_limit = vpath_len > crate::storage::MAX_PATH_LEN;
         if over_limit {
@@ -2579,10 +2589,8 @@ fn doc_section(
             );
         }
         if ui.add_enabled(!over_limit, egui::Button::new("⬆ Attach (encrypt into volume)")).clicked() {
-            req = DocReq::Attach;
+            req = DocSectionReq::Upload;
         }
-    } else {
-        ui.label(egui::RichText::new("(no document attached)").weak());
     }
     req
 }

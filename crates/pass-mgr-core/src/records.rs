@@ -148,15 +148,24 @@ pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String 
     dir
 }
 
-/// Sanitize a user-supplied filename for the volume path: drop path separators and
-/// control characters (so the user controls the name without injecting extra path
-/// levels or `..` traversal), strip surrounding whitespace and dots, and cap the
-/// length. Falls back to `"file"` when nothing usable remains. Dots inside the name
-/// are kept so extensions like `return.pdf` survive.
+/// Sanitize a user-supplied filename for the volume path: replace any whitespace
+/// with `-` (so no path component contains a space), neutralize path separators and
+/// control characters with `_` (so the user controls the name without injecting
+/// extra path levels or `..` traversal), strip surrounding dots, and cap the length.
+/// Falls back to `"file"` when nothing usable remains. Dots inside the name are kept
+/// so extensions like `return.pdf` survive.
 pub fn doc_filename(name: &str) -> String {
     let mut out: String = name
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if c.is_whitespace() {
+                '-' // no spaces (or tabs/newlines) anywhere in a volume path
+            } else if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     // Cap at 120 bytes, truncating on a UTF-8 char boundary. A raw `truncate(120)`
     // PANICS when byte 120 lands mid-character (multibyte name: accented Latin, CJK,
@@ -168,7 +177,9 @@ pub fn doc_filename(name: &str) -> String {
         }
         out.truncate(cut);
     }
-    let trimmed = out.trim().trim_matches('.').trim();
+    // Strip leading/trailing dots and dashes (whitespace is already mapped to `-`),
+    // so a dot/space-only name collapses to the fallback rather than "--..".
+    let trimmed = out.trim_matches(|c: char| c == '.' || c == '-');
     if trimmed.is_empty() { "file".to_string() } else { trimmed.to_string() }
 }
 
@@ -1697,6 +1708,10 @@ mod tests {
     fn doc_filename_is_user_controlled_but_safe() {
         assert_eq!(doc_filename("return.pdf"), "return.pdf"); // extension preserved
         assert_eq!(doc_filename("a/b/c.pdf"), "a_b_c.pdf"); // separators neutralized
+        assert_eq!(doc_filename("my report.pdf"), "my-report.pdf"); // spaces -> '-'
+        assert_eq!(doc_filename("  spaced  name .pdf"), "spaced--name-.pdf"); // no spaces remain
+        assert_eq!(doc_filename("tab\tname.pdf"), "tab-name.pdf"); // tabs are whitespace too
+        assert!(!doc_filename("a b\tc\nd.pdf").contains(' '), "no whitespace survives");
         assert_eq!(doc_filename("  ..  "), "file"); // dot/space-only -> fallback
         assert_eq!(doc_filename(""), "file");
         assert!(doc_filename(&"x".repeat(500)).len() <= 120); // capped
