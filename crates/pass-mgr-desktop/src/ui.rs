@@ -38,7 +38,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::crypto::KdfParams;
 use crate::password::{self, GenOptions};
 use crate::records::{
-    self, Account, AssetLiability, Change, Instruction, RealEstate, Record, TaxFiling, TrustWill,
+    self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
 };
 use crate::vault::{self, OpenVault, VaultError};
 
@@ -105,14 +105,22 @@ enum Tab {
     Accounts,
     RealEstate,
     Taxes,
+    GeneralDocuments,
 }
 
 // `impl Tab { ... }` attaches methods/constants to the `Tab` type.
 impl Tab {
     // `[Tab; 6]` is a fixed-size array of 6 `Tab` values. `const` = a
     // compile-time constant.
-    const ALL: [Tab; 6] =
-        [Tab::Instructions, Tab::TrustWill, Tab::Assets, Tab::Accounts, Tab::RealEstate, Tab::Taxes];
+    const ALL: [Tab; 7] = [
+        Tab::Instructions,
+        Tab::TrustWill,
+        Tab::Assets,
+        Tab::Accounts,
+        Tab::RealEstate,
+        Tab::Taxes,
+        Tab::GeneralDocuments,
+    ];
 
     // Methods take `self`; because `Tab` is `Copy`, taking `self` by value here is
     // cheap and does not consume the caller's copy. The return type
@@ -126,6 +134,7 @@ impl Tab {
             Tab::Accounts => "Accounts",
             Tab::RealEstate => "Real Estate",
             Tab::Taxes => "Taxes",
+            Tab::GeneralDocuments => "General Documents",
         }
     }
 
@@ -304,8 +313,9 @@ struct EditState {
 /// The tabs whose records can carry an attached document (single source of truth).
 fn tab_has_docs(tab: Tab) -> bool {
     // `matches!(value, PATTERN)` is a one-shot boolean: true if `value` fits the
-    // pattern. The `|` means "or" — TrustWill or Assets.
-    matches!(tab, Tab::TrustWill | Tab::Assets)
+    // pattern. The `|` means "or". These are the SINGLE-document tabs (one file via
+    // `attached_file_id`); Taxes/Real Estate manage multi-doc folders separately.
+    matches!(tab, Tab::TrustWill | Tab::Assets | Tab::GeneralDocuments)
 }
 
 impl EditState {
@@ -469,6 +479,7 @@ impl App {
                 .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
             Tab::Taxes => label_list(&v.tax_filings),
+            Tab::GeneralDocuments => label_list(&v.general_documents),
         }
     }
 
@@ -1187,26 +1198,47 @@ impl App {
                     r.history.clone(),
                 )
             }
+            Tab::GeneralDocuments => {
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.general_documents.iter().find(|r| &r.id == id).cloned())
+                    .unwrap_or_else(|| GeneralDocument::new().unwrap_or_default());
+                let id = if existing { Some(r.id.clone()) } else { None };
+                (
+                    id,
+                    r.created_at,
+                    vec![
+                        Field::text("Title", r.title.clone()),
+                        Field::multiline("Description", r.description.clone()),
+                    ],
+                    r.file.clone(),
+                    r.history.clone(),
+                )
+            }
         };
 
         // Remember how many fields belong to the record itself, before appending
         // the extra doc-upload inputs (so the two groups can be told apart later).
         let record_fields = fields.len();
-        // Append document-upload inputs for the single-document tabs.
-        if tab_has_docs(tab) {
-            fields.push(Field::text("Doc location", String::new()));
+        // Uniform document-upload inputs for every document-bearing tab. The stored
+        // location is auto-derived as <root>/<auto-group>/<timestamp>[/<subfolder>];
+        // the user controls only the filename and the optional subfolder. The
+        // multi-document tabs additionally get a "Doc #" selecting which listed
+        // document Ctrl+E / Ctrl+K act on. Field order after `record_fields` (rc):
+        //   rc+0 filename · rc+1 upload-from · rc+2 export-to · rc+3 subfolder ·
+        //   rc+4 doc# (multi-document tabs only).
+        let multi = matches!(tab, Tab::Taxes | Tab::RealEstate);
+        if tab_has_docs(tab) || multi {
             fields.push(Field::text("Doc filename", String::new()));
             fields.push(Field::text("Upload from", String::new()));
             fields.push(Field::text("Export to", String::new()));
+            fields.push(Field::text("Subfolder (optional)", String::new()));
+            if multi {
+                fields.push(Field::text("Doc # (export/remove)", String::new()));
+            }
         }
-        // The Taxes tab manages several documents per year (folder taxes/<year>);
-        // a "Doc #" selects which listed document Ctrl+E / Ctrl+K act on. `tax_docs`
-        // is loaded from the record (and stays empty for every other tab).
+        // Load the existing document list for the multi-document tabs.
         let tax_docs: Vec<String> = if tab == Tab::Taxes {
-            fields.push(Field::text("Doc filename", String::new()));
-            fields.push(Field::text("Upload from", String::new()));
-            fields.push(Field::text("Export to", String::new()));
-            fields.push(Field::text("Doc # (export/remove)", String::new()));
             sel_id
                 .as_ref()
                 .and_then(|id| v.tax_filings.iter().find(|r| &r.id == id).map(|r| r.documents.clone()))
@@ -1214,13 +1246,7 @@ impl App {
         } else {
             Vec::new()
         };
-        // The Real Estate tab likewise manages several documents per property
-        // (folder real-estate/<address>).
         let re_docs: Vec<String> = if tab == Tab::RealEstate {
-            fields.push(Field::text("Doc filename", String::new()));
-            fields.push(Field::text("Upload from", String::new()));
-            fields.push(Field::text("Export to", String::new()));
-            fields.push(Field::text("Doc # (export/remove)", String::new()));
             sel_id
                 .as_ref()
                 .and_then(|id| v.real_estate.iter().find(|r| &r.id == id).map(|r| r.documents.clone()))
@@ -1410,17 +1436,31 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let location = es.fields[rc].value.clone();
-        let filename = es.fields[rc + 1].value.clone();
-        let source = es.fields[rc + 2].value.clone();
+        let filename = es.fields[rc].value.clone();
+        let source = es.fields[rc + 1].value.clone();
+        let subfolder = es.fields[rc + 3].value.clone();
         if filename.trim().is_empty() || source.trim().is_empty() {
             self.status = "Doc filename and 'upload from' are required.".into();
             self.edit = Some(es);
             return;
         }
+        // The auto-group level is derived from the record's identifying field; the
+        // user controls only the subfolder and filename. Build the uniform
+        // <root>/<auto-group>/<timestamp>[/<subfolder>] directory.
+        let prefix = match es.tab {
+            Tab::TrustWill => records::trust_will_doc_location(&es.fields[0].value),
+            Tab::Assets => records::asset_doc_location(&es.fields[1].value),
+            Tab::GeneralDocuments => records::general_doc_location(&es.fields[0].value),
+            _ => {
+                self.edit = Some(es);
+                return;
+            }
+        };
+        let fname = records::doc_filename(&filename);
+        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
         // Reject an over-length virtual path up front (same limit the core
         // enforces) so the upload key gives a clear message, not a generic error.
-        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        let vpath_len = crate::vault::virtual_path(&location, &fname).len();
         if vpath_len > crate::storage::MAX_PATH_LEN {
             self.status =
                 format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
@@ -1428,7 +1468,7 @@ impl App {
             return;
         }
         let id = match self.vault.as_mut() {
-            Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
+            Some(ov) => match ov.add_document(&location, &fname, Path::new(&source)) {
                 Ok(id) => id,
                 Err(e) => {
                     self.status = format!("Upload failed: {e}");
@@ -1445,11 +1485,11 @@ impl App {
         // not become an orphan in the archive.
         // `.replace(id)` stores the new id and returns the OLD one (as an Option).
         let previous = es.attached_file_id.replace(id);
-        // `rc..rc + 3` is a half-open range (rc, rc+1, rc+2): clear the three doc
-        // input fields now that the upload consumed them.
-        for i in rc..rc + 3 {
-            es.fields[i].value.clear();
-        }
+        // Clear the consumed upload inputs (filename, upload-from, subfolder),
+        // leaving the "Export to" field (rc+2) for a later export.
+        es.fields[rc].value.clear();
+        es.fields[rc + 1].value.clear();
+        es.fields[rc + 3].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1520,7 +1560,7 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let dest = es.fields[rc + 3].value.clone();
+        let dest = es.fields[rc + 2].value.clone();
         // let-else: require an attached document, or report and bail.
         let Some(id) = es.attached_file_id.clone() else {
             self.status = "No document attached to export.".into();
@@ -1551,13 +1591,16 @@ impl App {
         let year = es.fields[0].value.clone();
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
+        let subfolder = es.fields[rc + 3].value.clone();
         if filename.trim().is_empty() || source.trim().is_empty() {
             self.status = "Doc filename and 'upload from' are required.".into();
             self.edit = Some(es);
             return;
         }
-        let location = records::tax_doc_location(&year);
-        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        let prefix = records::tax_doc_location(&year);
+        let fname = records::doc_filename(&filename);
+        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
+        let vpath_len = crate::vault::virtual_path(&location, &fname).len();
         if vpath_len > crate::storage::MAX_PATH_LEN {
             self.status =
                 format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
@@ -1565,7 +1608,7 @@ impl App {
             return;
         }
         let id = match self.vault.as_mut() {
-            Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
+            Some(ov) => match ov.add_document(&location, &fname, Path::new(&source)) {
                 Ok(id) => id,
                 Err(e) => {
                     self.status = format!("Upload failed: {e}");
@@ -1581,6 +1624,7 @@ impl App {
         es.tax_docs.push(id);
         es.fields[rc].value.clear(); // filename
         es.fields[rc + 1].value.clear(); // upload-from
+        es.fields[rc + 3].value.clear(); // subfolder
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1601,7 +1645,7 @@ impl App {
         }
         let rc = es.record_fields;
         let dest = es.fields[rc + 2].value.clone();
-        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.tax_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {}.", es.tax_docs.len());
             return;
         };
@@ -1627,13 +1671,13 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.tax_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {} to remove.", es.tax_docs.len());
             self.edit = Some(es);
             return;
         };
         let id = es.tax_docs.remove(idx);
-        es.fields[rc + 3].value.clear();
+        es.fields[rc + 4].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1667,13 +1711,16 @@ impl App {
         let address = es.fields[0].value.clone();
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
+        let subfolder = es.fields[rc + 3].value.clone();
         if filename.trim().is_empty() || source.trim().is_empty() {
             self.status = "Doc filename and 'upload from' are required.".into();
             self.edit = Some(es);
             return;
         }
-        let location = records::real_estate_doc_location(&address);
-        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        let prefix = records::real_estate_doc_location(&address);
+        let fname = records::doc_filename(&filename);
+        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
+        let vpath_len = crate::vault::virtual_path(&location, &fname).len();
         if vpath_len > crate::storage::MAX_PATH_LEN {
             self.status =
                 format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
@@ -1681,7 +1728,7 @@ impl App {
             return;
         }
         let id = match self.vault.as_mut() {
-            Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
+            Some(ov) => match ov.add_document(&location, &fname, Path::new(&source)) {
                 Ok(id) => id,
                 Err(e) => {
                     self.status = format!("Upload failed: {e}");
@@ -1697,6 +1744,7 @@ impl App {
         es.re_docs.push(id);
         es.fields[rc].value.clear(); // filename
         es.fields[rc + 1].value.clear(); // upload-from
+        es.fields[rc + 3].value.clear(); // subfolder
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1717,7 +1765,7 @@ impl App {
         }
         let rc = es.record_fields;
         let dest = es.fields[rc + 2].value.clone();
-        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.re_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {}.", es.re_docs.len());
             return;
         };
@@ -1742,13 +1790,13 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.re_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {} to remove.", es.re_docs.len());
             self.edit = Some(es);
             return;
         };
         let id = es.re_docs.remove(idx);
-        es.fields[rc + 3].value.clear();
+        es.fields[rc + 4].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1869,6 +1917,15 @@ impl App {
                 r.documents = es.tax_docs.clone();
                 records::upsert(&mut v.tax_filings, r);
             }
+            Tab::GeneralDocuments => {
+                let mut r = GeneralDocument::default();
+                r.id = id;
+                r.created_at = es.created_at;
+                r.title = f(0);
+                r.description = f(1);
+                r.file = es.attached_file_id.clone();
+                records::upsert(&mut v.general_documents, r);
+            }
         }
     }
 
@@ -1944,6 +2001,15 @@ impl App {
                         }
                     }
                     records::remove(&mut v.tax_filings, &id, &mut v.audit, "Tax filing");
+                }
+                Tab::GeneralDocuments => {
+                    // Reclaim the single attached file, if any.
+                    if let Some(r) = v.general_documents.iter().find(|r| r.id == id)
+                        && let Some(f) = &r.file
+                    {
+                        doc_ids.push(f.clone());
+                    }
+                    records::remove(&mut v.general_documents, &id, &mut v.audit, "General document");
                 }
             }
         }
@@ -2237,7 +2303,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Documents ({}) — saved to {}/",
+                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
                     es.tax_docs.len(),
                     records::tax_doc_location(&es.fields[0].value)
                 ),
@@ -2257,7 +2323,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Documents ({}) — saved to {}/",
+                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
                     es.re_docs.len(),
                     records::real_estate_doc_location(&es.fields[0].value)
                 ),
@@ -2563,7 +2629,15 @@ mod tests {
         let titles: Vec<&str> = Tab::ALL.iter().map(|t| t.title()).collect();
         assert_eq!(
             titles,
-            vec!["Instructions", "Trust and Will", "Assets & Liabilities", "Accounts", "Real Estate", "Taxes"]
+            vec![
+                "Instructions",
+                "Trust and Will",
+                "Assets & Liabilities",
+                "Accounts",
+                "Real Estate",
+                "Taxes",
+                "General Documents",
+            ]
         );
         for t in Tab::ALL {
             assert!(!t.title().is_empty());
@@ -2648,18 +2722,18 @@ mod tests {
         {
             let es = app.edit.as_mut().unwrap();
             es.fields[rc + 2].value = dest.to_string_lossy().into(); // export to
-            es.fields[rc + 3].value = "2".into(); // doc # (only 1 exists)
+            es.fields[rc + 4].value = "2".into(); // doc # (only 1 exists)
         }
         app.export_tax_document();
         assert!(!dest.exists(), "out-of-range doc # exports nothing");
         assert!(app.status.contains("between 1 and 1"));
 
-        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
         app.export_tax_document();
         assert_eq!(std::fs::read(&dest).unwrap(), b"taxable income", "exported bytes round-trip");
 
         // --- remove ---
-        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
         app.remove_tax_document();
         assert!(app.edit.as_ref().unwrap().tax_docs.is_empty(), "removed the document");
         assert!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.is_empty(), "and unlinked it");
@@ -2696,15 +2770,64 @@ mod tests {
         {
             let es = app.edit.as_mut().unwrap();
             es.fields[rc + 2].value = dest.to_string_lossy().into();
-            es.fields[rc + 3].value = "1".into();
+            es.fields[rc + 4].value = "1".into();
         }
         app.export_re_document();
         assert_eq!(std::fs::read(&dest).unwrap(), b"the deed", "exported bytes round-trip");
 
-        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
         app.remove_re_document();
         assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "removed the document");
         assert!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.is_empty(), "and unlinked it");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn general_document_attach_export_detach_and_path_layout() {
+        let (mut app, path) = app_unlocked("uigendoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.general_documents, GeneralDocument::new().unwrap());
+        }
+        app.tab = Tab::GeneralDocuments;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields; // Title, Description -> rc == 2
+        app.edit.as_mut().unwrap().fields[0].value = "Passport".into(); // drives the auto-group
+
+        let src = dir.join("passport.pdf");
+        std::fs::write(&src, b"passport bytes").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc].value = "passport.pdf".into(); // filename
+            es.fields[rc + 1].value = src.to_string_lossy().into(); // upload from
+            es.fields[rc + 3].value = "ids".into(); // subfolder
+        }
+        app.attach_document();
+        let id = app.edit.as_ref().unwrap().attached_file_id.clone();
+        assert!(id.is_some(), "attached; status: {}", app.status);
+        let id = id.unwrap();
+
+        // Uniform layout: /general-documents/<title>/<timestamp>/<subfolder>/<filename>
+        // (virtual paths are normalized with a leading slash).
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
+        let parts: Vec<&str> = vpath.trim_start_matches('/').split('/').collect();
+        assert_eq!(parts[0], "general-documents");
+        assert_eq!(parts[1], "passport", "auto-group from title");
+        assert_eq!(parts[2].len(), 15, "timestamp folder YYYYMMDD-HHMMSS, got {:?}", parts.get(2));
+        assert_eq!(parts[3], "ids", "user subfolder");
+        assert_eq!(parts[4], "passport.pdf", "user filename");
+
+        let dest = dir.join("out.pdf");
+        app.edit.as_mut().unwrap().fields[rc + 2].value = dest.to_string_lossy().into();
+        app.export_document();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"passport bytes", "exported bytes round-trip");
+
+        app.detach_document();
+        assert!(app.edit.as_ref().unwrap().attached_file_id.is_none(), "detached");
+        assert!(!app.vault.as_ref().unwrap().has_document(&id), "blob reclaimed");
+        assert!(app.vault.as_ref().unwrap().vault.general_documents[0].file.is_none(), "unlinked + persisted");
         cleanup(&path);
     }
 
@@ -3016,7 +3139,10 @@ mod tests {
     }
 
     #[test]
-    fn over_length_doc_path_is_rejected_in_tui() {
+    fn over_long_filename_is_capped_in_tui() {
+        // The uniform layout caps every path component (filename 120, group/subfolder
+        // 40, timestamp fixed), so a huge filename can no longer push the virtual path
+        // past MAX_PATH_LEN — it is sanitized and truncated, and the upload succeeds.
         let (mut app, path) = app_unlocked("uipath");
         app.tab = Tab::Assets;
         app.start_edit(false); // builds the edit form, appending the doc fields
@@ -3026,13 +3152,14 @@ mod tests {
         {
             let es = app.edit.as_mut().unwrap();
             let rc = es.record_fields;
-            es.fields[rc].value = "/d".into(); // location
-            es.fields[rc + 1].value = "f".repeat(crate::storage::MAX_PATH_LEN); // filename
-            es.fields[rc + 2].value = src.display().to_string(); // upload from
+            es.fields[rc].value = "f".repeat(crate::storage::MAX_PATH_LEN); // filename (huge)
+            es.fields[rc + 1].value = src.display().to_string(); // upload from
         }
         app.attach_document();
-        assert!(app.status.contains("too long"), "status was: {}", app.status);
-        assert!(app.edit.as_ref().unwrap().attached_file_id.is_none(), "nothing attached");
+        let id = app.edit.as_ref().unwrap().attached_file_id.clone();
+        assert!(id.is_some(), "upload should succeed with a capped name; status: {}", app.status);
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id.unwrap()).unwrap_or_default();
+        assert!(vpath.len() <= crate::storage::MAX_PATH_LEN, "vpath within limit: {} bytes", vpath.len());
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }

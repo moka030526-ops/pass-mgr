@@ -33,7 +33,9 @@ use eframe::egui;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::password::{self, GenOptions};
-use crate::records::{self, Account, AssetLiability, Instruction, RealEstate, Record, TaxFiling, TrustWill};
+use crate::records::{
+    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
+};
 use crate::ui::format_time;
 use crate::vault::{self, OpenVault, VaultError};
 use crate::crypto::KdfParams;
@@ -309,6 +311,7 @@ enum Tab {
     Accounts,
     RealEstate,
     Taxes,
+    GeneralDocuments,
 }
 
 /// Deferred form action gathered during rendering, applied afterwards.
@@ -377,6 +380,7 @@ struct GuiApp {
     edit_account: Option<Account>,
     edit_realestate: Option<RealEstate>,
     edit_taxfiling: Option<TaxFiling>,
+    edit_general: Option<GeneralDocument>,
     reveal_pw: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
@@ -400,8 +404,10 @@ struct GuiApp {
     /// reset before Apply and the control would be dead). Re-seeded from the vault
     /// each time the Config screen is opened.
     cfg_redundancy: u32,
-    // Shared document-attach input buffers.
-    doc_location: String,
+    // Shared document-attach input buffers. The storage location is auto-derived
+    // (<root>/<auto-group>/<timestamp>/[subfolder]); the user controls only the
+    // optional subfolder and the filename.
+    doc_subfolder: String,
     doc_filename: String,
     doc_source: String,
     doc_dest: String,
@@ -471,6 +477,7 @@ impl GuiApp {
             edit_account: None,
             edit_realestate: None,
             edit_taxfiling: None,
+            edit_general: None,
             reveal_pw: false,
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
@@ -485,7 +492,7 @@ impl GuiApp {
             backup_dest: String::new(),
             cfg_volume_size: String::new(),
             cfg_redundancy: 0,
-            doc_location: String::new(),
+            doc_subfolder: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
             doc_dest: String::new(),
@@ -549,7 +556,7 @@ impl GuiApp {
     }
 
     fn clear_doc_inputs(&mut self) {
-        self.doc_location.clear();
+        self.doc_subfolder.clear();
         self.doc_filename.clear();
         self.doc_source.clear();
         self.doc_dest.clear();
@@ -783,6 +790,7 @@ impl GuiApp {
             tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
             tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
             tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
+            tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
             ui.separator();
             // Change-password is a write; only offer it when writable.
             // `&&` short-circuits: the button is only drawn/evaluated when
@@ -1187,7 +1195,7 @@ impl GuiApp {
                     "File",
                     r.file.is_some(),
                     attached.as_deref(),
-                    &mut self.doc_location,
+                    &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
@@ -1222,6 +1230,73 @@ impl GuiApp {
                 // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::TrustWill),
+            _ => {}
+        }
+    }
+
+    // --- Tab: General Documents ----------------------------------------------
+
+    fn tab_general(&mut self, ui: &mut egui::Ui) {
+        let labels = label_list(&self.vault_ref().vault.general_documents);
+        let cur = self.edit_general.as_ref().map(|r| r.id.clone());
+        let attached = self.attached_label(self.edit_general.as_ref().and_then(|r| r.file.clone()));
+        let mut new = false;
+        let mut select = None;
+        let mut action = FormAction::None;
+        let mut docreq = DocReq::None;
+
+        ui.columns(2, |c| {
+            (new, select) =
+                list_panel(&mut c[0], "General Documents", "➕ New", &labels, cur.as_deref(), self.writable);
+            let ui = &mut c[1];
+            if let Some(r) = self.edit_general.as_mut() {
+                egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    ui.label("Title");
+                    ui.add(egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
+                    ui.end_row();
+                });
+                ui.label("Description");
+                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(8).desired_width(f32::INFINITY));
+                ui.separator();
+                docreq = doc_section(
+                    ui,
+                    "File",
+                    r.file.is_some(),
+                    attached.as_deref(),
+                    &mut self.doc_subfolder,
+                    &mut self.doc_filename,
+                    &mut self.doc_source,
+                    &mut self.doc_dest,
+                    self.writable,
+                );
+                action = form_buttons(ui, self.writable);
+                history_view(ui, &r.history);
+            } else {
+                ui.label("Select a document or click “New”.");
+            }
+        });
+
+        if new {
+            self.edit_general = GeneralDocument::new().ok();
+            self.clear_doc_inputs();
+        }
+        if let Some(i) = select {
+            self.edit_general = self.vault_ref().vault.general_documents.get(i).cloned();
+            self.clear_doc_inputs();
+        }
+        self.handle_doc(docreq, DocTarget::General);
+        match action {
+            FormAction::Save => {
+                if let Some(r) = self.edit_general.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.general_documents, r);
+                }
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+            }
+            FormAction::Delete => self.delete_current(Tab::GeneralDocuments),
             _ => {}
         }
     }
@@ -1293,7 +1368,7 @@ impl GuiApp {
                     "Statement",
                     r.statement.is_some(),
                     attached.as_deref(),
-                    &mut self.doc_location,
+                    &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
                     &mut self.doc_dest,
@@ -1785,7 +1860,10 @@ impl GuiApp {
                     return;
                 }
                 let address = self.edit_realestate.as_ref().map(|r| r.address.clone()).unwrap_or_default();
-                let loc = records::real_estate_doc_location(&address);
+                let prefix = records::real_estate_doc_location(&address);
+                let name = records::doc_filename(&name);
+                let loc =
+                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
                 let vpath = vault::virtual_path(&loc, &name);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
@@ -1887,6 +1965,13 @@ impl GuiApp {
                     records::upsert(&mut ov.vault.assets, r);
                 }
             }
+            DocTarget::General => {
+                if let Some(r) = self.edit_general.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.general_documents, r);
+                }
+            }
         }
     }
 
@@ -1896,17 +1981,32 @@ impl GuiApp {
         match req {
             DocReq::None => {}
             DocReq::Attach => {
-                // Clone the three input strings into a tuple, then destructure.
-                let (loc, name, src) =
-                    (self.doc_location.clone(), self.doc_filename.clone(), self.doc_source.clone());
+                let (name, src) = (self.doc_filename.clone(), self.doc_source.clone());
                 if name.trim().is_empty() || src.trim().is_empty() {
                     self.status = "Filename and 'upload from' path are required.".into();
                     return;
                 }
-                let vpath = vault::virtual_path(&loc, &name);
+                // The auto-group level comes from the record's identifying field; the
+                // user controls only the subfolder and filename. Build the uniform
+                // <root>/<auto-group>/<timestamp>[/<subfolder>] directory.
+                let prefix = match target {
+                    DocTarget::TrustWill => records::trust_will_doc_location(
+                        self.edit_trustwill.as_ref().map(|r| r.document.as_str()).unwrap_or(""),
+                    ),
+                    DocTarget::Asset => records::asset_doc_location(
+                        self.edit_asset.as_ref().map(|r| r.description.as_str()).unwrap_or(""),
+                    ),
+                    DocTarget::General => records::general_doc_location(
+                        self.edit_general.as_ref().map(|r| r.title.as_str()).unwrap_or(""),
+                    ),
+                };
+                let fname = records::doc_filename(&name);
+                let loc =
+                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
+                let vpath = vault::virtual_path(&loc, &fname);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
-                        "Path too long: {} bytes (max {}). Shorten the location or filename.",
+                        "Path too long: {} bytes (max {}). Shorten the filename or subfolder.",
                         vpath.len(),
                         crate::storage::MAX_PATH_LEN
                     );
@@ -1915,7 +2015,7 @@ impl GuiApp {
                 // Nested match: get the vault (mut), then attempt the upload. Each
                 // branch either yields the new document `id` or returns early.
                 let id = match self.vault.as_mut() {
-                    Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
+                    Some(ov) => match ov.add_document(&loc, &fname, Path::new(&src)) {
                         Ok(id) => id,
                         Err(e) => {
                             self.status = format!("Upload failed: {e}");
@@ -1929,6 +2029,7 @@ impl GuiApp {
                 let previous = match target {
                     DocTarget::TrustWill => self.edit_trustwill.as_ref().and_then(|r| r.file.clone()),
                     DocTarget::Asset => self.edit_asset.as_ref().and_then(|r| r.statement.clone()),
+                    DocTarget::General => self.edit_general.as_ref().and_then(|r| r.file.clone()),
                 };
                 match target {
                     DocTarget::TrustWill => {
@@ -1939,6 +2040,11 @@ impl GuiApp {
                     DocTarget::Asset => {
                         if let Some(r) = self.edit_asset.as_mut() {
                             r.statement = Some(id);
+                        }
+                    }
+                    DocTarget::General => {
+                        if let Some(r) = self.edit_general.as_mut() {
+                            r.file = Some(id);
                         }
                     }
                 }
@@ -1965,6 +2071,7 @@ impl GuiApp {
                 let file_id = match target {
                     DocTarget::TrustWill => self.edit_trustwill.as_ref().and_then(|r| r.file.clone()),
                     DocTarget::Asset => self.edit_asset.as_ref().and_then(|r| r.statement.clone()),
+                    DocTarget::General => self.edit_general.as_ref().and_then(|r| r.file.clone()),
                 };
                 let dest = self.doc_dest.clone();
                 if dest.trim().is_empty() {
@@ -1986,6 +2093,7 @@ impl GuiApp {
                 let id = match target {
                     DocTarget::TrustWill => self.edit_trustwill.as_ref().and_then(|r| r.file.clone()),
                     DocTarget::Asset => self.edit_asset.as_ref().and_then(|r| r.statement.clone()),
+                    DocTarget::General => self.edit_general.as_ref().and_then(|r| r.file.clone()),
                 };
                 match target {
                     DocTarget::TrustWill => {
@@ -1996,6 +2104,11 @@ impl GuiApp {
                     DocTarget::Asset => {
                         if let Some(r) = self.edit_asset.as_mut() {
                             r.statement = None;
+                        }
+                    }
+                    DocTarget::General => {
+                        if let Some(r) = self.edit_general.as_mut() {
+                            r.file = None;
                         }
                     }
                 }
@@ -2037,7 +2150,10 @@ impl GuiApp {
                 }
                 // The folder is derived from the filing year, NOT user-entered.
                 let year = self.edit_taxfiling.as_ref().map(|r| r.year.clone()).unwrap_or_default();
-                let loc = records::tax_doc_location(&year);
+                let prefix = records::tax_doc_location(&year);
+                let name = records::doc_filename(&name);
+                let loc =
+                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
                 let vpath = vault::virtual_path(&loc, &name);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
@@ -2171,6 +2287,14 @@ impl GuiApp {
                         records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing");
                     }
                 }
+                Tab::GeneralDocuments => {
+                    if let Some(r) = self.edit_general.take() {
+                        if let Some(f) = &r.file {
+                            doc_ids.push(f.clone());
+                        }
+                        records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document");
+                    }
+                }
             }
         }
         // Persist the record removal BEFORE reclaiming its blobs, AND only reclaim
@@ -2210,6 +2334,7 @@ impl GuiApp {
 enum DocTarget {
     TrustWill,
     Asset,
+    General,
 }
 
 // Implement eframe's `App` trait so `GuiApp` can be driven by the framework.
@@ -2252,6 +2377,7 @@ impl eframe::App for GuiApp {
             Tab::Accounts => self.tab_accounts(ui),
             Tab::RealEstate => self.tab_realestate(ui),
             Tab::Taxes => self.tab_taxes(ui),
+            Tab::GeneralDocuments => self.tab_general(ui),
         });
     }
 }
@@ -2406,7 +2532,7 @@ fn doc_section(
     label: &str,
     attached_present: bool,
     attached_label: Option<&str>,
-    location: &mut String,
+    subfolder: &mut String,
     filename: &mut String,
     source: &mut String,
     dest: &mut String,
@@ -2431,8 +2557,8 @@ fn doc_section(
         });
     } else if writable {
         egui::Grid::new(format!("doc_{label}")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Location");
-            ui.add(egui::TextEdit::singleline(location).hint_text("/statements/2026").desired_width(300.0));
+            ui.label("Subfolder (optional)");
+            ui.add(egui::TextEdit::singleline(subfolder).hint_text("statements").desired_width(300.0));
             ui.end_row();
             ui.label("Filename");
             ui.add(egui::TextEdit::singleline(filename).hint_text("statement.pdf").desired_width(300.0));
@@ -2441,14 +2567,15 @@ fn doc_section(
             ui.add(egui::TextEdit::singleline(source).hint_text("/path/on/disk/file.pdf").desired_width(300.0));
             ui.end_row();
         });
-        // Validate the virtual path length live (same check the core enforces) so
-        // the limit is surfaced before attaching, and block the button if over.
-        let vpath_len = vault::virtual_path(location, filename).len();
+        // Approximate the virtual path length: the stored path also includes the
+        // auto-group and timestamp levels (~80 bytes, not visible here), so reserve
+        // for them. `handle_doc` does the authoritative check before writing.
+        let vpath_len = vault::virtual_path(subfolder, filename).len() + 80;
         let over_limit = vpath_len > crate::storage::MAX_PATH_LEN;
         if over_limit {
             ui.colored_label(
                 egui::Color32::from_rgb(0xC0, 0x30, 0x30),
-                format!("Path too long: {vpath_len} / {} bytes — shorten the location or filename.", crate::storage::MAX_PATH_LEN),
+                format!("Path may be too long (~{vpath_len} / {} bytes) — shorten the filename or subfolder.", crate::storage::MAX_PATH_LEN),
             );
         }
         if ui.add_enabled(!over_limit, egui::Button::new("⬆ Attach (encrypt into volume)")).clicked() {
@@ -2556,6 +2683,44 @@ mod tests {
         for t in Theme::ALL {
             let _ = visuals_for(t);
         }
+    }
+
+    #[test]
+    fn gui_general_document_upload_export_remove() {
+        let (mut app, path) = app_unlocked("guigendoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        let mut g = GeneralDocument::new().unwrap();
+        g.title = "Passport".into();
+        app.edit_general = Some(g);
+
+        let src = dir.join("p.pdf");
+        std::fs::write(&src, b"passport").unwrap();
+        app.doc_filename = "p.pdf".into();
+        app.doc_source = src.to_string_lossy().into();
+        app.doc_subfolder = "ids".into();
+        app.handle_doc(DocReq::Attach, DocTarget::General);
+        let id = app.edit_general.as_ref().unwrap().file.clone();
+        assert!(id.is_some(), "uploaded; status: {}", app.status);
+        let id = id.unwrap();
+        assert_eq!(
+            app.vault.as_ref().unwrap().vault.general_documents[0].file.as_deref(),
+            Some(id.as_str()),
+            "persisted"
+        );
+        // Uniform layout: /general-documents/<title>/<timestamp>/<subfolder>/<filename>.
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
+        assert!(vpath.trim_start_matches('/').starts_with("general-documents/passport/"), "got {vpath}");
+        assert!(vpath.ends_with("/ids/p.pdf"), "got {vpath}");
+
+        let dest = dir.join("out.pdf");
+        app.doc_dest = dest.to_string_lossy().into();
+        app.handle_doc(DocReq::Export, DocTarget::General);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"passport", "exported bytes round-trip");
+
+        app.handle_doc(DocReq::Remove, DocTarget::General);
+        assert!(app.edit_general.as_ref().unwrap().file.is_none(), "removed");
+        assert!(!app.vault.as_ref().unwrap().has_document(&id), "blob reclaimed");
+        cleanup(&path);
     }
 
     #[test]
@@ -2702,7 +2867,7 @@ mod tests {
         std::fs::write(&src, b"will body").unwrap();
 
         app.edit_asset = Some(AssetLiability::new().unwrap());
-        app.doc_location = "/wills".into();
+        app.doc_subfolder = "wills".into();
         app.doc_filename = "will.txt".into();
         app.doc_source = src.display().to_string();
         app.handle_doc(DocReq::Attach, DocTarget::Asset);
@@ -2724,18 +2889,24 @@ mod tests {
     }
 
     #[test]
-    fn over_length_doc_path_is_rejected_in_gui() {
+    fn over_long_filename_is_capped_not_rejected_in_gui() {
+        // With the uniform layout every path component is length-capped (filename to
+        // 120 bytes, group/subfolder to 40, timestamp fixed), so a huge filename can
+        // no longer push the virtual path over MAX_PATH_LEN — it is sanitized and
+        // truncated, and the upload succeeds rather than being rejected.
         let (mut app, path) = app_unlocked("guipath");
         let src = std::env::temp_dir().join(format!("passmgr-guipath-{}.txt", nanos()));
         std::fs::write(&src, b"x").unwrap();
         app.edit_asset = Some(AssetLiability::new().unwrap());
-        // A filename that alone pushes the virtual path past MAX_PATH_LEN bytes.
-        app.doc_location = "/d".into();
+        app.doc_subfolder = "d".into();
         app.doc_filename = "f".repeat(crate::storage::MAX_PATH_LEN);
         app.doc_source = src.display().to_string();
         app.handle_doc(DocReq::Attach, DocTarget::Asset);
-        assert!(app.status.contains("too long"), "status was: {}", app.status);
-        assert!(app.edit_asset.as_ref().unwrap().statement.is_none(), "nothing attached");
+        let id = app.edit_asset.as_ref().unwrap().statement.clone();
+        assert!(id.is_some(), "upload should succeed with a capped name; status: {}", app.status);
+        // The stored virtual path stays within the limit.
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id.unwrap()).unwrap_or_default();
+        assert!(vpath.len() <= crate::storage::MAX_PATH_LEN, "path within limit: {} bytes", vpath.len());
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }

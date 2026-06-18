@@ -38,7 +38,7 @@ Each numbered requirement from the brief maps to a concrete design element.
 |---|-------------|----------------|
 | 1 | Standalone, no internet | No network/async crates in `Cargo.toml`; offline by construction (§3) |
 | 2 | Filter screens + custom category types | Per-tab filters (account type/subtype/owner/review; asset review); editable `categories` stored in-vault (§4.2, §4.3) |
-| 3 | Rich records (accounts, assets, real estate, trust/will, instructions, taxes) | Six record types, one per tab (§4.1) |
+| 3 | Rich records (accounts, assets, real estate, trust/will, instructions, taxes, general documents) | Seven record types, one per tab (§4.1) |
 | 4 | Each change logged with timestamp | Per-record `history: Vec<Change>` + vault-level `audit` (§4.2) |
 | 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2); trimmable on demand via `compact --json` (§11.1) |
 | 6 | Last access maintained | `Vault.last_opened_at` + a monotonic `generation`, surfaced on unlock (§4.2) |
@@ -98,7 +98,7 @@ dependency tried.
 
 ## 4. Data model
 
-The model lives in `records.rs` and serializes to JSON. The app is a six-tab
+The model lives in `records.rs` and serializes to JSON. The app is a seven-tab
 estate vault: each tab is a `Vec` of one record type. Every record shares an
 `id` (128-bit random hex, stable across edits), `created_at`/`updated_at`, and an
 append-only `history: Vec<Change>` (req. 4, 5). The shared insert/edit/diff logic
@@ -118,14 +118,22 @@ Vault
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
 │                                     //   financing_balance, 3 portal logins (mgmt/insurance/HOA: url+username+password),
 │                                     //   comments, documents (doc ids; folder real-estate/<address>/)
-├── tax_filings:   Vec<TaxFiling>     // Tab 6: year, notes, documents (doc ids; folder taxes/<year>/)
+├── tax_filings:   Vec<TaxFiling>     // Tab 6: year, notes, documents (doc ids)
+├── general_documents: Vec<GeneralDocument> // Tab 7: title, description, file (one doc id)
 ├── categories: TypeLists        // the editable dropdown lists (in-vault, §5/§4.2)
 ├── settings: VaultSettings      // { volume_max_size, redundancy }  (Config screen, §4.3)
 └── audit: Vec<Change>           // vault-level log: created, password changed, deletions, uploads
 
-// The Taxes collection and the new Real Estate fields were all added as
-// #[serde(default)] fields, so the on-disk schema version stays 4 and a vault
-// written before them still loads (a missing field decodes to its default).
+// The Taxes/General-Documents collections and the new Real Estate fields were all
+// added as #[serde(default)] fields, so the on-disk schema version stays 4 and a
+// vault written before them still loads (a missing field decodes to its default).
+//
+// Document storage uses one uniform virtual-path layout across every document tab
+// (§4.3): <root>/<auto-group>/<timestamp>/[subfolder]/<filename>, where <root> is
+// the tab (taxes, real-estate, general-documents, trust-will, assets), <auto-group>
+// is the record's identifying field (year / address / title / document / desc),
+// <timestamp> is the upload time (YYYYMMDD-HHMMSS UTC), and the user controls only
+// the optional <subfolder> and the <filename>. Each component is slugged/capped.
 
 Change
 ├── at: i64                      // unix-seconds timestamp
@@ -189,6 +197,21 @@ design is in **§11**; the essentials:
 - **In-memory footprint.** Only the (small) manifests are decrypted on open;
   volume bytes are read on demand, one frame at a time — the whole document set is
   never held in memory at once.
+- **Uniform virtual-path layout.** Every document tab files its uploads under one
+  scheme — `<root>/<auto-group>/<timestamp>/[subfolder]/<filename>` — where `<root>`
+  is the tab (`taxes`, `real-estate`, `general-documents`, `trust-will`, `assets`),
+  `<auto-group>` is the record's identifying field (filing year, property address,
+  document title, …, so a record's documents cluster together), `<timestamp>` is the
+  upload instant (`YYYYMMDD-HHMMSS` UTC, making each upload's path unique), and the
+  user supplies only the optional `<subfolder>` and the `<filename>`. The auto-group
+  and subfolder are slugged (lowercased, ASCII-alphanumeric, `-`-separated, capped at
+  40) and the filename is sanitized (separators/control chars neutralized, capped at
+  120) — so no user input can inject extra path levels or `..` traversal, and the
+  built path stays within `MAX_PATH_LEN`. The virtual path is authenticated inside
+  the frame (it is part of the AEAD plaintext and checked against the manifest), so
+  it is integrity-protected like the bytes. These helpers live in `records.rs`
+  (`doc_slug`, `compact_utc`, `doc_upload_dir`, `doc_filename`, and the per-tab
+  `*_doc_location` prefixes) and are shared verbatim by the GUI and TUI.
 
 ### 4.4 Read-only by default
 
@@ -504,10 +527,10 @@ UI-independent. Adding or changing a front-end touches no security-critical code
 - **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
   headless. Key bindings are shown on-screen at all times; no mouse required.
 
-The desktop front-ends present the estate vault as **six tabs**, one per record
+The desktop front-ends present the estate vault as **seven tabs**, one per record
 type — Instructions, Trust & Will, Assets & Liabilities, Accounts, Real Estate,
-and Taxes — over four screens. (The read-only mobile viewer, §8, currently exposes
-the first five record types.) The four screens are:
+Taxes, and General Documents — over four screens. (The read-only mobile viewer, §8,
+currently exposes the first five record types.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
    On a missing vault it switches to a create flow that asks for each password

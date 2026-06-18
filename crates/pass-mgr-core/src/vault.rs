@@ -1204,8 +1204,9 @@ fn compaction_detail(opts: &CompactOptions, bytes_reclaimed: u64, history_remove
     format!("{mode}: reclaimed {bytes_reclaimed} bytes, removed {history_removed} history entries")
 }
 
-/// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`, and
-/// every Taxes filing's and Real Estate property's `documents`).
+/// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`, every
+/// Taxes filing's and Real Estate property's `documents`, and each General
+/// Document's `file`).
 fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
     let mut ids = Vec::new();
     // `for t in &vault.trust_wills` iterates by shared reference (doesn't consume
@@ -1233,6 +1234,12 @@ fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
     // compaction (`--volume`) never reclaims them.
     for re in &vault.real_estate {
         for f in &re.documents {
+            ids.push(f.clone());
+        }
+    }
+    // General Documents each reference a single attached file.
+    for g in &vault.general_documents {
+        if let Some(f) = &g.file {
             ids.push(f.clone());
         }
     }
@@ -1844,7 +1851,8 @@ mod tests {
     #[test]
     fn referenced_doc_ids_spans_all_four_record_kinds() {
         // referenced_doc_ids must surface ids from Trust&Will.file, Asset.statement,
-        // every Taxes filing's documents, and every Real Estate property's documents.
+        // every Taxes filing's documents, every Real Estate property's documents, and
+        // each General Document's file.
         let path = tmp_path("refids");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
         let src = write_src("refids", b"x");
@@ -1855,6 +1863,7 @@ mod tests {
         let tax_id2 = v.add_document("taxes/2024", "1099.pdf", &src).unwrap();
         let re_id1 = v.add_document("real-estate/main", "deed.pdf", &src).unwrap();
         let re_id2 = v.add_document("real-estate/main", "policy.pdf", &src).unwrap();
+        let gen_id = v.add_document("general-documents/passport", "passport.pdf", &src).unwrap();
 
         let mut tw = records::TrustWill::new().unwrap();
         tw.file = Some(tw_id.clone());
@@ -1876,11 +1885,16 @@ mod tests {
         re.documents.push(re_id2.clone());
         records::upsert(&mut v.vault.real_estate, re);
 
+        let mut g = records::GeneralDocument::new().unwrap();
+        g.title = "Passport".into();
+        g.file = Some(gen_id.clone());
+        records::upsert(&mut v.vault.general_documents, g);
+
         let ids = referenced_doc_ids(&v.vault);
-        for want in [&tw_id, &asset_id, &tax_id1, &tax_id2, &re_id1, &re_id2] {
+        for want in [&tw_id, &asset_id, &tax_id1, &tax_id2, &re_id1, &re_id2, &gen_id] {
             assert!(ids.contains(want), "referenced_doc_ids missing {want}; got {ids:?}");
         }
-        assert_eq!(ids.len(), 6, "exactly the six referenced ids, got {ids:?}");
+        assert_eq!(ids.len(), 7, "exactly the seven referenced ids, got {ids:?}");
 
         cleanup(&path);
         fs::remove_file(&src).ok();

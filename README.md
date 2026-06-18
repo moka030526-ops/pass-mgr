@@ -96,7 +96,7 @@ If a password is wrong it simply says so — try again, checking the order.
 
 ## The six sections (tabs)
 
-Across the top are six tabs. Click a tab to switch:
+Across the top are seven tabs. Click a tab to switch:
 
 1. **Instructions** — notes and instructions for your family/executor (funeral
    wishes, who to contact, where to find things).
@@ -112,6 +112,9 @@ Across the top are six tabs. Click a tab to switch:
 6. **Taxes** — one entry per **filing year**, holding that year's tax documents
    (W-2s, 1099s, the return, receipts). Each entry can hold **several** uploaded
    documents, all kept together in that year's own folder inside the vault.
+7. **General Documents** — anything else worth keeping: a title, a description,
+   and **one uploaded file** per entry (passport scan, birth certificate, a
+   contract). Use one entry per document.
 
 ## Adding or changing an entry (step by step)
 
@@ -129,19 +132,24 @@ To remove an entry, select it and click **Delete**.
 You can store scanned documents (PDFs, images) **inside** the vault, encrypted
 along with everything else.
 
-1. In **Edit mode**, open a **Trust and Will** or **Assets and Liabilities**
-   entry.
-2. Use the **Upload / Attach document** option and pick the file from your
-   computer.
+1. In **Edit mode**, open a **Trust and Will**, **Assets and Liabilities**, or
+   **General Documents** entry (these hold one document each).
+2. Optionally type a **Subfolder** to organize the file, set the **Filename** to
+   save it as, then pick the file to **Upload / Attach** from your computer.
 3. Save. The document is now encrypted inside your vault.
 
 To get a document back out later, open the entry and use **Export** to save a copy
 to your computer.
 
-On the **Taxes** tab it works the same way, but each filing year can hold
-**several** documents: open (or create) the year, then upload as many files as you
-like — they are all stored together in that year's folder inside the vault. Use
-**Export** or **Remove** on any individual document.
+On the **Taxes** and **Real Estate** tabs it works the same way, but each entry can
+hold **several** documents: open (or create) the entry, then upload as many files as
+you like. Use **Export** or **Remove** on any individual document (by its number).
+
+**How files are organized inside the vault.** Every uploaded document is filed under
+`<tab>/<entry>/<timestamp>/[your subfolder]/<your filename>` — e.g. a 2024 tax W-2
+lands in `taxes/2024/<when-you-uploaded-it>/[subfolder]/W-2.pdf`. The tab and entry
+(filing year, property address, document title, …) are filled in for you; you choose
+only the optional subfolder and the filename.
 
 ## Showing or copying a password
 
