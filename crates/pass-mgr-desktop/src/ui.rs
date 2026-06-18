@@ -2501,6 +2501,170 @@ mod tests {
     }
 
     #[test]
+    fn parse_doc_index_validates_one_based_range() {
+        // 1-based user input → 0-based index, accepted only within 1..=len.
+        assert_eq!(parse_doc_index("1", 3), Some(0));
+        assert_eq!(parse_doc_index("3", 3), Some(2));
+        assert_eq!(parse_doc_index(" 2 ", 3), Some(1)); // surrounding whitespace trimmed
+        assert_eq!(parse_doc_index("0", 3), None); // below range (no zero-based input)
+        assert_eq!(parse_doc_index("4", 3), None); // above range
+        assert_eq!(parse_doc_index("1", 0), None); // empty list: nothing is valid
+        assert_eq!(parse_doc_index("x", 3), None); // not a number
+        assert_eq!(parse_doc_index("", 3), None);
+    }
+
+    #[test]
+    fn tab_titles_are_correct_and_unique() {
+        // Pins each tab's on-screen title (kills the "" / "xyzzy" title mutants).
+        let titles: Vec<&str> = Tab::ALL.iter().map(|t| t.title()).collect();
+        assert_eq!(
+            titles,
+            vec!["Instructions", "Trust and Will", "Assets & Liabilities", "Accounts", "Real Estate", "Taxes"]
+        );
+        for t in Tab::ALL {
+            assert!(!t.title().is_empty());
+        }
+        let mut uniq = titles.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), titles.len(), "every tab title is distinct");
+    }
+
+    /// Render the current screen to a flat string of cell symbols, so tests can
+    /// assert on what is actually drawn (a draw fn replaced by a no-op then fails).
+    fn render_to_string(app: &App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(160, 200)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn real_estate_edit_screen_renders_its_fields() {
+        let (mut app, path) = app_unlocked("uirerender");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.real_estate, RealEstate::new().unwrap());
+        }
+        app.tab = Tab::RealEstate;
+        app.selected = 0;
+        app.start_edit(true);
+        let screen = render_to_string(&app);
+        // Real-Estate-specific labels must be drawn (kills the tab_realestate /
+        // draw_edit / portal-rendering no-op mutants).
+        assert!(screen.contains("Financing balance"), "RE edit form renders its fields");
+        assert!(screen.contains("Property Mgmt"), "RE edit form renders the portal sections");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn taxes_edit_screen_renders_its_fields() {
+        let (mut app, path) = app_unlocked("uitaxrender");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.tax_filings, TaxFiling::new().unwrap());
+        }
+        app.tab = Tab::Taxes;
+        app.selected = 0;
+        app.start_edit(true);
+        let screen = render_to_string(&app);
+        assert!(screen.contains("Filing year"), "Taxes edit form renders its fields");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tax_document_attach_export_remove_round_trip() {
+        let (mut app, path) = app_unlocked("uitaxdoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.tax_filings, TaxFiling::new().unwrap());
+        }
+        app.tab = Tab::Taxes;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+        app.edit.as_mut().unwrap().fields[0].value = "2024".into(); // filing year
+
+        // --- attach ---
+        let src = dir.join("w2.txt");
+        std::fs::write(&src, b"taxable income").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc].value = "w2.txt".into(); // doc filename
+            es.fields[rc + 1].value = src.to_string_lossy().into(); // upload from
+        }
+        app.attach_tax_document();
+        assert_eq!(app.edit.as_ref().unwrap().tax_docs.len(), 1, "attached one document");
+        assert_eq!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.len(), 1, "and persisted it");
+
+        // --- export: an out-of-range number exports nothing ---
+        let dest = dir.join("out.txt");
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc + 2].value = dest.to_string_lossy().into(); // export to
+            es.fields[rc + 3].value = "2".into(); // doc # (only 1 exists)
+        }
+        app.export_tax_document();
+        assert!(!dest.exists(), "out-of-range doc # exports nothing");
+        assert!(app.status.contains("between 1 and 1"));
+
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.export_tax_document();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"taxable income", "exported bytes round-trip");
+
+        // --- remove ---
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.remove_tax_document();
+        assert!(app.edit.as_ref().unwrap().tax_docs.is_empty(), "removed the document");
+        assert!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.is_empty(), "and unlinked it");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn real_estate_document_attach_export_remove_round_trip() {
+        let (mut app, path) = app_unlocked("uiredoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut re = RealEstate::new().unwrap();
+            re.address = "1 Main".into();
+            records::upsert(&mut v.real_estate, re);
+        }
+        app.tab = Tab::RealEstate;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+
+        let src = dir.join("deed.txt");
+        std::fs::write(&src, b"the deed").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc].value = "deed.txt".into();
+            es.fields[rc + 1].value = src.to_string_lossy().into();
+        }
+        app.attach_re_document();
+        assert_eq!(app.edit.as_ref().unwrap().re_docs.len(), 1, "attached one document");
+        assert_eq!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.len(), 1, "and persisted it");
+
+        let dest = dir.join("deed-out.txt");
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc + 2].value = dest.to_string_lossy().into();
+            es.fields[rc + 3].value = "1".into();
+        }
+        app.export_re_document();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the deed", "exported bytes round-trip");
+
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
+        app.remove_re_document();
+        assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "removed the document");
+        assert!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.is_empty(), "and unlinked it");
+        cleanup(&path);
+    }
+
+    #[test]
     fn formats_timestamps() {
         assert_eq!(format_time(0), "never");
         assert_eq!(format_time(-5), "never");
