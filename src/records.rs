@@ -69,6 +69,15 @@ pub fn random_id() -> Result<String, CryptoError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The virtual folder a property's documents live in: `real-estate/<sanitized>`,
+/// derived from the address (alphanumeric only, lowercased, truncated), with a
+/// `real-estate/property` fallback for a blank address. Shared by both UIs.
+pub fn real_estate_doc_location(address: &str) -> String {
+    let a: String =
+        address.chars().filter(|c| c.is_ascii_alphanumeric()).take(40).collect::<String>().to_lowercase();
+    if a.is_empty() { "real-estate/property".to_string() } else { format!("real-estate/{a}") }
+}
+
 /// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
 /// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
 /// to the epoch. Shared by the human and filename timestamp formatters so the
@@ -427,6 +436,37 @@ pub struct RealEstate {
     pub income_account: String,
     pub financing_account: String,
     pub payment_account: String,
+    /// Outstanding financing/mortgage balance (free text).
+    #[serde(default)]
+    pub financing_balance: String,
+    /// Property-management portal login.
+    #[serde(default)]
+    pub property_mgmt_url: String,
+    #[serde(default)]
+    pub property_mgmt_username: String,
+    #[serde(default)]
+    pub property_mgmt_password: String,
+    /// Insurance portal login.
+    #[serde(default)]
+    pub insurance_url: String,
+    #[serde(default)]
+    pub insurance_username: String,
+    #[serde(default)]
+    pub insurance_password: String,
+    /// HOA portal login.
+    #[serde(default)]
+    pub hoa_url: String,
+    #[serde(default)]
+    pub hoa_username: String,
+    #[serde(default)]
+    pub hoa_password: String,
+    /// Free-form comments.
+    #[serde(default)]
+    pub comments: String,
+    /// Volume file ids of documents attached to this property (deed, policy,
+    /// statements), all stored under `real-estate/<address>/`.
+    #[serde(default)]
+    pub documents: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub history: Vec<Change>,
@@ -617,7 +657,25 @@ impl_record!(
         track(out, at, "hoa", &s.hoa, &n.hoa);
         track(out, at, "income_account", &s.income_account, &n.income_account);
         track(out, at, "financing_account", &s.financing_account, &n.financing_account);
+        track(out, at, "financing_balance", &s.financing_balance, &n.financing_balance);
         track(out, at, "payment_account", &s.payment_account, &n.payment_account);
+        track(out, at, "property_mgmt_url", &s.property_mgmt_url, &n.property_mgmt_url);
+        track(out, at, "property_mgmt_username", &s.property_mgmt_username, &n.property_mgmt_username);
+        track(out, at, "property_mgmt_password", &s.property_mgmt_password, &n.property_mgmt_password);
+        track(out, at, "insurance_url", &s.insurance_url, &n.insurance_url);
+        track(out, at, "insurance_username", &s.insurance_username, &n.insurance_username);
+        track(out, at, "insurance_password", &s.insurance_password, &n.insurance_password);
+        track(out, at, "hoa_url", &s.hoa_url, &n.hoa_url);
+        track(out, at, "hoa_username", &s.hoa_username, &n.hoa_username);
+        track(out, at, "hoa_password", &s.hoa_password, &n.hoa_password);
+        track(out, at, "comments", &s.comments, &n.comments);
+        if s.documents != n.documents {
+            out.push(Change {
+                at,
+                action: "updated".into(),
+                detail: format!("documents: {} -> {}", s.documents.len(), n.documents.len()),
+            });
+        }
     },
     |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() }
 );
@@ -816,6 +874,29 @@ mod tests {
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn real_estate_diff_tracks_portals_docs_and_folder() {
+        let old = RealEstate::new().unwrap();
+        let mut new = old.clone();
+        new.financing_balance = "250000".into();
+        new.property_mgmt_url = "https://pm.example".into();
+        new.insurance_password = "s3cret".into();
+        new.hoa_username = "owner1".into();
+        new.comments = "tenant occupied".into();
+        new.documents.push("blob".into());
+        let c = old.diff(&new, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("financing_balance")));
+        assert!(c.iter().any(|x| x.detail.contains("property_mgmt_url")));
+        assert!(c.iter().any(|x| x.detail.contains("insurance_password") && x.detail.contains("s3cret")));
+        assert!(c.iter().any(|x| x.detail.contains("hoa_username")));
+        assert!(c.iter().any(|x| x.detail.contains("comments")));
+        assert!(c.iter().any(|x| x.detail.contains("documents") && x.detail.contains("0 -> 1")));
+
+        // Folder convention: real-estate/<sanitized-address>, with a fallback.
+        assert_eq!(real_estate_doc_location("123 Main St"), "real-estate/123mainst");
+        assert_eq!(real_estate_doc_location(""), "real-estate/property");
     }
 
     #[test]

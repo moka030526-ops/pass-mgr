@@ -327,6 +327,16 @@ enum DocReq {
     Remove,
 }
 
+/// Deferred Real-Estate document action. `Export`/`Remove` carry the index into
+/// the property's `documents` list.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ReDocReq {
+    None,
+    Upload,
+    Export(usize),
+    Remove(usize),
+}
+
 // `struct` is a record of named fields — the whole application state lives here.
 // Field types tell you the shape of each piece: `String` (owned text),
 // `bool` (flag), `Option<T>` (maybe present). egui calls our `ui()` method each
@@ -1524,25 +1534,84 @@ impl GuiApp {
     fn tab_realestate(&mut self, ui: &mut egui::Ui) {
         let labels = label_list(&self.vault_ref().vault.real_estate);
         let cur = self.edit_realestate.as_ref().map(|r| r.id.clone());
+        // Pre-compute attached document labels (needs an immutable vault borrow).
+        let doc_labels: Vec<String> = match self.edit_realestate.as_ref() {
+            Some(r) => r
+                .documents
+                .iter()
+                .map(|id| self.vault_ref().doc_path(id).unwrap_or_else(|| id.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let reveal = self.reveal_pw;
+        let writable = self.writable;
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
+        let mut copy_pw: Option<Zeroizing<String>> = None;
+        let mut docreq = ReDocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), self.writable);
+            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_realestate.as_mut() {
-                egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Address", &mut r.address);
-                    text_row(ui, "Ownership", &mut r.ownership);
-                    text_row(ui, "Taxes", &mut r.taxes);
-                    text_row(ui, "HOA", &mut r.hoa);
-                    text_row(ui, "Income account", &mut r.income_account);
-                    text_row(ui, "Financing account", &mut r.financing_account);
-                    text_row(ui, "Payment account", &mut r.payment_account);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        text_row(ui, "Address", &mut r.address);
+                        text_row(ui, "Ownership", &mut r.ownership);
+                        text_row(ui, "Taxes", &mut r.taxes);
+                        text_row(ui, "HOA dues / info", &mut r.hoa);
+                        text_row(ui, "Income account", &mut r.income_account);
+                        text_row(ui, "Financing account", &mut r.financing_account);
+                        text_row(ui, "Financing balance", &mut r.financing_balance);
+                        text_row(ui, "Payment account", &mut r.payment_account);
+                    });
+
+                    portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, &mut copy_pw);
+                    portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, &mut copy_pw);
+                    portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, &mut copy_pw);
+                    ui.checkbox(&mut self.reveal_pw, "Reveal portal passwords");
+
+                    ui.separator();
+                    ui.label("Comments");
+                    ui.add(egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY));
+
+                    ui.separator();
+                    ui.label(format!("Documents ({}) — saved to {}/", r.documents.len(), records::real_estate_doc_location(&r.address)));
+                    for (i, label) in doc_labels.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("• {label}"));
+                            if ui.button("Export").clicked() {
+                                docreq = ReDocReq::Export(i);
+                            }
+                            if writable && ui.button("Remove").clicked() {
+                                docreq = ReDocReq::Remove(i);
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Export to");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.doc_dest)
+                                .desired_width(320.0)
+                                .hint_text("folder or file path to save into"),
+                        );
+                    });
+                    if writable {
+                        ui.separator();
+                        ui.label("Upload a document for this property:");
+                        egui::Grid::new("re_upload").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                            text_row(ui, "Filename", &mut self.doc_filename);
+                            text_row(ui, "Upload from", &mut self.doc_source);
+                        });
+                        if ui.button("⬆ Upload").clicked() {
+                            docreq = ReDocReq::Upload;
+                        }
+                    }
+
+                    action = form_buttons(ui, writable);
+                    history_view(ui, &r.history);
                 });
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
             } else {
                 ui.label("Select a property or click “New”.");
             }
@@ -1550,10 +1619,18 @@ impl GuiApp {
 
         if new {
             self.edit_realestate = RealEstate::new().ok();
+            self.clear_doc_inputs();
+            self.reveal_pw = false;
         }
         if let Some(i) = select {
             self.edit_realestate = self.vault_ref().vault.real_estate.get(i).cloned();
+            self.clear_doc_inputs();
+            self.reveal_pw = false;
         }
+        if let Some(pw) = copy_pw {
+            self.copy_to_clipboard(pw);
+        }
+        self.handle_re_doc(docreq);
         match action {
             FormAction::Save => {
                 if let Some(r) = self.edit_realestate.clone()
@@ -1568,6 +1645,93 @@ impl GuiApp {
             }
             FormAction::Delete => self.delete_current(Tab::RealEstate),
             _ => {}
+        }
+    }
+
+    // Performs a Real-Estate document action (upload to real-estate/<address>/,
+    // export, or remove), mirroring handle_doc's persist-then-reclaim ordering.
+    fn handle_re_doc(&mut self, req: ReDocReq) {
+        match req {
+            ReDocReq::None => {}
+            ReDocReq::Upload => {
+                let name = self.doc_filename.trim().to_string();
+                let src = self.doc_source.trim().to_string();
+                if name.is_empty() || src.is_empty() {
+                    self.status = "Filename and 'upload from' path are required.".into();
+                    return;
+                }
+                let address = self.edit_realestate.as_ref().map(|r| r.address.clone()).unwrap_or_default();
+                let loc = records::real_estate_doc_location(&address);
+                let vpath = vault::virtual_path(&loc, &name);
+                if vpath.len() > crate::storage::MAX_PATH_LEN {
+                    self.status = format!(
+                        "Path too long: {} bytes (max {}). Shorten the filename.",
+                        vpath.len(),
+                        crate::storage::MAX_PATH_LEN
+                    );
+                    return;
+                }
+                let id = match self.vault.as_mut() {
+                    Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status = format!("Upload failed: {e}");
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                if let Some(r) = self.edit_realestate.as_mut() {
+                    r.documents.push(id);
+                }
+                if let Some(r) = self.edit_realestate.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.real_estate, r);
+                }
+                self.clear_doc_inputs();
+                if self.persist() {
+                    self.status = "Document uploaded to the encrypted volume.".into();
+                }
+            }
+            ReDocReq::Export(i) => {
+                let dest = self.doc_dest.trim().to_string();
+                if dest.is_empty() {
+                    self.status = "Enter an 'export to' path first.".into();
+                    return;
+                }
+                let id = self.edit_realestate.as_ref().and_then(|r| r.documents.get(i).cloned());
+                if let (Some(id), Some(ov)) = (id, self.vault.as_ref()) {
+                    match ov.export_document(&id, Path::new(&dest)) {
+                        Ok(()) => self.status = format!("Exported to {dest}"),
+                        Err(e) => self.status = format!("Export failed: {e}"),
+                    }
+                }
+            }
+            ReDocReq::Remove(i) => {
+                let id = self.edit_realestate.as_ref().and_then(|r| r.documents.get(i).cloned());
+                if let Some(r) = self.edit_realestate.as_mut()
+                    && i < r.documents.len()
+                {
+                    r.documents.remove(i);
+                }
+                if let Some(r) = self.edit_realestate.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.real_estate, r);
+                }
+                if !self.persist() {
+                    return;
+                }
+                if let Some(id) = id
+                    && let Some(ov) = self.vault.as_mut()
+                    && let Err(e) = ov.remove_document(&id)
+                {
+                    self.status = format!("Unlinked, but blob cleanup failed: {e}");
+                    return;
+                }
+                self.status = "Removed document from the vault.".into();
+            }
         }
     }
 
@@ -1772,6 +1936,10 @@ impl GuiApp {
                 }
                 Tab::RealEstate => {
                     if let Some(r) = self.edit_realestate.take() {
+                        // Reclaim every document attached to this property.
+                        for f in &r.documents {
+                            doc_ids.push(f.clone());
+                        }
                         records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate");
                     }
                 }
@@ -1935,6 +2103,34 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
     ui.end_row();
+}
+
+/// Render one portal-login section (URL / username / masked password + copy) into
+/// the Real Estate form. The password is masked unless `reveal`; `copy_pw` is set
+/// when the copy button is clicked, to be acted on after rendering.
+fn portal_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    url: &mut String,
+    username: &mut String,
+    password: &mut String,
+    reveal: bool,
+    copy_pw: &mut Option<Zeroizing<String>>,
+) {
+    ui.separator();
+    ui.label(egui::RichText::new(title).strong());
+    egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        text_row(ui, "URL", url);
+        text_row(ui, "Username", username);
+        ui.label("Password");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(password).password(!reveal).desired_width(260.0));
+            if ui.button("📋").on_hover_text("Copy").clicked() {
+                *copy_pw = Some(Zeroizing::new(password.clone()));
+            }
+        });
+        ui.end_row();
+    });
 }
 
 /// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.

@@ -1191,7 +1191,8 @@ fn compaction_detail(opts: &CompactOptions, bytes_reclaimed: u64, history_remove
     format!("{mode}: reclaimed {bytes_reclaimed} bytes, removed {history_removed} history entries")
 }
 
-/// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`).
+/// Doc ids referenced by any record (Trust&Will `file`, Asset `statement`, and
+/// every Real Estate property's `documents`).
 fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
     let mut ids = Vec::new();
     // `for t in &vault.trust_wills` iterates by shared reference (doesn't consume
@@ -1205,6 +1206,13 @@ fn referenced_doc_ids(vault: &Vault) -> Vec<String> {
     }
     for a in &vault.assets {
         if let Some(f) = &a.statement {
+            ids.push(f.clone());
+        }
+    }
+    // Real Estate documents (deeds, policies, statements) are referenced too, so
+    // compaction (`--volume`) never reclaims them.
+    for re in &vault.real_estate {
+        for f in &re.documents {
             ids.push(f.clone());
         }
     }
@@ -3209,6 +3217,35 @@ mod tests {
         let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         assert_eq!(&*re.read_document(&keep).unwrap(), &vec![9u8; 400][..]);
         assert!(!parent_dir(&path).join(REKEY_DIR).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_volume_keeps_real_estate_documents() {
+        // Regression guard: a property's documents must be treated as live by
+        // referenced_doc_ids, so `compact --volume` never reclaims them.
+        let path = tmp_path("cvolre");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("cvolre", &vec![5u8; 320]);
+        let keep = v.add_document("real-estate/123mainst", "deed.pdf", &src).unwrap();
+        let mut re = records::RealEstate::new().unwrap();
+        re.address = "123 Main St".into();
+        re.documents.push(keep.clone());
+        records::upsert(&mut v.vault.real_estate, re);
+        for i in 0..3 {
+            let id = v.add_document("/g", &format!("g{i}.bin"), &src).unwrap();
+            v.remove_document(&id).unwrap();
+        }
+        v.save().unwrap();
+        fs::remove_file(&src).ok();
+        drop(v); // release the single-writer lock before reopening
+
+        let mut v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        v.compact(&volume_opts()).unwrap();
+        assert_eq!(&*v.read_document(&keep).unwrap(), &vec![5u8; 320][..], "RE doc survives compaction");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&*re.read_document(&keep).unwrap(), &vec![5u8; 320][..]);
         cleanup(&path);
     }
 

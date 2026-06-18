@@ -105,7 +105,10 @@ Across the top are five tabs. Click a tab to switch:
    property, vehicles, loans), with values, owners, and beneficiaries.
 4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with
    usernames and passwords.
-5. **Real Estate** — properties: address, ownership, taxes, mortgage/financing.
+5. **Real Estate** — properties: address, ownership, taxes, financing (account +
+   balance), and per-property **portal logins** (property management, insurance,
+   HOA — each with URL, username, password). Each property can also hold uploaded
+   **documents** (deed, insurance policy, statements).
 
 ## Adding or changing an entry (step by step)
 
