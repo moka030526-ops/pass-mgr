@@ -1481,6 +1481,22 @@ impl GuiApp {
         }
     }
 
+    /// One-off maintenance: left/right-trim every field on every account, persist,
+    /// and report the count. Each change is recorded in that account's history.
+    /// Returns the number of accounts changed.
+    fn trim_all_accounts(&mut self) -> usize {
+        let n = match self.vault.as_mut() {
+            Some(ov) => records::trim_all_accounts(&mut ov.vault.accounts),
+            None => return 0,
+        };
+        if n == 0 {
+            self.status = "Nothing to trim — all account fields are already clean.".into();
+        } else if self.persist() {
+            self.status = format!("Trimmed {n} account(s).");
+        }
+        n
+    }
+
     fn tab_accounts(&mut self, ui: &mut egui::Ui) {
         // Configured account types for the EDIT form's type dropdown (offers every
         // configured type, not just the ones currently in use).
@@ -1521,6 +1537,9 @@ impl GuiApp {
             }
         };
 
+        // Set inside the filter row's closure when the one-off trim button is clicked;
+        // handled just after so the bulk vault mutation isn't tangled in the UI borrow.
+        let mut trim_all = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter — type:");
             filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &facets.types);
@@ -1547,7 +1566,22 @@ impl GuiApp {
                 self.acct_filter_review = false;
                 self.acct_search_user.clear();
             }
+            // One-off maintenance: left/right-trim every field on every account.
+            if self.writable
+                && ui
+                    .button("Trim all fields")
+                    .on_hover_text("One-off: left/right-trim every field on every account (recorded in history)")
+                    .clicked()
+            {
+                trim_all = true;
+            }
         });
+
+        // Perform the one-off bulk trim (after the filter row, before the list is
+        // built, so the cleaned values show this frame).
+        if trim_all {
+            self.trim_all_accounts();
+        }
 
         // Filtered list (after the filter row, so a change applies this frame).
         let labels = self.filtered_account_labels();
@@ -1674,6 +1708,11 @@ impl GuiApp {
         }
         match action {
             FormAction::Save => {
+                // Left/right-trim every field before persisting. Trim the live edit
+                // form too, so the displayed values match what was saved.
+                if let Some(r) = self.edit_account.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_account.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -2775,6 +2814,32 @@ mod tests {
         assert_eq!(app.acct_filter_type, "Bank", "active type filter follows the saved value");
         assert_eq!(app.acct_filter_title, "Savings", "active title filter follows the saved value");
         assert_eq!(app.acct_filter_owner, "", "an inactive filter stays unset");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn trim_all_accounts_bulk_trims_and_reports_in_gui() {
+        let (mut app, path) = app_unlocked("guitrimall");
+        {
+            let ov = app.vault.as_mut().unwrap();
+            let mut a = Account::new().unwrap();
+            a.owner = "  Alice  ".into();
+            a.title = " Brokerage ".into();
+            a.password = "  s3cret  ".into();
+            records::upsert(&mut ov.vault.accounts, a);
+            let b = Account::new().unwrap(); // already clean (all empty)
+            records::upsert(&mut ov.vault.accounts, b);
+        }
+        let n = app.trim_all_accounts();
+        assert_eq!(n, 1, "only the dirty account is counted");
+        let a = &app.vault.as_ref().unwrap().vault.accounts[0];
+        assert_eq!(a.owner, "Alice");
+        assert_eq!(a.title, "Brokerage");
+        assert_eq!(a.password, "s3cret", "the password is trimmed too (configured policy)");
+        assert!(app.status.contains("Trimmed 1"), "status: {}", app.status);
+        // Idempotent.
+        assert_eq!(app.trim_all_accounts(), 0);
+        assert!(app.status.contains("Nothing to trim"), "status: {}", app.status);
         cleanup(&path);
     }
 

@@ -498,7 +498,12 @@ record (TUI `start_edit` for a new record; GUI `new_account_from_filters`), and 
 entry rather than hiding it. A global **reveal** toggle on the Accounts screen
 (GUI `reveal_all` checkbox; TUI `r`) shows all account passwords, overriding the
 per-record reveal. These only seed/adjust the in-memory view; nothing is persisted
-except on an explicit save. A password copied to the clipboard is auto-cleared after
+except on an explicit save. **Every Account field is left/right-trimmed on save**
+(`Account::trim_fields`, called from the GUI/TUI account-commit paths) — including
+the password (chosen policy). A one-off **Trim all fields** maintenance action
+(GUI button on the Accounts filter row; TUI `T`) runs `records::trim_all_accounts`
+over the whole vault, routing each changed record through `upsert` so the trim is
+recorded in that account's history (old → new) and reports how many changed. A password copied to the clipboard is auto-cleared after
 15 s (a deadline the event loop polls for — the GUI schedules a repaint so it fires
 even when idle) and again on exit. The write `generation` is shown on unlock so a
 rollback is noticeable. Both UIs validate a document's virtual path against

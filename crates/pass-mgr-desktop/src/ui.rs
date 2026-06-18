@@ -571,6 +571,20 @@ impl App {
         }
     }
 
+    /// One-off maintenance: left/right-trim every field on every account, persist,
+    /// and report how many changed. Each change is recorded in the account history.
+    fn trim_all_accounts(&mut self) {
+        let n = match self.vault.as_mut() {
+            Some(ov) => records::trim_all_accounts(&mut ov.vault.accounts),
+            None => return,
+        };
+        if n == 0 {
+            self.status = "Nothing to trim — all account fields are already clean.".into();
+        } else if self.persist() {
+            self.status = format!("Trimmed {n} account(s).");
+        }
+    }
+
     /// Gate a mutating action: returns true if writable, else sets a status hint.
     // `&mut self` because it may set `self.status`. An early `return true` exits
     // immediately; otherwise the function falls through to the final `false`.
@@ -876,6 +890,13 @@ impl App {
             // Global reveal toggle (Accounts tab): overrides the per-record Ctrl+R.
             KeyCode::Char('r') if self.tab == Tab::Accounts => {
                 self.reveal_all = !self.reveal_all;
+            }
+            // One-off maintenance (Accounts tab): left/right-trim every field on
+            // every account. Capital T (Shift+t) so it can't be hit by accident.
+            KeyCode::Char('T') if self.tab == Tab::Accounts => {
+                if self.require_writable() {
+                    self.trim_all_accounts();
+                }
             }
             // Enter username-search input mode (Accounts tab).
             KeyCode::Char('/') if self.tab == Tab::Accounts => {
@@ -1948,6 +1969,7 @@ impl App {
                 r.closed_as_of = f(7);
                 r.description = f(8);
                 r.review = f(9) == "Yes";
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.accounts, r);
             }
             Tab::RealEstate => {
@@ -2330,7 +2352,7 @@ impl App {
         } else {
             match self.tab {
                 Tab::Accounts => {
-                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · / search · ←→ tab · c config · p pw · q quit"
+                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · T trim-all · / search · ←→ tab · c config · p pw · q quit"
                 }
                 Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
                 _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
@@ -3182,6 +3204,61 @@ mod tests {
         assert_eq!(v.accounts[0].username, "jane");
         assert_eq!(v.accounts[0].password, "pw");
         assert_eq!(v.accounts[0].closed_as_of, "2026-06-18");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn saving_an_account_trims_every_field_in_tui() {
+        let (mut app, path) = app_unlocked("trimsave");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('n'))); // new
+        // owner (focus 3) with surrounding spaces
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        for c in "  Jane  ".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(key(KeyCode::Down)); // username
+        for c in " jane ".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(key(KeyCode::Down)); // password
+        for c in "  pw  ".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(ctrl('s'));
+        let a = &app.vault.as_ref().unwrap().vault.accounts[0];
+        assert_eq!(a.owner, "Jane");
+        assert_eq!(a.username, "jane");
+        assert_eq!(a.password, "pw", "the password is trimmed too (configured policy)");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn trim_all_key_bulk_trims_existing_accounts_in_tui() {
+        let (mut app, path) = app_unlocked("trimallkey");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.owner = "  Alice  ".into();
+            a.title = " Brokerage ".into();
+            a.password = "  s3cret  ".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('T'))); // one-off trim-all
+        let a = &app.vault.as_ref().unwrap().vault.accounts[0];
+        assert_eq!(a.owner, "Alice");
+        assert_eq!(a.title, "Brokerage");
+        assert_eq!(a.password, "s3cret");
+        assert!(app.status.contains("Trimmed 1"), "status reports the count: {}", app.status);
+        // Idempotent: a second pass finds nothing to trim.
+        app.handle_key(key(KeyCode::Char('T')));
+        assert!(app.status.contains("Nothing to trim"), "second pass is a no-op: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn trim_all_key_is_blocked_in_read_only_tui() {
+        let (mut app, path) = app_read_only("trimro");
+        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Char('T')));
+        assert!(app.status.contains("Read-only"), "read-only blocks the bulk trim: {}", app.status);
         cleanup(&path);
     }
 

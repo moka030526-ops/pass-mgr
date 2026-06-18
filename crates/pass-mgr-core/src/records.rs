@@ -731,6 +731,61 @@ impl Account {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(Account))
     }
+
+    /// Left/right-trim every text field in place (including the password, per the
+    /// configured policy). Returns `true` if any field actually changed. Used both
+    /// on save and by the one-off bulk cleanup ([`trim_all_accounts`]).
+    pub fn trim_fields(&mut self) -> bool {
+        let mut changed = false;
+        // `&mut self.<field>` collected into an array of mutable references so the
+        // same trim runs over every text field. `review`/`id`/timestamps/history
+        // are deliberately excluded (a bool and bookkeeping, not user free text).
+        for f in [
+            &mut self.title,
+            &mut self.account_type,
+            &mut self.account_subtype,
+            &mut self.owner,
+            &mut self.username,
+            &mut self.password,
+            &mut self.url,
+            &mut self.closed_as_of,
+            &mut self.description,
+        ] {
+            // `f.trim().to_string()` copies the trimmed slice into a fresh String,
+            // ending the borrow of `*f` before the assignment below.
+            let trimmed = f.trim().to_string();
+            if trimmed != *f {
+                // Wipe the old buffer before it is freed: a plain `*f = ...` would
+                // deallocate the previous String WITHOUT zeroizing, stranding the
+                // untrimmed value (notably the password) in freed heap. Matches the
+                // password-buffer hygiene the GUI uses on regenerate.
+                f.zeroize();
+                *f = trimmed;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// One-off maintenance: left/right-trim every field on every account, routing each
+/// changed record through [`upsert`] so the trim is recorded in that account's
+/// history (old -> new) and bumps `updated_at`. Returns how many accounts changed.
+pub fn trim_all_accounts(accounts: &mut Vec<Account>) -> usize {
+    // Trim clones first (so we don't mutate while iterating), collect the ones that
+    // actually changed, then upsert them back by id.
+    let mut changed: Vec<Account> = Vec::new();
+    for a in accounts.iter() {
+        let mut t = a.clone();
+        if t.trim_fields() {
+            changed.push(t);
+        }
+    }
+    let n = changed.len();
+    for t in changed {
+        upsert(accounts, t);
+    }
+    n
 }
 impl RealEstate {
     pub fn new() -> Result<Self, CryptoError> {
@@ -1157,6 +1212,59 @@ mod tests {
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn account_trim_fields_trims_every_text_field_including_password() {
+        let mut a = Account::new().unwrap();
+        a.title = "  Brokerage  ".into();
+        a.account_type = " Financial ".into();
+        a.account_subtype = "\tIRA\t".into();
+        a.owner = " Jane ".into();
+        a.username = "  jane@x.com ".into();
+        a.password = "  s3cret  ".into(); // password IS trimmed (configured policy)
+        a.url = " https://x ".into();
+        a.closed_as_of = " 2026-06-18 ".into();
+        a.description = "\n notes \n".into();
+        assert!(a.trim_fields(), "fields with surrounding whitespace report a change");
+        assert_eq!(a.title, "Brokerage");
+        assert_eq!(a.account_type, "Financial");
+        assert_eq!(a.account_subtype, "IRA");
+        assert_eq!(a.owner, "Jane");
+        assert_eq!(a.username, "jane@x.com");
+        assert_eq!(a.password, "s3cret");
+        assert_eq!(a.url, "https://x");
+        assert_eq!(a.closed_as_of, "2026-06-18");
+        assert_eq!(a.description, "notes");
+        // Interior whitespace is preserved; only the ends are trimmed.
+        let mut b = Account::new().unwrap();
+        b.username = "a b".into();
+        b.password = "p w".into();
+        assert!(!b.trim_fields(), "already-trimmed fields report no change");
+        assert_eq!(b.username, "a b");
+        assert_eq!(b.password, "p w");
+    }
+
+    #[test]
+    fn trim_all_accounts_trims_in_bulk_and_records_history() {
+        let mut accts = Vec::new();
+        let mut a = Account::new().unwrap();
+        a.owner = "  Alice  ".into();
+        let mut b = Account::new().unwrap();
+        b.owner = "Bob".into(); // already clean
+        accts.push(a);
+        accts.push(b);
+        let n = trim_all_accounts(&mut accts);
+        assert_eq!(n, 1, "only the dirty account is counted");
+        assert_eq!(accts[0].owner, "Alice");
+        assert_eq!(accts[1].owner, "Bob");
+        // The change is auditable: the trimmed account's history records owner old->new.
+        assert!(
+            accts[0].history.iter().any(|c| c.detail.contains("owner") && c.detail.contains("Alice")),
+            "the bulk trim is recorded in history"
+        );
+        // Running it again is a no-op (nothing left to trim).
+        assert_eq!(trim_all_accounts(&mut accts), 0);
     }
 
     #[test]
