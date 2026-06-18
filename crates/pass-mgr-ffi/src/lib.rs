@@ -1120,4 +1120,48 @@ mod tests {
         assert!(matches!(e, VaultError::NotFound));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn previous_access_is_a_real_timestamp_not_a_constant() {
+        // Kills the `previous_access -> 1` mutant: after create+save+reopen the
+        // prior last-opened time is a real unix timestamp, never a small constant.
+        let dir = tmp();
+        make_vault(&dir, b"one", b"two");
+        let v = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec()).unwrap();
+        assert!(
+            v.previous_access() > 1_000_000_000,
+            "previous_access should be a real unix timestamp, got {}",
+            v.previous_access()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_notice_is_some_after_mirror_recovery() {
+        // Kills the `recovery_notice -> None` mutant: with in-place redundancy on and
+        // the primary vault.pmv corrupted, a read-only FFI open recovers from the
+        // intact same-generation mirror and reports a recovery notice.
+        let dir = tmp();
+        let path = dir.join("vault.pmv");
+        let params = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        {
+            let mut ov = OpenVault::create(path.clone(), b"one", b"two", params).unwrap();
+            ov.set_redundancy(1).unwrap();
+            let mut ins = records::Instruction::new().unwrap();
+            ins.title = "keep".into();
+            records::upsert(&mut ov.vault.instructions, ins);
+            ov.save().unwrap();
+        } // drop releases the writer lock; save wrote the mirror
+        // Flip the last byte (inside the Poly1305 tag) of the primary so its AEAD
+        // fails while the same-generation mirror stays intact.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let v = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .expect("FFI open recovers from the mirror");
+        assert!(v.recovery_notice().is_some(), "FFI open should report recovery from the mirror");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -30,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,13 +69,30 @@ private enum class Section(val title: String, val kind: RecordKind) {
 fun App(vaultDir: String) {
     MaterialTheme {
         var vault by remember { mutableStateOf<Vault?>(null) }
+        val clipboard = LocalClipboardManager.current
+        // App-scoped clipboard auto-clear. Copying a password bumps this token,
+        // which (re)arms a single 15s wipe at the app ROOT — so it SURVIVES
+        // navigating back to the list or locking the vault (the timer is no longer
+        // tied to the detail screen's lifecycle, which would cancel it on dispose).
+        var clipboardToken by remember { mutableStateOf(0) }
+        LaunchedEffect(clipboardToken) {
+            if (clipboardToken == 0) return@LaunchedEffect // don't wipe at startup
+            delay(15_000)
+            clipboard.setText(AnnotatedString(""))
+        }
+        val copyToClipboard: (String) -> Unit = { secret ->
+            clipboard.setText(AnnotatedString(secret))
+            clipboardToken++
+        }
+
         val current = vault
         if (current == null) {
             UnlockScreen(vaultDir) { vault = it }
         } else {
-            VaultScreen(current) {
+            VaultScreen(current, copyToClipboard) {
                 current.destroy()
                 vault = null
+                clipboard.setText(AnnotatedString("")) // wipe any copied secret on lock
             }
         }
     }
@@ -161,7 +179,7 @@ private fun friendlyError(e: Throwable): String = when (e) {
 }
 
 @Composable
-private fun VaultScreen(vault: Vault, onLock: () -> Unit) {
+private fun VaultScreen(vault: Vault, onCopy: (String) -> Unit, onLock: () -> Unit) {
     var section by remember { mutableStateOf(Section.Accounts) }
     var selectedId by remember { mutableStateOf<String?>(null) }
 
@@ -209,14 +227,14 @@ private fun VaultScreen(vault: Vault, onLock: () -> Unit) {
                     }
                 }
             } else {
-                DetailScreen(vault, section.kind, id)
+                DetailScreen(vault, section.kind, id, onCopy)
             }
         }
     }
 }
 
 @Composable
-private fun DetailScreen(vault: Vault, kind: RecordKind, id: String) {
+private fun DetailScreen(vault: Vault, kind: RecordKind, id: String, onCopy: (String) -> Unit) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
     ) {
@@ -258,7 +276,7 @@ private fun DetailScreen(vault: Vault, kind: RecordKind, id: String) {
                     Field("Subtype", r.accountSubtype)
                     Field("Owner", r.owner)
                     Field("Username", r.username)
-                    PasswordField(r.password)
+                    PasswordField(r.password, onCopy)
                     Field("URL", r.url)
                     Field("Description", r.description)
                 }
@@ -295,15 +313,14 @@ private fun Field(label: String, value: String) {
 }
 
 /**
- * Password row: hidden by default, with a reveal toggle and a copy button that
- * auto-clears the clipboard after 15s (re-implementing the desktop's wipe — the
- * OS gives no auto-clear contract).
+ * Password row: hidden by default, with a reveal toggle and a copy button. The
+ * actual clipboard write + the 15s auto-clear are owned by [App] (via `onCopy`),
+ * so the wipe survives navigating away or locking — see the App-scoped timer.
  */
 @Composable
-private fun PasswordField(password: String) {
+private fun PasswordField(password: String, onCopy: (String) -> Unit) {
     var revealed by remember { mutableStateOf(false) }
     var copied by remember { mutableStateOf(false) }
-    val clipboard = LocalClipboardManager.current
 
     Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
         Text("Password", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
@@ -315,28 +332,13 @@ private fun PasswordField(password: String) {
             )
             TextButton(onClick = { revealed = !revealed }) { Text(if (revealed) "Hide" else "Reveal") }
             TextButton(onClick = {
-                clipboard.setText(AnnotatedString(password))
+                onCopy(password) // copies + (re)arms the app-scoped 15s auto-clear
                 copied = true
             }) { Text("Copy") }
         }
         if (copied) {
-            Text("Copied — clipboard clears in 15s", style = MaterialTheme.typography.bodySmall)
+            Text("Copied — clipboard auto-clears in 15s (and on lock)", style = MaterialTheme.typography.bodySmall)
         }
     }
     HorizontalDivider()
-
-    if (copied) {
-        LaunchedClipboardClear {
-            clipboard.setText(AnnotatedString(""))
-            copied = false
-        }
-    }
-}
-
-@Composable
-private fun LaunchedClipboardClear(onClear: () -> Unit) {
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        delay(15_000)
-        onClear()
-    }
 }

@@ -1641,6 +1641,17 @@ impl GuiApp {
             self.clear_doc_inputs();
             self.reveal_pw = false;
         }
+        // Pre-size the portal password buffers so per-keystroke typing never grows
+        // (and so reallocates) them — a reallocation frees the old buffer WITHOUT
+        // zeroizing, stranding cleartext fragments of a portal password in freed
+        // heap. RealEstate is ZeroizeOnDrop, but that only wipes the final buffer,
+        // not abandoned reallocations. Same mitigation as the Accounts password
+        // field; `reserve` is a no-op once capacity is sufficient.
+        if let Some(r) = self.edit_realestate.as_mut() {
+            r.property_mgmt_password.reserve(128);
+            r.insurance_password.reserve(128);
+            r.hoa_password.reserve(128);
+        }
         if let Some(pw) = copy_pw {
             self.copy_to_clipboard(pw);
         }
