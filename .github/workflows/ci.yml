@@ -40,7 +40,7 @@ jobs:
         run: cargo test -p pass-mgr-core -p pass-mgr --features pass-mgr/fault-injection
 
   audit:
-    name: cargo-audit (dependency CVEs)
+    name: supply chain (cargo-audit + cargo-deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +48,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      # cargo-deny enforces deny.toml: advisories, the license allow-list, and the
+      # crates.io-only source policy, so a new dependency can't slip in an unvetted
+      # license or registry.
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
 
   windows-cross:
     name: windows cross-compile check
@@ -76,7 +81,10 @@ jobs:
       - name: Build + short-run the parser fuzzers
         run: |
           cargo +nightly fuzz build
-          for t in parse_header parse_frame parse_manifest scan_volume; do
+          # parse_*/scan_volume fuzz the untrusted-input parsers; doc_paths fuzzes the
+          # user-controlled document path helpers for the no-space/no-separator/
+          # no-traversal/length invariants.
+          for t in parse_header parse_frame parse_manifest scan_volume doc_paths; do
             cargo +nightly fuzz run "$t" -- -max_total_time=30 -print_final_stats=1
           done
 
