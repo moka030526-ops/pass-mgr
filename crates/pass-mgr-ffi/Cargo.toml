@@ -15,7 +15,12 @@ name = "pass_mgr_ffi"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-pass-mgr-core = { path = "../pass-mgr-core" }
+# default-features = false drops `mlock` (region) and `single-writer-lock` (flock):
+# phones grant no mlock budget and a single app process needs no cross-process lock.
+# (In a host workspace build these are re-enabled by the desktop crate via feature
+# unification; they are only truly off in the Android/iOS-only builds, where the
+# desktop crate isn't in the dependency graph.)
+pass-mgr-core = { path = "../pass-mgr-core", default-features = false }
 # Version is coupled to Gobley 0.3.7's gobley-uniffi-bindgen (UniFFI 0.29.x): the
 # bindgen must match the metadata baked into this cdylib, so keep them in lockstep.
 uniffi = "0.29.4"

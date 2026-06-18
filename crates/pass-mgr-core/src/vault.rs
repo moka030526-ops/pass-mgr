@@ -69,6 +69,7 @@ const VAULT_FILE: &str = "vault.pmv";
 const REKEY_DIR: &str = ".rekey";
 const REKEY_READY: &str = "READY";
 /// Single-writer advisory lock file inside the vault directory.
+#[cfg(feature = "single-writer-lock")]
 const LOCK_FILE: &str = "pass-mgr.lock";
 /// Upper bound on the opt-in in-place redundancy depth (§12.8): the number of prior
 /// `vault.pmv` generations retained. Each generation is a small encrypted copy, so a
@@ -240,6 +241,7 @@ pub struct OpenVault {
 /// writable [`OpenVault`]. The lock is taken on the open file handle, so the
 /// kernel releases it when the handle closes — no stale lock file to clean up.
 struct WriteLock {
+    #[cfg(feature = "single-writer-lock")]
     _file: fs::File,
 }
 
@@ -247,6 +249,7 @@ impl WriteLock {
     /// Acquire the single-writer lock for `dir`. Errors with
     /// [`VaultError::Locked`] if another writable session already holds it.
     // `Self` is shorthand for the type being impl'd (here `WriteLock`).
+    #[cfg(feature = "single-writer-lock")]
     fn acquire(dir: &Path) -> Result<Self, VaultError> {
         let path = dir.join(LOCK_FILE); // `.join()` appends a path component
         // The lock file carries no contents; never truncate it (avoids racing a
@@ -267,6 +270,16 @@ impl WriteLock {
             Err(fs::TryLockError::WouldBlock) => Err(VaultError::Locked), // someone else holds it
             Err(fs::TryLockError::Error(e)) => Err(VaultError::Io(e)),   // `e` binds the inner error
         }
+    }
+
+    /// No-op stand-in when the `single-writer-lock` feature is disabled (the mobile
+    /// build). A single app process serializes all vault access behind one mutex, so
+    /// there is no second writable process to exclude — this never returns `Locked`.
+    /// The crash-safe atomic-commit + rekey roll-forward design already tolerates a
+    /// crash without the lock, so dropping it only removes cross-process exclusion.
+    #[cfg(not(feature = "single-writer-lock"))]
+    fn acquire(_dir: &Path) -> Result<Self, VaultError> {
+        Ok(WriteLock {})
     }
 }
 
