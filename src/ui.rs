@@ -294,6 +294,9 @@ struct EditState {
     /// filing year. Empty/unused for the single-document tabs (TrustWill, Assets),
     /// which carry their one document in `attached_file_id`.
     tax_docs: Vec<String>,
+    /// Document file ids for the Real Estate tab, which manages several documents
+    /// per property. Empty for the single-document tabs.
+    re_docs: Vec<String>,
     reveal: bool,
     history: Vec<Change>,
 }
@@ -1147,10 +1150,21 @@ impl App {
                         Field::text("Address", r.address.clone()),
                         Field::text("Ownership", r.ownership.clone()),
                         Field::text("Taxes", r.taxes.clone()),
-                        Field::text("HOA", r.hoa.clone()),
+                        Field::text("HOA dues/info", r.hoa.clone()),
                         Field::text("Income account", r.income_account.clone()),
                         Field::text("Financing account", r.financing_account.clone()),
+                        Field::text("Financing balance", r.financing_balance.clone()),
                         Field::text("Payment account", r.payment_account.clone()),
+                        Field::text("Property Mgmt URL", r.property_mgmt_url.clone()),
+                        Field::text("Property Mgmt username", r.property_mgmt_username.clone()),
+                        Field::password("Property Mgmt password", r.property_mgmt_password.clone()),
+                        Field::text("Insurance URL", r.insurance_url.clone()),
+                        Field::text("Insurance username", r.insurance_username.clone()),
+                        Field::password("Insurance password", r.insurance_password.clone()),
+                        Field::text("HOA URL", r.hoa_url.clone()),
+                        Field::text("HOA username", r.hoa_username.clone()),
+                        Field::password("HOA password", r.hoa_password.clone()),
+                        Field::multiline("Comments", r.comments.clone()),
                     ],
                     None,
                     r.history.clone(),
@@ -1185,10 +1199,9 @@ impl App {
             fields.push(Field::text("Upload from", String::new()));
             fields.push(Field::text("Export to", String::new()));
         }
-        // The Taxes tab manages several documents per year. There is no manual
-        // "Doc location" (it is always taxes/<year>); a "Doc #" instead selects
-        // which listed document Ctrl+E / Ctrl+K act on. `tax_docs` is loaded from
-        // the record (and stays empty for every other tab).
+        // The Taxes tab manages several documents per year (folder taxes/<year>);
+        // a "Doc #" selects which listed document Ctrl+E / Ctrl+K act on. `tax_docs`
+        // is loaded from the record (and stays empty for every other tab).
         let tax_docs: Vec<String> = if tab == Tab::Taxes {
             fields.push(Field::text("Doc filename", String::new()));
             fields.push(Field::text("Upload from", String::new()));
@@ -1197,6 +1210,20 @@ impl App {
             sel_id
                 .as_ref()
                 .and_then(|id| v.tax_filings.iter().find(|r| &r.id == id).map(|r| r.documents.clone()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // The Real Estate tab likewise manages several documents per property
+        // (folder real-estate/<address>).
+        let re_docs: Vec<String> = if tab == Tab::RealEstate {
+            fields.push(Field::text("Doc filename", String::new()));
+            fields.push(Field::text("Upload from", String::new()));
+            fields.push(Field::text("Export to", String::new()));
+            fields.push(Field::text("Doc # (export/remove)", String::new()));
+            sel_id
+                .as_ref()
+                .and_then(|id| v.real_estate.iter().find(|r| &r.id == id).map(|r| r.documents.clone()))
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -1211,6 +1238,7 @@ impl App {
             focus: 0,
             attached_file_id: attached,
             tax_docs,
+            re_docs,
             reveal: false,
             history,
         });
@@ -1272,6 +1300,8 @@ impl App {
                 if self.require_writable() {
                     if self.tab == Tab::Taxes {
                         self.attach_tax_document();
+                    } else if self.tab == Tab::RealEstate {
+                        self.attach_re_document();
                     } else {
                         self.attach_document();
                     }
@@ -1280,6 +1310,8 @@ impl App {
             KeyCode::Char('e') if ctrl => {
                 if self.tab == Tab::Taxes {
                     self.export_tax_document();
+                } else if self.tab == Tab::RealEstate {
+                    self.export_re_document();
                 } else {
                     self.export_document();
                 }
@@ -1288,6 +1320,8 @@ impl App {
                 if self.require_writable() {
                     if self.tab == Tab::Taxes {
                         self.remove_tax_document();
+                    } else if self.tab == Tab::RealEstate {
+                        self.remove_re_document();
                     } else {
                         self.detach_document();
                     }
@@ -1616,6 +1650,121 @@ impl App {
         self.edit = Some(es);
     }
 
+    /// Upload a document into the current property's `real-estate/<address>/`
+    /// folder and append it to the property's document list.
+    fn attach_re_document(&mut self) {
+        let Some(mut es) = self.edit.take() else { return };
+        if es.tab != Tab::RealEstate {
+            self.edit = Some(es);
+            return;
+        }
+        let rc = es.record_fields;
+        let address = es.fields[0].value.clone();
+        let filename = es.fields[rc].value.clone();
+        let source = es.fields[rc + 1].value.clone();
+        if filename.trim().is_empty() || source.trim().is_empty() {
+            self.status = "Doc filename and 'upload from' are required.".into();
+            self.edit = Some(es);
+            return;
+        }
+        let location = records::real_estate_doc_location(&address);
+        let vpath_len = crate::vault::virtual_path(&location, &filename).len();
+        if vpath_len > crate::storage::MAX_PATH_LEN {
+            self.status =
+                format!("Doc path too long: {vpath_len} bytes (max {}). Shorten it.", crate::storage::MAX_PATH_LEN);
+            self.edit = Some(es);
+            return;
+        }
+        let id = match self.vault.as_mut() {
+            Some(ov) => match ov.add_document(&location, &filename, Path::new(&source)) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Upload failed: {e}");
+                    self.edit = Some(es);
+                    return;
+                }
+            },
+            None => {
+                self.edit = Some(es);
+                return;
+            }
+        };
+        es.re_docs.push(id);
+        es.fields[rc].value.clear(); // filename
+        es.fields[rc + 1].value.clear(); // upload-from
+        if let Err(e) = Self::ensure_id(&mut es) {
+            self.status = e;
+            self.edit = Some(es);
+            return;
+        }
+        self.commit_edit_record(&es);
+        if self.persist() {
+            self.status = "Document uploaded to the encrypted volume.".into();
+        }
+        self.edit = Some(es);
+    }
+
+    /// Export the property document whose 1-based number is in the "Doc #" field.
+    fn export_re_document(&mut self) {
+        let Some(es) = self.edit.as_ref() else { return };
+        if es.tab != Tab::RealEstate {
+            return;
+        }
+        let rc = es.record_fields;
+        let dest = es.fields[rc + 2].value.clone();
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
+            self.status = format!("Enter a document # between 1 and {}.", es.re_docs.len());
+            return;
+        };
+        if dest.trim().is_empty() {
+            self.status = "Enter an 'export to' path first.".into();
+            return;
+        }
+        let id = es.re_docs[idx].clone();
+        if let Some(ov) = self.vault.as_ref() {
+            match ov.export_document(&id, Path::new(&dest)) {
+                Ok(()) => self.status = format!("Exported to {dest}"),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Remove (and reclaim) the property document whose 1-based number is in "Doc #".
+    fn remove_re_document(&mut self) {
+        let Some(mut es) = self.edit.take() else { return };
+        if es.tab != Tab::RealEstate {
+            self.edit = Some(es);
+            return;
+        }
+        let rc = es.record_fields;
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
+            self.status = format!("Enter a document # between 1 and {} to remove.", es.re_docs.len());
+            self.edit = Some(es);
+            return;
+        };
+        let id = es.re_docs.remove(idx);
+        es.fields[rc + 3].value.clear();
+        if let Err(e) = Self::ensure_id(&mut es) {
+            self.status = e;
+            self.edit = Some(es);
+            return;
+        }
+        self.commit_edit_record(&es);
+        if !self.persist() {
+            self.edit = Some(es);
+            return;
+        }
+        if let Some(ov) = self.vault.as_mut()
+            && let Err(e) = ov.remove_document(&id)
+        {
+            self.status = format!("Unlinked, but blob cleanup failed: {e}");
+            self.edit = Some(es);
+            return;
+        }
+        self.status = "Removed document from the vault.".into();
+        self.edit = Some(es);
+    }
+
     /// Rebuild the typed record from the edit fields (using the buffer's stable
     /// id, which must already be set) and upsert it into the vault.
     // `es: &EditState` is a shared borrow — this reads the edit buffer and writes
@@ -1691,7 +1840,19 @@ impl App {
                 r.hoa = f(3);
                 r.income_account = f(4);
                 r.financing_account = f(5);
-                r.payment_account = f(6);
+                r.financing_balance = f(6);
+                r.payment_account = f(7);
+                r.property_mgmt_url = f(8);
+                r.property_mgmt_username = f(9);
+                r.property_mgmt_password = f(10);
+                r.insurance_url = f(11);
+                r.insurance_username = f(12);
+                r.insurance_password = f(13);
+                r.hoa_url = f(14);
+                r.hoa_username = f(15);
+                r.hoa_password = f(16);
+                r.comments = f(17);
+                r.documents = es.re_docs.clone();
                 records::upsert(&mut v.real_estate, r);
             }
             Tab::Taxes => {
@@ -1762,6 +1923,12 @@ impl App {
                     records::remove(&mut v.accounts, &id, &mut v.audit, "Account");
                 }
                 Tab::RealEstate => {
+                    // Reclaim every document attached to this property.
+                    if let Some(r) = v.real_estate.iter().find(|r| r.id == id) {
+                        for f in &r.documents {
+                            doc_ids.push(f.clone());
+                        }
+                    }
                     records::remove(&mut v.real_estate, &id, &mut v.audit, "Real Estate");
                 }
                 Tab::Taxes => {
@@ -2079,6 +2246,26 @@ impl App {
                 )));
             }
         }
+        if es.tab == Tab::RealEstate {
+            // List the property's documents with their 1-based numbers (used by the
+            // "Doc #" field for Ctrl+E export / Ctrl+K remove).
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Documents ({}) — saved to {}/",
+                    es.re_docs.len(),
+                    records::real_estate_doc_location(&es.fields[0].value)
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+            for (i, id) in es.re_docs.iter().enumerate() {
+                let label = self.vault_ref().doc_path(id).unwrap_or_else(|| id.clone());
+                lines.push(Line::from(Span::styled(
+                    format!("  #{}  {label}", i + 1),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
         if !es.history.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("History:", Style::default().add_modifier(Modifier::BOLD))));
@@ -2101,6 +2288,8 @@ impl App {
 
         let hints = if es.tab == Tab::Taxes {
             "Tab/↑↓ field · Ctrl+S save · Ctrl+U upload · Ctrl+E export(Doc#) · Ctrl+K remove(Doc#) · Esc cancel"
+        } else if es.tab == Tab::RealEstate {
+            "Tab/↑↓ field · Ctrl+R reveal · Ctrl+Y copy · Ctrl+U upload · Ctrl+E export(Doc#) · Ctrl+K remove(Doc#) · Ctrl+S save · Esc"
         } else if es.has_docs() {
             "Tab/↑↓ field · ←/→ choice · Ctrl+S save · Ctrl+U upload · Ctrl+E export · Ctrl+K detach · Esc cancel"
         } else {

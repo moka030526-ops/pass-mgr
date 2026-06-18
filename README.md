@@ -105,7 +105,10 @@ Across the top are six tabs. Click a tab to switch:
    property, vehicles, loans), with values, owners, and beneficiaries.
 4. **Accounts** — logins: banks, email, utilities, subscriptions, etc., with
    usernames and passwords.
-5. **Real Estate** — properties: address, ownership, taxes, mortgage/financing.
+5. **Real Estate** — properties: address, ownership, taxes, financing (account +
+   balance), and per-property **portal logins** (property management, insurance,
+   HOA — each with URL, username, password). Each property can also hold uploaded
+   **documents** (deed, insurance policy, statements).
 6. **Taxes** — one entry per **filing year**, holding that year's tax documents
    (W-2s, 1099s, the return, receipts). Each entry can hold **several** uploaded
    documents, all kept together in that year's own folder inside the vault.
