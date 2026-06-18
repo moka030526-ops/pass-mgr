@@ -579,7 +579,7 @@ sudo tests/dmflakey_powerloss.sh              # real power-loss test (dm-flakey;
 
 **Test counts (current).** `cargo test --workspace` runs, by default, **192**
 `pass-mgr-core` library tests + **4** core integration tests + **31**
-`pass-mgr-ffi` tests + the desktop crate's **35** library tests and **19** binary
+`pass-mgr-ffi` tests + the desktop crate's **47** library tests and **19** binary
 (CLI) tests (plus one `#[ignore]`d ThreadSanitizer reproducer, run separately — see
 below). `cargo test --features fault-injection` adds the feature-gated fault tests
 and the **18** `tests/crash_recovery.rs` integration tests (a force-kill harness —

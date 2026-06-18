@@ -18,11 +18,11 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 | Layer | Result |
 | --- | --- |
 | Adversarial security review | **2 real defects found and fixed**; 8 candidate findings investigated and refuted |
-| Mutation testing (`cargo-mutants`, new code) | 2 real survivors **killed** with new tests; the 1 remaining is a `cfg` phantom (dead code in the compiled config), not a coverage gap |
+| Mutation testing (`cargo-mutants --in-diff`, 194 mutants) | **56 survivors killed** (106→50 missed); `core`/`ffi` clean (only a `cfg` phantom); the 50 remaining are all in the thin desktop UI (rendering / keyboard / cosmetic) — see §4 |
 | Fuzzing (`cargo-fuzz`, 4 targets) | **≈81.6 M executions, 0 crashes** |
 | Supply-chain (`cargo-audit`) | **0 advisories across 595 deps** |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 192 · ffi 31 · compat 4 · desktop 35 + 19 · crash-recovery 18 — all green** (`--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 192 · ffi 31 · compat 4 · desktop 47 + 19 · crash-recovery 18 — all green** (`--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
 Both confirmed defects were **secret-hygiene** issues (plaintext password lifetime),
 not breaks of the cryptographic envelope. Neither lets an attacker read a vault they
@@ -92,33 +92,62 @@ or clipboard access could recover a password.
 
 ## 4. Mutation testing
 
-`cargo-mutants` was run over the new-code diff (`--in-diff`). Surviving mutants mark
-behaviour that the test suite does not actually constrain.
+`cargo-mutants --in-diff` was run over the whole new-code diff (the merged Taxes /
+Real Estate / mobile / FFI work) — 194 mutants. A surviving mutant marks behaviour no
+test actually constrains. Adding the tests below moved the result from **106 missed /
+54 caught** to **50 missed / 110 caught / 34 unviable** — **56 survivors killed**.
 
-* **3 survivors** were reported on the FFI surface and the write-lock path.
-* **2 killed** with new FFI tests in `crates/pass-mgr-ffi/src/lib.rs`:
-  * `previous_access_is_a_real_timestamp_not_a_constant` — pins that `previous_access()`
-    returns the stored access time, not a hard-coded constant (kills a mutant that
-    replaced the body with a fixed value).
-  * `recovery_notice_is_some_after_mirror_recovery` — creates a redundant vault, corrupts
-    the primary copy, opens it through the FFI, and asserts a recovery notice surfaces
-    (kills a mutant that always returned "no notice").
-* **1 survivor** at `vault.rs:282` is a **`cfg` phantom, not a coverage gap.** That line
-  is the body of the *no-op* `WriteLock::acquire` — the
-  `#[cfg(not(feature = "single-writer-lock"))]` stand-in used by the read-only mobile
-  build. cargo-mutants parses source text without evaluating `cfg`, so in the default
-  (feature-**on**) tree it compiles it mutated this dead code: the mutated function is
-  never compiled, every test still passes, and the mutant is reported "missed." When the
-  feature is **off** and the function *is* compiled, the specific mutant
-  (`-> Ok(Default::default())`) is **unviable** — `WriteLock` is an empty struct with no
-  `Default` impl. Either way it is unkillable by construction. The *compiled* `acquire`
+### 4.1 Security-critical surface (`core` + `ffi`) — clean
+
+The crates where the security logic lives have **no real survivors left**:
+
+* **2 FFI survivors killed** with new tests in `crates/pass-mgr-ffi/src/lib.rs`:
+  * `previous_access_is_a_real_timestamp_not_a_constant` — `previous_access()` returns the
+    stored access time, not a hard-coded constant.
+  * `recovery_notice_is_some_after_mirror_recovery` — corrupt the primary copy of a
+    redundant vault, open it through the FFI, and assert a recovery notice surfaces.
+* **1 remaining `core` survivor (`vault.rs:282`) is a `cfg` phantom, not a coverage gap.**
+  It is the *no-op* `WriteLock::acquire` — the `#[cfg(not(feature = "single-writer-lock"))]`
+  stand-in for the read-only mobile build. cargo-mutants does not evaluate `cfg`, so in
+  the default (feature-**on**) tree it mutated dead code: the mutated fn is never compiled,
+  every test passes, and it is reported "missed." When the feature is **off** and the fn
+  *is* compiled, the mutant (`-> Ok(Default::default())`) is **unviable** — `WriteLock` is
+  an empty struct with no `Default`. Unkillable by construction. The *compiled* `acquire`
   (the real `flock`, `vault.rs:253`) is pinned by `single_writer_lock_blocks_second_writable_open`.
-  To close the loop we additionally **`cfg`-gated** that test (it asserted `Locked`, which
-  only holds with the feature on — a latent failure under `--no-default-features`) and
-  added `no_op_lock_allows_a_second_writable_open` for the feature-off path, so both lock
-  configurations now have real, passing coverage.
+  We also **`cfg`-gated** that test (it asserted `Locked`, only true with the feature on — a
+  latent failure under `--no-default-features`) and added `no_op_lock_allows_a_second_writable_open`
+  for the feature-off path, so both lock configurations now have real coverage.
 
-FFI tests went from 29 → **31**; core gained the no-op-lock test; all green.
+### 4.2 Desktop UI surface (`gui.rs` + `ui.rs`) — bulk killed, remainder accepted
+
+The merged feature UI had a large untested cluster. **12 new desktop tests** were added,
+killing 56 of the ~106 survivors by exercising the real logic:
+
+* `parse_doc_index` (1-based→0-based parsing, range/whitespace/non-numeric);
+* `Tab::title` (correct, non-empty, unique);
+* Real Estate and Taxes **edit screens rendered to a `TestBackend`** with content
+  assertions (kills the draw-fn→`()` mutants in the TUI);
+* full **attach → export → remove** document round-trips for both Taxes and Real Estate,
+  in **both** the TUI (`ui.rs`) and GUI (`gui.rs`) handlers, plus out-of-range and
+  missing-input rejection, and record-selection-by-id under multiple records.
+
+The **50 remaining survivors are all in the thin desktop UI** — by design the front-ends
+"touch no security-critical code" (DESIGN §7); they drive the audited core, which is
+separately and fully tested. They fall into three accepted classes:
+
+1. **egui rendering fns** (`tab_realestate`, `tab_taxes`, `portal_section`, `ui_top_bar`,
+   `App::ui`) mutated to `()` — egui is immediate-mode and has no `TestBackend`-equivalent
+   render-assertion harness, so a no-op draw cannot be caught the way the ratatui ones are.
+2. **keyboard / render dispatch** (`handle_edit_key` key matching, `draw_edit` field-type
+   comparisons) — exercised functionally but not pinned at the per-branch level.
+3. **status-message arithmetic and boundary edges** in the doc handlers (e.g. `n+1`
+   display math, exact `MAX_PATH_LEN` boundary) — cosmetic/off-by-one in user-facing
+   strings, not data-affecting.
+
+No surviving mutant lets bad data reach disk or weakens the crypto envelope; the
+data-affecting handler logic (what gets attached, exported, removed, persisted) is pinned.
+
+FFI tests 29 → **31**; desktop lib tests 35 → **47**; core gained the no-op-lock test; all green.
 
 ## 5. Fuzzing
 
