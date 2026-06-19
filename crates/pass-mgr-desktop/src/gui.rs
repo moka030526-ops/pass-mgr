@@ -740,19 +740,19 @@ impl GuiApp {
         egui::Grid::new("auth_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label("Password 1");
             // `&mut self.pw1` lends the field to the widget so typing updates it.
-            submit |= password_field(ui, &mut self.pw1);
+            submit |= password_field(ui, "auth_pw1", &mut self.pw1);
             ui.end_row();
             if confirm {
                 ui.label("Confirm password 1");
-                submit |= password_field(ui, &mut self.confirm1);
+                submit |= password_field(ui, "auth_confirm1", &mut self.confirm1);
                 ui.end_row();
             }
             ui.label("Password 2");
-            submit |= password_field(ui, &mut self.pw2);
+            submit |= password_field(ui, "auth_pw2", &mut self.pw2);
             ui.end_row();
             if confirm {
                 ui.label("Confirm password 2");
-                submit |= password_field(ui, &mut self.confirm2);
+                submit |= password_field(ui, "auth_confirm2", &mut self.confirm2);
                 ui.end_row();
             }
         });
@@ -1649,16 +1649,11 @@ impl GuiApp {
                     ui.horizontal(|ui| {
                         // Masked unless the per-record reveal OR the global "reveal all" is on.
                         let revealed = self.reveal_pw || self.reveal_all;
-                        // KNOWN RESIDUAL (audit R-7, accepted): egui's stock `TextEdit`
-                        // keeps un-zeroized snapshots of the edited string in its
-                        // in-memory undo buffer, and a REVEALED field's built-in Ctrl+C
-                        // copies via eframe→arboard WITHOUT the Linux exclude_from_history
-                        // hint. Both are LOW (they need local process-memory or
-                        // clipboard-history access, which already compromises the user).
-                        // The hardened path is the 📋 button below (self-wiping +
-                        // history-excluded). A full fix needs a custom password widget;
-                        // deferred as it requires interactive GUI verification.
-                        ui.add(egui::TextEdit::singleline(&mut r.password).password(!revealed).desired_width(280.0));
+                        // `secret_text_edit` (audit R-7 fix) scrubs egui's undo buffer of
+                        // secret snapshots and re-routes the built-in copy through the
+                        // history-excluded clipboard path — so a revealed field is no longer
+                        // a residue/clipboard-history leak.
+                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, 280.0);
                         ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
                         // Generate is only useful when you can save; copy is a read.
                         if self.writable && ui.button("🎲").on_hover_text("Generate").clicked() {
@@ -2589,7 +2584,9 @@ fn portal_section(
         text_row(ui, "Username", username);
         ui.label("Password");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(password).password(!reveal).desired_width(260.0));
+            // `title` is unique per portal (Property Mgmt / Insurance / HOA), so it is
+            // a valid per-field id salt for the secret-field hardening.
+            secret_text_edit(ui, title, password, reveal, 260.0);
             if ui.button("📋").on_hover_text("Copy").clicked() {
                 *copy_pw = Some(Zeroizing::new(password.clone()));
             }
@@ -2742,12 +2739,58 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
     });
 }
 
-/// A masked single-line password field; returns true if Enter was pressed.
-fn password_field(ui: &mut egui::Ui, value: &mut String) -> bool {
-    let resp = ui.add(egui::TextEdit::singleline(value).password(true).desired_width(280.0));
-    // The final expression (no `;`) is the return value. `ui.input(|i| ...)`
-    // passes a closure that inspects the frame's input state; this returns true
-    // when the field just lost focus AND Enter was pressed.
+/// A single-line text field for a SECRET (a password), hardening egui's stock
+/// `TextEdit` against the two residual leaks the audit flagged (R-7):
+///
+/// 1. **Undo residue.** egui keeps un-zeroized snapshots of the edited string in its
+///    per-widget undo buffer, which would otherwise retain past values of the secret
+///    for the whole process lifetime. We clear the undoer every frame (undo on a
+///    password is not worth the residue), bounding it to at most the current frame.
+/// 2. **Copy hint bypass.** The built-in Ctrl+C / Ctrl+X / context-menu copy queues an
+///    `OutputCommand::CopyText` that eframe writes via a plain clipboard `set_text`
+///    (no history-exclusion hint), unlike the dedicated 📋 button. While this field is
+///    focused we intercept that command and re-route the secret through the hardened
+///    [`crate::copy_secret_to_clipboard`] (Linux `exclude_from_history`).
+///
+/// `id_salt` MUST be unique per field (it pins a stable widget id for the state-scrub).
+fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, revealed: bool, width: f32) -> egui::Response {
+    let id = ui.make_persistent_id(id_salt);
+    let resp = ui.add(egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width));
+    // (1) Never accumulate undo snapshots of a secret.
+    if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id) {
+        state.clear_undoer();
+        state.store(ui.ctx(), id);
+    }
+    // (2) Re-route any built-in copy/cut of THIS focused field through the hardened
+    // clipboard path. Gating on focus means we only touch a CopyText that this field
+    // produced (you cannot have two focused widgets), so other widgets' copies are
+    // untouched.
+    if resp.has_focus() {
+        let copied: Vec<String> = ui.ctx().output_mut(|o| {
+            let mut taken = Vec::new();
+            o.commands.retain(|c| {
+                if let egui::OutputCommand::CopyText(t) = c {
+                    taken.push(t.clone());
+                    false // drop it so eframe's plain set_text never runs
+                } else {
+                    true
+                }
+            });
+            taken
+        });
+        for t in copied {
+            let _ = crate::copy_secret_to_clipboard(&t);
+        }
+    }
+    resp
+}
+
+/// A masked single-line password field; returns true if Enter was pressed. `id_salt`
+/// is unique per field (unlock/create/change-password use four distinct fields).
+fn password_field(ui: &mut egui::Ui, id_salt: &str, value: &mut String) -> bool {
+    // Always masked (revealed = false); the secret hardening (undo scrub + copy
+    // re-route) still applies — a master password is the most sensitive of all.
+    let resp = secret_text_edit(ui, id_salt, value, false, 280.0);
     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
