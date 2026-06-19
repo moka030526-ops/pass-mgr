@@ -1555,6 +1555,10 @@ impl App {
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Captured before borrowing `self.edit` below. In read-only mode the Edit
+        // screen is a VIEW: reveal/copy/export still work, but the field-mutating keys
+        // (typing, backspace, choice-cycling) are inert — nothing can be edited.
+        let writable = self.writable;
         // `let Some(es) = ... else { ... }` is a *let-else*: if the pattern matches,
         // `es` is bound (here an exclusive borrow of the edit buffer) and used
         // after the block; if it does NOT match (no edit in progress), the `else`
@@ -1649,7 +1653,8 @@ impl App {
             }
             // One arm handles both arrow keys (`A | B` = "A or B"); `delta` is -1
             // for Left, +1 for Right, used to step a Choice field's selection.
-            KeyCode::Left | KeyCode::Right => {
+            // Read-only: cycling a choice would edit the record, so it is inert.
+            KeyCode::Left | KeyCode::Right if writable => {
                 let delta = if matches!(key.code, KeyCode::Left) { -1 } else { 1 };
                 es.fields[es.focus].cycle(delta);
                 // On the Accounts tab, cycling the account-type field reconstrains
@@ -1676,13 +1681,15 @@ impl App {
             // `!matches!(f.kind, FieldKind::Choice(_))` skips dropdowns, which are
             // edited with the arrow keys instead. `&mut es.fields[es.focus]` is an
             // exclusive borrow of the focused field.
-            KeyCode::Char(c) if !ctrl => {
+            // Read-only mode (`writable` false) drops typing/backspace so the fields
+            // cannot be edited; reveal/copy/export above remain available for viewing.
+            KeyCode::Char(c) if !ctrl && writable => {
                 let f = &mut es.fields[es.focus];
                 if !matches!(f.kind, FieldKind::Choice(_)) {
                     f.value.push(c);
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if writable => {
                 let f = &mut es.fields[es.focus];
                 if !matches!(f.kind, FieldKind::Choice(_)) {
                     f.value.pop();
@@ -2229,10 +2236,15 @@ impl App {
             self.edit = Some(es);
             return;
         }
-        // Title is mandatory for accounts (field 0): refuse a blank title and keep the
-        // edit form open so the user can fill it in.
+        // Title (field 0) and owner (field 3) are mandatory for accounts: refuse a
+        // blank value for either and keep the edit form open so the user can fill it.
         if es.tab == Tab::Accounts && es.fields[0].value.trim().is_empty() {
             self.status = "Title is required — every account must have a title.".into();
+            self.edit = Some(es);
+            return;
+        }
+        if es.tab == Tab::Accounts && es.fields[3].value.trim().is_empty() {
+            self.status = "Owner is required — every account must have an owner.".into();
             self.edit = Some(es);
             return;
         }
@@ -3034,6 +3046,7 @@ mod tests {
         // Title is mandatory; change the type and give it a username.
         app.edit.as_mut().unwrap().fields[0].value = "Work".into(); // title (field 0)
         app.edit.as_mut().unwrap().fields[1].value = "Bank".into(); // type (field 1)
+        app.edit.as_mut().unwrap().fields[3].value = "Alice".into(); // owner (field 3, mandatory)
         app.edit.as_mut().unwrap().fields[4].value = "newuser".into(); // username (field 4)
         app.save_edit();
         // The active type filter followed the saved entry instead of hiding it.
@@ -3051,6 +3064,7 @@ mod tests {
         app.acct_search = "alice".into(); // username search active
         app.start_edit(false); // New (prefills username=alice from the search)
         app.edit.as_mut().unwrap().fields[0].value = "Mail".into(); // title (mandatory)
+        app.edit.as_mut().unwrap().fields[3].value = "Alice".into(); // owner (mandatory)
         app.edit.as_mut().unwrap().fields[4].value = "bob".into(); // username (no longer matches)
         // review (field 9) stays default "No" — saved record is NOT flagged.
         app.save_edit();
@@ -3664,6 +3678,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('n')));
         // title (focus 0) — mandatory.
         for c in "Acct".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        // owner (field 3) is also mandatory — set it directly.
+        app.edit.as_mut().unwrap().fields[3].value = "Alice".into();
         // focus 9 = review choice (0 title .. 7 closed_as_of, 8 description); cycle to "Yes".
         for _ in 0..9 {
             app.handle_key(key(KeyCode::Down));
@@ -3688,6 +3704,50 @@ mod tests {
         assert_eq!(app.screen, Screen::Edit, "stays in the edit form when the title is blank");
         assert!(app.status.contains("Title is required"), "status: {}", app.status);
         assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing saved without a title");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_save_requires_an_owner_in_tui() {
+        let (mut app, path) = app_unlocked("ownerreq");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('n'))); // new
+        // Give a title (field 0) but leave the owner (field 3) blank.
+        for c in "Acct".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(ctrl('s')); // save — must be rejected for the missing owner
+        assert_eq!(app.screen, Screen::Edit, "stays in the edit form when the owner is blank");
+        assert!(app.status.contains("Owner is required"), "status: {}", app.status);
+        assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing saved without an owner");
+        // Supplying an owner lets it save.
+        app.edit.as_mut().unwrap().fields[3].value = "Alice".into();
+        app.handle_key(ctrl('s'));
+        assert_eq!(app.screen, Screen::Browse, "saves once title + owner are present");
+        assert_eq!(app.vault.as_ref().unwrap().vault.accounts.len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_edit_form_is_not_editable() {
+        let (mut app, path) = app_read_only("roedit");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Enter)); // Enter opens the record as a VIEW
+        assert_eq!(app.screen, Screen::Edit);
+
+        // Typing + backspace into the focused (title) text field is inert.
+        for c in "HACK".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.edit.as_ref().unwrap().fields[0].value, "", "text field not editable in read-only");
+
+        // Cycling a Choice field (account type, field 1) is inert too.
+        app.handle_key(key(KeyCode::Down)); // focus -> 1 (account type choice)
+        let before = app.edit.as_ref().unwrap().fields[1].value.clone();
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.edit.as_ref().unwrap().fields[1].value, before, "choice not cyclable in read-only");
+
+        // Reads still work: the reveal toggle flips even in read-only.
+        app.handle_key(ctrl('r'));
+        assert!(app.edit.as_ref().unwrap().reveal, "reveal still works in read-only");
         cleanup(&path);
     }
 

@@ -31,6 +31,10 @@ date and bump the crate versions to match.
 - **Accounts enhancements:**
   - **Title** field (shown in the list as `Title - Account Type - Username`, with its
     own filter and new-entry prefill).
+  - **Mandatory title and owner** — an account cannot be saved without both (enforced
+    in the GUI and TUI; see `account_required_field_error`).
+  - **Grouped tree view** — toggle the list into an `owner → type → subtype → title`
+    tree (empty grouping levels are skipped, no "(none)" buckets).
   - **Closed as of** date field.
   - **Faceted (cross-filtering) filters** — type/subtype/owner/title each narrow to
     the values still valid under the other active filters, auto-clearing stale picks.
@@ -62,6 +66,10 @@ date and bump the crate versions to match.
   overflow) in addition to `strip`.
 - New fields are additive (`#[serde(default)]`); the on-disk **format stays v4** and
   older vaults open unchanged.
+- **Read-only mode is now fully non-editable.** A read-only session previously let you
+  type into a record's form fields (the edits were silently discarded on close); the
+  forms are now a true view — every data field is disabled. Only the color theme can be
+  changed; backup and document export (both read-only-safe) remain available.
 
 ### Security
 

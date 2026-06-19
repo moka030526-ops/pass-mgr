@@ -872,8 +872,11 @@ impl GuiApp {
         });
         if !self.writable {
             ui.label(
-                egui::RichText::new("Read-only: type editing is disabled (backup is still available).")
-                    .color(egui::Color32::from_rgb(170, 90, 0)),
+                egui::RichText::new(
+                    "Read-only: no field can be edited. Only the color theme can be changed; \
+                     backup and document export are still available.",
+                )
+                .color(egui::Color32::from_rgb(170, 90, 0)),
             );
         }
 
@@ -934,7 +937,10 @@ impl GuiApp {
                 }
             });
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0),
+                );
                 if self.writable && ui.button("Add type").clicked() {
                     add_asset = true;
                 }
@@ -971,7 +977,12 @@ impl GuiApp {
                 });
             }
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.new_account_type).hint_text("New account type").desired_width(220.0));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::singleline(&mut self.new_account_type)
+                        .hint_text("New account type")
+                        .desired_width(220.0),
+                );
                 if self.writable && ui.button("Add type").clicked() {
                     add_account = true;
                 }
@@ -980,12 +991,17 @@ impl GuiApp {
                 ui.label("Add subtype to:");
                 // Pick the type the subtype belongs to.
                 let cur = if self.new_subtype_for.is_empty() { "(choose type)".to_string() } else { self.new_subtype_for.clone() };
-                egui::ComboBox::from_id_salt("subtype_for").selected_text(cur).show_ui(ui, |ui| {
-                    for name in &type_names {
-                        ui.selectable_value(&mut self.new_subtype_for, name.clone(), name);
-                    }
+                ui.add_enabled_ui(self.writable, |ui| {
+                    egui::ComboBox::from_id_salt("subtype_for").selected_text(cur).show_ui(ui, |ui| {
+                        for name in &type_names {
+                            ui.selectable_value(&mut self.new_subtype_for, name.clone(), name);
+                        }
+                    });
                 });
-                ui.add(egui::TextEdit::singleline(&mut self.new_subtype_name).hint_text("New subtype").desired_width(180.0));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::singleline(&mut self.new_subtype_name).hint_text("New subtype").desired_width(180.0),
+                );
                 if self.writable && ui.button("Add subtype").clicked() {
                     add_subtype = true;
                 }
@@ -1220,11 +1236,14 @@ impl GuiApp {
             if let Some(r) = self.edit_instruction.as_mut() {
                 egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
-                    ui.add(egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
+                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(12).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::multiline(&mut r.description).desired_rows(12).desired_width(f32::INFINITY),
+                );
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1285,11 +1304,14 @@ impl GuiApp {
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Document");
-                    ui.add(egui::TextEdit::singleline(&mut r.document).desired_width(420.0));
+                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.document).desired_width(420.0));
                     ui.end_row();
                 });
                 ui.label("Usage");
-                ui.add(egui::TextEdit::multiline(&mut r.usage).desired_rows(8).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::multiline(&mut r.usage).desired_rows(8).desired_width(f32::INFINITY),
+                );
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1353,11 +1375,14 @@ impl GuiApp {
             if let Some(r) = self.edit_general.as_mut() {
                 egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
-                    ui.add(egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
+                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(8).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::multiline(&mut r.description).desired_rows(8).desired_width(f32::INFINITY),
+                );
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1432,37 +1457,41 @@ impl GuiApp {
             (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_asset.as_mut() {
+                let w = self.writable;
                 egui::Grid::new("asset_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Asset / Liability");
-                    combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()]);
+                    combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()], w);
                     ui.end_row();
                     ui.label("Owner");
-                    ui.add(egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
                     ui.end_row();
                     ui.label("Beneficiary");
-                    ui.add(egui::TextEdit::singleline(&mut r.beneficiary).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.beneficiary).desired_width(420.0));
                     ui.end_row();
                     ui.label("Approximate value");
-                    ui.add(egui::TextEdit::singleline(&mut r.approx_value).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.approx_value).desired_width(420.0));
                     ui.end_row();
                     ui.label("As-of date");
-                    ui.add(egui::TextEdit::singleline(&mut r.as_of_date).hint_text("YYYY-MM-DD").desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.as_of_date).hint_text("YYYY-MM-DD").desired_width(420.0));
                     ui.end_row();
                     ui.label("Institution");
-                    ui.add(egui::TextEdit::singleline(&mut r.institution).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.institution).desired_width(420.0));
                     ui.end_row();
                     ui.label("Type");
-                    combo(ui, "asset_type", &mut r.asset_type, &asset_types);
+                    combo(ui, "asset_type", &mut r.asset_type, &asset_types, w);
                     ui.end_row();
                     ui.label("URL");
-                    ui.add(egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
                     ui.end_row();
                     ui.label("Review");
-                    ui.checkbox(&mut r.review, "flag for review");
+                    ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY),
+                );
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1779,24 +1808,25 @@ impl GuiApp {
             }
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
+                let w = self.writable;
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Title", &mut r.title);
+                    text_row(ui, "Title", &mut r.title, w);
                     ui.label("Account type");
                     let prev_type = r.account_type.clone();
-                    combo(ui, "acct_type", &mut r.account_type, &type_names);
+                    combo(ui, "acct_type", &mut r.account_type, &type_names, w);
                     if r.account_type != prev_type {
                         // Subtypes are type-specific; drop a now-mismatched subtype.
                         r.account_subtype.clear();
                     }
                     ui.end_row();
                     ui.label("Subtype");
-                    combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes);
+                    combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes, w);
                     ui.end_row();
                     ui.label("Owner");
-                    ui.add(egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
                     ui.end_row();
                     ui.label("Username");
-                    ui.add(egui::TextEdit::singleline(&mut r.username).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.username).desired_width(420.0));
                     ui.end_row();
                     ui.label("Password");
                     ui.horizontal(|ui| {
@@ -1805,11 +1835,12 @@ impl GuiApp {
                         // `secret_text_edit` (audit R-7 fix) scrubs egui's undo buffer of
                         // secret snapshots and re-routes the built-in copy through the
                         // history-excluded clipboard path — so a revealed field is no longer
-                        // a residue/clipboard-history leak.
-                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, 280.0);
+                        // a residue/clipboard-history leak. Read-only: the field is shown but
+                        // not editable; reveal + copy stay available (they are reads).
+                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, w, 280.0);
                         ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
                         // Generate is only useful when you can save; copy is a read.
-                        if self.writable && ui.button("🎲").on_hover_text("Generate").clicked() {
+                        if w && ui.button("🎲").on_hover_text("Generate").clicked() {
                             generate = true;
                         }
                         if ui.button("📋").on_hover_text("Copy").clicked() {
@@ -1819,17 +1850,20 @@ impl GuiApp {
                     });
                     ui.end_row();
                     ui.label("URL");
-                    ui.add(egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
                     ui.end_row();
                     ui.label("Closed as of");
-                    ui.add(egui::TextEdit::singleline(&mut r.closed_as_of).hint_text("YYYY-MM-DD").desired_width(420.0));
+                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.closed_as_of).hint_text("YYYY-MM-DD").desired_width(420.0));
                     ui.end_row();
                     ui.label("Review");
-                    ui.checkbox(&mut r.review, "flag for review");
+                    ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add(egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    self.writable,
+                    egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY),
+                );
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1881,10 +1915,10 @@ impl GuiApp {
                 if let Some(r) = self.edit_account.as_mut() {
                     r.trim_fields();
                 }
-                // Title is mandatory: refuse to save an account with a blank title
-                // (after trimming), keeping the edit form open so the user can fill it.
-                if self.edit_account.as_ref().is_some_and(|r| r.title.is_empty()) {
-                    self.status = "Title is required — every account must have a title.".into();
+                // Title and owner are mandatory: refuse to save an account missing
+                // either (after trimming), keeping the edit form open to fill it.
+                if let Some(msg) = self.edit_account.as_ref().and_then(account_required_field_error) {
+                    self.status = msg.into();
                 } else {
                     if let Some(r) = self.edit_account.clone()
                         && let Some(ov) = self.vault.as_mut()
@@ -1945,26 +1979,29 @@ impl GuiApp {
                 // form would capture the wheel and (having no overflow of its own)
                 // scroll nothing, while the outer area never saw the event.
                 egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Address", &mut r.address);
-                    text_row(ui, "Ownership", &mut r.ownership);
-                    text_row(ui, "Taxes", &mut r.taxes);
-                    text_row(ui, "HOA dues / info", &mut r.hoa);
-                    text_row(ui, "Income account", &mut r.income_account);
-                    text_row(ui, "Financing account", &mut r.financing_account);
-                    text_row(ui, "Financing balance", &mut r.financing_balance);
-                    text_row(ui, "Payment account", &mut r.payment_account);
+                    text_row(ui, "Address", &mut r.address, writable);
+                    text_row(ui, "Ownership", &mut r.ownership, writable);
+                    text_row(ui, "Taxes", &mut r.taxes, writable);
+                    text_row(ui, "HOA dues / info", &mut r.hoa, writable);
+                    text_row(ui, "Income account", &mut r.income_account, writable);
+                    text_row(ui, "Financing account", &mut r.financing_account, writable);
+                    text_row(ui, "Financing balance", &mut r.financing_balance, writable);
+                    text_row(ui, "Payment account", &mut r.payment_account, writable);
                 });
 
-                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, &mut copy_pw);
-                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, &mut copy_pw);
-                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, &mut copy_pw);
+                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, writable, &mut copy_pw);
+                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, writable, &mut copy_pw);
+                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, writable, &mut copy_pw);
                 // Per-record reveal; disabled while the screen-level "reveal all" is
                 // on (which already overrides it), exactly like the Accounts form.
                 ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
 
                 ui.separator();
                 ui.label("Comments");
-                ui.add(egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    writable,
+                    egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY),
+                );
 
                 ui.separator();
                 ui.label(format!(
@@ -2064,10 +2101,13 @@ impl GuiApp {
             let ui = &mut c[1];
             if let Some(r) = self.edit_taxfiling.as_mut() {
                 egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Filing year", &mut r.year);
+                    text_row(ui, "Filing year", &mut r.year, writable);
                 });
                 ui.label("Notes");
-                ui.add(egui::TextEdit::multiline(&mut r.notes).desired_rows(4).desired_width(f32::INFINITY));
+                ui.add_enabled(
+                    writable,
+                    egui::TextEdit::multiline(&mut r.notes).desired_rows(4).desired_width(f32::INFINITY),
+                );
                 ui.separator();
 
                 // Attached documents — all live under taxes/<year>/<timestamp>/…
@@ -2741,15 +2781,31 @@ fn form_buttons(ui: &mut egui::Ui, writable: bool) -> FormAction {
 /// A two-column "label + single-line edit" row inside a Grid.
 // `value: &mut String` lets the text widget write the user's edits straight back
 // into the caller's field.
-fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+/// Validate a to-be-saved account, returning the user-facing error for the first
+/// missing mandatory field (title, then owner) or `None` when it may be saved. The
+/// GUI save path and its tests share this so the rule lives in exactly one place
+/// (the TUI enforces the same rule on its `fields[0]`/`fields[3]`).
+fn account_required_field_error(a: &Account) -> Option<&'static str> {
+    if a.title.trim().is_empty() {
+        Some("Title is required — every account must have a title.")
+    } else if a.owner.trim().is_empty() {
+        Some("Owner is required — every account must have an owner.")
+    } else {
+        None
+    }
+}
+
+fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, writable: bool) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(value).desired_width(420.0));
+    // In read-only mode the field shows its value but is not editable.
+    ui.add_enabled(writable, egui::TextEdit::singleline(value).desired_width(420.0));
     ui.end_row();
 }
 
 /// Render one portal-login section (URL / username / masked password + copy) into
 /// the Real Estate form. The password is masked unless `reveal`; `copy_pw` is set
 /// when the copy button is clicked, to be acted on after rendering.
+#[allow(clippy::too_many_arguments)]
 fn portal_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -2757,18 +2813,20 @@ fn portal_section(
     username: &mut String,
     password: &mut String,
     reveal: bool,
+    writable: bool,
     copy_pw: &mut Option<Zeroizing<String>>,
 ) {
     ui.separator();
     ui.label(egui::RichText::new(title).strong());
     egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-        text_row(ui, "URL", url);
-        text_row(ui, "Username", username);
+        text_row(ui, "URL", url, writable);
+        text_row(ui, "Username", username, writable);
         ui.label("Password");
         ui.horizontal(|ui| {
             // `title` is unique per portal (Property Mgmt / Insurance / HOA), so it is
-            // a valid per-field id salt for the secret-field hardening.
-            secret_text_edit(ui, title, password, reveal, 260.0);
+            // a valid per-field id salt for the secret-field hardening. Copy stays
+            // available read-only (it is a read, not an edit).
+            secret_text_edit(ui, title, password, reveal, writable, 260.0);
             if ui.button("📋").on_hover_text("Copy").clicked() {
                 *copy_pw = Some(Zeroizing::new(password.clone()));
             }
@@ -2792,13 +2850,15 @@ fn filter_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[Stri
     });
 }
 
-/// A dropdown restricted to `options`.
-fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {
+/// A dropdown restricted to `options`. Non-interactive (display-only) in read-only mode.
+fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String], writable: bool) {
     let current = if value.is_empty() { "(choose)".to_string() } else { value.clone() };
-    egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
-        for opt in options {
-            ui.selectable_value(value, opt.clone(), opt);
-        }
+    ui.add_enabled_ui(writable, |ui| {
+        egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
+            for opt in options {
+                ui.selectable_value(value, opt.clone(), opt);
+            }
+        });
     });
 }
 
@@ -2935,9 +2995,10 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
 ///    [`crate::copy_secret_to_clipboard`] (Linux `exclude_from_history`).
 ///
 /// `id_salt` MUST be unique per field (it pins a stable widget id for the state-scrub).
-fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, revealed: bool, width: f32) -> egui::Response {
+fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, revealed: bool, writable: bool, width: f32) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
-    let resp = ui.add(egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width));
+    // Read-only: still display the (masked/revealed) value, but it cannot be edited.
+    let resp = ui.add_enabled(writable, egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width));
     // (1) Never accumulate undo snapshots of a secret.
     if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id) {
         state.clear_undoer();
@@ -2972,7 +3033,9 @@ fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, reveal
 fn password_field(ui: &mut egui::Ui, id_salt: &str, value: &mut String) -> bool {
     // Always masked (revealed = false); the secret hardening (undo scrub + copy
     // re-route) still applies — a master password is the most sensitive of all.
-    let resp = secret_text_edit(ui, id_salt, value, false, 280.0);
+    // Always editable (`writable = true`): this is the unlock/create field, which
+    // exists before any vault is open, so the read-only mode does not apply here.
+    let resp = secret_text_edit(ui, id_salt, value, false, true, 280.0);
     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
@@ -3103,6 +3166,27 @@ mod tests {
         assert!(app.account_passes_filters(&other));
         assert!(!app.account_passes_filters(&by_title));
         cleanup(&path);
+    }
+
+    #[test]
+    fn account_requires_title_then_owner_in_gui() {
+        // The shared save-validation rule the GUI form enforces: title first, then
+        // owner; only a record with both (non-blank after trim) may be saved.
+        let mut a = Account::new().unwrap();
+        assert_eq!(
+            account_required_field_error(&a),
+            Some("Title is required — every account must have a title.")
+        );
+        a.title = "  Brokerage  ".into(); // whitespace-only would still fail; real text passes
+        assert_eq!(
+            account_required_field_error(&a),
+            Some("Owner is required — every account must have an owner."),
+            "title satisfied, owner still missing"
+        );
+        a.owner = "   ".into(); // whitespace-only owner is still missing
+        assert_eq!(account_required_field_error(&a), Some("Owner is required — every account must have an owner."));
+        a.owner = "Alice".into();
+        assert_eq!(account_required_field_error(&a), None, "title + owner present -> savable");
     }
 
     #[test]

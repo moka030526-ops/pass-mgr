@@ -244,7 +244,14 @@ enforced in two layers:
   session is guaranteed not to modify `vault.pmv` or the document store.
 - **UI:** the front-ends hide write controls (New/Save/Delete/attach/detach/
   generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
-  (browse, reveal, copy, export, backup) remain available.
+  (browse, reveal, copy, export, backup) remain available. The record forms are a
+  **view, not an editor**, in read-only mode: every data field is non-interactive
+  (GUI widgets are rendered with `add_enabled(writable, …)`; the TUI's
+  `handle_edit_key` drops typing / backspace / choice-cycling unless `writable`), so
+  a read-only user can open and inspect a record but cannot type into it. The **only**
+  changeable setting is the color theme (a non-vault preference, §13 / `save_theme`);
+  the backup-destination and document-export paths stay editable because backup and
+  export are themselves read-only-safe operations.
 
 Because the category lists now live **inside the vault** (not in external files),
 a read-only session writes **nothing** to disk at all — there are no auxiliary
@@ -577,8 +584,8 @@ currently exposes the first five record types.) The four screens are:
    (no "(none)" placeholder nodes): an account with no owner appears at the top level,
    one with no type hangs directly under its owner, and a fully-ungrouped account is a
    top-level leaf. The tree is built from the same filtered accounts
-   (`records::account_tree`, a recursive `AcctNode`), so filters and search still apply. Account **titles are mandatory** (a blank title is refused
-   on save). The Accounts filters are
+   (`records::account_tree`, a recursive `AcctNode`), so filters and search still apply. An account's **title and owner are mandatory** (a blank
+   title or owner is refused on save — see `account_required_field_error`). The Accounts filters are
    **cross-filtered (faceted)**: each dropdown offers only values present on accounts
    matching *all the other* active filters (`records::account_facets`), and a
    selection that a change makes invalid is **auto-cleared** (a fixpoint sweep), so
