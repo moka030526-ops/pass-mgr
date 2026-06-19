@@ -385,6 +385,10 @@ struct GuiApp {
     // Global "reveal" toggle on the Accounts screen: when on, account passwords are
     // shown regardless of the per-record `reveal_pw` (it overrides it).
     reveal_all: bool,
+    // The same idea for the Real Estate screen's three portal passwords: a top-level
+    // toggle that overrides the per-record "Reveal portal passwords" (`reveal_pw`).
+    // Kept separate from `reveal_all` so the two screens don't reveal each other.
+    re_reveal_all: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
     acct_filter_subtype: String,
@@ -484,6 +488,7 @@ impl GuiApp {
             edit_general: None,
             reveal_pw: false,
             reveal_all: false,
+            re_reveal_all: false,
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
@@ -1828,7 +1833,15 @@ impl GuiApp {
                 .collect(),
             None => Vec::new(),
         };
-        let reveal = self.reveal_pw;
+        // Top-level "reveal all" (mirrors the Accounts screen): when on, all three
+        // portal passwords are shown, overriding the per-record "Reveal portal
+        // passwords" toggle in the edit form below.
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.re_reveal_all, "reveal all portal passwords");
+        });
+        // Portal passwords are revealed when the per-record toggle OR the screen-level
+        // "reveal all" is on (matching the Accounts `reveal_pw || reveal_all`).
+        let reveal = self.reveal_pw || self.re_reveal_all;
         let writable = self.writable;
         let mut new = false;
         let mut select = None;
@@ -1855,7 +1868,9 @@ impl GuiApp {
                     portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, &mut copy_pw);
                     portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, &mut copy_pw);
                     portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, &mut copy_pw);
-                    ui.checkbox(&mut self.reveal_pw, "Reveal portal passwords");
+                    // Per-record reveal; disabled while the screen-level "reveal all" is
+                    // on (which already overrides it), exactly like the Accounts form.
+                    ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
 
                     ui.separator();
                     ui.label("Comments");

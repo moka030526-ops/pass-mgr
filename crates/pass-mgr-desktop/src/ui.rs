@@ -354,6 +354,9 @@ struct App {
     // Global "reveal" toggle for the Accounts tab: when on, account passwords are
     // shown regardless of the per-record reveal (it overrides Ctrl+R).
     reveal_all: bool,
+    // The same for the Real Estate tab's three portal passwords (toggled with `r` on
+    // the RE tab). Scoped per-tab so revealing one screen never reveals the other.
+    re_reveal_all: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -409,6 +412,7 @@ impl App {
             acct_search: String::new(),
             search_active: false,
             reveal_all: false,
+            re_reveal_all: false,
             asset_filter_review: false,
             cfg_focus: 0,
             cfg_asset_type: String::new(),
@@ -890,6 +894,10 @@ impl App {
             // Global reveal toggle (Accounts tab): overrides the per-record Ctrl+R.
             KeyCode::Char('r') if self.tab == Tab::Accounts => {
                 self.reveal_all = !self.reveal_all;
+            }
+            // Same, for the Real Estate tab's portal passwords.
+            KeyCode::Char('r') if self.tab == Tab::RealEstate => {
+                self.re_reveal_all = !self.re_reveal_all;
             }
             // One-off maintenance (Accounts tab): left/right-trim every field on
             // every account. Capital T (Shift+t) so it can't be hit by accident.
@@ -2435,6 +2443,7 @@ impl App {
                     "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · T trim-all · / search · ←→ tab · c config · p pw · q quit"
                 }
                 Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
+                Tab::RealEstate => "↑↓ · Enter edit · n new · d del · r reveal-all (portals) · ←→ tab · c config · p pw · q quit",
                 _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
             }
         };
@@ -2455,10 +2464,14 @@ impl App {
             // Decide what to display per field kind: a hidden password shows bullets
             // (unless `reveal` is on); a Choice shows arrows around the value; others
             // show their text verbatim. `&field.kind` matches by borrow.
-            // Masked unless the per-record reveal (Ctrl+R) OR the global "reveal all"
-            // (Accounts 'r' toggle) is on — the latter overrides the former.
+            // Masked unless the per-record reveal (Ctrl+R) OR the screen-level "reveal
+            // all" for THIS record's tab is on (the latter overrides the former):
+            // the Accounts `r` toggle for account edits, the Real Estate `r` toggle for
+            // property edits. Scoping by `es.tab` keeps the two screens independent.
+            let reveal_all_here = (self.reveal_all && es.tab == Tab::Accounts)
+                || (self.re_reveal_all && es.tab == Tab::RealEstate);
             let shown = match &field.kind {
-                FieldKind::Password if !(es.reveal || self.reveal_all) => "•".repeat(field.value.chars().count()),
+                FieldKind::Password if !(es.reveal || reveal_all_here) => "•".repeat(field.value.chars().count()),
                 FieldKind::Choice(_) => format!("◄ {} ►", field.value),
                 _ => field.value.clone(),
             };
@@ -2871,6 +2884,30 @@ mod tests {
         // The global reveal-all overrides the per-record reveal.
         app.reveal_all = true;
         assert!(render_to_string(&app).contains("SECRETPW"), "reveal-all shows the password");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn re_reveal_all_overrides_portal_masking_and_is_scoped_in_tui() {
+        let (mut app, path) = app_unlocked("uirereveal");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut r = RealEstate::new().unwrap();
+            r.address = "1 Main St".into();
+            r.property_mgmt_password = "PORTALPW".into();
+            records::upsert(&mut v.real_estate, r);
+        }
+        app.tab = Tab::RealEstate;
+        app.selected = 0;
+        app.start_edit(true);
+        // Masked by default (per-record Ctrl+R reveal off).
+        assert!(!render_to_string(&app).contains("PORTALPW"), "portal password masked by default");
+        // The ACCOUNT reveal-all must NOT reveal RE portals (scoped per tab).
+        app.reveal_all = true;
+        assert!(!render_to_string(&app).contains("PORTALPW"), "account reveal-all does not leak into RE");
+        // The RE reveal-all does reveal them.
+        app.re_reveal_all = true;
+        assert!(render_to_string(&app).contains("PORTALPW"), "re reveal-all shows the portal password");
         cleanup(&path);
     }
 
