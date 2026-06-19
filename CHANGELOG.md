@@ -74,10 +74,19 @@ date and bump the crate versions to match.
 
 ### Security
 
-Five rounds of adversarial multi-agent audit (including a 152-agent and a 159-agent
-hunt, plus an overnight three-phase autonomous sweep) fixed **34 confirmed defects**;
-none broke the cryptographic envelope (no finding lets an attacker read a vault they
-could not already open). Highlights:
+Six rounds of adversarial multi-agent audit (including a 152-agent and a 159-agent
+hunt, an overnight three-phase autonomous sweep, and a dynamic-verification round)
+fixed **36 confirmed defects**; none broke the cryptographic envelope (no finding lets
+an attacker read a vault they could not already open). Highlights:
+
+- **Dynamic verification (round 6)** — moved past static review: mutation testing
+  (`cargo-mutants`) on the changed security core (closed the one test gap it found,
+  in `trim_all_records`), a fresh fuzzing run (~67 M executions, 0 crashes), and a new
+  exhaustive **every-byte tamper matrix** asserting any single-byte change to a vault
+  file fails closed without panicking. Two fixes landed: **momentary reveal** (the
+  "reveal all" toggles now clear on tab switch instead of persisting) and a
+  **fail-closed `staged_rewrite`** (a future index/manifest desync errors instead of
+  silently storing an empty document path).
 
 - **Rekey crash-durability (round 5)** — the password-change commit renamed the new
   `volume/`/`manifest/`/`vault.pmv` into place but fsync'd the directory only once at the

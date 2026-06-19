@@ -876,12 +876,16 @@ impl OpenVault {
             self.storage.ids().filter(|id| !self.vault.deleted_docs.iter().any(|d| d == id)).map(|s| s.to_string()).collect();
         for id in &ids {
             let bytes = self.storage.read(id, &self.key)?; // decrypt under the CURRENT key
-            let (path, uploaded_at) = self
+            // `id` came from `self.storage.ids()` (the in-memory index), so its manifest
+            // `entry` must exist. Fail CLOSED if it doesn't rather than silently writing
+            // an empty path / `uploaded_at = 0`: a missing entry means the index and
+            // manifest have desynced, and silently defaulting would bake corrupt metadata
+            // into the rewritten store with no error (audit — `unwrap_or_default` removed).
+            let entry = self
                 .storage
                 .entry(id)
-                .map(|e| (e.path.clone(), e.uploaded_at))
-                .unwrap_or_default();
-            new_store.put(id, &path, &bytes, uploaded_at, write_key)?; // encrypt under the staged key
+                .ok_or_else(|| StorageError::Corrupt(format!("index/manifest desync: no manifest entry for {id}")))?;
+            new_store.put(id, &entry.path, &bytes, entry.uploaded_at, write_key)?; // encrypt under the staged key
         }
         drop(new_store); // flush/close the staged store before commit
 
@@ -3295,6 +3299,40 @@ mod tests {
         assert!(flipped_fails(9), "param tampering detected");
         assert!(flipped_fails(21), "salt tampering detected");
         assert!(flipped_fails(37), "nonce tampering detected");
+        fs::write(&path, &good).unwrap();
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn every_single_byte_flip_of_a_valid_vault_is_rejected_without_panic() {
+        // Exhaustive tamper matrix over the WHOLE open path (parse → KDF → AEAD → JSON →
+        // referenced⊆stored), complementing the byte-level parser fuzzers: flip one bit
+        // of EVERY byte of a valid `vault.pmv` and assert the open fails closed — never
+        // a panic, never a silent accept. This pins the guarantee that the entire file
+        // (magic/version/params/salt/nonce as AAD + ciphertext + Poly1305 tag) is
+        // integrity-protected, not just the three header offsets checked above.
+        let path = tmp_path("byteflip");
+        OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let good = fs::read(&path).unwrap();
+        for off in 0..good.len() {
+            for bit in [0x01u8, 0x80u8] {
+                let mut bad = good.clone();
+                bad[off] ^= bit;
+                if bad == good {
+                    continue;
+                }
+                fs::write(&path, &bad).unwrap();
+                // `is_err()` requires the open to RETURN an error — a panic here would
+                // fail the test (libtest treats a panic as a failure), which is the
+                // point: no single-byte corruption may crash the opener.
+                assert!(
+                    OpenVault::open(path.clone(), b"a", b"b").is_err(),
+                    "flipping bit {bit:#x} of byte {off} was accepted (integrity gap)"
+                );
+            }
+        }
+        // The untouched file still opens — proves the matrix wasn't vacuously passing.
         fs::write(&path, &good).unwrap();
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_ok());
         cleanup(&path);

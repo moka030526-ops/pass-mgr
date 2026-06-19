@@ -694,6 +694,17 @@ impl App {
         }
     }
 
+    /// Switch to tab `t`, reset the selection, and clear the "reveal all" toggles.
+    /// Reveal is a momentary, in-context action: a stale `reveal_all`/`re_reveal_all`
+    /// must not silently persist into a later visit and expose every password (the
+    /// per-edit `es.reveal` is already scoped to its own buffer).
+    fn switch_tab(&mut self, t: Tab) {
+        self.tab = t;
+        self.selected = 0;
+        self.reveal_all = false;
+        self.re_reveal_all = false;
+    }
+
     /// Gate a mutating action: returns true if writable, else sets a status hint.
     // `&mut self` because it may set `self.status`. An early `return true` exits
     // immediately; otherwise the function falls through to the final `false`.
@@ -925,22 +936,15 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Right | KeyCode::Tab => {
-                self.tab = self.tab.shifted(1);
-                self.selected = 0;
-            }
-            KeyCode::Left | KeyCode::BackTab => {
-                self.tab = self.tab.shifted(-1);
-                self.selected = 0;
-            }
+            KeyCode::Right | KeyCode::Tab => self.switch_tab(self.tab.shifted(1)),
+            KeyCode::Left | KeyCode::BackTab => self.switch_tab(self.tab.shifted(-1)),
             // `c @ '1'..='9'` is a range pattern that also binds the matched char to
             // `c`: a digit key jumps straight to that tab. `Tab::ALL.get(...)` keys
             // off the actual tab count, so this covers every tab (now 7) and never
             // panics on a digit past the end (it just does nothing).
             KeyCode::Char(c @ '1'..='9') => {
                 if let Some(&t) = Tab::ALL.get(c as usize - '1' as usize) {
-                    self.tab = t;
-                    self.selected = 0;
+                    self.switch_tab(t);
                 }
             }
             KeyCode::Down => {
@@ -3135,6 +3139,26 @@ mod tests {
         // The RE reveal-all does reveal them.
         app.re_reveal_all = true;
         assert!(render_to_string(&app).contains("PORTALPW"), "re reveal-all shows the portal password");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn switching_tabs_resets_reveal_all_toggles() {
+        // Reveal is momentary: switching tabs must clear `reveal_all`/`re_reveal_all`
+        // so a sticky toggle can't silently expose every password on a later visit.
+        let (mut app, path) = app_unlocked("revealreset");
+        app.tab = Tab::Accounts;
+        app.reveal_all = true;
+        app.re_reveal_all = true;
+        // Any tab-change key routes through `switch_tab`, which clears both toggles.
+        app.handle_key(key(KeyCode::Char('5'))); // jump to the Real Estate tab
+        assert_eq!(app.tab, Tab::RealEstate);
+        assert!(!app.reveal_all, "reveal_all cleared on tab switch");
+        assert!(!app.re_reveal_all, "re_reveal_all cleared on tab switch");
+        // Arrow-key tab navigation clears them too.
+        app.re_reveal_all = true;
+        app.handle_key(key(KeyCode::Right));
+        assert!(!app.re_reveal_all, "arrow tab-switch also clears reveal");
         cleanup(&path);
     }
 

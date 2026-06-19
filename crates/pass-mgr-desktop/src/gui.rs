@@ -867,9 +867,15 @@ impl GuiApp {
                 }
             });
         });
-        // Re-mask passwords when the user switches tabs (see prev_tab above).
+        // Re-mask passwords when the user switches tabs (see prev_tab above). Reset
+        // ALL three reveal toggles, not just the per-record one: "reveal all" is meant
+        // to be a momentary, in-context action, so it should not silently persist into a
+        // later visit to the tab and expose every password to a bystander (it stays
+        // scoped per screen either way, but a stale sticky reveal is its own hazard).
         if self.tab != prev_tab {
             self.reveal_pw = false;
+            self.reveal_all = false;
+            self.re_reveal_all = false;
         }
     }
 

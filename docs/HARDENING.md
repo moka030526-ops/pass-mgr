@@ -17,20 +17,22 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 
 | Layer | Result |
 | --- | --- |
-| Adversarial security review (5 rounds incl. a 152- and a 159-agent deep hunt + an overnight 3-phase autonomous sweep) | **34 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
-| Mutation testing (`cargo-mutants --in-diff`, 194 mutants) | **56 survivors killed** (106→50 missed); `core`/`ffi` clean (only a `cfg` phantom); the 50 remaining are all in the thin desktop UI (rendering / keyboard / cosmetic) — see §4 |
-| Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M executions, 0 crashes** (latest extended run) |
+| Adversarial security review (6 rounds incl. a 152- and a 159-agent deep hunt, an overnight 3-phase autonomous sweep, and a dynamic-verification round) | **36 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8 + round-6 B-1…B-2; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
+| Mutation testing (`cargo-mutants`) | round-6 run over this session's security-core diff: **44 mutants → 4 missed, closed by a test fix** (the 4 were `trim_all_records`'s sum, now pinned); prior new-code run killed 56 survivors — see §4 |
+| Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M cumulative + ~67 M round-6, 0 crashes** |
 | Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** (re-confirmed round 5) |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 225 · ffi 32 · compat 4 · desktop 72 + 20 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 226 · ffi 32 · compat 4 · desktop 73 + 20 — all green** (incl. an exhaustive every-byte vault-tamper matrix; debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
-The cryptographic envelope was never broken: across five rounds no finding lets an
+The cryptographic envelope was never broken: across six rounds no finding lets an
 attacker read a vault they could not already open. The fixes harden secret hygiene
-(plaintext password lifetime / display / clipboard auto-clear), open-time DoS
-resistance, untrusted-import path safety (incl. a symlink-TOCTOU arbitrary-file read),
-deletion durability, **rekey crash-durability**, backup integrity, FFI **and desktop**
-no-oracle parity, iOS clipboard/snapshot parity, and a destructive-CLI footgun — see
-§3.1 / §3.1b / §3.1c / §3.1d / §3.1e.
+(plaintext password lifetime / display / clipboard auto-clear / momentary reveal),
+open-time DoS resistance, untrusted-import path safety (incl. a symlink-TOCTOU
+arbitrary-file read), deletion durability, **rekey crash-durability**, backup
+integrity, FFI **and desktop** no-oracle parity, iOS clipboard/snapshot parity, and a
+destructive-CLI footgun — see §3.1 / §3.1b / §3.1c / §3.1d / §3.1e / §3.1f. Round 6
+added a **dynamic-verification** layer (mutation testing, fuzzing, and an exhaustive
+every-byte tamper matrix) on top of the static review.
 
 ## 2. Assurance layers applied
 
@@ -191,6 +193,21 @@ bug, and the secret-hygiene pass found a real **HIGH** clipboard leak (the round
 
 **Dynamic corroboration:** `cargo audit` (0 advisories, 0 yanked) and `cargo deny check` (advisories/bans/licenses/sources ok) re-run clean; no networking crate in the tree. The cryptographic core was re-verified end-to-end (fresh random nonce on every encrypt/save/frame, fresh salt per KDF, whole-header AAD, vault-id+partition-bound frame AAD, genuine two-password Argon2id chaining, `Zeroizing`/`mlock` key handling, CSPRNG-only randomness, params validated on both read and write, constant-time AEAD tag check) — no change needed.
 
+### 3.1f Sixth round — dynamic verification (mutation testing + fuzzing + exhaustive tamper) + fix re-audit
+
+Where rounds 1–5 were *static* multi-agent review, this round moved to **dynamic verification** — executing adversarial inputs rather than reasoning about them — plus an adversarial re-audit of the round-5 fixes (new code is where regressions hide). Tools actually run, not just cited:
+
+- **Mutation testing** (`cargo-mutants` 27.1) over this session's security-core diff: **44 mutants → 4 missed, 38 caught, 2 unviable**. The 4 survivors were ALL the `+` operators in `trim_all_records`'s seven-term sum — behaviour no test pinned because the test left most tabs at count 0. Killed by strengthening the test to put one dirty record in **every** collection: the expected total (7) then changes under any `+`→`-`/`*` mutation of any term, so all four arithmetic survivors are pinned by construction (confirmed by a targeted `cargo-mutants` re-run over `trim_all_records`). The round-5 fsync, symlink-guard, export-validation, `saturating_add`, and tree changes were all already caught.
+- **Fuzzing** (`cargo-fuzz`, libFuzzer+ASan) — a fresh run of all five parser targets (`parse_header`, `parse_frame`, `parse_manifest`, `scan_volume`, `doc_paths`): **~67 M executions this session, 0 crashes / panics / leaks / OOMs** (atop the ~183 M cumulative).
+- **Exhaustive tamper matrix** (new test `every_single_byte_flip_of_a_valid_vault_is_rejected_without_panic`): flips both the low and high bit of **every byte** of a valid `vault.pmv` and asserts `OpenVault::open` fails closed over the WHOLE path (parse → KDF → AEAD → JSON → referenced⊆stored) — never a panic, never a silent accept. This generalises the prior 3-offset header-tamper test to the entire file (header-as-AAD + ciphertext + Poly1305 tag).
+
+Two real fixes landed from the re-audit; the round-5 fixes themselves were confirmed regression-free.
+
+| # | Sev | Fix |
+| --- | --- | --- |
+| B-1 | Med | **`reveal_all` / `re_reveal_all` were sticky across tab switches.** The per-record `reveal_pw` is re-masked on every tab change, but the two screen-level "reveal all" toggles were not — so a reveal-all left on in one tab silently persisted into a later visit, exposing every password to a bystander (it stayed scoped per screen, so not a cross-tab leak — just a stale sticky reveal). Both UIs now clear all three reveal toggles on tab switch (GUI `ui_top_bar`; TUI a new `switch_tab` helper routing every tab-change key). |
+| B-2 | Low | **`staged_rewrite` silently defaulted a doc's path on an index/manifest desync.** `entry(id).map(...).unwrap_or_default()` would, if the in-memory index and on-disk manifest ever disagreed, re-encrypt a document into the compacted/rekeyed store with an EMPTY path and `uploaded_at = 0` — silent metadata corruption with no error. Currently unreachable (`reindex` keeps them in sync), but now **fails closed** with a `Corrupt` error instead of defaulting, so a future desync can't bake in bad metadata. |
+
 ### 3.2 Investigated and refuted (no change needed)
 
 | # | Hypothesis | Why it does not hold |
@@ -214,6 +231,10 @@ bug, and the secret-hygiene pass found a real **HIGH** clipboard leak (the round
 | A-13 | CLI prints distinct `VaultError` messages (wrong-password vs corrupt) | The CLI is a local diagnostic surface (`verify`/`manifest` exist *to* report structural state) and CLI access already implies file access; the no-oracle property is enforced where it matters — the FFI (R-3) and now the desktop unlock (A-3). Left verbose by design. |
 | A-14 | `account_tree` group build is O(N²) in distinct group count | Linear `child_mut` scan; ~165 ms only at 8 000 *distinct* owners (far past estate scale; the GUI rebuilds it per frame only when grouped). Not worth a `HashMap` index at realistic sizes. |
 | A-15 | egui revealed-field galley / cross-platform clipboard-history residues | Platform-inherent: a revealed password is laid into egui's font galley cache (not zeroizable without patching egui), and the `exclude_from_history` clipboard hint is best-effort on macOS/Windows. Mitigations in place; documented as residual. |
+| B-3 | TUI redundancy field accepts an unbounded number (GUI offers a 0–5 combo) | Not a bug: `set_redundancy` clamps to `MAX_REDUNDANCY` (10) and the success line re-reads the applied value, so no false success and no oversized ring — just a cosmetic GUI/TUI input asymmetry. Left as-is. |
+| B-4 | Redundancy ring shows two equal-generation slots right after a rekey/compact | After a rekey, `cleanup_redundancy` wipes the old-key baks and `refresh_redundancy_copies` writes mirror+bak1 at the same (current) generation; the next save then leaves `bak1 == bak2` for one cycle. No data loss and no wrong recovery (the duplicate copies are byte-identical, and "newest valid wins" still holds) — only the "strictly descending" ring invariant is briefly non-strict and effective depth is one less for that cycle. Cosmetic; the strict invariant proptest covers only the save-only path. |
+| B-5 | `recovery_notice` can't tell a stale (one-generation-behind) mirror from a current one | By design: the lost primary is unreadable, so the recovered copy can't be compared against it. The notice already hedges ("the most recent change may be missing") and never claims "no data lost"; `opened_generation`/`previous_access` surface the recovered generation for the user to notice a rollback. |
+| B-6 | The four `unreachable!()` arms for `CategoryRemoval::HasSubtypes` on asset-types/subtypes (GUI+TUI) | Kept: asset types and subtypes structurally have no children, so the core never returns `HasSubtypes` for them — the arms are correct fail-loud defensive code that a test would catch if a future core change violated the contract, preferable to silently swallowing it. |
 
 ## 4. Mutation testing
 

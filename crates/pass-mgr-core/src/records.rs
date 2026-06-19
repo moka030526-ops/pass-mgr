@@ -1524,23 +1524,43 @@ mod tests {
 
     #[test]
     fn trim_all_records_trims_every_tab_of_the_vault() {
+        // Put EXACTLY ONE dirty record in every one of the seven collections, so the
+        // expected total (7) pins down each `+` in the `trim_all_records` sum: any
+        // operator mutation (`+`→`-`/`*`) changes the total and fails this assert.
+        // (Caught a real mutation-testing gap where zero-count tabs let those mutants
+        // survive.)
         let mut v = Vault::default();
+        let mut ins = Instruction::new().unwrap();
+        ins.title = " Note ".into();
+        v.instructions.push(ins);
+        let mut tw = TrustWill::new().unwrap();
+        tw.document = " Will ".into();
+        v.trust_wills.push(tw);
+        let mut al = AssetLiability::new().unwrap();
+        al.owner = "  Bob  ".into();
+        v.assets.push(al);
         let mut a = Account::new().unwrap();
         a.owner = "  Alice  ".into();
         v.accounts.push(a);
         let mut re = RealEstate::new().unwrap();
         re.address = "  Home  ".into();
         v.real_estate.push(re);
-        let mut tw = TrustWill::new().unwrap();
-        tw.document = " Will ".into();
-        v.trust_wills.push(tw);
-        v.instructions.push(Instruction::new().unwrap()); // empty -> already clean
+        let mut tax = TaxFiling::new().unwrap();
+        tax.year = " 2024 ".into();
+        v.tax_filings.push(tax);
+        let mut gd = GeneralDocument::new().unwrap();
+        gd.title = " Deed ".into();
+        v.general_documents.push(gd);
 
         let n = trim_all_records(&mut v);
-        assert_eq!(n, 3, "three dirty records across three different tabs are trimmed");
+        assert_eq!(n, 7, "one dirty record in each of the 7 collections is trimmed (pins every `+`)");
+        assert_eq!(v.instructions[0].title, "Note");
+        assert_eq!(v.trust_wills[0].document, "Will");
+        assert_eq!(v.assets[0].owner, "Bob");
         assert_eq!(v.accounts[0].owner, "Alice");
         assert_eq!(v.real_estate[0].address, "Home");
-        assert_eq!(v.trust_wills[0].document, "Will");
+        assert_eq!(v.tax_filings[0].year, "2024");
+        assert_eq!(v.general_documents[0].title, "Deed");
         // The trim is auditable in the changed record's own history.
         assert!(
             v.accounts[0].history.iter().any(|c| c.detail.contains("owner") && c.detail.contains("Alice")),
