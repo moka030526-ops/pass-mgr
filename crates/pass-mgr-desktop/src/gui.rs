@@ -1934,55 +1934,57 @@ impl GuiApp {
             (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable);
             let ui = &mut c[1];
             if let Some(r) = self.edit_realestate.as_mut() {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                        text_row(ui, "Address", &mut r.address);
-                        text_row(ui, "Ownership", &mut r.ownership);
-                        text_row(ui, "Taxes", &mut r.taxes);
-                        text_row(ui, "HOA dues / info", &mut r.hoa);
-                        text_row(ui, "Income account", &mut r.income_account);
-                        text_row(ui, "Financing account", &mut r.financing_account);
-                        text_row(ui, "Financing balance", &mut r.financing_balance);
-                        text_row(ui, "Payment account", &mut r.payment_account);
-                    });
-
-                    portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, &mut copy_pw);
-                    portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, &mut copy_pw);
-                    portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, &mut copy_pw);
-                    // Per-record reveal; disabled while the screen-level "reveal all" is
-                    // on (which already overrides it), exactly like the Accounts form.
-                    ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
-
-                    ui.separator();
-                    ui.label("Comments");
-                    ui.add(egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY));
-
-                    ui.separator();
-                    ui.label(format!(
-                        "Documents ({}) — under {}/<timestamp>/[subfolder]/",
-                        r.documents.len(),
-                        records::real_estate_doc_location(&r.address)
-                    ));
-                    // Same uniform widget as Trust & Will (multi-document: the list
-                    // holds every attached doc); map its request to ReDocReq.
-                    docreq = match doc_section(
-                        ui,
-                        &doc_labels,
-                        &mut self.doc_subfolder,
-                        &mut self.doc_filename,
-                        &mut self.doc_source,
-                        &mut self.doc_dest,
-                        writable,
-                    ) {
-                        DocSectionReq::Upload => ReDocReq::Upload,
-                        DocSectionReq::Export(i) => ReDocReq::Export(i),
-                        DocSectionReq::Remove(i) => ReDocReq::Remove(i),
-                        DocSectionReq::None => ReDocReq::None,
-                    };
-
-                    action = form_buttons(ui, writable);
-                    history_view(ui, &r.history);
+                // No inner ScrollArea here: the whole tab is already wrapped in the
+                // CentralPanel's both-axis scroll. A nested vertical scroll over this
+                // form would capture the wheel and (having no overflow of its own)
+                // scroll nothing, while the outer area never saw the event.
+                egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    text_row(ui, "Address", &mut r.address);
+                    text_row(ui, "Ownership", &mut r.ownership);
+                    text_row(ui, "Taxes", &mut r.taxes);
+                    text_row(ui, "HOA dues / info", &mut r.hoa);
+                    text_row(ui, "Income account", &mut r.income_account);
+                    text_row(ui, "Financing account", &mut r.financing_account);
+                    text_row(ui, "Financing balance", &mut r.financing_balance);
+                    text_row(ui, "Payment account", &mut r.payment_account);
                 });
+
+                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, &mut copy_pw);
+                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, &mut copy_pw);
+                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, &mut copy_pw);
+                // Per-record reveal; disabled while the screen-level "reveal all" is
+                // on (which already overrides it), exactly like the Accounts form.
+                ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
+
+                ui.separator();
+                ui.label("Comments");
+                ui.add(egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY));
+
+                ui.separator();
+                ui.label(format!(
+                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    r.documents.len(),
+                    records::real_estate_doc_location(&r.address)
+                ));
+                // Same uniform widget as Trust & Will (multi-document: the list
+                // holds every attached doc); map its request to ReDocReq.
+                docreq = match doc_section(
+                    ui,
+                    &doc_labels,
+                    &mut self.doc_subfolder,
+                    &mut self.doc_filename,
+                    &mut self.doc_source,
+                    &mut self.doc_dest,
+                    writable,
+                ) {
+                    DocSectionReq::Upload => ReDocReq::Upload,
+                    DocSectionReq::Export(i) => ReDocReq::Export(i),
+                    DocSectionReq::Remove(i) => ReDocReq::Remove(i),
+                    DocSectionReq::None => ReDocReq::None,
+                };
+
+                action = form_buttons(ui, writable);
+                history_view(ui, &r.history);
             } else {
                 ui.label("Select a property or click “New”.");
             }
