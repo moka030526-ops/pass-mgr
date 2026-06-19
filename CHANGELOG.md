@@ -43,8 +43,9 @@ date and bump the crate versions to match.
     saved value (incl. the review-only and username-search filters) so the entry never
     silently vanishes.
   - **New-from-filter** — clicking *New* under active filters pre-populates the form.
-  - **Trim all fields** — every Account field is left/right-trimmed on save, plus a
-    one-off bulk-trim action over the whole vault (history-recorded).
+  - **Trim all fields** — every field of **every record type** (all tabs, secrets
+    included) is left/right-trimmed on save, plus a one-off bulk-trim action that
+    sweeps the whole vault (history-recorded).
 - **Config: delete an unused category** — asset types, account types, and account
   subtypes can be deleted from Config, **only when no live record uses them** (history
   mentions never block); an account type with subtypes must have those removed first.

@@ -1264,6 +1264,11 @@ impl GuiApp {
         }
         match action {
             FormAction::Save => {
+                // Left/right-trim every field before persisting (whole-vault policy);
+                // trim the live form too so the displayed values match what was saved.
+                if let Some(r) = self.edit_instruction.as_mut() {
+                    r.trim_fields();
+                }
                 // Let-chain: take an owned clone of the edited record AND a mutable
                 // borrow of the vault, then upsert (insert-or-update) into it.
                 if let Some(r) = self.edit_instruction.clone()
@@ -1341,6 +1346,9 @@ impl GuiApp {
         self.handle_doc(docreq, DocTarget::TrustWill);
         match action {
             FormAction::Save => {
+                if let Some(r) = self.edit_trustwill.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_trustwill.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -1412,6 +1420,9 @@ impl GuiApp {
         self.handle_doc(docreq, DocTarget::General);
         match action {
             FormAction::Save => {
+                if let Some(r) = self.edit_general.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_general.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -1527,6 +1538,9 @@ impl GuiApp {
         self.handle_doc(docreq, DocTarget::Asset);
         match action {
             FormAction::Save => {
+                if let Some(r) = self.edit_asset.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_asset.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -1612,18 +1626,18 @@ impl GuiApp {
         }
     }
 
-    /// One-off maintenance: left/right-trim every field on every account, persist,
-    /// and report the count. Each change is recorded in that account's history.
-    /// Returns the number of accounts changed.
-    fn trim_all_accounts(&mut self) -> usize {
+    /// One-off maintenance: left/right-trim every field on every record across ALL
+    /// tabs, persist, and report the count. Each change is recorded in that record's
+    /// history. Returns the number of records changed.
+    fn trim_all_records(&mut self) -> usize {
         let n = match self.vault.as_mut() {
-            Some(ov) => records::trim_all_accounts(&mut ov.vault.accounts),
+            Some(ov) => records::trim_all_records(&mut ov.vault),
             None => return 0,
         };
         if n == 0 {
-            self.status = "Nothing to trim — all account fields are already clean.".into();
+            self.status = "Nothing to trim — every field is already clean.".into();
         } else if self.persist() {
-            self.status = format!("Trimmed {n} account(s).");
+            self.status = format!("Trimmed {n} record(s).");
         }
         n
     }
@@ -1699,11 +1713,11 @@ impl GuiApp {
                 self.acct_filter_review = false;
                 self.acct_search_user.clear();
             }
-            // One-off maintenance: left/right-trim every field on every account.
+            // One-off maintenance: left/right-trim every field on every record (all tabs).
             if self.writable
                 && ui
                     .button("Trim all fields")
-                    .on_hover_text("One-off: left/right-trim every field on every account (recorded in history)")
+                    .on_hover_text("One-off: left/right-trim every field on every record in the whole vault (recorded in history)")
                     .clicked()
             {
                 trim_all = true;
@@ -1713,7 +1727,7 @@ impl GuiApp {
         // Perform the one-off bulk trim (after the filter row, before the list is
         // built, so the cleaned values show this frame).
         if trim_all {
-            self.trim_all_accounts();
+            self.trim_all_records();
         }
 
         // Filtered list (after the filter row, so a change applies this frame).
@@ -2060,6 +2074,9 @@ impl GuiApp {
         self.handle_re_doc(docreq);
         match action {
             FormAction::Save => {
+                if let Some(r) = self.edit_realestate.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_realestate.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -2150,6 +2167,9 @@ impl GuiApp {
         self.handle_tax_doc(docreq);
         match action {
             FormAction::Save => {
+                if let Some(r) = self.edit_taxfiling.as_mut() {
+                    r.trim_fields();
+                }
                 if let Some(r) = self.edit_taxfiling.clone()
                     && let Some(ov) = self.vault.as_mut()
                 {
@@ -3190,7 +3210,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_all_accounts_bulk_trims_and_reports_in_gui() {
+    fn trim_all_records_bulk_trims_every_tab_and_reports_in_gui() {
         let (mut app, path) = app_unlocked("guitrimall");
         {
             let ov = app.vault.as_mut().unwrap();
@@ -3201,16 +3221,28 @@ mod tests {
             records::upsert(&mut ov.vault.accounts, a);
             let b = Account::new().unwrap(); // already clean (all empty)
             records::upsert(&mut ov.vault.accounts, b);
+            // A dirty record on ANOTHER tab must also be trimmed (whole-vault sweep).
+            let mut re = RealEstate::new().unwrap();
+            re.address = "  1 Main St  ".into();
+            re.property_mgmt_password = "  portalpw  ".into();
+            records::upsert(&mut ov.vault.real_estate, re);
+            let mut tax = TaxFiling::new().unwrap();
+            tax.year = " 2024 ".into();
+            records::upsert(&mut ov.vault.tax_filings, tax);
         }
-        let n = app.trim_all_accounts();
-        assert_eq!(n, 1, "only the dirty account is counted");
+        let n = app.trim_all_records();
+        assert_eq!(n, 3, "the dirty account + real-estate + tax records are all counted");
         let a = &app.vault.as_ref().unwrap().vault.accounts[0];
         assert_eq!(a.owner, "Alice");
         assert_eq!(a.title, "Brokerage");
         assert_eq!(a.password, "s3cret", "the password is trimmed too (configured policy)");
-        assert!(app.status.contains("Trimmed 1"), "status: {}", app.status);
+        let re = &app.vault.as_ref().unwrap().vault.real_estate[0];
+        assert_eq!(re.address, "1 Main St");
+        assert_eq!(re.property_mgmt_password, "portalpw", "portal passwords are trimmed too");
+        assert_eq!(app.vault.as_ref().unwrap().vault.tax_filings[0].year, "2024");
+        assert!(app.status.contains("Trimmed 3"), "status: {}", app.status);
         // Idempotent.
-        assert_eq!(app.trim_all_accounts(), 0);
+        assert_eq!(app.trim_all_records(), 0);
         assert!(app.status.contains("Nothing to trim"), "status: {}", app.status);
         cleanup(&path);
     }

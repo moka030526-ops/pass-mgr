@@ -597,9 +597,10 @@ currently exposes the first five record types.) The four screens are:
    **reveal** toggle on the Accounts screen shows every account password at once,
    overriding the per-record reveal. All of this only affects the view/edit buffer;
    nothing is written until the record is saved. A one-off **Trim all fields** action
-   (GUI button; TUI `T`) left/right-trims every field on every account in one pass,
-   recording each change in history; the same trim runs automatically on every
-   account save (`Account::trim_fields`, password included).
+   (GUI button; TUI `T`) left/right-trims every field on every record across **all
+   tabs** in one pass (`records::trim_all_records`), recording each change in history;
+   the same trim runs automatically on **every save of every record type**
+   (`Record::trim_fields`, secrets such as passwords included).
 3. **Edit.** All fields of one record; passwords masked with a reveal toggle and
    a clipboard copy that auto-clears (§7.1). Saving appends a field-level `Change`
    to the record's history (req. 4, 5), shown in a History pane. Document-bearing

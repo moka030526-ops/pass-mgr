@@ -569,6 +569,30 @@ pub trait Record: Clone {
     fn diff(&self, new: &Self, at: i64) -> Vec<Change>;
     /// Short label for list display.
     fn label(&self) -> String;
+    /// Left/right-trim every free-text field in place (including secrets such as
+    /// passwords, per the project policy). Returns `true` if any field changed.
+    /// Bookkeeping fields (id/timestamps/history), booleans, and volume file ids are
+    /// left untouched. Applied on every save and by the bulk [`trim_all_records`].
+    fn trim_fields(&mut self) -> bool;
+}
+
+/// Left/right-trim each string in place, zeroizing the old buffer before replacing
+/// it so a trimmed secret is never stranded in freed heap (a plain `*f = ...` would
+/// deallocate the old `String` without wiping it). Returns whether anything changed.
+/// Shared by every record's [`Record::trim_fields`].
+fn trim_strings_in_place(fields: &mut [&mut String]) -> bool {
+    let mut changed = false;
+    for f in fields {
+        // `f.trim().to_string()` copies the trimmed slice into a fresh String,
+        // ending the borrow of `**f` before the assignment below.
+        let trimmed = f.trim().to_string();
+        if trimmed != **f {
+            f.zeroize();
+            **f = trimmed;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Insert `rec` or, if a record with the same id exists, replace it — appending
@@ -837,61 +861,45 @@ impl Account {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(Account))
     }
-
-    /// Left/right-trim every text field in place (including the password, per the
-    /// configured policy). Returns `true` if any field actually changed. Used both
-    /// on save and by the one-off bulk cleanup ([`trim_all_accounts`]).
-    pub fn trim_fields(&mut self) -> bool {
-        let mut changed = false;
-        // `&mut self.<field>` collected into an array of mutable references so the
-        // same trim runs over every text field. `review`/`id`/timestamps/history
-        // are deliberately excluded (a bool and bookkeeping, not user free text).
-        for f in [
-            &mut self.title,
-            &mut self.account_type,
-            &mut self.account_subtype,
-            &mut self.owner,
-            &mut self.username,
-            &mut self.password,
-            &mut self.url,
-            &mut self.closed_as_of,
-            &mut self.description,
-        ] {
-            // `f.trim().to_string()` copies the trimmed slice into a fresh String,
-            // ending the borrow of `*f` before the assignment below.
-            let trimmed = f.trim().to_string();
-            if trimmed != *f {
-                // Wipe the old buffer before it is freed: a plain `*f = ...` would
-                // deallocate the previous String WITHOUT zeroizing, stranding the
-                // untrimmed value (notably the password) in freed heap. Matches the
-                // password-buffer hygiene the GUI uses on regenerate.
-                f.zeroize();
-                *f = trimmed;
-                changed = true;
-            }
-        }
-        changed
-    }
 }
 
-/// One-off maintenance: left/right-trim every field on every account, routing each
-/// changed record through [`upsert`] so the trim is recorded in that account's
-/// history (old -> new) and bumps `updated_at`. Returns how many accounts changed.
-pub fn trim_all_accounts(accounts: &mut Vec<Account>) -> usize {
+/// One-off bulk maintenance: left/right-trim every field on every record in `list`,
+/// routing each changed record through [`upsert`] so the trim is recorded in that
+/// record's history (old -> new) and bumps `updated_at`. Returns how many changed.
+/// Generic over any [`Record`] type via its [`Record::trim_fields`].
+pub fn trim_all<R: Record>(list: &mut Vec<R>) -> usize {
     // Trim clones first (so we don't mutate while iterating), collect the ones that
     // actually changed, then upsert them back by id.
-    let mut changed: Vec<Account> = Vec::new();
-    for a in accounts.iter() {
-        let mut t = a.clone();
+    let mut changed: Vec<R> = Vec::new();
+    for r in list.iter() {
+        let mut t = r.clone();
         if t.trim_fields() {
             changed.push(t);
         }
     }
     let n = changed.len();
     for t in changed {
-        upsert(accounts, t);
+        upsert(list, t);
     }
     n
+}
+
+/// Trim every account (the original bulk action, kept as a named convenience).
+pub fn trim_all_accounts(accounts: &mut Vec<Account>) -> usize {
+    trim_all(accounts)
+}
+
+/// Trim EVERY field on EVERY record across ALL tabs of the vault. Returns the total
+/// number of records changed. Backs the "Trim all fields" maintenance action so the
+/// whole vault — not just accounts — has its leading/trailing whitespace removed.
+pub fn trim_all_records(vault: &mut Vault) -> usize {
+    trim_all(&mut vault.instructions)
+        + trim_all(&mut vault.trust_wills)
+        + trim_all(&mut vault.assets)
+        + trim_all(&mut vault.accounts)
+        + trim_all(&mut vault.real_estate)
+        + trim_all(&mut vault.tax_filings)
+        + trim_all(&mut vault.general_documents)
 }
 impl RealEstate {
     pub fn new() -> Result<Self, CryptoError> {
@@ -918,7 +926,7 @@ impl GeneralDocument {
 // two closures supplied at each call site below). The macro stamps out a full
 // `impl Record for <type>` so we don't hand-write the same accessors five times.
 macro_rules! impl_record {
-    ($ty:ty, $diff:expr, $label:expr) => {
+    ($ty:ty, $diff:expr, $label:expr, $trim:expr) => {
         // `impl Record for $ty` = "this type provides the Record interface".
         impl Record for $ty {
             fn id(&self) -> &str {
@@ -950,6 +958,10 @@ macro_rules! impl_record {
                 let f: fn(&$ty) -> String = $label;
                 f(self)
             }
+            fn trim_fields(&mut self) -> bool {
+                let f: fn(&mut $ty) -> bool = $trim;
+                f(self)
+            }
         }
     };
 }
@@ -966,7 +978,8 @@ impl_record!(
     // Label closure: `l` is the record. `if/else` is an expression here (it yields
     // a value). Uses a literal placeholder when empty, else `.clone()`s the title
     // into a new owned String (the trait requires returning an owned `String`).
-    |l: &Instruction| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() }
+    |l: &Instruction| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() },
+    |r: &mut Instruction| trim_strings_in_place(&mut [&mut r.title, &mut r.description])
 );
 
 impl_record!(
@@ -980,7 +993,8 @@ impl_record!(
             out.push(Change { at, action: "updated".into(), detail: "attached file changed".into() });
         }
     },
-    |l: &TrustWill| if l.document.is_empty() { "(untitled)".to_string() } else { l.document.clone() }
+    |l: &TrustWill| if l.document.is_empty() { "(untitled)".to_string() } else { l.document.clone() },
+    |r: &mut TrustWill| trim_strings_in_place(&mut [&mut r.document, &mut r.usage])
 );
 
 impl_record!(
@@ -1005,6 +1019,19 @@ impl_record!(
         // type (the literal is already a `&str`); no allocation happens here.
         let d = if l.description.is_empty() { "(no description)" } else { l.description.as_str() };
         format!("[{}] {d}", l.kind)
+    },
+    |r: &mut AssetLiability| {
+        trim_strings_in_place(&mut [
+            &mut r.kind,
+            &mut r.description,
+            &mut r.owner,
+            &mut r.approx_value,
+            &mut r.as_of_date,
+            &mut r.institution,
+            &mut r.asset_type,
+            &mut r.url,
+            &mut r.beneficiary,
+        ])
     }
 );
 
@@ -1040,6 +1067,21 @@ impl_record!(
             parts.push(who);
         }
         if parts.is_empty() { "(account)".to_string() } else { parts.join(" - ") }
+    },
+    |r: &mut Account| {
+        // Every text field, including the password (accepted policy). `review`,
+        // id, timestamps, and history are deliberately excluded.
+        trim_strings_in_place(&mut [
+            &mut r.title,
+            &mut r.account_type,
+            &mut r.account_subtype,
+            &mut r.owner,
+            &mut r.username,
+            &mut r.password,
+            &mut r.url,
+            &mut r.closed_as_of,
+            &mut r.description,
+        ])
     }
 );
 
@@ -1072,7 +1114,31 @@ impl_record!(
             });
         }
     },
-    |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() }
+    |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() },
+    |r: &mut RealEstate| {
+        // Every text field, including the three portal passwords. `documents` (volume
+        // ids), id, timestamps, and history are excluded.
+        trim_strings_in_place(&mut [
+            &mut r.address,
+            &mut r.ownership,
+            &mut r.taxes,
+            &mut r.hoa,
+            &mut r.income_account,
+            &mut r.financing_account,
+            &mut r.payment_account,
+            &mut r.financing_balance,
+            &mut r.property_mgmt_url,
+            &mut r.property_mgmt_username,
+            &mut r.property_mgmt_password,
+            &mut r.insurance_url,
+            &mut r.insurance_username,
+            &mut r.insurance_password,
+            &mut r.hoa_url,
+            &mut r.hoa_username,
+            &mut r.hoa_password,
+            &mut r.comments,
+        ])
+    }
 );
 
 impl_record!(
@@ -1089,7 +1155,8 @@ impl_record!(
             });
         }
     },
-    |l: &TaxFiling| if l.year.is_empty() { "(no year)".to_string() } else { format!("Taxes {}", l.year) }
+    |l: &TaxFiling| if l.year.is_empty() { "(no year)".to_string() } else { format!("Taxes {}", l.year) },
+    |r: &mut TaxFiling| trim_strings_in_place(&mut [&mut r.year, &mut r.notes])
 );
 
 impl_record!(
@@ -1102,7 +1169,8 @@ impl_record!(
             out.push(Change { at, action: "updated".into(), detail: "attached file changed".into() });
         }
     },
-    |l: &GeneralDocument| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() }
+    |l: &GeneralDocument| if l.title.is_empty() { "(untitled)".to_string() } else { l.title.clone() },
+    |r: &mut GeneralDocument| trim_strings_in_place(&mut [&mut r.title, &mut r.description])
 );
 
 // --- Vault settings ----------------------------------------------------------
@@ -1407,6 +1475,79 @@ mod tests {
         );
         // Running it again is a no-op (nothing left to trim).
         assert_eq!(trim_all_accounts(&mut accts), 0);
+    }
+
+    #[test]
+    fn trim_fields_works_for_every_record_type() {
+        // RealEstate: a portal password and ordinary fields are all trimmed.
+        let mut re = RealEstate::new().unwrap();
+        re.address = "  1 Main St  ".into();
+        re.hoa_password = "  hoapw  ".into();
+        re.comments = " hi ".into();
+        assert!(re.trim_fields());
+        assert_eq!(re.address, "1 Main St");
+        assert_eq!(re.hoa_password, "hoapw", "portal passwords are trimmed too");
+        assert_eq!(re.comments, "hi");
+
+        let mut tw = TrustWill::new().unwrap();
+        tw.document = " Will ".into();
+        tw.usage = "  notes  ".into();
+        assert!(tw.trim_fields());
+        assert_eq!((tw.document.as_str(), tw.usage.as_str()), ("Will", "notes"));
+
+        let mut al = AssetLiability::new().unwrap();
+        al.owner = "  Bob  ".into();
+        al.approx_value = " 100 ".into();
+        assert!(al.trim_fields());
+        assert_eq!((al.owner.as_str(), al.approx_value.as_str()), ("Bob", "100"));
+
+        let mut ins = Instruction::new().unwrap();
+        ins.title = " T ".into();
+        assert!(ins.trim_fields());
+        assert_eq!(ins.title, "T");
+
+        let mut tax = TaxFiling::new().unwrap();
+        tax.year = " 2024 ".into();
+        assert!(tax.trim_fields());
+        assert_eq!(tax.year, "2024");
+
+        let mut gd = GeneralDocument::new().unwrap();
+        gd.title = " Deed ".into();
+        assert!(gd.trim_fields());
+        assert_eq!(gd.title, "Deed");
+
+        // An already-clean record reports no change.
+        let mut clean = Instruction::new().unwrap();
+        clean.title = "Done".into();
+        assert!(!clean.trim_fields());
+    }
+
+    #[test]
+    fn trim_all_records_trims_every_tab_of_the_vault() {
+        let mut v = Vault::default();
+        let mut a = Account::new().unwrap();
+        a.owner = "  Alice  ".into();
+        v.accounts.push(a);
+        let mut re = RealEstate::new().unwrap();
+        re.address = "  Home  ".into();
+        v.real_estate.push(re);
+        let mut tw = TrustWill::new().unwrap();
+        tw.document = " Will ".into();
+        v.trust_wills.push(tw);
+        v.instructions.push(Instruction::new().unwrap()); // empty -> already clean
+
+        let n = trim_all_records(&mut v);
+        assert_eq!(n, 3, "three dirty records across three different tabs are trimmed");
+        assert_eq!(v.accounts[0].owner, "Alice");
+        assert_eq!(v.real_estate[0].address, "Home");
+        assert_eq!(v.trust_wills[0].document, "Will");
+        // The trim is auditable in the changed record's own history.
+        assert!(
+            v.accounts[0].history.iter().any(|c| c.detail.contains("owner") && c.detail.contains("Alice")),
+            "the whole-vault trim is recorded in history"
+        );
+        // Idempotent.
+        assert_eq!(trim_all_records(&mut v), 0);
     }
 
     #[test]

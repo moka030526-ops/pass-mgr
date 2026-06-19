@@ -672,17 +672,18 @@ impl App {
         }
     }
 
-    /// One-off maintenance: left/right-trim every field on every account, persist,
-    /// and report how many changed. Each change is recorded in the account history.
-    fn trim_all_accounts(&mut self) {
+    /// One-off maintenance: left/right-trim every field on every record across ALL
+    /// tabs, persist, and report how many changed. Each change is recorded in that
+    /// record's history.
+    fn trim_all_records(&mut self) {
         let n = match self.vault.as_mut() {
-            Some(ov) => records::trim_all_accounts(&mut ov.vault.accounts),
+            Some(ov) => records::trim_all_records(&mut ov.vault),
             None => return,
         };
         if n == 0 {
-            self.status = "Nothing to trim — all account fields are already clean.".into();
+            self.status = "Nothing to trim — every field is already clean.".into();
         } else if self.persist() {
-            self.status = format!("Trimmed {n} account(s).");
+            self.status = format!("Trimmed {n} record(s).");
         }
     }
 
@@ -1016,11 +1017,12 @@ impl App {
             KeyCode::Char('r') if self.tab == Tab::RealEstate => {
                 self.re_reveal_all = !self.re_reveal_all;
             }
-            // One-off maintenance (Accounts tab): left/right-trim every field on
-            // every account. Capital T (Shift+t) so it can't be hit by accident.
-            KeyCode::Char('T') if self.tab == Tab::Accounts => {
+            // One-off maintenance (any tab): left/right-trim every field on every
+            // record in the whole vault. Capital T (Shift+t) so it can't be hit by
+            // accident.
+            KeyCode::Char('T') => {
                 if self.require_writable() {
-                    self.trim_all_accounts();
+                    self.trim_all_records();
                 }
             }
             // Enter username-search input mode (Accounts tab).
@@ -2134,6 +2136,7 @@ impl App {
                 r.created_at = es.created_at;
                 r.title = f(0);
                 r.description = f(1);
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.instructions, r);
             }
             Tab::TrustWill => {
@@ -2143,6 +2146,7 @@ impl App {
                 r.document = f(0);
                 r.usage = f(1);
                 r.file = es.attached_file_id.clone();
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.trust_wills, r);
             }
             Tab::Assets => {
@@ -2161,6 +2165,7 @@ impl App {
                 // The "Review" Choice stores "Yes"/"No"; compare to get a bool.
                 r.review = f(9) == "Yes";
                 r.statement = es.attached_file_id.clone();
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.assets, r);
             }
             Tab::Accounts => {
@@ -2203,6 +2208,7 @@ impl App {
                 r.hoa_password = f(16);
                 r.comments = f(17);
                 r.documents = es.re_docs.clone();
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.real_estate, r);
             }
             Tab::Taxes => {
@@ -2212,6 +2218,7 @@ impl App {
                 r.year = f(0);
                 r.notes = f(1);
                 r.documents = es.tax_docs.clone();
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.tax_filings, r);
             }
             Tab::GeneralDocuments => {
@@ -2221,6 +2228,7 @@ impl App {
                 r.title = f(0);
                 r.description = f(1);
                 r.file = es.attached_file_id.clone();
+                r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.general_documents, r);
             }
         }
@@ -3583,7 +3591,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_all_key_bulk_trims_existing_accounts_in_tui() {
+    fn trim_all_key_bulk_trims_every_tab_in_tui() {
         let (mut app, path) = app_unlocked("trimallkey");
         {
             let v = &mut app.vault.as_mut().unwrap().vault;
@@ -3592,14 +3600,23 @@ mod tests {
             a.title = " Brokerage ".into();
             a.password = "  s3cret  ".into();
             records::upsert(&mut v.accounts, a);
+            // A dirty record on a DIFFERENT tab must be trimmed by the same key.
+            let mut re = RealEstate::new().unwrap();
+            re.address = "  1 Main St  ".into();
+            re.hoa_password = "  hoapw  ".into();
+            records::upsert(&mut v.real_estate, re);
         }
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
-        app.handle_key(key(KeyCode::Char('T'))); // one-off trim-all
+        // Press T from a tab OTHER than the records being trimmed — it is whole-vault.
+        app.handle_key(key(KeyCode::Char('6'))); // Taxes tab
+        app.handle_key(key(KeyCode::Char('T'))); // one-off trim-all (whole vault)
         let a = &app.vault.as_ref().unwrap().vault.accounts[0];
         assert_eq!(a.owner, "Alice");
         assert_eq!(a.title, "Brokerage");
         assert_eq!(a.password, "s3cret");
-        assert!(app.status.contains("Trimmed 1"), "status reports the count: {}", app.status);
+        let re = &app.vault.as_ref().unwrap().vault.real_estate[0];
+        assert_eq!(re.address, "1 Main St");
+        assert_eq!(re.hoa_password, "hoapw", "portal passwords are trimmed too");
+        assert!(app.status.contains("Trimmed 2"), "status reports the count: {}", app.status);
         // Idempotent: a second pass finds nothing to trim.
         app.handle_key(key(KeyCode::Char('T')));
         assert!(app.status.contains("Nothing to trim"), "second pass is a no-op: {}", app.status);
