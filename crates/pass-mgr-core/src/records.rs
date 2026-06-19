@@ -118,85 +118,70 @@ pub fn account_facets(
 
 // --- Grouped (tree) view of accounts ----------------------------------------
 
-/// A leaf of the account tree: one account, shown by its title only (the type /
-/// subtype / owner are implied by its position in the tree).
+/// A leaf of the account tree: one account, shown by its title only (the owner /
+/// type / subtype are implied by its position in the tree).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountLeaf {
     pub id: String,
     pub title: String,
 }
 
-/// Accounts under one (type, subtype, owner) path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerGroup {
-    pub owner: String,
-    pub accounts: Vec<AccountLeaf>,
+/// A node of the grouped account tree: one grouping value (`label`, never empty)
+/// with its child groups and the accounts that end at this node. The grouping order
+/// is owner → type → subtype; an EMPTY grouping value is SKIPPED (its accounts are
+/// promoted to the parent level), so there are no "(none)" placeholder nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AcctNode {
+    pub label: String,
+    pub children: Vec<AcctNode>,
+    pub leaves: Vec<AccountLeaf>,
 }
 
-/// The owners under one (type, subtype).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubtypeGroup {
-    pub subtype: String,
-    pub owners: Vec<OwnerGroup>,
-}
-
-/// The subtypes under one account type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeGroup {
-    pub account_type: String,
-    pub subtypes: Vec<SubtypeGroup>,
-}
-
-/// Build the **grouped tree** of `accounts`: type → subtype → owner → account
-/// (leaf, title only), for the GUI/TUI "grouped" view. An account missing a
-/// subtype/owner/title keeps an EMPTY string at that level (the UIs render empties
-/// as "(no subtype)" / "(no owner)" / "(no title)"). Every level is sorted
-/// case-insensitively with the empty "(none)" bucket placed LAST. Takes any iterator
-/// of account references, so a caller can pass the FILTERED accounts (no clone) to
-/// have the tree honour the active filters.
-pub fn account_tree<'a>(accounts: impl IntoIterator<Item = &'a Account>) -> Vec<TypeGroup> {
-    let mut types: Vec<TypeGroup> = Vec::new();
-    for a in accounts {
-        // find-or-insert at each level (linear scan — account counts are modest).
-        let tg = match types.iter_mut().position(|g| g.account_type == a.account_type) {
-            Some(i) => &mut types[i],
+impl AcctNode {
+    /// Find or create the child group named `label`, preserving insertion order
+    /// (the final sort reorders). Linear scan — group counts are modest.
+    fn child_mut(&mut self, label: &str) -> &mut AcctNode {
+        match self.children.iter().position(|c| c.label == label) {
+            Some(i) => &mut self.children[i],
             None => {
-                types.push(TypeGroup { account_type: a.account_type.clone(), subtypes: Vec::new() });
-                types.last_mut().unwrap()
-            }
-        };
-        let sg = match tg.subtypes.iter_mut().position(|g| g.subtype == a.account_subtype) {
-            Some(i) => &mut tg.subtypes[i],
-            None => {
-                tg.subtypes.push(SubtypeGroup { subtype: a.account_subtype.clone(), owners: Vec::new() });
-                tg.subtypes.last_mut().unwrap()
-            }
-        };
-        let og = match sg.owners.iter_mut().position(|g| g.owner == a.owner) {
-            Some(i) => &mut sg.owners[i],
-            None => {
-                sg.owners.push(OwnerGroup { owner: a.owner.clone(), accounts: Vec::new() });
-                sg.owners.last_mut().unwrap()
-            }
-        };
-        og.accounts.push(AccountLeaf { id: a.id.clone(), title: a.title.clone() });
-    }
-    // Sort every level: real names alphabetical (case-insensitive), empty bucket last.
-    // `(s.is_empty(), s.to_lowercase())` sorts `false` (non-empty) before `true`.
-    fn key(s: &str) -> (bool, String) {
-        (s.is_empty(), s.to_lowercase())
-    }
-    types.sort_by_key(|g| key(&g.account_type));
-    for tg in &mut types {
-        tg.subtypes.sort_by_key(|g| key(&g.subtype));
-        for sg in &mut tg.subtypes {
-            sg.owners.sort_by_key(|g| key(&g.owner));
-            for og in &mut sg.owners {
-                og.accounts.sort_by_key(|l| key(&l.title));
+                self.children.push(AcctNode { label: label.to_string(), ..Default::default() });
+                self.children.last_mut().unwrap()
             }
         }
     }
-    types
+    /// Sort children by label and leaves by title, case-insensitively, recursively.
+    fn sort_recursive(&mut self) {
+        self.children.sort_by_key(|c| c.label.to_lowercase());
+        self.leaves.sort_by_key(|l| l.title.to_lowercase());
+        for c in &mut self.children {
+            c.sort_recursive();
+        }
+    }
+}
+
+/// Build the **grouped tree** of `accounts` for the GUI/TUI "grouped" view: each
+/// account is placed along the path of its NON-EMPTY grouping values in the order
+/// **owner → type → subtype**, then added as a leaf (title only) at the end of that
+/// path. An empty owner/type/subtype is **skipped** — there are no "(none)" nodes —
+/// so an account with no owner appears at the top level, an account with no type
+/// appears directly under its owner, and so on. The returned ROOT node's `label` is
+/// unused: render its `children` (top-level groups) and `leaves` (accounts that have
+/// no grouping at all). Every level is sorted case-insensitively. Takes any iterator
+/// of account references so a caller can pass the FILTERED accounts (no clone).
+pub fn account_tree<'a>(accounts: impl IntoIterator<Item = &'a Account>) -> AcctNode {
+    let mut root = AcctNode::default();
+    for a in accounts {
+        // Descend (creating as needed) along the non-empty grouping values.
+        let mut node = &mut root;
+        for level in [&a.owner, &a.account_type, &a.account_subtype] {
+            if !level.is_empty() {
+                node = node.child_mut(level);
+            }
+        }
+        node.leaves.push(AccountLeaf { id: a.id.clone(), title: a.title.clone() });
+    }
+    root.sort_recursive();
+    root
 }
 
 /// A random 128-bit hex id, used for records and volume blobs.
@@ -1447,49 +1432,54 @@ mod tests {
     }
 
     #[test]
-    fn account_tree_groups_buckets_empties_last_and_sorts() {
-        let mk = |ty: &str, st: &str, owner: &str, title: &str| {
+    fn account_tree_owner_first_skips_empty_levels_and_sorts() {
+        let mk = |owner: &str, ty: &str, st: &str, title: &str| {
             let mut a = Account::new().unwrap();
+            a.owner = owner.into();
             a.account_type = ty.into();
             a.account_subtype = st.into();
-            a.owner = owner.into();
             a.title = title.into();
             a
         };
         let accts = vec![
-            mk("Financial", "Bank", "Alice", "Joint brokerage"),
-            mk("Financial", "Bank", "Alice", "Emergency fund"),
-            mk("Financial", "Bank", "", "Shared bill pay"), // (no owner) under Bank
-            mk("Financial", "IRA", "Bob", "Retirement"),
-            mk("Email", "", "", "Personal gmail"), // (no subtype) + (no owner)
+            mk("Alice", "Financial", "Bank", "Joint brokerage"),
+            mk("Alice", "Financial", "Bank", "Emergency fund"),
+            mk("Alice", "Financial", "IRA", "Retirement"),
+            mk("Bob", "Email", "", "Personal gmail"), // no subtype -> leaf directly under Email
+            mk("", "Email", "", "Orphan mail"),       // no owner -> Email at the top level
+            mk("", "", "", "Loose account"),          // no grouping at all -> top-level leaf
         ];
-        let tree = account_tree(&accts);
+        let root = account_tree(&accts);
 
-        // Types sorted case-insensitively: Email before Financial.
-        assert_eq!(tree.iter().map(|t| t.account_type.as_str()).collect::<Vec<_>>(), ["Email", "Financial"]);
+        // Top-level groups are OWNERS, plus the no-owner account's type "Email"
+        // promoted up. Sorted case-insensitively: Alice, Bob, Email.
+        assert_eq!(root.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Alice", "Bob", "Email"]);
+        // The fully-ungrouped account is a leaf at the root.
+        assert_eq!(root.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(), ["Loose account"]);
 
-        // Email → empty subtype → empty owner → the one leaf (UIs render the empties).
-        let email = &tree[0];
-        assert_eq!(email.subtypes.len(), 1);
-        assert_eq!(email.subtypes[0].subtype, "");
-        assert_eq!(email.subtypes[0].owners[0].owner, "");
-        assert_eq!(email.subtypes[0].owners[0].accounts[0].title, "Personal gmail");
-
-        // Financial subtypes sorted: Bank, IRA.
-        let fin = &tree[1];
-        assert_eq!(fin.subtypes.iter().map(|s| s.subtype.as_str()).collect::<Vec<_>>(), ["Bank", "IRA"]);
-
-        // Bank owners: real owner "Alice" first, the empty "(no owner)" bucket LAST.
-        let bank = &fin.subtypes[0];
-        assert_eq!(bank.owners.iter().map(|o| o.owner.as_str()).collect::<Vec<_>>(), ["Alice", ""]);
-
-        // Alice's leaves sorted by title.
+        // Alice → Financial → {Bank, IRA}.
+        let alice = &root.children[0];
+        assert_eq!(alice.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Financial"]);
+        let fin = &alice.children[0];
+        assert_eq!(fin.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Bank", "IRA"]);
+        // Bank's leaves sorted by title; every leaf carries its account id.
         assert_eq!(
-            bank.owners[0].accounts.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            fin.children[0].leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
             ["Emergency fund", "Joint brokerage"]
         );
-        // Every leaf carries the account id so the UI can select/edit it.
-        assert!(!bank.owners[0].accounts[0].id.is_empty());
+        assert!(!fin.children[0].leaves[0].id.is_empty());
+
+        // Bob → Email → leaf directly (the empty subtype level is skipped, no node).
+        let bob = &root.children[1];
+        assert_eq!(bob.children[0].label, "Email");
+        assert!(bob.children[0].children.is_empty(), "empty subtype produces no child node");
+        assert_eq!(bob.children[0].leaves[0].title, "Personal gmail");
+
+        // The no-owner Email account: its type is a top-level group; the leaf hangs
+        // directly off it (owner and subtype both skipped).
+        let email_top = &root.children[2];
+        assert_eq!(email_top.label, "Email");
+        assert_eq!(email_top.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(), ["Orphan mail"]);
     }
 
     #[test]

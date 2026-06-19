@@ -339,6 +339,32 @@ impl AcctRow {
     }
 }
 
+/// Flatten one grouped-tree node into visible rows: each child group becomes a
+/// header row (recursed into when expanded), then this node's leaf accounts follow
+/// (at the same depth, so they sit *inside* their parent group). `parent_path` keys
+/// each group's expand state in `expanded`. Mirrors the GUI's children-then-leaves
+/// order so the two front-ends present the same tree.
+fn flatten_acct_node(
+    node: &records::AcctNode,
+    depth: u16,
+    parent_path: &str,
+    expanded: &std::collections::HashSet<String>,
+    rows: &mut Vec<AcctRow>,
+) {
+    for child in &node.children {
+        let path = format!("{parent_path}\x1f{}", child.label);
+        let exp = expanded.contains(&path);
+        rows.push(AcctRow::group(depth, &child.label, exp, path.clone()));
+        if exp {
+            flatten_acct_node(child, depth + 1, &path, expanded, rows);
+        }
+    }
+    for leaf in &node.leaves {
+        let title = if leaf.title.is_empty() { "(no title)".to_string() } else { leaf.title.clone() };
+        rows.push(AcctRow::leaf(depth, &title, leaf.id.clone()));
+    }
+}
+
 /// The tabs whose records can carry an attached document (single source of truth).
 fn tab_has_docs(tab: Tab) -> bool {
     // `matches!(value, PATTERN)` is a one-shot boolean: true if `value` fits the
@@ -552,35 +578,8 @@ impl App {
     fn account_rows(&self) -> Vec<AcctRow> {
         let v = &self.vault_ref().vault;
         let tree = records::account_tree(v.accounts.iter().filter(|a| self.acct_passes_filters(a)));
-        let disp = |s: &str, none: &str| if s.is_empty() { none.to_string() } else { s.to_string() };
         let mut rows = Vec::new();
-        for tg in &tree {
-            let tpath = format!("t\x1f{}", tg.account_type);
-            let texp = self.acct_expanded.contains(&tpath);
-            rows.push(AcctRow::group(0, &disp(&tg.account_type, "(no type)"), texp, tpath.clone()));
-            if !texp {
-                continue;
-            }
-            for sg in &tg.subtypes {
-                let spath = format!("{tpath}\x1fs\x1f{}", sg.subtype);
-                let sexp = self.acct_expanded.contains(&spath);
-                rows.push(AcctRow::group(1, &disp(&sg.subtype, "(no subtype)"), sexp, spath.clone()));
-                if !sexp {
-                    continue;
-                }
-                for og in &sg.owners {
-                    let opath = format!("{spath}\x1fo\x1f{}", og.owner);
-                    let oexp = self.acct_expanded.contains(&opath);
-                    rows.push(AcctRow::group(2, &disp(&og.owner, "(no owner)"), oexp, opath.clone()));
-                    if !oexp {
-                        continue;
-                    }
-                    for leaf in &og.accounts {
-                        rows.push(AcctRow::leaf(3, &disp(&leaf.title, "(no title)"), leaf.id.clone()));
-                    }
-                }
-            }
-        }
+        flatten_acct_node(&tree, 0, "acct", &self.acct_expanded, &mut rows);
         rows
     }
 
@@ -3709,16 +3708,16 @@ mod tests {
         app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
         app.handle_key(key(KeyCode::Char('g'))); // switch to grouped
         assert!(app.acct_grouped);
-        // Collapsed by default: only the top-level type row is visible, and the leaf
+        // Collapsed by default: only the top-level owner row is visible, and the leaf
         // title is NOT shown yet.
         assert_eq!(app.account_rows().len(), 1);
         assert!(!render_to_string(&app).contains("Joint brokerage"), "leaf hidden while collapsed");
-        // Expand type → subtype → owner, stepping down to each newly revealed child.
-        app.handle_key(key(KeyCode::Enter)); // expand Financial (selected 0)
+        // Expand owner → type → subtype, stepping down to each newly revealed child.
+        app.handle_key(key(KeyCode::Enter)); // expand Alice (selected 0)
+        app.handle_key(key(KeyCode::Down)); // -> Financial
+        app.handle_key(key(KeyCode::Enter)); // expand Financial
         app.handle_key(key(KeyCode::Down)); // -> Bank
         app.handle_key(key(KeyCode::Enter)); // expand Bank
-        app.handle_key(key(KeyCode::Down)); // -> Alice
-        app.handle_key(key(KeyCode::Enter)); // expand Alice
         app.handle_key(key(KeyCode::Down)); // -> the leaf
         assert!(render_to_string(&app).contains("Joint brokerage"), "leaf title shown when expanded");
         // Enter on the leaf edits that account.

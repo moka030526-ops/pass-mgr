@@ -1722,11 +1722,44 @@ impl GuiApp {
             })
             .unwrap_or_default();
 
+        // Recursive render of one grouped-tree node: child groups (each an
+        // expandable CollapsingHeader) followed by this node's leaf accounts (shown
+        // by title only). Returns the index into `labels` of a clicked leaf, if any.
+        // `id_path` keeps egui's per-header id stable/unique across the tree.
+        fn render_acct_node(
+            ui: &mut egui::Ui,
+            node: &records::AcctNode,
+            id_path: &str,
+            cur: Option<&str>,
+            labels: &[(String, String)],
+        ) -> Option<usize> {
+            let mut select = None;
+            for child in &node.children {
+                let child_path = format!("{id_path}/{}", child.label);
+                let resp = egui::CollapsingHeader::new(&child.label)
+                    .id_salt(("acct_node", &child_path))
+                    .show(ui, |ui| render_acct_node(ui, child, &child_path, cur, labels));
+                if let Some(s) = resp.body_returned.flatten() {
+                    select = Some(s);
+                }
+            }
+            for leaf in &node.leaves {
+                let sel = cur == Some(leaf.id.as_str());
+                let title = if leaf.title.is_empty() { "(no title)".to_string() } else { leaf.title.clone() };
+                if ui.selectable_label(sel, title).clicked() {
+                    // `select` is an index into `labels` (the same filtered set as the
+                    // tree), matching the flat-list model used by the form below.
+                    select = labels.iter().position(|(id, _)| *id == leaf.id);
+                }
+            }
+            select
+        }
+
         ui.columns(2, |c| {
             match &tree {
-                // Grouped tree: type → subtype → owner → title (leaf). egui's
-                // CollapsingHeader provides the +/- expand control per node.
-                Some(types) => {
+                // Grouped tree: owner → type → subtype → title (leaf), with empty
+                // levels skipped. egui's CollapsingHeader gives the +/- expand control.
+                Some(root) => {
                     let lp = &mut c[0];
                     lp.horizontal(|ui| {
                         ui.heading("Accounts");
@@ -1735,35 +1768,8 @@ impl GuiApp {
                         }
                     });
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("acct_tree").show(lp, |ui| {
-                        let disp = |s: &str, none: &str| if s.is_empty() { none.to_string() } else { s.to_string() };
-                        for tg in types {
-                            egui::CollapsingHeader::new(disp(&tg.account_type, "(no type)"))
-                                .id_salt(("acct_t", &tg.account_type))
-                                .show(ui, |ui| {
-                                    for sg in &tg.subtypes {
-                                        egui::CollapsingHeader::new(disp(&sg.subtype, "(no subtype)"))
-                                            .id_salt(("acct_s", &tg.account_type, &sg.subtype))
-                                            .show(ui, |ui| {
-                                                for og in &sg.owners {
-                                                    egui::CollapsingHeader::new(disp(&og.owner, "(no owner)"))
-                                                        .id_salt(("acct_o", &tg.account_type, &sg.subtype, &og.owner))
-                                                        .show(ui, |ui| {
-                                                            for leaf in &og.accounts {
-                                                                let sel = cur.as_deref() == Some(leaf.id.as_str());
-                                                                if ui
-                                                                    .selectable_label(sel, disp(&leaf.title, "(no title)"))
-                                                                    .clicked()
-                                                                {
-                                                                    // `select` is an index into `labels` (same filtered
-                                                                    // set as the tree), matching the flat-list model.
-                                                                    select = labels.iter().position(|(id, _)| *id == leaf.id);
-                                                                }
-                                                            }
-                                                        });
-                                                }
-                                            });
-                                    }
-                                });
+                        if let Some(s) = render_acct_node(ui, root, "acct", cur.as_deref(), &labels) {
+                            select = Some(s);
                         }
                     });
                 }

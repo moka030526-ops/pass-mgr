@@ -571,11 +571,13 @@ currently exposes the first five record types.) The four screens are:
    has a search box, the TUI enters it with `/`). Selection resolves **by record id**,
    so a filtered or searched list never edits the wrong record. The Accounts list can
    also be shown as a **grouped tree** (toggle: GUI "grouped" checkbox, TUI `g`):
-   type → subtype → owner → account, each level collapsible (`+`/▸ to expand; egui
+   **owner → type → subtype → account**, each level collapsible (`+`/▸ to expand; egui
    CollapsingHeaders in the GUI, `Enter` to expand/collapse a node in the TUI), with
-   the leaf showing the **title** only and missing levels bucketed as "(no …)". The
-   tree is built from the same filtered accounts (`records::account_tree`), so filters
-   and search still apply. Account **titles are mandatory** (a blank title is refused
+   the leaf showing the **title** only. An **empty** grouping level is **skipped**
+   (no "(none)" placeholder nodes): an account with no owner appears at the top level,
+   one with no type hangs directly under its owner, and a fully-ungrouped account is a
+   top-level leaf. The tree is built from the same filtered accounts
+   (`records::account_tree`, a recursive `AcctNode`), so filters and search still apply. Account **titles are mandatory** (a blank title is refused
    on save). The Accounts filters are
    **cross-filtered (faceted)**: each dropdown offers only values present on accounts
    matching *all the other* active filters (`records::account_facets`), and a
