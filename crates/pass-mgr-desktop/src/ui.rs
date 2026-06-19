@@ -2274,6 +2274,12 @@ impl App {
         ];
         let cats = self.vault_ref().categories();
         let mut lines = vec![
+            // Where this vault lives on disk (the vault.pmv path).
+            Line::from(vec![
+                Span::styled("Vault location: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(self.path.display().to_string(), Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(""),
             Line::from(Span::styled("Asset/Liability types:", Style::default().add_modifier(Modifier::BOLD))),
             Line::from(Span::styled(cats.asset.join(" · "), Style::default().fg(Color::Gray))),
             Line::from(""),

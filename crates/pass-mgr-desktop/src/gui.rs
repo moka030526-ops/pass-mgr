@@ -860,6 +860,12 @@ impl GuiApp {
             }
         });
         ui.separator();
+        // Show where this vault lives on disk (the vault.pmv path; its parent dir holds
+        // the manifest/ and volume/ too).
+        ui.horizontal(|ui| {
+            ui.label("Vault location:");
+            ui.label(egui::RichText::new(self.path.display().to_string()).strong());
+        });
         if !self.writable {
             ui.label(
                 egui::RichText::new("Read-only: type editing is disabled (backup is still available).")
