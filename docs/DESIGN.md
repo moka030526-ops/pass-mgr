@@ -173,6 +173,18 @@ sensible defaults on creation and editable from the Config screen. They live
 **inside the encrypted vault** (not in external files), so they travel with it
 and leak nothing at rest (§5, §4.4).
 
+**Deleting a type/subtype** (Config screen — GUI per-item ×, TUI `Del` on the focused
+field) is allowed only when **no live record** still references it, so a delete can
+never orphan a record's `asset_type`/`account_type`/`account_subtype`. The usage scan
+looks at the live records ONLY — a type that appears merely in a record's *history*
+(`Change.detail`, e.g. `type: "Bank" -> "Email"`) does not block deletion. An account
+type that still has subtypes defined is refused until those subtypes are deleted first
+(a subtype of an unused type is necessarily unused, but the policy keeps the two-step
+removal explicit). The policy lives in `OpenVault::remove_{asset_type,account_type,
+account_subtype}`, which return a `CategoryRemoval` outcome
+(`Removed`/`NotFound`/`InUse(n)`/`HasSubtypes`) the UIs turn into a status message;
+read-only opens reject all three with `VaultError::ReadOnly`.
+
 ### 4.3 Encrypted document store (partitioned, format v4)
 
 Statements, wills, and other documents live in a **partitioned, lazily-loaded,

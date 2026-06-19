@@ -441,7 +441,12 @@ Config-screen edits go through `OpenVault::add_asset_type` /
 `save()` the encrypted vault (refused when read-only). The `types.rs` mutators
 themselves only touch memory and report whether anything actually changed (so a
 duplicate/empty add is a clean no-op, not a spurious save). The Account subtype
-dropdown/filter is dependent on the chosen account type.
+dropdown/filter is dependent on the chosen account type. **Deletion** mirrors this:
+`OpenVault::remove_{asset_type,account_type,account_subtype}` first scan the *live*
+records for usage (history is ignored) and refuse a type that still has subtypes,
+returning a `CategoryRemoval` outcome rather than a hard error; the `types.rs`
+`remove_*` helpers do the case-insensitive in-memory removal. GUI shows a × per item;
+the TUI deletes the focused field's value with `Del`.
 
 ---
 
