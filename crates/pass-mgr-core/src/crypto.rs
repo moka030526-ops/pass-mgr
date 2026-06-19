@@ -370,6 +370,25 @@ mod tests {
     }
 
     #[test]
+    fn default_params_pass_their_own_validator() {
+        // Invariant: the SHIPPED default must validate — the GUI/TUI/CLI always create
+        // and import with `KdfParams::default()`, so if the default fell outside the
+        // bounds, every new vault would be rejected (BadParams). This also pins the
+        // ceilings ABOVE the default (e.g. catches MAX_M_COST being mis-set below the
+        // 64 MiB default), and the explicit value guards the constant arithmetic.
+        let d = KdfParams::default();
+        assert!(d.validate().is_ok(), "default params must be within bounds");
+        assert!(d.m_cost >= KdfParams::MIN_M_COST && d.m_cost <= KdfParams::MAX_M_COST);
+        assert!(d.t_cost >= 1 && d.t_cost <= KdfParams::MAX_T_COST);
+        assert!(d.p_cost >= 1 && d.p_cost <= KdfParams::MAX_P_COST);
+        assert_eq!(KdfParams::MAX_M_COST, 524_288, "memory ceiling is 512 MiB (in KiB)");
+        // Out-of-range params are rejected (both ends + t_cost).
+        assert!(KdfParams { m_cost: KdfParams::MAX_M_COST + 1, t_cost: 3, p_cost: 1 }.validate().is_err());
+        assert!(KdfParams { m_cost: KdfParams::MIN_M_COST - 1, t_cost: 3, p_cost: 1 }.validate().is_err());
+        assert!(KdfParams { m_cost: 65_536, t_cost: KdfParams::MAX_T_COST + 1, p_cost: 1 }.validate().is_err());
+    }
+
+    #[test]
     fn round_trip() {
         let key = derive_key(b"correct horse", b"sixteen-byte-slt", &fast()).unwrap();
         let aad = b"header-bytes";
