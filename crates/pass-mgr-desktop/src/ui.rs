@@ -313,6 +313,32 @@ struct EditState {
     history: Vec<Change>,
 }
 
+/// One visible row of the grouped Accounts tree: a collapsible group (type/subtype/
+/// owner) or a leaf (one account, shown by title). Rebuilt each render from the tree
+/// + the expand set; `App::selected` indexes the row list when grouped.
+struct AcctRow {
+    depth: u16,
+    label: String,
+    kind: AcctRowKind,
+}
+
+enum AcctRowKind {
+    /// A type/subtype/owner header; `path` keys its expand state, `expanded` is its
+    /// current state (drives the ▸/▾ marker).
+    Group { path: String, expanded: bool },
+    /// An account leaf carrying its record id (what selecting it edits).
+    Leaf { id: String },
+}
+
+impl AcctRow {
+    fn group(depth: u16, label: &str, expanded: bool, path: String) -> Self {
+        AcctRow { depth, label: label.to_string(), kind: AcctRowKind::Group { path, expanded } }
+    }
+    fn leaf(depth: u16, label: &str, id: String) -> Self {
+        AcctRow { depth, label: label.to_string(), kind: AcctRowKind::Leaf { id } }
+    }
+}
+
 /// The tabs whose records can carry an attached document (single source of truth).
 fn tab_has_docs(tab: Tab) -> bool {
     // `matches!(value, PATTERN)` is a one-shot boolean: true if `value` fits the
@@ -357,6 +383,11 @@ struct App {
     // The same for the Real Estate tab's three portal passwords (toggled with `r` on
     // the RE tab). Scoped per-tab so revealing one screen never reveals the other.
     re_reveal_all: bool,
+    // Accounts view: false = flat filtered list, true = grouped tree
+    // (type → subtype → owner → title), toggled with `g`.
+    acct_grouped: bool,
+    // Paths of the EXPANDED tree nodes (collapsed by default — `+`/→ expands).
+    acct_expanded: std::collections::HashSet<String>,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -413,6 +444,8 @@ impl App {
             search_active: false,
             reveal_all: false,
             re_reveal_all: false,
+            acct_grouped: false,
+            acct_expanded: std::collections::HashSet::new(),
             asset_filter_review: false,
             cfg_focus: 0,
             cfg_asset_type: String::new(),
@@ -497,6 +530,66 @@ impl App {
         }
     }
 
+    /// Whether an account passes the current Accounts filters (mirrors the Accounts
+    /// arm of [`current_labels`]); shared by the flat list and the grouped tree.
+    fn acct_passes_filters(&self, a: &Account) -> bool {
+        self.acct_filter_type.as_deref().is_none_or(|t| a.account_type == t)
+            && self.acct_filter_subtype.as_deref().is_none_or(|s| a.account_subtype == s)
+            && self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o)
+            && self.acct_filter_title.as_deref().is_none_or(|t| a.title == t)
+            && (!self.acct_filter_review || a.review)
+            && records::matches_search(&a.username, &self.acct_search)
+    }
+
+    /// The currently VISIBLE rows of the grouped Accounts tree (collapsed nodes hide
+    /// their children). Built from the filtered accounts so the tree honours filters.
+    /// `self.selected` indexes this list when grouped.
+    fn account_rows(&self) -> Vec<AcctRow> {
+        let v = &self.vault_ref().vault;
+        let tree = records::account_tree(v.accounts.iter().filter(|a| self.acct_passes_filters(a)));
+        let disp = |s: &str, none: &str| if s.is_empty() { none.to_string() } else { s.to_string() };
+        let mut rows = Vec::new();
+        for tg in &tree {
+            let tpath = format!("t\x1f{}", tg.account_type);
+            let texp = self.acct_expanded.contains(&tpath);
+            rows.push(AcctRow::group(0, &disp(&tg.account_type, "(no type)"), texp, tpath.clone()));
+            if !texp {
+                continue;
+            }
+            for sg in &tg.subtypes {
+                let spath = format!("{tpath}\x1fs\x1f{}", sg.subtype);
+                let sexp = self.acct_expanded.contains(&spath);
+                rows.push(AcctRow::group(1, &disp(&sg.subtype, "(no subtype)"), sexp, spath.clone()));
+                if !sexp {
+                    continue;
+                }
+                for og in &sg.owners {
+                    let opath = format!("{spath}\x1fo\x1f{}", og.owner);
+                    let oexp = self.acct_expanded.contains(&opath);
+                    rows.push(AcctRow::group(2, &disp(&og.owner, "(no owner)"), oexp, opath.clone()));
+                    if !oexp {
+                        continue;
+                    }
+                    for leaf in &og.accounts {
+                        rows.push(AcctRow::leaf(3, &disp(&leaf.title, "(no title)"), leaf.id.clone()));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// True when the Accounts tab is showing the grouped tree.
+    fn acct_tree_mode(&self) -> bool {
+        self.tab == Tab::Accounts && self.acct_grouped
+    }
+
+    /// Number of selectable rows in the current browse view (tree rows when grouped,
+    /// else the flat label list).
+    fn current_row_count(&self) -> usize {
+        if self.acct_tree_mode() { self.account_rows().len() } else { self.current_labels().len() }
+    }
+
     /// Cross-filtered (faceted) Accounts filter options for the current selections:
     /// each field's distinct values among accounts matching all the OTHER filters.
     fn account_facets(&self) -> records::AccountFacets {
@@ -549,7 +642,7 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
-        let n = self.current_labels().len();
+        let n = self.current_row_count();
         if n == 0 {
             self.selected = 0;
         } else if self.selected >= n {
@@ -836,7 +929,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let n = self.current_labels().len();
+                let n = self.current_row_count();
                 if n > 0 {
                     // `.min(n - 1)` clamps so we can't move past the last item.
                     self.selected = (self.selected + 1).min(n - 1);
@@ -846,9 +939,29 @@ impl App {
             // (unsigned `usize` cannot go negative).
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Enter => {
-                if !self.current_labels().is_empty() {
+                if self.acct_tree_mode() {
+                    // In the grouped tree, Enter toggles a group's expansion or edits a
+                    // leaf account. (←/→ are reserved for switching tabs.)
+                    match self.account_rows().get(self.selected).map(|r| &r.kind) {
+                        Some(AcctRowKind::Group { path, expanded }) => {
+                            let (path, expanded) = (path.clone(), *expanded);
+                            if expanded {
+                                self.acct_expanded.remove(&path);
+                            } else {
+                                self.acct_expanded.insert(path);
+                            }
+                        }
+                        Some(AcctRowKind::Leaf { .. }) => self.start_edit(true),
+                        None => {}
+                    }
+                } else if !self.current_labels().is_empty() {
                     self.start_edit(true);
                 }
+            }
+            // Toggle the grouped tree view on the Accounts tab.
+            KeyCode::Char('g') if self.tab == Tab::Accounts => {
+                self.acct_grouped = !self.acct_grouped;
+                self.selected = 0;
             }
             KeyCode::Char('n') => {
                 if self.require_writable() {
@@ -1153,10 +1266,16 @@ impl App {
         // `.map(|(id, _)| id.clone())` transforms the inner `Some` value: it
         // destructures the `(id, label)` tuple, ignores the label (`_`), and clones
         // the id into an owned String. For a new record there is no selection.
-        let sel_id: Option<String> = if existing {
-            self.current_labels().get(self.selected).map(|(id, _)| id.clone())
-        } else {
+        let sel_id: Option<String> = if !existing {
             None
+        } else if self.acct_tree_mode() {
+            // Grouped Accounts: the selected row's leaf id (a group row has none).
+            match self.account_rows().get(self.selected).map(|r| &r.kind) {
+                Some(AcctRowKind::Leaf { id }) => Some(id.clone()),
+                _ => None,
+            }
+        } else {
+            self.current_labels().get(self.selected).map(|(id, _)| id.clone())
         };
         let v = &self.vault_ref().vault;
 
@@ -2153,10 +2272,19 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
-        let labels = self.current_labels();
-        // let-else with a tuple pattern: take the selected `(id, label)`, ignore
-        // the label (`_`), clone an owned id; bail if nothing is selected.
-        let Some((id, _)) = labels.get(self.selected).cloned() else { return };
+        // Resolve the selected record id. In the grouped Accounts tree the selection
+        // may be a GROUP header (nothing to delete) — only a leaf has an id.
+        let id = if self.acct_tree_mode() {
+            match self.account_rows().get(self.selected).map(|r| &r.kind) {
+                Some(AcctRowKind::Leaf { id }) => id.clone(),
+                _ => return,
+            }
+        } else {
+            match self.current_labels().get(self.selected).cloned() {
+                Some((id, _)) => id,
+                None => return,
+            }
+        };
         // Collect any attached document blob to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
         if let Some(ov) = self.vault.as_mut() {
@@ -2399,10 +2527,26 @@ impl App {
         frame.render_widget(tabs, chunks[0]);
 
         let labels = self.current_labels();
-        // Turn each `(id, label)` into a `ListItem`, ignoring the id (`_`) and using
-        // the label text. `Vec<ListItem>` annotation drives the `.collect()` type.
-        let items: Vec<ListItem> =
-            labels.iter().map(|(_, l)| ListItem::new(Line::from(l.clone()))).collect();
+        let grouped = self.acct_tree_mode();
+        let rows = if grouped { self.account_rows() } else { Vec::new() };
+        // Grouped: indent by depth and prefix groups with ▸ (collapsed) / ▾ (expanded);
+        // leaves show the title only. Flat: just the record label.
+        let items: Vec<ListItem> = if grouped {
+            rows.iter()
+                .map(|r| {
+                    let indent = "  ".repeat(r.depth as usize);
+                    let text = match &r.kind {
+                        AcctRowKind::Group { expanded, .. } => {
+                            format!("{indent}{} {}", if *expanded { "▾" } else { "▸" }, r.label)
+                        }
+                        AcctRowKind::Leaf { .. } => format!("{indent}  {}", r.label),
+                    };
+                    ListItem::new(Line::from(text))
+                })
+                .collect()
+        } else {
+            labels.iter().map(|(_, l)| ListItem::new(Line::from(l.clone()))).collect()
+        };
         let count = items.len();
         // Show any active filters in the title.
         let title = if self.tab == Tab::Accounts
@@ -2413,7 +2557,8 @@ impl App {
                 || self.acct_filter_review
                 || !self.acct_search.is_empty()
                 || self.search_active
-                || self.reveal_all)
+                || self.reveal_all
+                || self.acct_grouped)
         {
             let t = self.acct_filter_type.as_deref().unwrap_or("any");
             let s = self.acct_filter_subtype.as_deref().unwrap_or("any");
@@ -2421,6 +2566,7 @@ impl App {
             let ti = self.acct_filter_title.as_deref().unwrap_or("any");
             let r = if self.acct_filter_review { " · review" } else { "" };
             let rev = if self.reveal_all { " · 🔓reveal-all" } else { "" };
+            let grp = if self.acct_grouped { " · grouped" } else { "" };
             // Username search: show the query, with a trailing caret while typing.
             let u = if self.search_active {
                 format!(" · user~\"{}_\"", self.acct_search)
@@ -2429,7 +2575,7 @@ impl App {
             } else {
                 String::new()
             };
-            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o} · title={ti}{r}{u}{rev}] ")
+            format!(" Accounts ({count})  [type={t} · subtype={s} · owner={o} · title={ti}{r}{u}{rev}{grp}] ")
         } else if self.tab == Tab::Assets && self.asset_filter_review {
             format!(" Assets & Liabilities ({count})  [review only] ")
         } else {
@@ -2452,8 +2598,11 @@ impl App {
             "type to search usernames · Enter keep · Esc clear"
         } else {
             match self.tab {
+                Tab::Accounts if self.acct_grouped => {
+                    "↑↓ · Enter expand/edit · n new · d del · t/s/o/l filter · r reveal-all · g flat list · / search · ←→ tab · q quit"
+                }
                 Tab::Accounts => {
-                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · T trim-all · / search · ←→ tab · c config · p pw · q quit"
+                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · g grouped · T trim-all · / search · ←→ tab · c config · p pw · q quit"
                 }
                 Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · ←→ tab · c config · p pw · q quit",
                 Tab::RealEstate => "↑↓ · Enter edit · n new · d del · r reveal-all (portals) · ←→ tab · c config · p pw · q quit",
@@ -3508,6 +3657,42 @@ mod tests {
         assert_eq!(app.screen, Screen::Edit, "stays in the edit form when the title is blank");
         assert!(app.status.contains("Title is required"), "status: {}", app.status);
         assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing saved without a title");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tui_accounts_grouped_tree_expands_then_edits_leaf() {
+        let (mut app, path) = app_unlocked("uitree");
+        let want_id = {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.account_type = "Financial".into();
+            a.account_subtype = "Bank".into();
+            a.owner = "Alice".into();
+            a.title = "Joint brokerage".into();
+            let id = a.id.clone();
+            records::upsert(&mut v.accounts, a);
+            id
+        };
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('g'))); // switch to grouped
+        assert!(app.acct_grouped);
+        // Collapsed by default: only the top-level type row is visible, and the leaf
+        // title is NOT shown yet.
+        assert_eq!(app.account_rows().len(), 1);
+        assert!(!render_to_string(&app).contains("Joint brokerage"), "leaf hidden while collapsed");
+        // Expand type → subtype → owner, stepping down to each newly revealed child.
+        app.handle_key(key(KeyCode::Enter)); // expand Financial (selected 0)
+        app.handle_key(key(KeyCode::Down)); // -> Bank
+        app.handle_key(key(KeyCode::Enter)); // expand Bank
+        app.handle_key(key(KeyCode::Down)); // -> Alice
+        app.handle_key(key(KeyCode::Enter)); // expand Alice
+        app.handle_key(key(KeyCode::Down)); // -> the leaf
+        assert!(render_to_string(&app).contains("Joint brokerage"), "leaf title shown when expanded");
+        // Enter on the leaf edits that account.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Edit);
+        assert_eq!(app.edit.as_ref().unwrap().id.as_deref(), Some(want_id.as_str()));
         cleanup(&path);
     }
 
