@@ -528,7 +528,7 @@ fn track_bool(out: &mut Vec<Change>, at: i64, name: &str, old: bool, new: bool) 
 /// True if a history `Change.detail` describes a secret (password) field change.
 /// `detail` is formatted `"{field}: {old:?} -> {new:?}"`; the secret fields are
 /// exactly those whose name ends in `password` (the account password and the
-/// three RealEstate portal passwords). The UIs use this to mask secret values in
+/// four RealEstate portal passwords). The UIs use this to mask secret values in
 /// the history pane.
 pub fn detail_is_secret(detail: &str) -> bool {
     detail.split_once(':').map(|(name, _)| name).unwrap_or(detail).trim_end().ends_with("password")
@@ -757,6 +757,9 @@ pub struct RealEstate {
     pub property_mgmt_username: String,
     #[serde(default)]
     pub property_mgmt_password: String,
+    /// Free-form notes for the property-management portal.
+    #[serde(default)]
+    pub property_mgmt_comment: String,
     /// Insurance portal login.
     #[serde(default)]
     pub insurance_url: String,
@@ -764,6 +767,9 @@ pub struct RealEstate {
     pub insurance_username: String,
     #[serde(default)]
     pub insurance_password: String,
+    /// Free-form notes for the insurance portal.
+    #[serde(default)]
+    pub insurance_comment: String,
     /// HOA portal login.
     #[serde(default)]
     pub hoa_url: String,
@@ -771,6 +777,19 @@ pub struct RealEstate {
     pub hoa_username: String,
     #[serde(default)]
     pub hoa_password: String,
+    /// Free-form notes for the HOA portal.
+    #[serde(default)]
+    pub hoa_comment: String,
+    /// Tax portal login (property-tax authority / payment site).
+    #[serde(default)]
+    pub tax_portal_url: String,
+    #[serde(default)]
+    pub tax_portal_username: String,
+    #[serde(default)]
+    pub tax_portal_password: String,
+    /// Free-form notes for the tax portal.
+    #[serde(default)]
+    pub tax_portal_comment: String,
     /// Free-form comments.
     #[serde(default)]
     pub comments: String,
@@ -1099,12 +1118,19 @@ impl_record!(
         track(out, at, "property_mgmt_url", &s.property_mgmt_url, &n.property_mgmt_url);
         track(out, at, "property_mgmt_username", &s.property_mgmt_username, &n.property_mgmt_username);
         track(out, at, "property_mgmt_password", &s.property_mgmt_password, &n.property_mgmt_password);
+        track(out, at, "property_mgmt_comment", &s.property_mgmt_comment, &n.property_mgmt_comment);
         track(out, at, "insurance_url", &s.insurance_url, &n.insurance_url);
         track(out, at, "insurance_username", &s.insurance_username, &n.insurance_username);
         track(out, at, "insurance_password", &s.insurance_password, &n.insurance_password);
+        track(out, at, "insurance_comment", &s.insurance_comment, &n.insurance_comment);
         track(out, at, "hoa_url", &s.hoa_url, &n.hoa_url);
         track(out, at, "hoa_username", &s.hoa_username, &n.hoa_username);
         track(out, at, "hoa_password", &s.hoa_password, &n.hoa_password);
+        track(out, at, "hoa_comment", &s.hoa_comment, &n.hoa_comment);
+        track(out, at, "tax_portal_url", &s.tax_portal_url, &n.tax_portal_url);
+        track(out, at, "tax_portal_username", &s.tax_portal_username, &n.tax_portal_username);
+        track(out, at, "tax_portal_password", &s.tax_portal_password, &n.tax_portal_password);
+        track(out, at, "tax_portal_comment", &s.tax_portal_comment, &n.tax_portal_comment);
         track(out, at, "comments", &s.comments, &n.comments);
         if s.documents != n.documents {
             out.push(Change {
@@ -1116,7 +1142,7 @@ impl_record!(
     },
     |l: &RealEstate| if l.address.is_empty() { "(no address)".to_string() } else { l.address.clone() },
     |r: &mut RealEstate| {
-        // Every text field, including the three portal passwords. `documents` (volume
+        // Every text field, including the four portal passwords. `documents` (volume
         // ids), id, timestamps, and history are excluded.
         trim_strings_in_place(&mut [
             &mut r.address,
@@ -1130,12 +1156,19 @@ impl_record!(
             &mut r.property_mgmt_url,
             &mut r.property_mgmt_username,
             &mut r.property_mgmt_password,
+            &mut r.property_mgmt_comment,
             &mut r.insurance_url,
             &mut r.insurance_username,
             &mut r.insurance_password,
+            &mut r.insurance_comment,
             &mut r.hoa_url,
             &mut r.hoa_username,
             &mut r.hoa_password,
+            &mut r.hoa_comment,
+            &mut r.tax_portal_url,
+            &mut r.tax_portal_username,
+            &mut r.tax_portal_password,
+            &mut r.tax_portal_comment,
             &mut r.comments,
         ])
     }
@@ -1409,7 +1442,7 @@ mod tests {
         assert!(!shown.contains("Tr0ub4dor"), "new password value is masked: {shown}");
         assert!(shown.starts_with("password:"), "field name is kept for the audit trail: {shown}");
         // The RealEstate portal passwords are masked too.
-        for f in ["property_mgmt_password", "insurance_password", "hoa_password"] {
+        for f in ["property_mgmt_password", "insurance_password", "hoa_password", "tax_portal_password"] {
             let d = format!("{f}: \"SEKRET1\" -> \"SEKRET2\"");
             assert!(detail_is_secret(&d), "{f} is secret");
             let shown = display_detail(&d);

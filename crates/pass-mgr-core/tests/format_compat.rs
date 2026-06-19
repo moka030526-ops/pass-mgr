@@ -5,8 +5,8 @@
 //! format that are easy to break when adding fields:
 //!
 //!   1. End-to-end persistence of the recently-added record fields — a TaxFiling
-//!      with a document and an expanded RealEstate (the three portal logins,
-//!      `financing_balance`, `comments`, and an attached document) survive a
+//!      with a document and an expanded RealEstate (the four portal logins +
+//!      per-portal comments, `financing_balance`, `comments`, and an attached document) survive a
 //!      create -> save -> reopen cycle, and the generation counter advances.
 //!   2. Backward compatibility — an *old-style* vault JSON that predates
 //!      `tax_filings` and the new RealEstate fields still deserializes, with the
@@ -99,6 +99,13 @@ fn taxes_and_expanded_real_estate_survive_save_and_reopen() {
         re.hoa_url = "https://hoa.example".into();
         re.hoa_username = "hoa_user".into();
         re.hoa_password = "hoa_pw".into();
+        re.tax_portal_url = "https://tax.example".into();
+        re.tax_portal_username = "tax_user".into();
+        re.tax_portal_password = "tax_pw".into();
+        re.property_mgmt_comment = "PM notes".into();
+        re.insurance_comment = "INS notes".into();
+        re.hoa_comment = "HOA notes".into();
+        re.tax_portal_comment = "TAX notes".into();
         re_id = re.id.clone();
         let re_loc = records::real_estate_doc_location(&re.address);
         assert_eq!(re_loc, "real-estate/123mainst");
@@ -155,6 +162,13 @@ fn taxes_and_expanded_real_estate_survive_save_and_reopen() {
     assert_eq!(re.hoa_url, "https://hoa.example");
     assert_eq!(re.hoa_username, "hoa_user");
     assert_eq!(re.hoa_password, "hoa_pw");
+    assert_eq!(re.tax_portal_url, "https://tax.example");
+    assert_eq!(re.tax_portal_username, "tax_user");
+    assert_eq!(re.tax_portal_password, "tax_pw");
+    assert_eq!(re.property_mgmt_comment, "PM notes");
+    assert_eq!(re.insurance_comment, "INS notes");
+    assert_eq!(re.hoa_comment, "HOA notes");
+    assert_eq!(re.tax_portal_comment, "TAX notes");
     assert_eq!(re.documents, vec![re_doc_id.clone()]);
     assert_eq!(&*v2.read_document(&re_doc_id).unwrap(), deed_bytes, "RE doc readable");
     assert_eq!(v2.doc_path(&re_doc_id).unwrap(), "/real-estate/123mainst/deed.pdf");

@@ -116,7 +116,7 @@ Vault
 │                                     //         institution, type, statement (doc id)
 ├── accounts:      Vec<Account>       // Tab 4: title, account_type, subtype, owner, username, password, url, closed_as_of, description, review
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
-│                                     //   financing_balance, 3 portal logins (mgmt/insurance/HOA: url+username+password),
+│                                     //   financing_balance, 4 portal logins (mgmt/insurance/HOA/tax: url+username+password+comment),
 │                                     //   comments, documents (doc ids; folder real-estate/<address>/)
 ├── tax_filings:   Vec<TaxFiling>     // Tab 6: year, notes, documents (doc ids)
 ├── general_documents: Vec<GeneralDocument> // Tab 7: title, description, file (one doc id)

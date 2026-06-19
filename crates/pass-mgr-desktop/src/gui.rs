@@ -385,7 +385,7 @@ struct GuiApp {
     // Global "reveal" toggle on the Accounts screen: when on, account passwords are
     // shown regardless of the per-record `reveal_pw` (it overrides it).
     reveal_all: bool,
-    // The same idea for the Real Estate screen's three portal passwords: a top-level
+    // The same idea for the Real Estate screen's four portal passwords: a top-level
     // toggle that overrides the per-record "Reveal portal passwords" (`reveal_pw`).
     // Kept separate from `reveal_all` so the two screens don't reveal each other.
     re_reveal_all: bool,
@@ -2032,9 +2032,10 @@ impl GuiApp {
                     text_row(ui, "Payment account", &mut r.payment_account, writable);
                 });
 
-                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, reveal, writable, &mut copy_pw);
-                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, reveal, writable, &mut copy_pw);
-                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, reveal, writable, &mut copy_pw);
+                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, &mut r.property_mgmt_comment, reveal, writable, &mut copy_pw);
+                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, &mut r.insurance_comment, reveal, writable, &mut copy_pw);
+                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, &mut r.hoa_comment, reveal, writable, &mut copy_pw);
+                portal_section(ui, "Tax portal", &mut r.tax_portal_url, &mut r.tax_portal_username, &mut r.tax_portal_password, &mut r.tax_portal_comment, reveal, writable, &mut copy_pw);
                 // Per-record reveal; disabled while the screen-level "reveal all" is
                 // on (which already overrides it), exactly like the Accounts form.
                 ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
@@ -2851,9 +2852,10 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, writable: bool) 
     ui.end_row();
 }
 
-/// Render one portal-login section (URL / username / masked password + copy) into
-/// the Real Estate form. The password is masked unless `reveal`; `copy_pw` is set
-/// when the copy button is clicked, to be acted on after rendering.
+/// Render one portal-login section (URL / username / masked password + copy, plus a
+/// free-form comment) into the Real Estate form. The password is masked unless
+/// `reveal`; `copy_pw` is set when the copy button is clicked, to be acted on after
+/// rendering.
 #[allow(clippy::too_many_arguments)]
 fn portal_section(
     ui: &mut egui::Ui,
@@ -2861,6 +2863,7 @@ fn portal_section(
     url: &mut String,
     username: &mut String,
     password: &mut String,
+    comment: &mut String,
     reveal: bool,
     writable: bool,
     copy_pw: &mut Option<Zeroizing<String>>,
@@ -2872,8 +2875,8 @@ fn portal_section(
         text_row(ui, "Username", username, writable);
         ui.label("Password");
         ui.horizontal(|ui| {
-            // `title` is unique per portal (Property Mgmt / Insurance / HOA), so it is
-            // a valid per-field id salt for the secret-field hardening. Copy stays
+            // `title` is unique per portal (Property Mgmt / Insurance / HOA / Tax), so
+            // it is a valid per-field id salt for the secret-field hardening. Copy stays
             // available read-only (it is a read, not an edit).
             secret_text_edit(ui, title, password, reveal, writable, 260.0, copy_pw);
             if ui.button("📋").on_hover_text("Copy").clicked() {
@@ -2882,6 +2885,11 @@ fn portal_section(
         });
         ui.end_row();
     });
+    ui.label("Comment");
+    ui.add_enabled(
+        writable,
+        egui::TextEdit::multiline(comment).id_salt((title, "comment")).desired_rows(2).desired_width(f32::INFINITY),
+    );
 }
 
 /// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.

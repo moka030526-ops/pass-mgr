@@ -104,7 +104,7 @@ Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 | Trust and Will | `TrustWill` | document, usage, `file` (doc id) |
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id) |
 | Accounts | `Account` | title, account_type, account_subtype, owner, username, password, url, closed_as_of, description, review |
-| Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, three portal logins (property-management / insurance / HOA — each url + username + password), comments, `documents` (doc ids) |
+| Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, four portal logins (property-management / insurance / HOA / tax — each url + username + password + comment), comments, `documents` (doc ids) |
 | Taxes | `TaxFiling` | year, notes, `documents` (doc ids) |
 | General Documents | `GeneralDocument` | title, description, `file` (one doc id) |
 
@@ -164,8 +164,8 @@ whole-file rollback is noticeable — `DESIGN.md` §9.12); `last_opened_at`; and
 written by an older build load under a newer one (a missing field decodes to its
 type default) — this is how `VaultSettings.redundancy` (new in §3.7) was added
 without a format bump. The Taxes collection (`tax_filings`), the General Documents
-collection (`general_documents`), and every new `RealEstate` field (the three portal
-logins, `financing_balance`, `comments`, `documents`) were added the same way — all
+collection (`general_documents`), and every new `RealEstate` field (the four portal
+logins + per-portal comments, `financing_balance`, `comments`, `documents`) were added the same way — all
 `#[serde(default)]` — so the on-disk format version stays **v4** and a vault written
 before these features still opens.
 

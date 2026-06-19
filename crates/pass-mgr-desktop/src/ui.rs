@@ -409,7 +409,7 @@ struct App {
     // Global "reveal" toggle for the Accounts tab: when on, account passwords are
     // shown regardless of the per-record reveal (it overrides Ctrl+R).
     reveal_all: bool,
-    // The same for the Real Estate tab's three portal passwords (toggled with `r` on
+    // The same for the Real Estate tab's four portal passwords (toggled with `r` on
     // the RE tab). Scoped per-tab so revealing one screen never reveals the other.
     re_reveal_all: bool,
     // Accounts view: false = flat filtered list, true = grouped tree
@@ -1467,12 +1467,19 @@ impl App {
                         Field::text("Property Mgmt URL", r.property_mgmt_url.clone()),
                         Field::text("Property Mgmt username", r.property_mgmt_username.clone()),
                         Field::password("Property Mgmt password", r.property_mgmt_password.clone()),
+                        Field::multiline("Property Mgmt comment", r.property_mgmt_comment.clone()),
                         Field::text("Insurance URL", r.insurance_url.clone()),
                         Field::text("Insurance username", r.insurance_username.clone()),
                         Field::password("Insurance password", r.insurance_password.clone()),
+                        Field::multiline("Insurance comment", r.insurance_comment.clone()),
                         Field::text("HOA URL", r.hoa_url.clone()),
                         Field::text("HOA username", r.hoa_username.clone()),
                         Field::password("HOA password", r.hoa_password.clone()),
+                        Field::multiline("HOA comment", r.hoa_comment.clone()),
+                        Field::text("Tax URL", r.tax_portal_url.clone()),
+                        Field::text("Tax username", r.tax_portal_username.clone()),
+                        Field::password("Tax password", r.tax_portal_password.clone()),
+                        Field::multiline("Tax comment", r.tax_portal_comment.clone()),
                         Field::multiline("Comments", r.comments.clone()),
                     ],
                     None,
@@ -1597,9 +1604,9 @@ impl App {
             }
             KeyCode::Char('g') if ctrl => {
                 // Generate into the FOCUSED password field, not just the first one.
-                // The Real Estate tab has three independent portal password fields,
+                // The Real Estate tab has four independent portal password fields,
                 // so a blind "first password" would always regenerate Property Mgmt
-                // (silently overwriting it) and could never reach Insurance/HOA.
+                // (silently overwriting it) and could never reach Insurance/HOA/Tax.
                 let pw_idx = target_password_index(&es.fields, es.focus);
                 if self.writable
                     && let Some(i) = pw_idx
@@ -2214,13 +2221,20 @@ impl App {
                 r.property_mgmt_url = f(8);
                 r.property_mgmt_username = f(9);
                 r.property_mgmt_password = f(10);
-                r.insurance_url = f(11);
-                r.insurance_username = f(12);
-                r.insurance_password = f(13);
-                r.hoa_url = f(14);
-                r.hoa_username = f(15);
-                r.hoa_password = f(16);
-                r.comments = f(17);
+                r.property_mgmt_comment = f(11);
+                r.insurance_url = f(12);
+                r.insurance_username = f(13);
+                r.insurance_password = f(14);
+                r.insurance_comment = f(15);
+                r.hoa_url = f(16);
+                r.hoa_username = f(17);
+                r.hoa_password = f(18);
+                r.hoa_comment = f(19);
+                r.tax_portal_url = f(20);
+                r.tax_portal_username = f(21);
+                r.tax_portal_password = f(22);
+                r.tax_portal_comment = f(23);
+                r.comments = f(24);
                 r.documents = es.re_docs.clone();
                 r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.real_estate, r);
@@ -3497,6 +3511,49 @@ mod tests {
         let expected =
             app.vault.as_ref().unwrap().vault.real_estate.iter().find(|r| r.id == target_id).unwrap().address.clone();
         assert_eq!(es.fields[0].value, expected, "loads the selected property's fields");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn real_estate_tax_portal_and_comments_round_trip_in_tui() {
+        // Pins the RealEstate build↔commit field-index mapping for the NEW fields:
+        // edit a property, fill the tax portal + every per-portal comment by LABEL
+        // (so the test doesn't hard-code indices), save, and confirm each lands in the
+        // right struct field. A build/commit index mismatch would cross the values.
+        let (mut app, path) = app_unlocked("uitaxportal");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut re = RealEstate::new().unwrap();
+            re.address = "9 Audit Ave".into();
+            records::upsert(&mut v.real_estate, re);
+        }
+        app.tab = Tab::RealEstate;
+        app.selected = 0;
+        app.start_edit(true);
+        // Set fields by label so the assertion below is index-agnostic.
+        let set = |app: &mut App, label: &str, val: &str| {
+            let es = app.edit.as_mut().unwrap();
+            let f = es.fields.iter_mut().find(|f| f.label == label).unwrap_or_else(|| panic!("no field {label:?}"));
+            f.value = val.into();
+        };
+        set(&mut app, "Tax URL", "https://tax.example");
+        set(&mut app, "Tax username", "taxuser");
+        set(&mut app, "Tax password", "taxpw");
+        set(&mut app, "Tax comment", "tax notes");
+        set(&mut app, "Property Mgmt comment", "pm notes");
+        set(&mut app, "Insurance comment", "ins notes");
+        set(&mut app, "HOA comment", "hoa notes");
+        app.handle_key(ctrl('s'));
+        let re = &app.vault.as_ref().unwrap().vault.real_estate[0];
+        assert_eq!(re.tax_portal_url, "https://tax.example");
+        assert_eq!(re.tax_portal_username, "taxuser");
+        assert_eq!(re.tax_portal_password, "taxpw");
+        assert_eq!(re.tax_portal_comment, "tax notes");
+        assert_eq!(re.property_mgmt_comment, "pm notes");
+        assert_eq!(re.insurance_comment, "ins notes");
+        assert_eq!(re.hoa_comment, "hoa notes");
+        // The address (field 0) must be untouched — i.e. no field shifted onto another.
+        assert_eq!(re.address, "9 Audit Ave");
         cleanup(&path);
     }
 

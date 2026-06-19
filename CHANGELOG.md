@@ -23,8 +23,9 @@ date and bump the crate versions to match.
   passwords, browse the tabs, view a record, read its history. The Android APK builds
   in CI; iOS builds on a Mac (see `mobile/iosApp/IOS_SECURITY_VERIFY.md`).
 - **Taxes tab** — tax filings keyed by year, each with a per-year document folder.
-- **Real Estate tab** — property records with management/insurance/HOA portal logins,
-  financing balance, free-text comments, and multiple attached documents.
+- **Real Estate tab** — property records with management/insurance/HOA/**tax** portal
+  logins (url + username + password), a **per-portal comment** block, financing balance,
+  free-text comments, and multiple attached documents.
 - **General Documents tab** — standalone titled documents, on a uniform document
   path layout (`<root>/<auto-group>/<compact-utc>/[subfolder]/<filename>`) shared by
   every document-bearing tab, with a single, consistent attach/export widget.
