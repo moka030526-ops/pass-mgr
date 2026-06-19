@@ -112,11 +112,18 @@ impl From<CoreVaultError> for VaultError {
             | CoreVaultError::BadParams
             | CoreVaultError::Json(_)
             | CoreVaultError::ArchiveMismatch
+            // `TooLarge` IS reachable on the open path: `read_capped_vault` rejects a
+            // vault file > MAX_VAULT_SIZE BEFORE decryption. An oversize file is a
+            // corruption/tamper signal, so it must collapse here too — otherwise a
+            // padded vault would return a distinct `Internal`, breaking the "every open
+            // failure looks identical" property (it is password-independent, so not a
+            // password oracle, but folding it keeps the surface uniform).
+            | CoreVaultError::TooLarge
             | CoreVaultError::Storage(_) => VaultError::WrongPasswordOrCorrupt,
-            // Not reachable on a read-only open, but map defensively.
+            // Genuinely unreachable on a read-only open (create/write/doc-read only),
+            // mapped defensively to a generic internal error.
             CoreVaultError::AlreadyExists(_)
             | CoreVaultError::ReadOnly
-            | CoreVaultError::TooLarge
             | CoreVaultError::NoSuchPartition(_) => VaultError::Internal,
         }
     }
@@ -998,6 +1005,25 @@ mod tests {
         let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
             .err()
             .expect("a truncated vault must fail to open");
+        assert!(matches!(e, VaultError::WrongPasswordOrCorrupt), "got {e:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversize_vault_file_maps_to_wrong_password_or_corrupt_not_internal() {
+        // An oversize (padded) vault file is a tamper/corruption signal reachable on
+        // the open path (read_capped_vault's size cap). It must collapse to the same
+        // no-leak variant as every other open failure — never the distinct `Internal`.
+        let dir = tmp();
+        make_full_vault(&dir, b"one", b"two");
+        let path = dir.join("vault.pmv");
+        // Grow the file past MAX_VAULT_SIZE (256 MiB) sparsely (set_len doesn't allocate).
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(256 * 1024 * 1024 + 1).unwrap();
+        drop(f);
+        let e = open_vault(dir.to_str().unwrap().to_string(), b"one".to_vec(), b"two".to_vec())
+            .err()
+            .expect("an oversize vault must fail to open");
         assert!(matches!(e, VaultError::WrongPasswordOrCorrupt), "got {e:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
