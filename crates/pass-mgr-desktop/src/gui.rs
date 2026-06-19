@@ -37,7 +37,7 @@ use crate::records::{
     self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
 };
 use crate::ui::format_time;
-use crate::vault::{self, OpenVault, VaultError};
+use crate::vault::{self, CategoryRemoval, OpenVault, VaultError};
 use crate::crypto::KdfParams;
 
 /// Launch the graphical app and block until the window is closed. `writable`
@@ -867,6 +867,11 @@ impl GuiApp {
         let mut do_backup = false;
         let mut set_volume = false;
         let mut set_redundancy = false;
+        // Deferred DELETE actions: which category the user clicked × on (handled after
+        // the render closures, same borrow-discipline as the add_* flags).
+        let mut remove_asset: Option<String> = None;
+        let mut remove_account: Option<String> = None;
+        let mut remove_subtype: Option<(String, String)> = None;
         // Snapshot the category lists + volume cap (from the open vault) before the
         // render closure borrows `self` mutably for the text inputs.
         let cur_volume_mib = self.vault_ref().volume_max_size() / (1024 * 1024);
@@ -876,21 +881,11 @@ impl GuiApp {
         let cur_redundancy = self.vault_ref().redundancy();
         let cats = self.vault_ref().categories();
         let type_names = cats.account_type_names();
-        let asset_list = cats.asset.join(" · ");
-        // Iterator pipeline: `.iter()` walks the account types by reference;
-        // `.map(|t| ...)` transforms each into an `(name, subtypes)` tuple via a
-        // closure; `.collect()` gathers them into a `Vec` (growable array). The
-        // type annotation `Vec<(String, String)>` tells `collect` what to build.
-        let account_list: Vec<(String, String)> = cats
-            .account
-            .iter()
-            .map(|t| {
-                let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
-                // `.clone()` because the snapshot must own its strings (the
-                // borrow of `cats` ends when this function's closures run).
-                (t.name.clone(), subs)
-            })
-            .collect();
+        // Owned snapshots so the render closures don't hold a borrow of `self`/`cats`.
+        let asset_names: Vec<String> = cats.asset.clone();
+        // Each account type with its subtypes kept as a list (so each gets its own ×).
+        let account_list: Vec<(String, Vec<String>)> =
+            cats.account.iter().map(|t| (t.name.clone(), t.subtypes.clone())).collect();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // Appearance: a color-theme picker. Changing it applies live and is
@@ -905,7 +900,19 @@ impl GuiApp {
             ui.add_space(14.0);
 
             ui.label(egui::RichText::new("Asset / Liability types").strong());
-            ui.label(egui::RichText::new(asset_list).weak());
+            // One chip per type with a delete (×) button. The × only deletes when the
+            // type is unused by a live record (else a status message explains why).
+            ui.horizontal_wrapped(|ui| {
+                for name in &asset_names {
+                    ui.label(egui::RichText::new(name).weak());
+                    if self.writable
+                        && ui.small_button("×").on_hover_text(format!("Delete “{name}” (only if unused)")).clicked()
+                    {
+                        remove_asset = Some(name.clone());
+                    }
+                    ui.add_space(8.0);
+                }
+            });
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_asset_type).hint_text("New type").desired_width(240.0));
                 if self.writable && ui.button("Add type").clicked() {
@@ -915,10 +922,33 @@ impl GuiApp {
 
             ui.add_space(14.0);
             ui.label(egui::RichText::new("Account types & subtypes").strong());
-            // `for (name, subs) in &account_list` iterates by reference and
-            // destructures each tuple into its two parts.
+            // Each type on its own row: a × to delete the type (blocked while it has
+            // subtypes or is in use), then each subtype with its own × (blocked if used).
             for (name, subs) in &account_list {
-                ui.label(egui::RichText::new(format!("{name}: {subs}")).weak());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(name).strong());
+                    if self.writable
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("Delete type (only if it has no subtypes and is unused)")
+                            .clicked()
+                    {
+                        remove_account = Some(name.clone());
+                    }
+                    ui.label(":");
+                    if subs.is_empty() {
+                        ui.label(egui::RichText::new("—").weak());
+                    }
+                    for sub in subs {
+                        ui.label(egui::RichText::new(sub).weak());
+                        if self.writable
+                            && ui.small_button("×").on_hover_text(format!("Delete subtype “{sub}” (only if unused)")).clicked()
+                        {
+                            remove_subtype = Some((name.clone(), sub.clone()));
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
             }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.new_account_type).hint_text("New account type").desired_width(220.0));
@@ -1054,6 +1084,38 @@ impl GuiApp {
                     Err(e) => self.status = format!("Save failed: {e}"),
                 }
             }
+        }
+        // Deferred DELETE handlers. A refusal (in use / has subtypes) is a normal
+        // status message, not a failure; only a real save error reads as "failed".
+        if let Some(name) = remove_asset {
+            let outcome = self.vault.as_mut().expect("vault open on config").remove_asset_type(&name);
+            self.status = match outcome {
+                Ok(CategoryRemoval::Removed) => format!("Deleted asset/liability type “{name}”."),
+                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} record(s)."),
+                Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
+                Ok(CategoryRemoval::HasSubtypes) => unreachable!("asset types have no subtypes"),
+                Err(e) => format!("Delete failed: {e}"),
+            };
+        }
+        if let Some(name) = remove_account {
+            let outcome = self.vault.as_mut().expect("vault open on config").remove_account_type(&name);
+            self.status = match outcome {
+                Ok(CategoryRemoval::Removed) => format!("Deleted account type “{name}”."),
+                Ok(CategoryRemoval::HasSubtypes) => format!("Can’t delete “{name}”: delete its subtypes first."),
+                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} account(s)."),
+                Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
+                Err(e) => format!("Delete failed: {e}"),
+            };
+        }
+        if let Some((ty, sub)) = remove_subtype {
+            let outcome = self.vault.as_mut().expect("vault open on config").remove_account_subtype(&ty, &sub);
+            self.status = match outcome {
+                Ok(CategoryRemoval::Removed) => format!("Deleted subtype “{sub}” under “{ty}”."),
+                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{sub}”: still used by {n} account(s)."),
+                Ok(CategoryRemoval::NotFound) => format!("“{sub}” was not found under “{ty}”."),
+                Ok(CategoryRemoval::HasSubtypes) => unreachable!("a subtype has no subtypes"),
+                Err(e) => format!("Delete failed: {e}"),
+            };
         }
         if do_backup {
             let dest = self.backup_dest.trim().to_string();

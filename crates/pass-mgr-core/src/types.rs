@@ -187,6 +187,39 @@ impl TypeLists {
         t.subtypes.sort();
         true
     }
+
+    // --- Removers (in-memory only; the vault save persists them) -------------
+    // NOTE: these only edit the lists. The "is this type still used by a record?"
+    // and "block deleting a type that still has subtypes" policy lives in
+    // `OpenVault::remove_*` (it needs the records, which TypeLists cannot see).
+
+    /// Remove an Asset/Liability type (case-insensitive). Returns whether removed.
+    pub fn remove_asset_type(&mut self, name: &str) -> bool {
+        let before = self.asset.len();
+        // `retain` keeps only the elements for which the closure is true, i.e. drops
+        // every case-insensitive match. The length change tells us if anything went.
+        self.asset.retain(|t| !t.eq_ignore_ascii_case(name));
+        self.asset.len() != before
+    }
+
+    /// Remove an account type **and its subtype list** (case-insensitive). Returns
+    /// whether removed. Callers gate this on "no subtypes / not in use" themselves.
+    pub fn remove_account_type(&mut self, name: &str) -> bool {
+        let before = self.account.len();
+        self.account.retain(|t| !t.name.eq_ignore_ascii_case(name));
+        self.account.len() != before
+    }
+
+    /// Remove a subtype from an account type (case-insensitive). Returns whether
+    /// removed (false if the type is unknown or the subtype was absent).
+    pub fn remove_account_subtype(&mut self, type_name: &str, subtype: &str) -> bool {
+        let Some(t) = self.account.iter_mut().find(|t| t.name.eq_ignore_ascii_case(type_name)) else {
+            return false;
+        };
+        let before = t.subtypes.len();
+        t.subtypes.retain(|s| !s.eq_ignore_ascii_case(subtype));
+        t.subtypes.len() != before
+    }
 }
 
 /// Insert `name` (trimmed) into `list` if not already present (case-insensitive),
@@ -242,6 +275,32 @@ mod tests {
         assert!(!t.add_account_subtype("Unknown", "X")); // unknown type
         assert!(!t.add_account_subtype("Crypto", "  ")); // blank
         assert_eq!(t.subtypes_for("Crypto"), vec!["Exchange".to_string()]);
+    }
+
+    #[test]
+    fn remove_types_and_subtypes_case_insensitively() {
+        let mut t = TypeLists::default();
+        t.add_asset_type("Crypto");
+        t.add_account_type("Bank");
+        t.add_account_subtype("Bank", "Checking");
+        t.add_account_subtype("Bank", "Savings");
+
+        // Asset type: case-insensitive removal; no-op when absent.
+        assert!(t.remove_asset_type("crypto")); // case-insensitive match of stored "Crypto"
+        assert!(!t.remove_asset_type("Crypto"), "already gone");
+        assert!(t.asset.is_empty());
+
+        // Subtype removal is case-insensitive and scoped to the type.
+        assert!(t.remove_account_subtype("bank", "CHECKING"));
+        assert_eq!(t.subtypes_for("Bank"), vec!["Savings".to_string()]);
+        assert!(!t.remove_account_subtype("Bank", "Checking"), "already gone");
+        assert!(!t.remove_account_subtype("Unknown", "x"), "unknown type");
+
+        // Account type removal drops the whole entry (incl. remaining subtypes).
+        assert!(t.remove_account_type("BANK"));
+        assert!(!t.account_type_names().contains(&"Bank".to_string()));
+        assert!(t.subtypes_for("Bank").is_empty());
+        assert!(!t.remove_account_type("Bank"), "already gone");
     }
 
     #[test]

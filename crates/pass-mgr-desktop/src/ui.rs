@@ -40,7 +40,7 @@ use crate::password::{self, GenOptions};
 use crate::records::{
     self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
 };
-use crate::vault::{OpenVault, VaultError};
+use crate::vault::{CategoryRemoval, OpenVault, VaultError};
 
 /// Run the UI event loop until the user quits. `writable` enables mutations;
 /// when false the vault is opened read-only and write keys are inert.
@@ -941,6 +941,8 @@ impl App {
                 self.cfg_field_mut().pop();
             }
             KeyCode::Enter => self.submit_config(),
+            // Delete the type/subtype named in the focused field (only if unused).
+            KeyCode::Delete => self.delete_config(),
             _ => {}
         }
         false
@@ -1061,6 +1063,72 @@ impl App {
                 },
                 _ => self.status = "Enter a whole number (0 = off).".into(),
             },
+        }
+    }
+
+    /// Delete the category named in the focused field (Del key). Asset type (focus 0),
+    /// account type (focus 1), or subtype (focus 2/3, using both subtype fields). A
+    /// type/subtype is removed only when no LIVE record uses it (history never blocks),
+    /// and an account type is refused while it still has subtypes (delete those first).
+    fn delete_config(&mut self) {
+        if !self.require_writable() {
+            return;
+        }
+        match self.cfg_focus {
+            0 => {
+                let name = self.cfg_asset_type.trim().to_string();
+                if name.is_empty() {
+                    self.status = "Type the exact asset/liability type to delete.".into();
+                    return;
+                }
+                self.status = match self.vault.as_mut().expect("vault open on config").remove_asset_type(&name) {
+                    Ok(CategoryRemoval::Removed) => {
+                        self.cfg_asset_type.clear();
+                        format!("Deleted asset/liability type “{name}”.")
+                    }
+                    Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} record(s)."),
+                    Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
+                    Ok(CategoryRemoval::HasSubtypes) => unreachable!("asset types have no subtypes"),
+                    Err(e) => format!("Delete failed: {e}"),
+                };
+            }
+            1 => {
+                let name = self.cfg_account_type.trim().to_string();
+                if name.is_empty() {
+                    self.status = "Type the exact account type to delete.".into();
+                    return;
+                }
+                self.status = match self.vault.as_mut().expect("vault open on config").remove_account_type(&name) {
+                    Ok(CategoryRemoval::Removed) => {
+                        self.cfg_account_type.clear();
+                        format!("Deleted account type “{name}”.")
+                    }
+                    Ok(CategoryRemoval::HasSubtypes) => format!("Can’t delete “{name}”: delete its subtypes first."),
+                    Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} account(s)."),
+                    Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
+                    Err(e) => format!("Delete failed: {e}"),
+                };
+            }
+            2 | 3 => {
+                let ty = self.cfg_subtype_type.trim().to_string();
+                let sub = self.cfg_subtype_name.trim().to_string();
+                if ty.is_empty() || sub.is_empty() {
+                    self.status = "Fill both subtype fields (type + subtype) to delete.".into();
+                    return;
+                }
+                self.status =
+                    match self.vault.as_mut().expect("vault open on config").remove_account_subtype(&ty, &sub) {
+                        Ok(CategoryRemoval::Removed) => {
+                            self.cfg_subtype_name.clear();
+                            format!("Deleted subtype “{sub}” under “{ty}”.")
+                        }
+                        Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{sub}”: still used by {n} account(s)."),
+                        Ok(CategoryRemoval::NotFound) => format!("“{sub}” was not found under “{ty}”."),
+                        Ok(CategoryRemoval::HasSubtypes) => unreachable!("a subtype has no subtypes"),
+                        Err(e) => format!("Delete failed: {e}"),
+                    };
+            }
+            _ => self.status = "Delete (Del) only applies to the type/subtype fields.".into(),
         }
     }
 
@@ -2248,7 +2316,7 @@ impl App {
         self.draw_footer(
             frame,
             chunks[1],
-            "Tab/↑↓ field · type to edit · Enter = add type / backup · Esc back",
+            "Tab/↑↓ field · type to edit · Enter = add / backup · Del = delete type (if unused) · Esc back",
         );
     }
 
@@ -3292,6 +3360,62 @@ mod tests {
         app.handle_key(key(KeyCode::Char('4')));
         app.handle_key(key(KeyCode::Char('T')));
         assert!(app.status.contains("Read-only"), "read-only blocks the bulk trim: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tui_config_delete_type_unused_blocked_when_used_or_has_subtypes() {
+        let (mut app, path) = app_unlocked("cfgdel");
+        {
+            let v = app.vault.as_mut().unwrap();
+            v.add_asset_type("Crypto").unwrap();
+            v.add_account_type("Bank").unwrap();
+            v.add_account_subtype("Bank", "Checking").unwrap();
+            v.save().unwrap();
+        }
+        app.screen = Screen::Config;
+
+        // Delete an UNUSED asset type (focus 0, type the name, Del).
+        app.cfg_focus = 0;
+        app.cfg_asset_type = "Crypto".into();
+        app.handle_config_key(key(KeyCode::Delete));
+        assert!(app.status.contains("Deleted asset"), "status: {}", app.status);
+        assert!(!app.vault.as_ref().unwrap().categories().asset.contains(&"Crypto".to_string()));
+        assert!(app.cfg_asset_type.is_empty(), "field cleared on success");
+
+        // Deleting an account type WITH subtypes is blocked.
+        app.cfg_focus = 1;
+        app.cfg_account_type = "Bank".into();
+        app.handle_config_key(key(KeyCode::Delete));
+        assert!(app.status.contains("delete its subtypes first"), "status: {}", app.status);
+        assert!(app.vault.as_ref().unwrap().categories().account_type_names().contains(&"Bank".to_string()));
+
+        // A subtype IN USE by a live account is blocked.
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.account_type = "Bank".into();
+            a.account_subtype = "Checking".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.vault.as_mut().unwrap().save().unwrap();
+        app.cfg_focus = 2;
+        app.cfg_subtype_type = "Bank".into();
+        app.cfg_subtype_name = "Checking".into();
+        app.handle_config_key(key(KeyCode::Delete));
+        assert!(app.status.contains("still used by 1"), "status: {}", app.status);
+        assert_eq!(app.vault.as_ref().unwrap().categories().subtypes_for("Bank"), vec!["Checking".to_string()]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tui_config_delete_is_blocked_read_only() {
+        let (mut app, path) = app_read_only("cfgdelro");
+        app.screen = Screen::Config;
+        app.cfg_focus = 1;
+        app.cfg_account_type = "Email".into();
+        app.handle_config_key(key(KeyCode::Delete));
+        assert!(app.status.contains("Read-only"), "read-only blocks delete: {}", app.status);
         cleanup(&path);
     }
 

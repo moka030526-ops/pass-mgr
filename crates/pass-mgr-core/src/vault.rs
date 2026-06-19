@@ -230,6 +230,23 @@ pub struct OpenVault {
     _write_lock: Option<WriteLock>,
 }
 
+/// Outcome of deleting a category (asset type / account type / account subtype) via
+/// `OpenVault::remove_*`. Distinct from a hard `VaultError` so the UI can react with a
+/// helpful message instead of a generic failure: the refusals (`InUse`/`HasSubtypes`)
+/// are normal "can't do that yet" states, not errors. (Read-only opens still return
+/// `Err(VaultError::ReadOnly)`; an actual save failure still returns `Err`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryRemoval {
+    /// Deleted from the list and the change was persisted.
+    Removed,
+    /// The type/subtype was not in the list (nothing to do).
+    NotFound,
+    /// Refused: this many LIVE records still reference it (history does not count).
+    InUse(usize),
+    /// Refused: an account type that still has subtypes defined (delete those first).
+    HasSubtypes,
+}
+
 /// An OS advisory lock on `<dir>/pass-mgr.lock`, held for the lifetime of a
 /// writable [`OpenVault`]. The lock is taken on the open file handle, so the
 /// kernel releases it when the handle closes — no stale lock file to clean up.
@@ -1123,6 +1140,59 @@ impl OpenVault {
 
     pub fn add_account_subtype(&mut self, type_name: &str, subtype: &str) -> Result<bool, VaultError> {
         self.mutate_categories(|c| c.add_account_subtype(type_name, subtype))
+    }
+
+    /// Delete an Asset/Liability type — only if **no live asset/liability record**
+    /// still has that `asset_type`. (History never blocks: a `Change.detail` string
+    /// is not the `asset_type` field, so it is not scanned here.) See [`CategoryRemoval`].
+    pub fn remove_asset_type(&mut self, name: &str) -> Result<CategoryRemoval, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        let used = self.vault.assets.iter().filter(|a| a.asset_type.eq_ignore_ascii_case(name)).count();
+        if used > 0 {
+            return Ok(CategoryRemoval::InUse(used));
+        }
+        let removed = self.mutate_categories(|c| c.remove_asset_type(name))?;
+        Ok(if removed { CategoryRemoval::Removed } else { CategoryRemoval::NotFound })
+    }
+
+    /// Delete an account type — refused if it still has **subtypes defined**
+    /// (delete those first) or if any **live account** still has that `account_type`.
+    pub fn remove_account_type(&mut self, name: &str) -> Result<CategoryRemoval, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        // Block while subtypes exist (chosen policy): the user removes each subtype
+        // first, then the now-empty type.
+        if !self.vault.categories.subtypes_for(name).is_empty() {
+            return Ok(CategoryRemoval::HasSubtypes);
+        }
+        let used = self.vault.accounts.iter().filter(|a| a.account_type.eq_ignore_ascii_case(name)).count();
+        if used > 0 {
+            return Ok(CategoryRemoval::InUse(used));
+        }
+        let removed = self.mutate_categories(|c| c.remove_account_type(name))?;
+        Ok(if removed { CategoryRemoval::Removed } else { CategoryRemoval::NotFound })
+    }
+
+    /// Delete a subtype under an account type — only if **no live account** has that
+    /// (`account_type`, `account_subtype`) pair.
+    pub fn remove_account_subtype(&mut self, type_name: &str, subtype: &str) -> Result<CategoryRemoval, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        let used = self
+            .vault
+            .accounts
+            .iter()
+            .filter(|a| a.account_type.eq_ignore_ascii_case(type_name) && a.account_subtype.eq_ignore_ascii_case(subtype))
+            .count();
+        if used > 0 {
+            return Ok(CategoryRemoval::InUse(used));
+        }
+        let removed = self.mutate_categories(|c| c.remove_account_subtype(type_name, subtype))?;
+        Ok(if removed { CategoryRemoval::Removed } else { CategoryRemoval::NotFound })
     }
 
     // Shared helper for the three `add_*` methods above. `edit: impl FnOnce(...)`
@@ -4280,6 +4350,109 @@ mod tests {
         drop(v);
         cleanup(&path);
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    // --- Category deletion (asset/account types + subtypes) ------------------
+
+    #[test]
+    fn remove_asset_type_blocks_when_in_use_then_allows_when_free() {
+        let path = tmp_path("rmasset");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        assert!(v.add_asset_type("Crypto").unwrap());
+        // Used by a live asset -> refused with the count.
+        let mut al = records::AssetLiability::new().unwrap();
+        al.asset_type = "Crypto".into();
+        let al_id = al.id.clone();
+        records::upsert(&mut v.vault.assets, al);
+        v.save().unwrap();
+        assert_eq!(v.remove_asset_type("Crypto").unwrap(), CategoryRemoval::InUse(1));
+        assert!(v.categories().asset.contains(&"Crypto".to_string()), "kept while in use");
+        // Remove the using record -> now deletable; persists across reopen.
+        records::remove(&mut v.vault.assets, &al_id, &mut v.vault.audit, "Asset");
+        v.save().unwrap();
+        assert_eq!(v.remove_asset_type("crypto").unwrap(), CategoryRemoval::Removed); // case-insensitive
+        assert_eq!(v.remove_asset_type("Crypto").unwrap(), CategoryRemoval::NotFound);
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(!re.categories().asset.contains(&"Crypto".to_string()), "deletion persisted");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn remove_account_type_blocks_on_subtypes_then_on_use_then_allows() {
+        let path = tmp_path("rmacct");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.add_account_type("Bank").unwrap();
+        v.add_account_subtype("Bank", "Checking").unwrap();
+        // (1) Has a subtype -> blocked (delete subtypes first).
+        assert_eq!(v.remove_account_type("Bank").unwrap(), CategoryRemoval::HasSubtypes);
+        // (2) A live account uses the subtype -> the subtype can't go yet.
+        let mut acc = sample_account("u", "p");
+        acc.account_type = "Bank".into();
+        acc.account_subtype = "Checking".into();
+        let acc_id = acc.id.clone();
+        records::upsert(&mut v.vault.accounts, acc);
+        v.save().unwrap();
+        assert_eq!(v.remove_account_subtype("Bank", "Checking").unwrap(), CategoryRemoval::InUse(1));
+        // Move the account off the subtype (history will record the change, but that
+        // must NOT block deletion) -> subtype now free.
+        let mut edited = v.vault.accounts.iter().find(|a| a.id == acc_id).unwrap().clone();
+        edited.account_subtype = String::new();
+        records::upsert(&mut v.vault.accounts, edited);
+        v.save().unwrap();
+        assert_eq!(v.remove_account_subtype("Bank", "Checking").unwrap(), CategoryRemoval::Removed);
+        // (3) Type now has no subtypes but the account still uses the TYPE -> InUse.
+        assert_eq!(v.remove_account_type("Bank").unwrap(), CategoryRemoval::InUse(1));
+        // Move the account off the type entirely -> type now deletable.
+        let mut edited = v.vault.accounts.iter().find(|a| a.id == acc_id).unwrap().clone();
+        edited.account_type = "Email".into();
+        records::upsert(&mut v.vault.accounts, edited);
+        v.save().unwrap();
+        assert_eq!(v.remove_account_type("Bank").unwrap(), CategoryRemoval::Removed);
+        assert!(!v.categories().account_type_names().contains(&"Bank".to_string()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn category_deletion_ignores_history_only_usage() {
+        // The crux of the requested behaviour: a type that appears only in a record's
+        // HISTORY (never on a live record) is deletable.
+        let path = tmp_path("rmhist");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.add_account_type("Legacy").unwrap();
+        let mut acc = sample_account("u", "p");
+        acc.account_type = "Legacy".into();
+        let id = acc.id.clone();
+        records::upsert(&mut v.vault.accounts, acc);
+        v.save().unwrap();
+        // Edit the account OFF "Legacy"; upsert records `type: "Legacy" -> "Email"`.
+        let mut edited = v.vault.accounts.iter().find(|a| a.id == id).unwrap().clone();
+        edited.account_type = "Email".into();
+        records::upsert(&mut v.vault.accounts, edited);
+        v.save().unwrap();
+        // Sanity: the history really does mention "Legacy"...
+        assert!(
+            v.vault.accounts[0].history.iter().any(|c| c.detail.contains("Legacy")),
+            "history retains the old type"
+        );
+        // ...but no LIVE account uses it, so it deletes.
+        assert_eq!(v.remove_account_type("Legacy").unwrap(), CategoryRemoval::Removed);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn category_removal_is_blocked_read_only() {
+        let path = tmp_path("rmro");
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            v.add_asset_type("Crypto").unwrap();
+            v.save().unwrap();
+        }
+        let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        assert!(matches!(ro.remove_asset_type("Crypto"), Err(VaultError::ReadOnly)));
+        assert!(matches!(ro.remove_account_type("Email"), Err(VaultError::ReadOnly)));
+        assert!(matches!(ro.remove_account_subtype("Financial", "Bank"), Err(VaultError::ReadOnly)));
+        cleanup(&path);
     }
 
     #[cfg(unix)]
