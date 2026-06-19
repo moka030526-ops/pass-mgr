@@ -566,10 +566,17 @@ currently exposes the first five record types.) The four screens are:
    `OpenVault::change_password`.
 2. **Browse.** The selected tab's records as a list, with per-tab **filters**
    (Accounts by title/type/subtype/owner/"needs review"; Assets by "needs review")
-   driven by the in-vault category lists, plus a free-text **username search** on
-   the Accounts tab (case-insensitive substring; the GUI has a search box, the TUI
-   enters it with `/`). Selection resolves **by record id**, so a filtered or
-   searched list never edits the wrong record. The Accounts filters are
+   driven by the in-vault category lists, plus a free-text **search** on the Accounts
+   tab that matches the **username OR the title** (case-insensitive substring; the GUI
+   has a search box, the TUI enters it with `/`). Selection resolves **by record id**,
+   so a filtered or searched list never edits the wrong record. The Accounts list can
+   also be shown as a **grouped tree** (toggle: GUI "grouped" checkbox, TUI `g`):
+   type → subtype → owner → account, each level collapsible (`+`/▸ to expand; egui
+   CollapsingHeaders in the GUI, `Enter` to expand/collapse a node in the TUI), with
+   the leaf showing the **title** only and missing levels bucketed as "(no …)". The
+   tree is built from the same filtered accounts (`records::account_tree`), so filters
+   and search still apply. Account **titles are mandatory** (a blank title is refused
+   on save). The Accounts filters are
    **cross-filtered (faceted)**: each dropdown offers only values present on accounts
    matching *all the other* active filters (`records::account_facets`), and a
    selection that a change makes invalid is **auto-cleared** (a fixpoint sweep), so

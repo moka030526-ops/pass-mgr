@@ -520,8 +520,12 @@ impl App {
                 .filter(|a| self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o))
                 .filter(|a| self.acct_filter_title.as_deref().is_none_or(|t| a.title == t))
                 .filter(|a| !self.acct_filter_review || a.review)
-                // Username search: case-insensitive substring (empty = no filter).
-                .filter(|a| records::matches_search(&a.username, &self.acct_search))
+                // Free-text search: case-insensitive substring over username OR title
+                // (empty = no filter).
+                .filter(|a| {
+                    records::matches_search(&a.username, &self.acct_search)
+                        || records::matches_search(&a.title, &self.acct_search)
+                })
                 .map(|a| (a.id.clone(), a.label()))
                 .collect(),
             Tab::RealEstate => label_list(&v.real_estate),
@@ -538,7 +542,8 @@ impl App {
             && self.acct_filter_owner.as_deref().is_none_or(|o| a.owner == o)
             && self.acct_filter_title.as_deref().is_none_or(|t| a.title == t)
             && (!self.acct_filter_review || a.review)
-            && records::matches_search(&a.username, &self.acct_search)
+            && (records::matches_search(&a.username, &self.acct_search)
+                || records::matches_search(&a.title, &self.acct_search))
     }
 
     /// The currently VISIBLE rows of the grouped Accounts tree (collapsed nodes hide
@@ -2569,9 +2574,9 @@ impl App {
             let grp = if self.acct_grouped { " · grouped" } else { "" };
             // Username search: show the query, with a trailing caret while typing.
             let u = if self.search_active {
-                format!(" · user~\"{}_\"", self.acct_search)
+                format!(" · find~\"{}_\"", self.acct_search)
             } else if !self.acct_search.is_empty() {
-                format!(" · user~\"{}\"", self.acct_search)
+                format!(" · find~\"{}\"", self.acct_search)
             } else {
                 String::new()
             };
@@ -2595,7 +2600,7 @@ impl App {
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
         let hints = if self.search_active {
-            "type to search usernames · Enter keep · Esc clear"
+            "type to search username/title · Enter keep · Esc clear"
         } else {
             match self.tab {
                 Tab::Accounts if self.acct_grouped => {
@@ -2943,6 +2948,33 @@ mod tests {
         assert!(!quit, "Esc in search mode must not quit");
         assert!(!app.search_active && app.acct_search.is_empty());
         assert_eq!(app.current_labels().len(), 3, "cleared → all accounts");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_search_matches_title_too() {
+        let (mut app, path) = app_unlocked("uisearchtitle");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.username = "u1".into();
+            a.title = "Brokerage account".into();
+            records::upsert(&mut v.accounts, a);
+            let mut b = Account::new().unwrap();
+            b.username = "u2".into();
+            b.title = "Email".into();
+            records::upsert(&mut v.accounts, b);
+        }
+        app.tab = Tab::Accounts;
+        assert_eq!(app.current_labels().len(), 2);
+        // The free-text search matches the TITLE as well as the username.
+        app.acct_search = "broker".into();
+        let labels = app.current_labels();
+        assert_eq!(labels.len(), 1, "title substring matches");
+        assert!(labels[0].1.contains("Brokerage"), "the brokerage account: {labels:?}");
+        // And still matches by username.
+        app.acct_search = "u2".into();
+        assert_eq!(app.current_labels().len(), 1, "username substring still matches");
         cleanup(&path);
     }
 

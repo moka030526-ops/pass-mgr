@@ -1529,15 +1529,17 @@ impl GuiApp {
     }
 
     /// Whether an account passes the current Accounts filters (type/subtype/owner/
-    /// title/review + the username search). Shared by the flat list and the grouped
-    /// tree so both honour the same filters.
+    /// title/review + the free-text search, which matches the username OR the title).
+    /// Shared by the flat list and the grouped tree so both honour the same filters.
     fn account_passes_filters(&self, a: &Account) -> bool {
         (self.acct_filter_type.is_empty() || a.account_type == self.acct_filter_type)
             && (self.acct_filter_subtype.is_empty() || a.account_subtype == self.acct_filter_subtype)
             && (self.acct_filter_owner.is_empty() || a.owner == self.acct_filter_owner)
             && (self.acct_filter_title.is_empty() || a.title == self.acct_filter_title)
             && (!self.acct_filter_review || a.review)
-            && records::matches_search(&a.username, &self.acct_search_user)
+            // Free-text search matches the username OR the title (empty query = all).
+            && (records::matches_search(&a.username, &self.acct_search_user)
+                || records::matches_search(&a.title, &self.acct_search_user))
     }
 
     /// Build a fresh Account for the "New" button, pre-populated from the active
@@ -1654,11 +1656,11 @@ impl GuiApp {
             ui.checkbox(&mut self.reveal_all, "reveal all");
             // Flat filtered list ⇄ grouped tree (type → subtype → owner → title).
             ui.checkbox(&mut self.acct_grouped, "grouped");
-            ui.label("username:");
+            ui.label("search:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.acct_search_user)
-                    .hint_text("search…")
-                    .desired_width(140.0),
+                    .hint_text("username or title…")
+                    .desired_width(160.0),
             );
             if ui.button("Clear").clicked() {
                 self.acct_filter_type.clear();
@@ -3072,6 +3074,26 @@ mod tests {
         keep.username = "bob".into();
         app.sync_account_filters_to(&keep);
         assert_eq!(app.acct_search_user, "bo", "a still-matching search is left as-is");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_search_matches_username_or_title_in_gui() {
+        let (mut app, path) = app_unlocked("guisearchtitle");
+        let mut by_title = Account::new().unwrap();
+        by_title.username = "u1".into();
+        by_title.title = "Brokerage account".into();
+        let mut other = Account::new().unwrap();
+        other.username = "u2".into();
+        other.title = "Email".into();
+
+        app.acct_search_user = "broker".into();
+        assert!(app.account_passes_filters(&by_title), "title substring matches");
+        assert!(!app.account_passes_filters(&other), "non-match excluded");
+        // Still matches by username.
+        app.acct_search_user = "u2".into();
+        assert!(app.account_passes_filters(&other));
+        assert!(!app.account_passes_filters(&by_title));
         cleanup(&path);
     }
 
