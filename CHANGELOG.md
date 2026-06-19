@@ -39,7 +39,8 @@ date and bump the crate versions to match.
   - **Closed as of** date field.
   - **Faceted (cross-filtering) filters** — type/subtype/owner/title each narrow to
     the values still valid under the other active filters, auto-clearing stale picks.
-  - **Reveal-all** toggle on the Accounts screen (overrides per-record reveal).
+  - **Reveal** is a single global toggle on the Accounts and Real Estate screens
+    (there is no per-record reveal); it clears on tab switch so it can't linger.
   - **Keep-visible-on-save** — editing a filtered field moves the active filter to the
     saved value (incl. the review-only and username-search filters) so the entry never
     silently vanishes.
@@ -50,6 +51,9 @@ date and bump the crate versions to match.
 - **Config: delete an unused category** — asset types, account types, and account
   subtypes can be deleted from Config, **only when no live record uses them** (history
   mentions never block); an account type with subtypes must have those removed first.
+- **Color themes** — ten curated palettes (Light, Dark, High contrast, Solarized,
+  Sepia, Nord, Dracula, Gruvbox Dark, Gruvbox Light, Rosé Pine); the choice persists
+  in a small non-secret prefs file and applies on the lock screen too.
 - **Packaging & platform:** Windows GUI-subsystem binary (no console window on
   launch); desktop shortcuts with locked/unlocked vault icons; packaging docs.
 - **CI / tooling:** GitHub Actions verification suite (clippy `-D warnings`, tests,
@@ -68,10 +72,12 @@ date and bump the crate versions to match.
   overflow) in addition to `strip`.
 - New fields are additive (`#[serde(default)]`); the on-disk **format stays v4** and
   older vaults open unchanged.
-- **Read-only mode is now fully non-editable.** A read-only session previously let you
-  type into a record's form fields (the edits were silently discarded on close); the
-  forms are now a true view — every data field is disabled. Only the color theme can be
-  changed; backup and document export (both read-only-safe) remain available.
+- **Read-only mode is a true view, not an editor.** A read-only session previously let
+  you type into a record's form fields (edits were silently discarded on close). The
+  fields can no longer be edited — but in the GUI they remain **selectable and copyable**
+  (bound to an immutable `&str` buffer) so you can highlight and copy a value without
+  changing it. Only the color theme can be changed; backup and document export (both
+  read-only-safe) remain available.
 
 ### Security
 

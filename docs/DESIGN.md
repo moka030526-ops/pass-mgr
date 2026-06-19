@@ -245,13 +245,15 @@ enforced in two layers:
 - **UI:** the front-ends hide write controls (New/Save/Delete/attach/detach/
   generate/change-password/type-add) and show a `🔒 READ-ONLY` badge; reads
   (browse, reveal, copy, export, backup) remain available. The record forms are a
-  **view, not an editor**, in read-only mode: every data field is non-interactive
-  (GUI widgets are rendered with `add_enabled(writable, …)`; the TUI's
-  `handle_edit_key` drops typing / backspace / choice-cycling unless `writable`), so
-  a read-only user can open and inspect a record but cannot type into it. The **only**
-  changeable setting is the color theme (a non-vault preference, §13 / `save_theme`);
-  the backup-destination and document-export paths stay editable because backup and
-  export are themselves read-only-safe operations.
+  **view, not an editor**, in read-only mode: no data field can be edited. In the GUI
+  the text fields stay **selectable and copyable** — they bind an immutable `&str`
+  buffer (an egui edit needs a *mutable* `TextBuffer`, selection needs only an
+  interactive widget), so a read-only user can highlight and copy a value but not
+  change it (combos/checkboxes are simply disabled); the TUI's `handle_edit_key` drops
+  typing / backspace / choice-cycling unless `writable`. The **only** changeable
+  setting is the color theme (a non-vault preference, §13 / `save_theme`); the
+  backup-destination and document-export paths stay editable because backup and export
+  are themselves read-only-safe operations.
 
 Because the category lists now live **inside the vault** (not in external files),
 a read-only session writes **nothing** to disk at all — there are no auxiliary
@@ -593,9 +595,10 @@ currently exposes the first five record types.) The four screens are:
    on in view: clicking **New** while a filter/search is active **pre-populates** the
    matching fields (title/type/subtype/owner/username) on the new record, and on
    **save** any active field filter is **moved to the saved record's value** so
-   changing a filtered field follows the entry instead of hiding it. A global
-   **reveal** toggle on the Accounts screen shows every account password at once,
-   overriding the per-record reveal. All of this only affects the view/edit buffer;
+   changing a filtered field follows the entry instead of hiding it. A single global
+   **reveal** toggle on the Accounts screen (and likewise on Real Estate for its portal
+   passwords) shows every password at once — it is the only reveal control, and it
+   clears on a tab switch so a stale reveal can't linger. All of this only affects the view/edit buffer;
    nothing is written until the record is saved. A one-off **Trim all fields** action
    (GUI button; TUI `T`) left/right-trims every field on every record across **all
    tabs** in one pass (`records::trim_all_records`), recording each change in history;

@@ -309,7 +309,6 @@ struct EditState {
     /// Document file ids for the Real Estate tab, which manages several documents
     /// per property. Empty for the single-document tabs.
     re_docs: Vec<String>,
-    reveal: bool,
     history: Vec<Change>,
 }
 
@@ -406,8 +405,8 @@ struct App {
     // substring) query; `search_active` is true while typing it (entered with '/').
     acct_search: String,
     search_active: bool,
-    // Global "reveal" toggle for the Accounts tab: when on, account passwords are
-    // shown regardless of the per-record reveal (it overrides Ctrl+R).
+    // The ONLY reveal control for the Accounts tab: a single global toggle (browse `r`
+    // or edit Ctrl+R) that unmasks every account password. No per-record reveal.
     reveal_all: bool,
     // The same for the Real Estate tab's four portal passwords (toggled with `r` on
     // the RE tab). Scoped per-tab so revealing one screen never reveals the other.
@@ -695,9 +694,9 @@ impl App {
     }
 
     /// Switch to tab `t`, reset the selection, and clear the "reveal all" toggles.
-    /// Reveal is a momentary, in-context action: a stale `reveal_all`/`re_reveal_all`
-    /// must not silently persist into a later visit and expose every password (the
-    /// per-edit `es.reveal` is already scoped to its own buffer).
+    /// Reveal is a momentary, in-context action (and the ONLY reveal control — there is
+    /// no per-record reveal), so a stale `reveal_all`/`re_reveal_all` must not silently
+    /// persist into a later visit and expose every password.
     fn switch_tab(&mut self, t: Tab) {
         self.tab = t;
         self.selected = 0;
@@ -1023,7 +1022,7 @@ impl App {
                 self.narrow_account_filters();
                 self.selected = 0;
             }
-            // Global reveal toggle (Accounts tab): overrides the per-record Ctrl+R.
+            // The single global reveal toggle (Accounts tab) — the only reveal control.
             KeyCode::Char('r') if self.tab == Tab::Accounts => {
                 self.reveal_all = !self.reveal_all;
             }
@@ -1570,7 +1569,6 @@ impl App {
             attached_file_id: attached,
             tax_docs,
             re_docs,
-            reveal: false,
             history,
         });
         self.screen = Screen::Edit;
@@ -1617,14 +1615,25 @@ impl App {
                     let f = &mut es.fields[i];
                     f.value.zeroize();
                     f.value = password::generate(&GenOptions::default()).unwrap_or_default();
-                    es.reveal = true;
+                    // Show the generated value via the single global reveal (the only
+                    // reveal control now — there is no per-record reveal).
+                    match es.tab {
+                        Tab::Accounts => self.reveal_all = true,
+                        Tab::RealEstate => self.re_reveal_all = true,
+                        _ => {}
+                    }
                     self.status = "Generated a random password.".into();
                 } else if !self.writable {
                     self.require_writable();
                 }
             }
-            // Toggle reveal: `!` flips the bool.
-            KeyCode::Char('r') if ctrl => es.reveal = !es.reveal,
+            // Ctrl+R toggles the single GLOBAL reveal for the current tab (the only
+            // reveal control; it also governs the browse list, scoped per screen).
+            KeyCode::Char('r') if ctrl => match es.tab {
+                Tab::Accounts => self.reveal_all = !self.reveal_all,
+                Tab::RealEstate => self.re_reveal_all = !self.re_reveal_all,
+                _ => {}
+            },
             KeyCode::Char('y') if ctrl => {
                 // Copy the FOCUSED password field (not just the first), so each Real
                 // Estate portal password can be copied independently — otherwise
@@ -2678,14 +2687,13 @@ impl App {
             // Decide what to display per field kind: a hidden password shows bullets
             // (unless `reveal` is on); a Choice shows arrows around the value; others
             // show their text verbatim. `&field.kind` matches by borrow.
-            // Masked unless the per-record reveal (Ctrl+R) OR the screen-level "reveal
-            // all" for THIS record's tab is on (the latter overrides the former):
-            // the Accounts `r` toggle for account edits, the Real Estate `r` toggle for
-            // property edits. Scoping by `es.tab` keeps the two screens independent.
+            // Masked unless the single global "reveal all" for THIS record's tab is on
+            // (the only reveal control): the Accounts toggle for account edits, the Real
+            // Estate toggle for property edits. Scoping by `es.tab` keeps them independent.
             let reveal_all_here = (self.reveal_all && es.tab == Tab::Accounts)
                 || (self.re_reveal_all && es.tab == Tab::RealEstate);
             let shown = match &field.kind {
-                FieldKind::Password if !(es.reveal || reveal_all_here) => "•".repeat(field.value.chars().count()),
+                FieldKind::Password if !reveal_all_here => "•".repeat(field.value.chars().count()),
                 FieldKind::Choice(_) => format!("◄ {} ►", field.value),
                 _ => field.value.clone(),
             };
@@ -3145,7 +3153,7 @@ mod tests {
         app.tab = Tab::RealEstate;
         app.selected = 0;
         app.start_edit(true);
-        // Masked by default (per-record Ctrl+R reveal off).
+        // Masked by default (global reveal off).
         assert!(!render_to_string(&app).contains("PORTALPW"), "portal password masked by default");
         // The ACCOUNT reveal-all must NOT reveal RE portals (scoped per tab).
         app.reveal_all = true;
@@ -3173,6 +3181,24 @@ mod tests {
         app.re_reveal_all = true;
         app.handle_key(key(KeyCode::Right));
         assert!(!app.re_reveal_all, "arrow tab-switch also clears reveal");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn generate_reveals_via_the_global_toggle_in_tui() {
+        // Reveal is global-only now: generating a password turns on the single global
+        // reveal (`reveal_all` on Accounts) so the new value is visible — there is no
+        // per-record reveal to flip.
+        let (mut app, path) = app_unlocked("genglobal");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('n'))); // new record
+        assert!(!app.reveal_all, "reveal starts off");
+        app.handle_key(ctrl('g')); // generate into the account's password field
+        assert!(app.reveal_all, "generate turns on the global reveal");
+        assert!(
+            !app.edit.as_ref().unwrap().fields[5].value.is_empty(),
+            "a password was generated into the password field"
+        );
         cleanup(&path);
     }
 
@@ -3853,9 +3879,11 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         assert_eq!(app.edit.as_ref().unwrap().fields[1].value, before, "choice not cyclable in read-only");
 
-        // Reads still work: the reveal toggle flips even in read-only.
+        // Reads still work: Ctrl+R flips the global reveal (the only reveal control) even
+        // in read-only — on the Accounts tab that is `reveal_all`.
+        assert!(!app.reveal_all);
         app.handle_key(ctrl('r'));
-        assert!(app.edit.as_ref().unwrap().reveal, "reveal still works in read-only");
+        assert!(app.reveal_all, "global reveal still works in read-only");
         cleanup(&path);
     }
 

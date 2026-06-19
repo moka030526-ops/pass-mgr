@@ -5,3 +5,7 @@
 /fuzz/corpus
 /fuzz/artifacts
 /.mutants-tmp
+
+# Local audit scratch (cargo-mutants output, fuzz logs) — never committed
+.audit/
+mutants.out/

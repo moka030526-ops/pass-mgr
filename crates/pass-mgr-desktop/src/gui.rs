@@ -121,11 +121,27 @@ enum Theme {
     HighContrast,
     Solarized,
     Sepia,
+    Nord,
+    Dracula,
+    GruvboxDark,
+    GruvboxLight,
+    RosePine,
 }
 
 impl Theme {
     /// Every theme, in menu order.
-    const ALL: [Theme; 5] = [Theme::Light, Theme::Dark, Theme::HighContrast, Theme::Solarized, Theme::Sepia];
+    const ALL: [Theme; 10] = [
+        Theme::Light,
+        Theme::Dark,
+        Theme::HighContrast,
+        Theme::Solarized,
+        Theme::Sepia,
+        Theme::Nord,
+        Theme::Dracula,
+        Theme::GruvboxDark,
+        Theme::GruvboxLight,
+        Theme::RosePine,
+    ];
 
     /// Stable on-disk id (kept separate from the display label so relabelling
     /// never invalidates a saved preference).
@@ -136,6 +152,11 @@ impl Theme {
             Theme::HighContrast => "high-contrast",
             Theme::Solarized => "solarized",
             Theme::Sepia => "sepia",
+            Theme::Nord => "nord",
+            Theme::Dracula => "dracula",
+            Theme::GruvboxDark => "gruvbox-dark",
+            Theme::GruvboxLight => "gruvbox-light",
+            Theme::RosePine => "rose-pine",
         }
     }
 
@@ -147,6 +168,11 @@ impl Theme {
             Theme::HighContrast => "High contrast",
             Theme::Solarized => "Solarized",
             Theme::Sepia => "Sepia",
+            Theme::Nord => "Nord",
+            Theme::Dracula => "Dracula",
+            Theme::GruvboxDark => "Gruvbox Dark",
+            Theme::GruvboxLight => "Gruvbox Light",
+            Theme::RosePine => "Rosé Pine",
         }
     }
 
@@ -227,6 +253,105 @@ fn visuals_for(theme: Theme) -> egui::Visuals {
             v.widgets.hovered.bg_fill = rgb(226, 212, 182);
             v.selection.bg_fill = rgb(214, 196, 158);
             v.selection.stroke = egui::Stroke::new(1.0, rgb(120, 90, 50));
+            v
+        }
+        Theme::Nord => {
+            // Nord — cool, muted polar palette.
+            let (bg, bg2, bg3) = (rgb(46, 52, 64), rgb(59, 66, 82), rgb(67, 76, 94));
+            let (txt, frost, blue) = (rgb(216, 222, 233), rgb(136, 192, 208), rgb(129, 161, 193));
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = bg;
+            v.window_fill = bg;
+            v.extreme_bg_color = rgb(38, 43, 54);
+            v.faint_bg_color = bg2;
+            v.override_text_color = Some(txt);
+            v.widgets.noninteractive.bg_fill = bg2;
+            v.widgets.inactive.bg_fill = bg2;
+            v.widgets.inactive.weak_bg_fill = bg2;
+            v.widgets.hovered.bg_fill = bg3;
+            v.widgets.active.bg_fill = blue;
+            v.selection.bg_fill = bg3;
+            v.selection.stroke = egui::Stroke::new(1.0, frost);
+            v.hyperlink_color = frost;
+            v
+        }
+        Theme::Dracula => {
+            // Dracula — dark with vivid purple/cyan accents.
+            let (bg, panel, sel) = (rgb(40, 42, 54), rgb(48, 50, 64), rgb(68, 71, 90));
+            let (fg, purple, cyan) = (rgb(248, 248, 242), rgb(189, 147, 249), rgb(139, 233, 253));
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = bg;
+            v.window_fill = bg;
+            v.extreme_bg_color = rgb(33, 34, 44);
+            v.faint_bg_color = panel;
+            v.override_text_color = Some(fg);
+            v.widgets.noninteractive.bg_fill = panel;
+            v.widgets.inactive.bg_fill = panel;
+            v.widgets.inactive.weak_bg_fill = panel;
+            v.widgets.hovered.bg_fill = sel;
+            v.widgets.active.bg_fill = purple;
+            v.selection.bg_fill = sel;
+            v.selection.stroke = egui::Stroke::new(1.0, purple);
+            v.hyperlink_color = cyan;
+            v
+        }
+        Theme::GruvboxDark => {
+            // Gruvbox — warm retro dark.
+            let (bg, bg1, bg2) = (rgb(40, 40, 40), rgb(60, 56, 54), rgb(80, 73, 69));
+            let (fg, orange, aqua) = (rgb(235, 219, 178), rgb(254, 128, 25), rgb(142, 192, 124));
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = bg;
+            v.window_fill = bg;
+            v.extreme_bg_color = rgb(29, 32, 33);
+            v.faint_bg_color = bg1;
+            v.override_text_color = Some(fg);
+            v.widgets.noninteractive.bg_fill = bg1;
+            v.widgets.inactive.bg_fill = bg1;
+            v.widgets.inactive.weak_bg_fill = bg1;
+            v.widgets.hovered.bg_fill = bg2;
+            v.widgets.active.bg_fill = orange;
+            v.selection.bg_fill = bg2;
+            v.selection.stroke = egui::Stroke::new(1.0, aqua);
+            v.hyperlink_color = aqua;
+            v
+        }
+        Theme::GruvboxLight => {
+            // Gruvbox — warm retro light.
+            let (bg, bg1, bg2) = (rgb(251, 241, 199), rgb(235, 219, 178), rgb(213, 196, 161));
+            let (fg, orange) = (rgb(60, 56, 54), rgb(214, 93, 14));
+            let mut v = egui::Visuals::light();
+            v.panel_fill = bg;
+            v.window_fill = rgb(249, 245, 215);
+            v.extreme_bg_color = rgb(252, 248, 227);
+            v.faint_bg_color = bg1;
+            v.override_text_color = Some(fg);
+            v.widgets.noninteractive.bg_fill = bg1;
+            v.widgets.inactive.bg_fill = bg1;
+            v.widgets.inactive.weak_bg_fill = bg1;
+            v.widgets.hovered.bg_fill = bg2;
+            v.widgets.active.bg_fill = orange;
+            v.selection.bg_fill = bg2;
+            v.selection.stroke = egui::Stroke::new(1.0, rgb(175, 58, 3));
+            v
+        }
+        Theme::RosePine => {
+            // Rosé Pine — soft, moody low-contrast dark.
+            let (base, surface, overlay) = (rgb(25, 23, 36), rgb(31, 29, 46), rgb(38, 35, 58));
+            let (text, iris, foam) = (rgb(224, 222, 244), rgb(196, 167, 231), rgb(156, 207, 216));
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = base;
+            v.window_fill = base;
+            v.extreme_bg_color = rgb(20, 18, 30);
+            v.faint_bg_color = surface;
+            v.override_text_color = Some(text);
+            v.widgets.noninteractive.bg_fill = surface;
+            v.widgets.inactive.bg_fill = surface;
+            v.widgets.inactive.weak_bg_fill = surface;
+            v.widgets.hovered.bg_fill = overlay;
+            v.widgets.active.bg_fill = iris;
+            v.selection.bg_fill = overlay;
+            v.selection.stroke = egui::Stroke::new(1.0, foam);
+            v.hyperlink_color = foam;
             v
         }
     }
@@ -381,12 +506,10 @@ struct GuiApp {
     edit_realestate: Option<RealEstate>,
     edit_taxfiling: Option<TaxFiling>,
     edit_general: Option<GeneralDocument>,
-    reveal_pw: bool,
-    // Global "reveal" toggle on the Accounts screen: when on, account passwords are
-    // shown regardless of the per-record `reveal_pw` (it overrides it).
+    // The ONLY reveal control on the Accounts screen: a single global toggle that
+    // unmasks every account password at once (there is no per-record reveal).
     reveal_all: bool,
-    // The same idea for the Real Estate screen's four portal passwords: a top-level
-    // toggle that overrides the per-record "Reveal portal passwords" (`reveal_pw`).
+    // The same single global toggle for the Real Estate screen's four portal passwords.
     // Kept separate from `reveal_all` so the two screens don't reveal each other.
     re_reveal_all: bool,
     // Accounts-tab display filters ("" = no filter).
@@ -489,7 +612,6 @@ impl GuiApp {
             edit_realestate: None,
             edit_taxfiling: None,
             edit_general: None,
-            reveal_pw: false,
             reveal_all: false,
             re_reveal_all: false,
             acct_filter_type: String::new(),
@@ -817,11 +939,9 @@ impl GuiApp {
     // --- Main: top bar + active tab -----------------------------------------
 
     fn ui_top_bar(&mut self, ui: &mut egui::Ui) {
-        // Remember the active tab so a tab switch can reset the password-reveal flag
-        // below: `reveal_pw` is a single global toggle, so without this, revealing
-        // an Account password then switching to Real Estate would immediately show
-        // that property's portal passwords unmasked (the TUI scopes reveal per edit
-        // buffer; this keeps the GUI from leaking more than the user asked for).
+        // Remember the active tab so a tab switch can reset the global reveal toggles
+        // below: reveal is meant to be a momentary, in-context action, so it must not
+        // persist into a later visit and expose every password to a bystander.
         let prev_tab = self.tab;
         // Horizontal scroll so the tab/action row stays fully reachable when the
         // window is narrower than the toolbar (otherwise the rightmost tabs would be
@@ -867,13 +987,9 @@ impl GuiApp {
                 }
             });
         });
-        // Re-mask passwords when the user switches tabs (see prev_tab above). Reset
-        // ALL three reveal toggles, not just the per-record one: "reveal all" is meant
-        // to be a momentary, in-context action, so it should not silently persist into a
-        // later visit to the tab and expose every password to a bystander (it stays
-        // scoped per screen either way, but a stale sticky reveal is its own hazard).
+        // Re-mask passwords when the user switches tabs (see prev_tab above): reveal is
+        // momentary, so a stale "reveal all" must not persist into a later tab visit.
         if self.tab != prev_tab {
-            self.reveal_pw = false;
             self.reveal_all = false;
             self.re_reveal_all = false;
         }
@@ -1261,14 +1377,11 @@ impl GuiApp {
             if let Some(r) = self.edit_instruction.as_mut() {
                 egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
-                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
+                    field_singleline(ui, &mut r.title, self.writable, 420.0);
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add_enabled(
-                    self.writable,
-                    egui::TextEdit::multiline(&mut r.description).desired_rows(12).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.description, self.writable, 12);
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1334,14 +1447,11 @@ impl GuiApp {
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Document");
-                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.document).desired_width(420.0));
+                    field_singleline(ui, &mut r.document, self.writable, 420.0);
                     ui.end_row();
                 });
                 ui.label("Usage");
-                ui.add_enabled(
-                    self.writable,
-                    egui::TextEdit::multiline(&mut r.usage).desired_rows(8).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.usage, self.writable, 8);
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1408,14 +1518,11 @@ impl GuiApp {
             if let Some(r) = self.edit_general.as_mut() {
                 egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
-                    ui.add_enabled(self.writable, egui::TextEdit::singleline(&mut r.title).desired_width(420.0));
+                    field_singleline(ui, &mut r.title, self.writable, 420.0);
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add_enabled(
-                    self.writable,
-                    egui::TextEdit::multiline(&mut r.description).desired_rows(8).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.description, self.writable, 8);
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1499,35 +1606,32 @@ impl GuiApp {
                     combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()], w);
                     ui.end_row();
                     ui.label("Owner");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
+                    field_singleline(ui, &mut r.owner, w, 420.0);
                     ui.end_row();
                     ui.label("Beneficiary");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.beneficiary).desired_width(420.0));
+                    field_singleline(ui, &mut r.beneficiary, w, 420.0);
                     ui.end_row();
                     ui.label("Approximate value");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.approx_value).desired_width(420.0));
+                    field_singleline(ui, &mut r.approx_value, w, 420.0);
                     ui.end_row();
                     ui.label("As-of date");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.as_of_date).hint_text("YYYY-MM-DD").desired_width(420.0));
+                    field_singleline_hint(ui, &mut r.as_of_date, w, 420.0, "YYYY-MM-DD");
                     ui.end_row();
                     ui.label("Institution");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.institution).desired_width(420.0));
+                    field_singleline(ui, &mut r.institution, w, 420.0);
                     ui.end_row();
                     ui.label("Type");
                     combo(ui, "asset_type", &mut r.asset_type, &asset_types, w);
                     ui.end_row();
                     ui.label("URL");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
+                    field_singleline(ui, &mut r.url, w, 420.0);
                     ui.end_row();
                     ui.label("Review");
                     ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add_enabled(
-                    self.writable,
-                    egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.description, self.writable, 4);
                 ui.separator();
                 docreq = doc_section(
                     ui,
@@ -1866,22 +1970,19 @@ impl GuiApp {
                     combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes, w);
                     ui.end_row();
                     ui.label("Owner");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.owner).desired_width(420.0));
+                    field_singleline(ui, &mut r.owner, w, 420.0);
                     ui.end_row();
                     ui.label("Username");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.username).desired_width(420.0));
+                    field_singleline(ui, &mut r.username, w, 420.0);
                     ui.end_row();
                     ui.label("Password");
                     ui.horizontal(|ui| {
-                        // Masked unless the per-record reveal OR the global "reveal all" is on.
-                        let revealed = self.reveal_pw || self.reveal_all;
-                        // `secret_text_edit` (audit R-7 fix) scrubs egui's undo buffer of
-                        // secret snapshots and re-routes the built-in copy through the
-                        // history-excluded clipboard path — so a revealed field is no longer
-                        // a residue/clipboard-history leak. Read-only: the field is shown but
-                        // not editable; reveal + copy stay available (they are reads).
-                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, w, 280.0, &mut copy_pw);
-                        ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
+                        // Masked unless the single global "reveal all" toggle is on (there
+                        // is no per-record reveal). `secret_text_edit` (audit R-7) scrubs
+                        // egui's undo buffer and re-routes the built-in copy through the
+                        // history-excluded clipboard path. Read-only: the field is shown,
+                        // selectable, and copyable, but not editable.
+                        secret_text_edit(ui, "acct_pw", &mut r.password, self.reveal_all, w, 280.0, &mut copy_pw);
                         // Generate is only useful when you can save; copy is a read.
                         if w && ui.button("🎲").on_hover_text("Generate").clicked() {
                             generate = true;
@@ -1893,20 +1994,17 @@ impl GuiApp {
                     });
                     ui.end_row();
                     ui.label("URL");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.url).desired_width(420.0));
+                    field_singleline(ui, &mut r.url, w, 420.0);
                     ui.end_row();
                     ui.label("Closed as of");
-                    ui.add_enabled(w, egui::TextEdit::singleline(&mut r.closed_as_of).hint_text("YYYY-MM-DD").desired_width(420.0));
+                    field_singleline_hint(ui, &mut r.closed_as_of, w, 420.0, "YYYY-MM-DD");
                     ui.end_row();
                     ui.label("Review");
                     ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
                     ui.end_row();
                 });
                 ui.label("Description");
-                ui.add_enabled(
-                    self.writable,
-                    egui::TextEdit::multiline(&mut r.description).desired_rows(4).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.description, self.writable, 4);
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
@@ -1916,7 +2014,6 @@ impl GuiApp {
 
         if new {
             self.edit_account = self.new_account_from_filters();
-            self.reveal_pw = false;
         }
         if let Some(i) = select {
             // `labels` is the FILTERED list, so resolve the clicked row to its id
@@ -1925,7 +2022,6 @@ impl GuiApp {
             if let Some((id, _)) = labels.get(i) {
                 self.edit_account =
                     self.vault_ref().vault.accounts.iter().find(|a| &a.id == id).cloned();
-                self.reveal_pw = false;
             }
         }
         // Pre-size the password buffer so typing in the egui field doesn't reallocate
@@ -1945,7 +2041,9 @@ impl GuiApp {
             // password on success or an empty string on the (unexpected) error case.
             r.password.zeroize();
             r.password = password::generate(&GenOptions::default()).unwrap_or_default();
-            self.reveal_pw = true;
+            // Reveal is global-only now: turn on "reveal all" so the just-generated
+            // password is visible (the per-record reveal that used to do this is gone).
+            self.reveal_all = true;
         }
         if let Some(pw) = copy_pw {
             // `pw` is moved into the call and wiped when it drops there.
@@ -1997,15 +2095,12 @@ impl GuiApp {
                 .collect(),
             None => Vec::new(),
         };
-        // Top-level "reveal all" (mirrors the Accounts screen): when on, all three
-        // portal passwords are shown, overriding the per-record "Reveal portal
-        // passwords" toggle in the edit form below.
+        // The single global "reveal all" toggle for this screen (mirrors Accounts): when
+        // on, all four portal passwords are shown. There is no per-record reveal.
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.re_reveal_all, "reveal all portal passwords");
         });
-        // Portal passwords are revealed when the per-record toggle OR the screen-level
-        // "reveal all" is on (matching the Accounts `reveal_pw || reveal_all`).
-        let reveal = self.reveal_pw || self.re_reveal_all;
+        let reveal = self.re_reveal_all;
         let writable = self.writable;
         let mut new = false;
         let mut select = None;
@@ -2036,16 +2131,10 @@ impl GuiApp {
                 portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, &mut r.insurance_comment, reveal, writable, &mut copy_pw);
                 portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, &mut r.hoa_comment, reveal, writable, &mut copy_pw);
                 portal_section(ui, "Tax portal", &mut r.tax_portal_url, &mut r.tax_portal_username, &mut r.tax_portal_password, &mut r.tax_portal_comment, reveal, writable, &mut copy_pw);
-                // Per-record reveal; disabled while the screen-level "reveal all" is
-                // on (which already overrides it), exactly like the Accounts form.
-                ui.add_enabled(!self.re_reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "Reveal portal passwords"));
 
                 ui.separator();
                 ui.label("Comments");
-                ui.add_enabled(
-                    writable,
-                    egui::TextEdit::multiline(&mut r.comments).desired_rows(3).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.comments, writable, 3);
 
                 ui.separator();
                 ui.label(format!(
@@ -2080,12 +2169,10 @@ impl GuiApp {
         if new {
             self.edit_realestate = RealEstate::new().ok();
             self.clear_doc_inputs();
-            self.reveal_pw = false;
         }
         if let Some(i) = select {
             self.edit_realestate = self.vault_ref().vault.real_estate.get(i).cloned();
             self.clear_doc_inputs();
-            self.reveal_pw = false;
         }
         // Pre-size the portal password buffers so per-keystroke typing never grows
         // (and so reallocates) them — a reallocation frees the old buffer WITHOUT
@@ -2151,10 +2238,7 @@ impl GuiApp {
                     text_row(ui, "Filing year", &mut r.year, writable);
                 });
                 ui.label("Notes");
-                ui.add_enabled(
-                    writable,
-                    egui::TextEdit::multiline(&mut r.notes).desired_rows(4).desired_width(f32::INFINITY),
-                );
+                field_multiline(ui, &mut r.notes, writable, 4);
                 ui.separator();
 
                 // Attached documents — all live under taxes/<year>/<timestamp>/…
@@ -2845,10 +2929,45 @@ fn account_required_field_error(a: &Account) -> Option<&'static str> {
     }
 }
 
+/// A single-line text field that is editable when `writable`, and otherwise shown as
+/// an **immutable but still selectable/copyable** field. egui edits require a *mutable*
+/// `TextBuffer` while selection only needs an interactive widget — so binding a `&str`
+/// (an immutable `TextBuffer`) gives a read-only field whose text the user can still
+/// highlight and Ctrl+C, exactly what read-only mode wants (vs. `add_enabled(false)`,
+/// which greys it out and blocks selection entirely).
+fn field_singleline(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32) -> egui::Response {
+    if writable {
+        ui.add(egui::TextEdit::singleline(value).desired_width(width))
+    } else {
+        let mut ro = value.as_str();
+        ui.add(egui::TextEdit::singleline(&mut ro).desired_width(width))
+    }
+}
+
+/// Like [`field_singleline`] but with a placeholder hint (shown only when editable).
+fn field_singleline_hint(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32, hint: &str) -> egui::Response {
+    if writable {
+        ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(width))
+    } else {
+        let mut ro = value.as_str();
+        ui.add(egui::TextEdit::singleline(&mut ro).desired_width(width))
+    }
+}
+
+/// A multi-line field: editable when `writable`, else immutable-but-selectable (see
+/// [`field_singleline`]).
+fn field_multiline(ui: &mut egui::Ui, value: &mut String, writable: bool, rows: usize) -> egui::Response {
+    if writable {
+        ui.add(egui::TextEdit::multiline(value).desired_rows(rows).desired_width(f32::INFINITY))
+    } else {
+        let mut ro = value.as_str();
+        ui.add(egui::TextEdit::multiline(&mut ro).desired_rows(rows).desired_width(f32::INFINITY))
+    }
+}
+
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, writable: bool) {
     ui.label(label);
-    // In read-only mode the field shows its value but is not editable.
-    ui.add_enabled(writable, egui::TextEdit::singleline(value).desired_width(420.0));
+    field_singleline(ui, value, writable, 420.0);
     ui.end_row();
 }
 
@@ -2886,10 +3005,15 @@ fn portal_section(
         ui.end_row();
     });
     ui.label("Comment");
-    ui.add_enabled(
-        writable,
-        egui::TextEdit::multiline(comment).id_salt((title, "comment")).desired_rows(2).desired_width(f32::INFINITY),
-    );
+    // Editable when writable, else immutable-but-selectable (see `field_singleline`).
+    // The per-portal `id_salt` keeps the four comment boxes' ids distinct.
+    let salt = (title, "comment");
+    if writable {
+        ui.add(egui::TextEdit::multiline(comment).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
+    } else {
+        let mut ro = comment.as_str();
+        ui.add(egui::TextEdit::multiline(&mut ro).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
+    }
 }
 
 /// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.
@@ -3062,8 +3186,15 @@ fn secret_text_edit(
     copied_out: &mut Option<Zeroizing<String>>,
 ) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
-    // Read-only: still display the (masked/revealed) value, but it cannot be edited.
-    let resp = ui.add_enabled(writable, egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width));
+    // Read-only: bind a `&str` (immutable TextBuffer) so the field stays selectable and
+    // copyable (incl. the hardened Ctrl+C reroute below) but cannot be edited; writable
+    // binds the real `&mut String`.
+    let resp = if writable {
+        ui.add(egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width))
+    } else {
+        let mut ro = value.as_str();
+        ui.add(egui::TextEdit::singleline(&mut ro).id(id).password(!revealed).desired_width(width))
+    };
     // (1) Never accumulate undo snapshots of a secret.
     if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id) {
         state.clear_undoer();
