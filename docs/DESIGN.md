@@ -1502,6 +1502,60 @@ lock-arbitration tests in `single_instance`. The persist-gating fixes are covere
 by the existing crash/fault-injection suite (§12.5), which already exercises failed
 writes.
 
+#### 13.2.8 Multi-round adversarial audit (rounds 3–4)
+
+Two further multi-agent adversarial audits (a 152-agent deep hunt and a 159-agent
+"hardcore" hunt; full write-up + per-finding PoCs in `docs/HARDENING.md` §3.1c/§3.1d)
+fixed these additional invariants. None breaks the cryptographic envelope — they
+harden behaviour against the dir-write threat model (§8) and the untrusted import
+mirror (§6.3). Each fix carries a regression test (see `HARDENING.md`).
+
+- **Deletion is durable against manifest loss (tombstones).** A lazy
+  `remove_document` only drops the manifest entry; the encrypted frame lingers until a
+  volume rewrite. A manifest-loss rebuild (§12.6) re-scans the volume and would
+  otherwise **resurrect** the deleted frame — and `compact` would bake it in
+  permanently. The vault now carries an authenticated `deleted_docs` tombstone list
+  (in `vault.pmv`, `#[serde(default)]` so v4 stays v4): `remove_document` records the
+  id, the doc readers (`read_document`/`has_document`/`doc_path`) suppress a tombstoned
+  id, and `staged_rewrite` drops tombstoned frames then clears the set once the volume
+  has been fully re-encrypted. This keys on `remove_document`, not on record
+  references, so the deliberate "compaction never silently drops a *not-yet-reclaimed*
+  orphan" guarantee (§11.1) is preserved.
+- **Untrusted-import hardening (`import_tree`, §6.3).** Blob ids are validated against
+  a strict **lowercase-hex allowlist** (`is_safe_blob_id` — real ids are 32 hex
+  chars), which also rejects Windows ADS/drive-relative/device-name escapes and
+  case-insensitive-FS collisions. Mirror-supplied virtual paths reject control bytes
+  **and Unicode bidi/zero-width** chars (`is_safe_doc_path` — RLO/`U+202E` label
+  spoofing). A mirror that lists the same id twice is rejected (a duplicate id would
+  leave two frames for one id, enabling a later truncation to roll the document back
+  to a stale version). The capped reads open with `O_NOFOLLOW` (`read_bounded`) so a
+  symlink swapped in after the stat-check cannot redirect the read to an arbitrary
+  file (a TOCTOU that previously could launder e.g. `/etc/shadow` into the vault).
+- **KDF parameter bounds are shared and enforced both ways.** `KdfParams::validate()`
+  (m_cost ≤ 512 MiB, t_cost ≤ 16, p_cost ≤ 16) runs on the read path (`Header::parse`,
+  a pre-derivation DoS guard, §9.13) **and** the write paths (`create`/`import_tree`),
+  so a vault can never be written that the reader would later refuse, and a tampered
+  header cannot force a multi-GiB Argon2 allocation per open. The default always
+  validates (pinned by a test).
+- **`backup()` is lock-correct and symlink-safe.** The free `backup` acquires the
+  single-writer lock (CLI/standalone); an *open* session uses `OpenVault::backup`,
+  which reuses its held lock (re-acquiring the per-fd flock in-process would
+  self-deadlock). The snapshot refuses a symlinked source `vault.pmv` (and `copy_dir`
+  refuses symlink entries), so a backup cannot copy an arbitrary link target.
+- **FFI no-oracle contract restored.** Every open failure — including
+  `ArchiveMismatch` (reachable only *after* a correct-password decrypt) and the
+  pre-decrypt `TooLarge` size-cap trip — collapses to the single
+  `WrongPasswordOrCorrupt` variant, so the read-only FFI never discriminates a correct
+  password from a tampered/corrupt vault (§8.1).
+- **UI secret-exposure fixes.** The history pane masks password before/after values
+  (`records::display_detail`, §4.1); the clipboard is flagged sensitive on every
+  platform (Linux `exclude_from_history`; Android `EXTRA_IS_SENSITIVE` + `FLAG_SECURE`;
+  iOS `UIPasteboard` `LocalOnly`+expiry, a scene-phase privacy overlay, and real file
+  Data Protection — iOS pieces pending Mac build-verification). Keep-visible-on-save
+  also relaxes the review/username filters so a just-saved account never vanishes, and
+  the redundancy-recovery notice no longer cries "data lost" when the recovered copy
+  is in fact the current generation.
+
 ### 13.3 Windows GUI subsystem — the two-binary split
 
 **Symptom.** On Windows, launching the app showed **two windows**: a command/console

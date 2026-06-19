@@ -67,7 +67,10 @@ crates/
                       The ONLY crate that permits `unsafe` (the UniFFI scaffolding); it
                       does NOT inherit the core's `forbid`. v1 surface is READ-ONLY
                       (open + browse + view + history) behind an opaque `Vault` handle,
-                      with a no-leak error map (wrong-password ≡ corrupt). Depends on the
+                      with a no-leak error map: EVERY open failure (wrong password, any
+                      corruption, the post-decrypt ArchiveMismatch, the pre-decrypt
+                      size-cap TooLarge) collapses to one `WrongPasswordOrCorrupt`
+                      variant, so it is never a correct-password oracle. Depends on the
                       core with `default-features = false`, so the Android/iOS build links
                       no `region` (mlock) and uses a no-op writer lock.
 
@@ -124,7 +127,10 @@ encrypted volume; records hold only opaque doc-id references.
 `vault::referenced_doc_ids` collects the ids from all of `TrustWill.file`,
 `Asset.statement`, every `Taxes`/`RealEstate` `documents`, and each
 `GeneralDocument.file`, so compaction never reclaims a live document and deletes
-reclaim all of a record's blobs.
+reclaim all of a record's blobs. **Deletion is durable against manifest loss:**
+`remove_document` records the id in an authenticated `Vault::deleted_docs` tombstone
+list, so a manifest-loss rebuild (which re-scans the volume) can't resurrect the
+still-present frame and a volume rewrite drops it for good (see DESIGN §13.2.8).
 
 **The `Record` trait + generic CRUD.** Rather than repeat insert/edit/history
 logic five times, each type implements a small `Record` trait supplying only its
