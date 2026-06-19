@@ -116,6 +116,88 @@ pub fn account_facets(
     }
 }
 
+// --- Grouped (tree) view of accounts ----------------------------------------
+
+/// A leaf of the account tree: one account, shown by its title only (the type /
+/// subtype / owner are implied by its position in the tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLeaf {
+    pub id: String,
+    pub title: String,
+}
+
+/// Accounts under one (type, subtype, owner) path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerGroup {
+    pub owner: String,
+    pub accounts: Vec<AccountLeaf>,
+}
+
+/// The owners under one (type, subtype).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtypeGroup {
+    pub subtype: String,
+    pub owners: Vec<OwnerGroup>,
+}
+
+/// The subtypes under one account type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeGroup {
+    pub account_type: String,
+    pub subtypes: Vec<SubtypeGroup>,
+}
+
+/// Build the **grouped tree** of `accounts`: type → subtype → owner → account
+/// (leaf, title only), for the GUI/TUI "grouped" view. An account missing a
+/// subtype/owner/title keeps an EMPTY string at that level (the UIs render empties
+/// as "(no subtype)" / "(no owner)" / "(no title)"). Every level is sorted
+/// case-insensitively with the empty "(none)" bucket placed LAST. Pass already
+/// filtered accounts to have the tree honour the active filters.
+pub fn account_tree(accounts: &[Account]) -> Vec<TypeGroup> {
+    let mut types: Vec<TypeGroup> = Vec::new();
+    for a in accounts {
+        // find-or-insert at each level (linear scan — account counts are modest).
+        let tg = match types.iter_mut().position(|g| g.account_type == a.account_type) {
+            Some(i) => &mut types[i],
+            None => {
+                types.push(TypeGroup { account_type: a.account_type.clone(), subtypes: Vec::new() });
+                types.last_mut().unwrap()
+            }
+        };
+        let sg = match tg.subtypes.iter_mut().position(|g| g.subtype == a.account_subtype) {
+            Some(i) => &mut tg.subtypes[i],
+            None => {
+                tg.subtypes.push(SubtypeGroup { subtype: a.account_subtype.clone(), owners: Vec::new() });
+                tg.subtypes.last_mut().unwrap()
+            }
+        };
+        let og = match sg.owners.iter_mut().position(|g| g.owner == a.owner) {
+            Some(i) => &mut sg.owners[i],
+            None => {
+                sg.owners.push(OwnerGroup { owner: a.owner.clone(), accounts: Vec::new() });
+                sg.owners.last_mut().unwrap()
+            }
+        };
+        og.accounts.push(AccountLeaf { id: a.id.clone(), title: a.title.clone() });
+    }
+    // Sort every level: real names alphabetical (case-insensitive), empty bucket last.
+    // `(s.is_empty(), s.to_lowercase())` sorts `false` (non-empty) before `true`.
+    fn key(s: &str) -> (bool, String) {
+        (s.is_empty(), s.to_lowercase())
+    }
+    types.sort_by_key(|g| key(&g.account_type));
+    for tg in &mut types {
+        tg.subtypes.sort_by_key(|g| key(&g.subtype));
+        for sg in &mut tg.subtypes {
+            sg.owners.sort_by_key(|g| key(&g.owner));
+            for og in &mut sg.owners {
+                og.accounts.sort_by_key(|l| key(&l.title));
+            }
+        }
+    }
+    types
+}
+
 /// A random 128-bit hex id, used for records and volume blobs.
 // Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
@@ -1361,6 +1443,52 @@ mod tests {
         assert_eq!(acc.title, "", "missing title defaults to empty");
         assert_eq!(acc.closed_as_of, "", "missing closed_as_of defaults to empty");
         assert_eq!(acc.username, "jane", "old fields preserved");
+    }
+
+    #[test]
+    fn account_tree_groups_buckets_empties_last_and_sorts() {
+        let mk = |ty: &str, st: &str, owner: &str, title: &str| {
+            let mut a = Account::new().unwrap();
+            a.account_type = ty.into();
+            a.account_subtype = st.into();
+            a.owner = owner.into();
+            a.title = title.into();
+            a
+        };
+        let accts = vec![
+            mk("Financial", "Bank", "Alice", "Joint brokerage"),
+            mk("Financial", "Bank", "Alice", "Emergency fund"),
+            mk("Financial", "Bank", "", "Shared bill pay"), // (no owner) under Bank
+            mk("Financial", "IRA", "Bob", "Retirement"),
+            mk("Email", "", "", "Personal gmail"), // (no subtype) + (no owner)
+        ];
+        let tree = account_tree(&accts);
+
+        // Types sorted case-insensitively: Email before Financial.
+        assert_eq!(tree.iter().map(|t| t.account_type.as_str()).collect::<Vec<_>>(), ["Email", "Financial"]);
+
+        // Email → empty subtype → empty owner → the one leaf (UIs render the empties).
+        let email = &tree[0];
+        assert_eq!(email.subtypes.len(), 1);
+        assert_eq!(email.subtypes[0].subtype, "");
+        assert_eq!(email.subtypes[0].owners[0].owner, "");
+        assert_eq!(email.subtypes[0].owners[0].accounts[0].title, "Personal gmail");
+
+        // Financial subtypes sorted: Bank, IRA.
+        let fin = &tree[1];
+        assert_eq!(fin.subtypes.iter().map(|s| s.subtype.as_str()).collect::<Vec<_>>(), ["Bank", "IRA"]);
+
+        // Bank owners: real owner "Alice" first, the empty "(no owner)" bucket LAST.
+        let bank = &fin.subtypes[0];
+        assert_eq!(bank.owners.iter().map(|o| o.owner.as_str()).collect::<Vec<_>>(), ["Alice", ""]);
+
+        // Alice's leaves sorted by title.
+        assert_eq!(
+            bank.owners[0].accounts.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["Emergency fund", "Joint brokerage"]
+        );
+        // Every leaf carries the account id so the UI can select/edit it.
+        assert!(!bank.owners[0].accounts[0].id.is_empty());
     }
 
     #[test]

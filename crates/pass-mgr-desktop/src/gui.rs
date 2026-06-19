@@ -1806,19 +1806,25 @@ impl GuiApp {
                 if let Some(r) = self.edit_account.as_mut() {
                     r.trim_fields();
                 }
-                if let Some(r) = self.edit_account.clone()
-                    && let Some(ov) = self.vault.as_mut()
-                {
-                    records::upsert(&mut ov.vault.accounts, r.clone());
-                    // Keep the just-saved entry visible: move any ACTIVE filter to the
-                    // saved record's value (so changing a filtered field doesn't make
-                    // the entry vanish from the filtered list).
-                    self.sync_account_filters_to(&r);
+                // Title is mandatory: refuse to save an account with a blank title
+                // (after trimming), keeping the edit form open so the user can fill it.
+                if self.edit_account.as_ref().is_some_and(|r| r.title.is_empty()) {
+                    self.status = "Title is required — every account must have a title.".into();
+                } else {
+                    if let Some(r) = self.edit_account.clone()
+                        && let Some(ov) = self.vault.as_mut()
+                    {
+                        records::upsert(&mut ov.vault.accounts, r.clone());
+                        // Keep the just-saved entry visible: move any ACTIVE filter to the
+                        // saved record's value (so changing a filtered field doesn't make
+                        // the entry vanish from the filtered list).
+                        self.sync_account_filters_to(&r);
+                    }
+                    if self.persist() {
+                        self.status = "Saved.".into();
+                    }
+                    // On failure persist() has already set the "Save failed: …" status.
                 }
-                if self.persist() {
-                    self.status = "Saved.".into();
-                }
-                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::Accounts),
             _ => {}

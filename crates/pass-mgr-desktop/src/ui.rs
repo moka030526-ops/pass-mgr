@@ -2106,6 +2106,13 @@ impl App {
             self.edit = Some(es);
             return;
         }
+        // Title is mandatory for accounts (field 0): refuse a blank title and keep the
+        // edit form open so the user can fill it in.
+        if es.tab == Tab::Accounts && es.fields[0].value.trim().is_empty() {
+            self.status = "Title is required — every account must have a title.".into();
+            self.edit = Some(es);
+            return;
+        }
         self.commit_edit_record(&es);
         if self.persist() {
             self.status = "Saved.".into();
@@ -2844,7 +2851,8 @@ mod tests {
         app.tab = Tab::Accounts;
         app.acct_filter_type = Some("Email".into()); // active filter
         app.start_edit(false); // New (prefills type=Email from the filter)
-        // Change the type to something else and give it a username.
+        // Title is mandatory; change the type and give it a username.
+        app.edit.as_mut().unwrap().fields[0].value = "Work".into(); // title (field 0)
         app.edit.as_mut().unwrap().fields[1].value = "Bank".into(); // type (field 1)
         app.edit.as_mut().unwrap().fields[4].value = "newuser".into(); // username (field 4)
         app.save_edit();
@@ -2862,6 +2870,7 @@ mod tests {
         app.acct_filter_review = true; // review-only active
         app.acct_search = "alice".into(); // username search active
         app.start_edit(false); // New (prefills username=alice from the search)
+        app.edit.as_mut().unwrap().fields[0].value = "Mail".into(); // title (mandatory)
         app.edit.as_mut().unwrap().fields[4].value = "bob".into(); // username (no longer matches)
         // review (field 9) stays default "No" — saved record is NOT flagged.
         app.save_edit();
@@ -3326,6 +3335,8 @@ mod tests {
         // Field order: 0 title 1 type(choice) 2 subtype(choice) 3 owner 4 username
         // 5 password 6 url 7 closed_as_of 8 description 9 review(choice).
         let typ = |app: &mut App, c: char| app.handle_key(key(KeyCode::Char(c)));
+        // title (focus 0) — mandatory.
+        for c in "My login".chars() { typ(&mut app, c); }
         // owner (focus 3)
         app.handle_key(key(KeyCode::Down)); // 0->1
         app.handle_key(key(KeyCode::Down)); // 1->2
@@ -3344,6 +3355,7 @@ mod tests {
         let v = &app.vault.as_ref().unwrap().vault;
         assert_eq!(v.accounts.len(), 1);
         // Verify field-index mapping: owner/username/password/closed_as_of landed correctly.
+        assert_eq!(v.accounts[0].title, "My login");
         assert_eq!(v.accounts[0].owner, "Jane");
         assert_eq!(v.accounts[0].username, "jane");
         assert_eq!(v.accounts[0].password, "pw");
@@ -3356,6 +3368,8 @@ mod tests {
         let (mut app, path) = app_unlocked("trimsave");
         app.handle_key(key(KeyCode::Char('4'))); // Accounts
         app.handle_key(key(KeyCode::Char('n'))); // new
+        // title (focus 0) — mandatory; also exercises trimming.
+        for c in "  Brokerage  ".chars() { app.handle_key(key(KeyCode::Char(c))); }
         // owner (focus 3) with surrounding spaces
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
@@ -3367,6 +3381,7 @@ mod tests {
         for c in "  pw  ".chars() { app.handle_key(key(KeyCode::Char(c))); }
         app.handle_key(ctrl('s'));
         let a = &app.vault.as_ref().unwrap().vault.accounts[0];
+        assert_eq!(a.title, "Brokerage");
         assert_eq!(a.owner, "Jane");
         assert_eq!(a.username, "jane");
         assert_eq!(a.password, "pw", "the password is trimmed too (configured policy)");
@@ -3467,6 +3482,8 @@ mod tests {
         let (mut app, path) = app_unlocked("review");
         app.handle_key(key(KeyCode::Char('4'))); // Accounts
         app.handle_key(key(KeyCode::Char('n')));
+        // title (focus 0) — mandatory.
+        for c in "Acct".chars() { app.handle_key(key(KeyCode::Char(c))); }
         // focus 9 = review choice (0 title .. 7 closed_as_of, 8 description); cycle to "Yes".
         for _ in 0..9 {
             app.handle_key(key(KeyCode::Down));
@@ -3474,6 +3491,23 @@ mod tests {
         app.handle_key(key(KeyCode::Right)); // cycle choice No -> Yes
         app.handle_key(ctrl('s'));
         assert!(app.vault.as_ref().unwrap().vault.accounts[0].review);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_save_requires_a_title_in_tui() {
+        let (mut app, path) = app_unlocked("titlereq");
+        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('n'))); // new
+        // Fill the username but leave the title (field 0) blank.
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        for c in "notitle".chars() { app.handle_key(key(KeyCode::Char(c))); }
+        app.handle_key(ctrl('s')); // save — must be rejected
+        assert_eq!(app.screen, Screen::Edit, "stays in the edit form when the title is blank");
+        assert!(app.status.contains("Title is required"), "status: {}", app.status);
+        assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "nothing saved without a title");
         cleanup(&path);
     }
 
