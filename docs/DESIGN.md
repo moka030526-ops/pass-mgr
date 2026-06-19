@@ -545,7 +545,11 @@ screen), so every line of crypto, storage, and data-model logic is shared and
 UI-independent. Adding or changing a front-end touches no security-critical code.
 
 - **Graphical (`gui.rs`, the default)** — `egui`/`eframe`, immediate-mode,
-  on-screen buttons and tabs. Needs a desktop (X11/Wayland).
+  on-screen buttons and tabs. Needs a desktop (X11/Wayland). Each screen's content
+  (Auth, the per-tab browse/edit area, and Config) and the tab toolbar sit in
+  scroll areas, so a window smaller than the content shows **vertical + horizontal
+  scrollbars** instead of clipping — the fixed top bar and bottom status line stay
+  put, and scrollbars appear only on genuine overflow.
 - **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
   headless. Key bindings are shown on-screen at all times; no mouse required.
 

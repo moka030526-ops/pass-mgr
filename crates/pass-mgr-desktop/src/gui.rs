@@ -795,44 +795,49 @@ impl GuiApp {
         // that property's portal passwords unmasked (the TUI scopes reveal per edit
         // buffer; this keeps the GUI from leaking more than the user asked for).
         let prev_tab = self.tab;
-        ui.horizontal(|ui| {
-            tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
-            tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
-            tab_button(ui, &mut self.tab, Tab::Assets, "Assets and Liabilities");
-            tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
-            tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
-            tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
-            tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
-            ui.separator();
-            // Change-password is a write; only offer it when writable.
-            // `&&` short-circuits: the button is only drawn/evaluated when
-            // `self.writable` is true, so read-only mode hides it entirely.
-            if self.writable
-                && ui.button("🔑 Passwords").clicked()
-            {
-                self.auth_mode = AuthMode::ChangePassword;
-                self.auth_error = None;
-                self.wipe_passwords();
-                self.screen = Screen::Auth;
-            }
-            if ui.button("⚙ Config").clicked() {
-                // Seed the redundancy picker from the live setting each time Config
-                // opens, so the combo reflects the current value (and its selection
-                // survives across frames until Apply).
-                self.cfg_redundancy = self.vault_ref().redundancy();
-                self.screen = Screen::Config;
-            }
-            if ui.button("Quit").clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            if !self.writable {
+        // Horizontal scroll so the tab/action row stays fully reachable when the
+        // window is narrower than the toolbar (otherwise the rightmost tabs would be
+        // clipped and unselectable). No vertical scroll — the row is one line tall.
+        egui::ScrollArea::horizontal().id_salt("topbar_scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
+                tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
+                tab_button(ui, &mut self.tab, Tab::Assets, "Assets and Liabilities");
+                tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
+                tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
+                tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
+                tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
                 ui.separator();
-                ui.label(
-                    egui::RichText::new("🔒 READ-ONLY")
-                        .strong()
-                        .color(egui::Color32::from_rgb(170, 90, 0)),
-                );
-            }
+                // Change-password is a write; only offer it when writable.
+                // `&&` short-circuits: the button is only drawn/evaluated when
+                // `self.writable` is true, so read-only mode hides it entirely.
+                if self.writable
+                    && ui.button("🔑 Passwords").clicked()
+                {
+                    self.auth_mode = AuthMode::ChangePassword;
+                    self.auth_error = None;
+                    self.wipe_passwords();
+                    self.screen = Screen::Auth;
+                }
+                if ui.button("⚙ Config").clicked() {
+                    // Seed the redundancy picker from the live setting each time Config
+                    // opens, so the combo reflects the current value (and its selection
+                    // survives across frames until Apply).
+                    self.cfg_redundancy = self.vault_ref().redundancy();
+                    self.screen = Screen::Config;
+                }
+                if ui.button("Quit").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if !self.writable {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("🔒 READ-ONLY")
+                            .strong()
+                            .color(egui::Color32::from_rgb(170, 90, 0)),
+                    );
+                }
+            });
         });
         // Re-mask passwords when the user switches tabs (see prev_tab above).
         if self.tab != prev_tab {
@@ -887,7 +892,7 @@ impl GuiApp {
         let account_list: Vec<(String, Vec<String>)> =
             cats.account.iter().map(|t| (t.name.clone(), t.subtypes.clone())).collect();
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::both().auto_shrink([false, false]).id_salt("config_scroll").show(ui, |ui| {
             // Appearance: a color-theme picker. Changing it applies live and is
             // saved to a small preferences file (it carries no vault data), so it
             // works in read-only mode too and persists to the next launch.
@@ -2517,7 +2522,11 @@ impl eframe::App for GuiApp {
             self.applied_theme = self.theme;
         }
         if self.screen == Screen::Auth {
-            egui::CentralPanel::default().show_inside(ui, |ui| self.ui_auth(ui));
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink([false, false]).id_salt("auth_scroll").show(ui, |ui| {
+                    self.ui_auth(ui)
+                });
+            });
             return;
         }
         if self.screen == Screen::Config {
@@ -2535,16 +2544,23 @@ impl eframe::App for GuiApp {
                 ui.label(egui::RichText::new(&self.status).weak());
             });
         }
-        // Draw the active tab. The closure body is a `match` selecting which
-        // tab-rendering method to call based on the current `self.tab`.
-        egui::CentralPanel::default().show_inside(ui, |ui| match self.tab {
-            Tab::Instructions => self.tab_instructions(ui),
-            Tab::TrustWill => self.tab_trustwill(ui),
-            Tab::Assets => self.tab_assets(ui),
-            Tab::Accounts => self.tab_accounts(ui),
-            Tab::RealEstate => self.tab_realestate(ui),
-            Tab::Taxes => self.tab_taxes(ui),
-            Tab::GeneralDocuments => self.tab_general(ui),
+        // Draw the active tab inside a both-axis scroll area, so when a tab's content
+        // is larger than the window the user gets vertical AND horizontal scrollbars
+        // instead of clipped content. `auto_shrink([false, false])` makes the area fill
+        // the panel (so the two-column layouts get full width); egui constrains the
+        // content to the viewport, so scrollbars appear only on genuine overflow.
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::both().auto_shrink([false, false]).id_salt("main_scroll").show(ui, |ui| {
+                match self.tab {
+                    Tab::Instructions => self.tab_instructions(ui),
+                    Tab::TrustWill => self.tab_trustwill(ui),
+                    Tab::Assets => self.tab_assets(ui),
+                    Tab::Accounts => self.tab_accounts(ui),
+                    Tab::RealEstate => self.tab_realestate(ui),
+                    Tab::Taxes => self.tab_taxes(ui),
+                    Tab::GeneralDocuments => self.tab_general(ui),
+                }
+            });
         });
     }
 }
