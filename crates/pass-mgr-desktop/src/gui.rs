@@ -397,6 +397,9 @@ struct GuiApp {
     acct_filter_review: bool,
     // Free-text, case-insensitive substring search over account usernames.
     acct_search_user: String,
+    // Accounts view: false = flat filtered list, true = grouped tree
+    // (type → subtype → owner → title).
+    acct_grouped: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -495,6 +498,7 @@ impl GuiApp {
             acct_filter_title: String::new(),
             acct_filter_review: false,
             acct_search_user: String::new(),
+            acct_grouped: false,
             asset_filter_review: false,
             new_asset_type: String::new(),
             new_account_type: String::new(),
@@ -1519,14 +1523,21 @@ impl GuiApp {
             .vault
             .accounts
             .iter()
-            .filter(|a| self.acct_filter_type.is_empty() || a.account_type == self.acct_filter_type)
-            .filter(|a| self.acct_filter_subtype.is_empty() || a.account_subtype == self.acct_filter_subtype)
-            .filter(|a| self.acct_filter_owner.is_empty() || a.owner == self.acct_filter_owner)
-            .filter(|a| self.acct_filter_title.is_empty() || a.title == self.acct_filter_title)
-            .filter(|a| !self.acct_filter_review || a.review)
-            .filter(|a| records::matches_search(&a.username, &self.acct_search_user))
+            .filter(|a| self.account_passes_filters(a))
             .map(|a| (a.id.clone(), a.label()))
             .collect()
+    }
+
+    /// Whether an account passes the current Accounts filters (type/subtype/owner/
+    /// title/review + the username search). Shared by the flat list and the grouped
+    /// tree so both honour the same filters.
+    fn account_passes_filters(&self, a: &Account) -> bool {
+        (self.acct_filter_type.is_empty() || a.account_type == self.acct_filter_type)
+            && (self.acct_filter_subtype.is_empty() || a.account_subtype == self.acct_filter_subtype)
+            && (self.acct_filter_owner.is_empty() || a.owner == self.acct_filter_owner)
+            && (self.acct_filter_title.is_empty() || a.title == self.acct_filter_title)
+            && (!self.acct_filter_review || a.review)
+            && records::matches_search(&a.username, &self.acct_search_user)
     }
 
     /// Build a fresh Account for the "New" button, pre-populated from the active
@@ -1641,6 +1652,8 @@ impl GuiApp {
             ui.checkbox(&mut self.acct_filter_review, "review only");
             // Global reveal: overrides the per-record "reveal" toggle below.
             ui.checkbox(&mut self.reveal_all, "reveal all");
+            // Flat filtered list ⇄ grouped tree (type → subtype → owner → title).
+            ui.checkbox(&mut self.acct_grouped, "grouped");
             ui.label("username:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.acct_search_user)
@@ -1674,6 +1687,13 @@ impl GuiApp {
 
         // Filtered list (after the filter row, so a change applies this frame).
         let labels = self.filtered_account_labels();
+        // In grouped mode, the same filtered accounts as a type→subtype→owner→title
+        // tree (built here so the render closure doesn't re-borrow `self`).
+        let tree = if self.acct_grouped {
+            Some(records::account_tree(self.vault_ref().vault.accounts.iter().filter(|a| self.account_passes_filters(a))))
+        } else {
+            None
+        };
         let cur = self.edit_account.as_ref().map(|r| r.id.clone());
         let mut new = false;
         let mut select = None;
@@ -1701,7 +1721,54 @@ impl GuiApp {
             .unwrap_or_default();
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable);
+            match &tree {
+                // Grouped tree: type → subtype → owner → title (leaf). egui's
+                // CollapsingHeader provides the +/- expand control per node.
+                Some(types) => {
+                    let lp = &mut c[0];
+                    lp.horizontal(|ui| {
+                        ui.heading("Accounts");
+                        if self.writable && ui.button("➕ New").clicked() {
+                            new = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("acct_tree").show(lp, |ui| {
+                        let disp = |s: &str, none: &str| if s.is_empty() { none.to_string() } else { s.to_string() };
+                        for tg in types {
+                            egui::CollapsingHeader::new(disp(&tg.account_type, "(no type)"))
+                                .id_salt(("acct_t", &tg.account_type))
+                                .show(ui, |ui| {
+                                    for sg in &tg.subtypes {
+                                        egui::CollapsingHeader::new(disp(&sg.subtype, "(no subtype)"))
+                                            .id_salt(("acct_s", &tg.account_type, &sg.subtype))
+                                            .show(ui, |ui| {
+                                                for og in &sg.owners {
+                                                    egui::CollapsingHeader::new(disp(&og.owner, "(no owner)"))
+                                                        .id_salt(("acct_o", &tg.account_type, &sg.subtype, &og.owner))
+                                                        .show(ui, |ui| {
+                                                            for leaf in &og.accounts {
+                                                                let sel = cur.as_deref() == Some(leaf.id.as_str());
+                                                                if ui
+                                                                    .selectable_label(sel, disp(&leaf.title, "(no title)"))
+                                                                    .clicked()
+                                                                {
+                                                                    // `select` is an index into `labels` (same filtered
+                                                                    // set as the tree), matching the flat-list model.
+                                                                    select = labels.iter().position(|(id, _)| *id == leaf.id);
+                                                                }
+                                                            }
+                                                        });
+                                                }
+                                            });
+                                    }
+                                });
+                        }
+                    });
+                }
+                None => {
+                    (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable);
+                }
+            }
             let ui = &mut c[1];
             if let Some(r) = self.edit_account.as_mut() {
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {

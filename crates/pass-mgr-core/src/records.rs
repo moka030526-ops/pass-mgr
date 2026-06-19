@@ -151,9 +151,10 @@ pub struct TypeGroup {
 /// (leaf, title only), for the GUI/TUI "grouped" view. An account missing a
 /// subtype/owner/title keeps an EMPTY string at that level (the UIs render empties
 /// as "(no subtype)" / "(no owner)" / "(no title)"). Every level is sorted
-/// case-insensitively with the empty "(none)" bucket placed LAST. Pass already
-/// filtered accounts to have the tree honour the active filters.
-pub fn account_tree(accounts: &[Account]) -> Vec<TypeGroup> {
+/// case-insensitively with the empty "(none)" bucket placed LAST. Takes any iterator
+/// of account references, so a caller can pass the FILTERED accounts (no clone) to
+/// have the tree honour the active filters.
+pub fn account_tree<'a>(accounts: impl IntoIterator<Item = &'a Account>) -> Vec<TypeGroup> {
     let mut types: Vec<TypeGroup> = Vec::new();
     for a in accounts {
         // find-or-insert at each level (linear scan — account counts are modest).
