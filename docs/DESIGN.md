@@ -1112,7 +1112,12 @@ crash in between leaves an orphan, never a dangling reference (which would be
    `volume/`), re-encrypting every blob; fsync the files and dirs.
 2. Write the `.rekey/READY` marker (fsync) — the staging is now complete & valid.
 3. **Commit by roll-forward:** move `volume/`, then `manifest/`, then `vault.pmv`
-   **last**; fsync; remove `.rekey/`.
+   **last**, **fsync'ing the parent directory after _each_ rename** (not just once at
+   the end); then remove `.rekey/`. The per-step directory fsync is load-bearing: a
+   rename's directory entry is only durable once its parent dir is fsync'd, so without
+   the barrier a power loss could let the `vault.pmv` rename reach disk *before* the
+   `volume/`/`manifest/` renames — a new-key vault over an old-key store, which the
+   roll-forward cannot repair (hardened in round 5; see `docs/HARDENING.md` §3.1e A-1).
 
 On the next open, `recover_pending_rekey` runs *before* anything else:
 `.rekey/` with `READY` → finish the (idempotent) roll-forward → the new passwords

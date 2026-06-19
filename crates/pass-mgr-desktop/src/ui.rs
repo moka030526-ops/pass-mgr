@@ -323,15 +323,17 @@ struct AcctRow {
 }
 
 enum AcctRowKind {
-    /// A type/subtype/owner header; `path` keys its expand state, `expanded` is its
-    /// current state (drives the ▸/▾ marker).
-    Group { path: String, expanded: bool },
+    /// A type/subtype/owner header; `path` (the stack of ancestor labels) keys its
+    /// expand state, `expanded` is its current state (drives the ▸/▾ marker). A Vec —
+    /// not a separator-joined string — so two distinct group paths can never collide
+    /// (e.g. owner "a\x1fb" vs owner "a" + type "b").
+    Group { path: Vec<String>, expanded: bool },
     /// An account leaf carrying its record id (what selecting it edits).
     Leaf { id: String },
 }
 
 impl AcctRow {
-    fn group(depth: u16, label: &str, expanded: bool, path: String) -> Self {
+    fn group(depth: u16, label: &str, expanded: bool, path: Vec<String>) -> Self {
         AcctRow { depth, label: label.to_string(), kind: AcctRowKind::Group { path, expanded } }
     }
     fn leaf(depth: u16, label: &str, id: String) -> Self {
@@ -341,18 +343,19 @@ impl AcctRow {
 
 /// Flatten one grouped-tree node into visible rows: each child group becomes a
 /// header row (recursed into when expanded), then this node's leaf accounts follow
-/// (at the same depth, so they sit *inside* their parent group). `parent_path` keys
-/// each group's expand state in `expanded`. Mirrors the GUI's children-then-leaves
-/// order so the two front-ends present the same tree.
+/// (at the same depth, so they sit *inside* their parent group). `parent_path` is the
+/// stack of ancestor labels keying each group's expand state in `expanded`. Mirrors
+/// the GUI's children-then-leaves order so the two front-ends present the same tree.
 fn flatten_acct_node(
     node: &records::AcctNode,
     depth: u16,
-    parent_path: &str,
-    expanded: &std::collections::HashSet<String>,
+    parent_path: &[String],
+    expanded: &std::collections::HashSet<Vec<String>>,
     rows: &mut Vec<AcctRow>,
 ) {
     for child in &node.children {
-        let path = format!("{parent_path}\x1f{}", child.label);
+        let mut path = parent_path.to_vec();
+        path.push(child.label.clone());
         let exp = expanded.contains(&path);
         rows.push(AcctRow::group(depth, &child.label, exp, path.clone()));
         if exp {
@@ -412,8 +415,8 @@ struct App {
     // Accounts view: false = flat filtered list, true = grouped tree
     // (type → subtype → owner → title), toggled with `g`.
     acct_grouped: bool,
-    // Paths of the EXPANDED tree nodes (collapsed by default — `+`/→ expands).
-    acct_expanded: std::collections::HashSet<String>,
+    // Paths (ancestor-label stacks) of the EXPANDED tree nodes (collapsed by default).
+    acct_expanded: std::collections::HashSet<Vec<String>>,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -498,7 +501,11 @@ impl App {
             clear_clipboard();
             self.clipboard_dirty = false;
             self.clipboard_clear_at = None;
-            self.status = "Clipboard cleared.".into();
+            // Don't clobber a meaningful status (e.g. "Save failed: …") the user may not
+            // have seen yet; only replace a blank or the prior "Copied …" notice.
+            if self.status.is_empty() || self.status.starts_with("Copied") {
+                self.status = "Clipboard cleared.".into();
+            }
         }
     }
 
@@ -579,7 +586,7 @@ impl App {
         let v = &self.vault_ref().vault;
         let tree = records::account_tree(v.accounts.iter().filter(|a| self.acct_passes_filters(a)));
         let mut rows = Vec::new();
-        flatten_acct_node(&tree, 0, "acct", &self.acct_expanded, &mut rows);
+        flatten_acct_node(&tree, 0, &[], &self.acct_expanded, &mut rows);
         rows
     }
 
@@ -871,14 +878,17 @@ impl App {
                 self.wipe_auth();
                 self.screen = Screen::Browse;
             }
-            // Match a specific error variant. `Crypto(_)` matches the Crypto case
-            // while ignoring its payload (`_`); shown as a generic message so we
-            // don't leak whether the password or the file was the problem.
-            Err(VaultError::Crypto(_)) => {
+            // Collapse every CORRECT-password-reachable failure into ONE message so the
+            // unlock screen can't be used as a "this password is correct" oracle: wrong
+            // password yields `Crypto`, while `ArchiveMismatch`/`Json`/`Storage` are
+            // reachable only after a successful decrypt — a distinct message would reveal
+            // the password was right (audit O-1; mirrors the FFI collapse). Structural,
+            // password-INDEPENDENT errors keep their specific messages in the catch-all.
+            Err(VaultError::Crypto(_) | VaultError::ArchiveMismatch | VaultError::Json(_) | VaultError::Storage(_)) => {
                 self.auth = AuthState::new(self.auth.mode);
-                self.auth.error = Some("Wrong password(s) or corrupted vault.".into());
+                self.auth.error = Some("Wrong password(s) or corrupted/unreadable vault.".into());
             }
-            // Catch-all for any other error variant; `e` binds the whole error.
+            // Catch-all for any other (password-independent) error variant.
             Err(e) => {
                 self.auth = AuthState::new(self.auth.mode);
                 self.auth.error = Some(format!("{e}"));
@@ -3801,6 +3811,39 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Edit);
         assert_eq!(app.edit.as_ref().unwrap().id.as_deref(), Some(want_id.as_str()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn grouped_tree_expand_keys_do_not_collide_in_tui() {
+        // Regression for the expand-key collision (audit fix): keying `acct_expanded`
+        // on a separator-JOINED string let two distinct group paths share state — a
+        // nested ["Alice","Bank"] collided with a single top-level owner label
+        // "Alice\x1fBank". Keying on the label STACK (Vec) makes them distinct.
+        let (mut app, path) = app_unlocked("treekeycollide");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.owner = "Alice".into();
+            a.account_type = "Bank".into();
+            a.title = "Nested".into();
+            records::upsert(&mut v.accounts, a);
+            let mut b = Account::new().unwrap();
+            b.owner = "Alice\u{1f}Bank".into(); // ONE owner label containing the old separator
+            b.title = "TopLevel".into();
+            records::upsert(&mut v.accounts, b);
+        }
+        app.tab = Tab::Accounts;
+        app.acct_grouped = true;
+        // Expand owner "Alice" and then the NESTED "Bank" group beneath it.
+        app.acct_expanded.insert(vec!["Alice".to_string()]);
+        app.acct_expanded.insert(vec!["Alice".to_string(), "Bank".to_string()]);
+        let labels: Vec<String> = app.account_rows().iter().map(|r| r.label.clone()).collect();
+        // The nested group's leaf is visible (its path IS expanded)...
+        assert!(labels.iter().any(|l| l == "Nested"), "nested expanded group shows its leaf: {labels:?}");
+        // ...but the separate top-level "Alice\x1fBank" group must stay COLLAPSED — if its
+        // key collided with ["Alice","Bank"] it would wrongly expand and show "TopLevel".
+        assert!(!labels.iter().any(|l| l == "TopLevel"), "colliding top-level group must stay collapsed: {labels:?}");
         cleanup(&path);
     }
 

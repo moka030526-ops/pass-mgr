@@ -17,19 +17,20 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 
 | Layer | Result |
 | --- | --- |
-| Adversarial security review (4 rounds incl. a 152- and a 159-agent deep hunt) | **26 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14; 5 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
+| Adversarial security review (5 rounds incl. a 152- and a 159-agent deep hunt + an overnight 3-phase autonomous sweep) | **34 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
 | Mutation testing (`cargo-mutants --in-diff`, 194 mutants) | **56 survivors killed** (106→50 missed); `core`/`ffi` clean (only a `cfg` phantom); the 50 remaining are all in the thin desktop UI (rendering / keyboard / cosmetic) — see §4 |
 | Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M executions, 0 crashes** (latest extended run) |
-| Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** |
+| Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** (re-confirmed round 5) |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 215 · ffi 31 · compat 4 · desktop 61 + 20 · crash-recovery 18 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 225 · ffi 32 · compat 4 · desktop 72 + 20 — all green** (debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
-The cryptographic envelope was never broken: across four rounds no finding lets an
+The cryptographic envelope was never broken: across five rounds no finding lets an
 attacker read a vault they could not already open. The fixes harden secret hygiene
-(plaintext password lifetime / display), open-time DoS resistance, untrusted-import
-path safety (incl. a symlink-TOCTOU arbitrary-file read), deletion durability, backup
-integrity, an FFI no-oracle regression, iOS clipboard/snapshot parity, and a
-destructive-CLI footgun — see §3.1 / §3.1b / §3.1c / §3.1d.
+(plaintext password lifetime / display / clipboard auto-clear), open-time DoS
+resistance, untrusted-import path safety (incl. a symlink-TOCTOU arbitrary-file read),
+deletion durability, **rekey crash-durability**, backup integrity, FFI **and desktop**
+no-oracle parity, iOS clipboard/snapshot parity, and a destructive-CLI footgun — see
+§3.1 / §3.1b / §3.1c / §3.1d / §3.1e.
 
 ## 2. Assurance layers applied
 
@@ -166,6 +167,30 @@ The meanest pass yet: a dedicated **bypass phase** attacking the round-3 fixes, 
 
 Dropped as non-security: `extract --part` swallowed-positional footgun (operator-only, needs the operator's own passwords; `cli_extract` already echoes the target).
 
+### 3.1e Fifth round — overnight autonomous multi-agent audit (bugs → security → deep bugs)
+
+A three-phase sweep: a bug hunt (correctness/panics/data-loss), then a security hunt
+(crypto, oracle/timing, untrusted input + supply chain, secret leakage), then a deeper
+bug hunt (crash-recovery/concurrency state machines, degenerate-data/panic fuzz-by-reason,
+desktop cross-frame state). Each phase fanned out parallel analysis agents; every finding
+was verified against the source before fixing. The codebase held up well — most lenses came
+back clean or by-design — but the deep crash-safety pass found a real **HIGH** durability
+bug, and the secret-hygiene pass found a real **HIGH** clipboard leak (the round-4 R-7
+"accepted residual", now actually fixed). All confirmed items fixed:
+
+| # | Sev | Fix |
+| --- | --- | --- |
+| A-1 | **High** | **Rekey commit was not crash-durable.** `commit_rekey` renamed `volume/` → `manifest/` → `vault.pmv` then fsync'd the parent dir only ONCE at the end; `replace_dir`/`replace_path` fsync'd nothing. On a power loss the rename metadata can reach disk out of program order, leaving a **new-key `vault.pmv` durable while `volume/`+`manifest/` are still old-key** — an unopenable vault the roll-forward can't repair (the abort-based crash tests don't model page-cache loss, so they missed it). Fixed: `replace_dir`/`replace_path` now `sync_parent_dir` after each rename, so new-volume-durable-before-new-manifest-before-new-vault is enforced. |
+| A-2 | **High** | **Built-in Ctrl+C/cut of a secret field never auto-cleared.** A focused password (account, RE portal, **or the master-password unlock/create/change fields**) copied via the OS Ctrl+C / cut / context-menu was rerouted through the hardened (history-excluded) clipboard path, but — unlike the 📋 button — never armed the 15 s auto-clear or the on-exit wipe, so it lingered on the clipboard indefinitely. (This is round-4 **R-7**, previously accepted as residual.) Fixed: `secret_text_edit` surfaces the intercepted secret to the caller, which routes it through `copy_to_clipboard` (hardened copy **+** armed clear), unifying it with the button path; the auth screen arms it too. |
+| A-3 | Med | **Desktop unlock correct-password oracle.** The GUI/TUI showed a distinct message for `ArchiveMismatch`/`Json`/`Storage` — failures reachable ONLY after a successful (correct-password) decrypt — vs the generic `Crypto` (wrong password), so a dir-write attacker who pre-broke the archive could tell when a guessed password was right. (Same class the FFI closed as R-3.) Fixed: all correct-password-reachable failures collapse to one "wrong password or corrupted/unreadable vault" message; password-INDEPENDENT structural errors (bad magic/version/truncated/params/too-large, not-found, locked, rekey-pending) keep their specific, useful messages. |
+| A-4 | Med | **`tick_clipboard` masked a save failure.** The 15 s auto-clear set `status = "Clipboard cleared."` unconditionally, so an idle-repaint wipe could silently overwrite a `"Save failed: …"` the user hadn't seen (both front-ends). Fixed: only replace a blank or the prior `"Copied …"` notice. |
+| A-5 | Low | **`import_tree` symlink guard covered only the leaf.** `read_capped`/`read_bounded` apply `O_NOFOLLOW` to the final component, so a symlinked intermediate `manifest/`, `volume/`, or `vol.<p>/` in an untrusted mirror could still redirect reads outside it (id is hex-constrained, so exfiltration is limited, but it broke the symlink-guard invariant). Fixed: new `reject_symlink_dir` on every intermediate mirror directory. |
+| A-6 | Low | **`export_tree` didn't validate the blob id it uses as a filename.** The import side enforces `is_safe_blob_id`; export joined `e.id` into the output path without it. Fixed: the same lowercase-hex allowlist on the write side (symmetry; closes the gap if any future path ever admits a stray id). |
+| A-7 | Low | **Grouped-tree expand-state key collisions.** The GUI salted each `CollapsingHeader` id with a `/`-joined label path and the TUI keyed `acct_expanded` with a `\x1f`-joined string, so two distinct group paths could collide (owner `"a/b"` vs owner `"a"` + type `"b"`) and share expand state. Fixed: the GUI hashes the label-stack **slice** and the TUI keys on a `Vec<String>` label stack — collision-free. |
+| A-8 | Low | **Unchecked `u64` arithmetic in `storage.rs`** (`end_offset` add, partition-fit add, `space_stats` sums). Not attacker-reachable (values are post-AEAD), but inconsistent with the module's `checked_add` discipline and would PANIC (DoS) rather than wrap under `overflow-checks = true`. Fixed: `saturating_add`, matching the rest of the module. |
+
+**Dynamic corroboration:** `cargo audit` (0 advisories, 0 yanked) and `cargo deny check` (advisories/bans/licenses/sources ok) re-run clean; no networking crate in the tree. The cryptographic core was re-verified end-to-end (fresh random nonce on every encrypt/save/frame, fresh salt per KDF, whole-header AAD, vault-id+partition-bound frame AAD, genuine two-password Argon2id chaining, `Zeroizing`/`mlock` key handling, CSPRNG-only randomness, params validated on both read and write, constant-time AEAD tag check) — no change needed.
+
 ### 3.2 Investigated and refuted (no change needed)
 
 | # | Hypothesis | Why it does not hold |
@@ -181,7 +206,14 @@ Dropped as non-security: `extract --part` swallowed-positional footgun (operator
 | R-9 | FFI `count()` truncates `usize` → `u32` | Unreachable: needs >4.29 B in-memory records in a single-user offline vault. Cosmetic; left as-is. |
 | R-10 | `scan_volume` (manifest-loss rebuild) adopts an uncommitted trailing frame that a normal reopen would roll back | Concerns only a single *unacknowledged* write after a compound double-fault; standard durability semantics, no integrity/secret/oracle impact. |
 | R-11 | Mobile 15 s clipboard wipe clobbers unrelated content copied meanwhile | WONTFIX: unconditionally wiping is the *secure* default for a password auto-clear; the proposed read-compare-then-clear weakens the guarantee and triggers OS clipboard-access prompts. |
-| R-12 | `ArchiveMismatch`/`RekeyPending` mildly distinguish "password correct but store tampered" from "wrong password" | Reaching either REQUIRES the correct passwords, so it grants no brute-force/oracle capability; left as an intentional, documented post-decrypt state. |
+| R-12 | `ArchiveMismatch`/`RekeyPending` mildly distinguish "password correct but store tampered" from "wrong password" | Reaching either REQUIRES the correct passwords, so it grants no brute-force/oracle capability; left as an intentional, documented post-decrypt state. (Round 5 nonetheless folded the desktop `ArchiveMismatch`/`Json`/`Storage` unlock messages into the generic one — see A-3 — for parity with the FFI.) |
+| A-9 | Password history stores cleartext before/after values (masked only at display) | Accepted design (full audit trail). `Change` is `ZeroizeOnDrop`; both UIs mask any `*password` line via `display_detail`; values can't be copied/revealed from history. Caveat recorded: a *future* secret field whose name does not end in `password` would bypass `detail_is_secret` — redact at `track`-time if such a field is ever added. |
+| A-10 | `remove_document` tombstone not single-fault durable | A crash between `storage.remove` (durable) and the caller's `vault.save()` drops the tombstone; only a SECOND fault (later manifest-loss rebuild) could then resurrect the frame. Narrow double-fault; the caller-saves contract is deliberate (batch deletes). Documented rather than restructured. |
+| A-11 | `rotate_generations` could lose the newest backup on a failed `bak1` write | Re-examined: the current shift-then-write order NEVER destroys an existing generation — a failed `bak1` write only fails to ADD the just-rotated-out primary, which the next save re-rings. The "write bak1 first" alternative would be the actual bug (it overwrites `bak1` before shifting). Left as-is. |
+| A-12 | Redundancy recovery runs up to ~4× Argon2 on a failed open when copies exist (co-located timing signal) | Bounded by `MAX_RECOVERY_SALTS`; leaks only "redundancy is on + primary didn't decrypt", NOT password correctness (the extra work fires for any failing password equally). Accepted for the offline local threat model. |
+| A-13 | CLI prints distinct `VaultError` messages (wrong-password vs corrupt) | The CLI is a local diagnostic surface (`verify`/`manifest` exist *to* report structural state) and CLI access already implies file access; the no-oracle property is enforced where it matters — the FFI (R-3) and now the desktop unlock (A-3). Left verbose by design. |
+| A-14 | `account_tree` group build is O(N²) in distinct group count | Linear `child_mut` scan; ~165 ms only at 8 000 *distinct* owners (far past estate scale; the GUI rebuilds it per frame only when grouped). Not worth a `HashMap` index at realistic sizes. |
+| A-15 | egui revealed-field galley / cross-platform clipboard-history residues | Platform-inherent: a revealed password is laid into egui's font galley cache (not zeroizable without patching egui), and the `exclude_from_history` clipboard hint is best-effort on macOS/Windows. Mitigations in place; documented as residual. |
 
 ## 4. Mutation testing
 

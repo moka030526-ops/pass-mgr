@@ -287,12 +287,12 @@ impl VolumeStore {
     /// `committed - live` is the **reclaimable garbage** — dead frames left by
     /// updates and deletes — that a `compact` rewrite would remove.
     pub fn space_stats(&self) -> (u64, u64) {
-        let committed: u64 = self.manifests.iter().map(|m| m.end_offset).sum();
+        let committed: u64 = self.manifests.iter().fold(0u64, |a, m| a.saturating_add(m.end_offset));
         // Sum live bytes from the UNIQUE index (one entry per id), not by summing all
         // manifest entries — a duplicate id across partitions (only reachable via a
         // crafted/corrupt authenticated manifest) would otherwise be double-counted,
         // making `committed - live` underflow-saturate to 0 and under-report garbage.
-        let live: u64 = self.index.values().map(|loc| loc.length).sum();
+        let live: u64 = self.index.values().fold(0u64, |a, loc| a.saturating_add(loc.length));
         (committed, live)
     }
 
@@ -383,7 +383,7 @@ impl VolumeStore {
             length: frame.len() as u64,
             uploaded_at, // field shorthand: same as `uploaded_at: uploaded_at`
         });
-        manifest.end_offset = start + frame.len() as u64;
+        manifest.end_offset = start.saturating_add(frame.len() as u64);
         manifest.seq += 1;
         self.commit_manifest(part, &manifest, key)?; // disk commit point; `?` aborts on failure
         // Fault point: a crash here (both volume + manifest committed) is a fully
@@ -438,7 +438,7 @@ impl VolumeStore {
             // Reserve the worst-case per-frame overhead (prefix + nonce + tag +
             // id/path length prefixes + a full-length path ~= 340 B; round up) so a
             // partition does not overshoot `max_size`.
-            Some(m) if m.end_offset + doc_size + FRAME_OVERHEAD_EST <= self.max_size => {
+            Some(m) if m.end_offset.saturating_add(doc_size).saturating_add(FRAME_OVERHEAD_EST) <= self.max_size => {
                 (self.manifests.len() - 1) as u32
             }
             Some(_) => self.manifests.len() as u32, // full → new partition

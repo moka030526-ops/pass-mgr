@@ -538,6 +538,14 @@ impl OpenVault {
             fs::create_dir_all(&vol_dir)?;
             harden_dir(&vol_dir);
             for e in &entries {
+                // Symmetry with `import_tree`: the id becomes a filename here
+                // (`vol_dir.join(&e.id)`), so enforce the same lowercase-hex allowlist
+                // on the WRITE side too. With a genuine vault the id is always safe
+                // (authenticated, 32 hex chars); this just guarantees export can never
+                // traverse out of `vol_dir` even if a future path admitted a stray id.
+                if !is_safe_blob_id(&e.id) {
+                    return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document id in vault: {:?}", e.id))));
+                }
                 let bytes = store.read(&e.id, &key)?; // decrypts + verifies id/path
                 write_new_bytes(&vol_dir.join(&e.id), &bytes)?;
             }
@@ -602,6 +610,12 @@ impl OpenVault {
         let mut store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         let man_dir = src.join("manifest");
         let vol_root = src.join("volume");
+        // `read_capped`/`read_bounded` apply O_NOFOLLOW to the FINAL path component only,
+        // so a symlinked `manifest/`, `volume/`, or `vol.<p>/` in an untrusted mirror
+        // could still redirect reads outside the mirror. Reject symlinked intermediate
+        // directories up front (the per-partition `vol.<p>` dirs are checked in the loop).
+        reject_symlink_dir(&man_dir)?;
+        reject_symlink_dir(&vol_root)?;
         // Reject a mirror that lists the same blob id more than once (across ALL
         // partitions). A duplicate id makes `store.put` append a SECOND frame for one
         // id while only one manifest entry survives — and a later manifest-loss rebuild
@@ -617,6 +631,7 @@ impl OpenVault {
             }
             let entries: Vec<ManifestEntry> = serde_json::from_slice(&read_capped(&man_path, storage::MAX_MANIFEST_SIZE)?)?;
             let vol_dir = vol_root.join(format!("vol.{p}"));
+            reject_symlink_dir(&vol_dir)?; // don't read blobs through a symlinked partition dir
             for e in &entries {
                 // The mirror is untrusted input: the blob is read from
                 // `vol.<p>/<id>`, so a crafted id containing a path separator or
@@ -1284,6 +1299,23 @@ fn is_safe_doc_path(path: &str) -> bool {
     !path.contains(|c: char| c.is_control() || records::is_spoofy_format_char(c))
 }
 
+/// Reject a path that is a symlink, used to guard the INTERMEDIATE directories of an
+/// untrusted import mirror (`manifest/`, `volume/`, `vol.<p>/`). `read_capped`/
+/// `read_bounded` apply O_NOFOLLOW to the final component only, so without this a
+/// symlinked parent directory could still redirect a blob/manifest read outside the
+/// mirror. A non-existent path is fine here (the subsequent read fails on its own).
+fn reject_symlink_dir(path: &Path) -> Result<(), VaultError> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(VaultError::Storage(StorageError::Corrupt(format!(
+            "refusing to import through a symlinked directory: {}",
+            path.display()
+        ))));
+    }
+    Ok(())
+}
+
 /// Read a file from an UNTRUSTED import mirror with a size ceiling, rejecting a
 /// symlink at the path. Mirrors the stat-before-read discipline used everywhere
 /// else (load_manifest, decrypt_file, add_document) so a crafted mirror cannot
@@ -1812,6 +1844,12 @@ fn replace_dir(live: &Path, staged: &Path) -> Result<(), VaultError> {
         fs::rename(live, &old)?; // move the current dir aside...
     }
     fs::rename(staged, live)?; // ...then move the staged dir into its place
+    // Make THIS swap durable before the caller proceeds to the next one. Without this
+    // barrier the directory renames in `commit_rekey` (volume → manifest → vault.pmv)
+    // can reach disk out of program order on a power loss, leaving a NEW-key vault.pmv
+    // durable while volume/manifest are still OLD-key — an unopenable vault that the
+    // roll-forward cannot repair. The fsync forces new-volume-durable-before-new-vault.
+    sync_parent_dir(live);
     let _ = fs::remove_dir_all(&old); // drop the old copy (best-effort; harmless if it lingers)
     Ok(())
 }
@@ -1822,6 +1860,10 @@ fn replace_path(live: &Path, staged: &Path) -> Result<(), VaultError> {
         return Ok(());
     }
     fs::rename(staged, live)?;
+    // Durability barrier — same reasoning as `replace_dir`: the vault.pmv rename is the
+    // rekey commit point and must be durable before staging (with its READY marker) is
+    // removed, so a crash never loses the commit while erasing its source of truth.
+    sync_parent_dir(live);
     Ok(())
 }
 
@@ -3533,6 +3575,30 @@ mod tests {
         std::fs::remove_file(&blob).unwrap();
         std::os::unix::fs::symlink("/etc/hostname", &blob).unwrap();
         let dest = std::env::temp_dir().join(format!("pmsymd-{}", nanos())).join(VAULT_FILE);
+        assert!(matches!(
+            OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()),
+            Err(VaultError::Storage(_))
+        ));
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(parent_dir(&dest)).ok();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_tree_rejects_symlinked_partition_dir() {
+        // A symlinked INTERMEDIATE directory (here vol.0 -> elsewhere) must be rejected:
+        // `read_capped`'s O_NOFOLLOW only guards the final component, so without the
+        // `reject_symlink_dir` guard a symlinked `vol.<p>/` would redirect blob reads
+        // outside the mirror (audit U-2).
+        let (path, _docs) = seed_multi_partition("impsymdir", b"o1", b"o2");
+        let mirror = std::env::temp_dir().join(format!("pmsymdir-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        let vol0 = mirror.join("volume/vol.0");
+        let elsewhere = mirror.join("volume/elsewhere");
+        std::fs::rename(&vol0, &elsewhere).unwrap(); // move the real partition aside...
+        std::os::unix::fs::symlink(&elsewhere, &vol0).unwrap(); // ...and symlink to it
+        let dest = std::env::temp_dir().join(format!("pmsymdird-{}", nanos())).join(VAULT_FILE);
         assert!(matches!(
             OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()),
             Err(VaultError::Storage(_))

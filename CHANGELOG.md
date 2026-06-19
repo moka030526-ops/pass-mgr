@@ -74,9 +74,23 @@ date and bump the crate versions to match.
 
 ### Security
 
-Four rounds of adversarial multi-agent audit (including a 152-agent and a 159-agent
-hunt) fixed **26 confirmed defects**; none broke the cryptographic envelope (no
-finding lets an attacker read a vault they could not already open). Highlights:
+Five rounds of adversarial multi-agent audit (including a 152-agent and a 159-agent
+hunt, plus an overnight three-phase autonomous sweep) fixed **34 confirmed defects**;
+none broke the cryptographic envelope (no finding lets an attacker read a vault they
+could not already open). Highlights:
+
+- **Rekey crash-durability (round 5)** — the password-change commit renamed the new
+  `volume/`/`manifest/`/`vault.pmv` into place but fsync'd the directory only once at the
+  end, so a power loss could leave a new-key `vault.pmv` durable while the new
+  volume/manifest weren't — an unopenable vault. Each commit step now fsyncs the
+  directory, enforcing the staged order on disk.
+- **Clipboard auto-clear on Ctrl+C (round 5)** — a password copied with the built-in
+  Ctrl+C / cut / context-menu (including the master-password fields) was hardened but
+  never armed the 15 s auto-clear or on-exit wipe; it now routes through the same armed
+  path as the 📋 button.
+- **Desktop no-oracle parity (round 5)** — the desktop unlock no longer shows a distinct
+  message for correct-password-only failures (`ArchiveMismatch`/`Json`/`Storage`),
+  closing the same "this password is correct" oracle the FFI already folds.
 
 - **Untrusted-import path safety** — `import_tree` symlink **TOCTOU** that could
   launder an arbitrary file (e.g. `/etc/shadow`) into the vault is closed with

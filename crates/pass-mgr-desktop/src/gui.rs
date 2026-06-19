@@ -531,7 +531,12 @@ impl GuiApp {
                 clear_clipboard();
                 self.clipboard_dirty = false;
                 self.clipboard_clear_at = None;
-                self.status = "Clipboard cleared.".into();
+                // Only replace a blank or the prior "Copied …" notice — never clobber a
+                // meaningful message the user may not have seen yet (e.g. "Save failed: …"),
+                // which the idle auto-clear repaint could otherwise silently overwrite.
+                if self.status.is_empty() || self.status.starts_with("Copied") {
+                    self.status = "Clipboard cleared.".into();
+                }
             } else {
                 ctx.request_repaint_after(deadline - now);
             }
@@ -696,17 +701,24 @@ impl GuiApp {
                 self.wipe_passwords();
                 self.screen = Screen::Main;
             }
-            // Match a specific error variant; `(_)` ignores its inner payload so
-            // the wrong-password case is reported generically (no detail leak).
-            Err(VaultError::Crypto(_)) => {
-                self.auth_error = Some("Wrong password(s) or corrupted vault.".into());
+            // Collapse every CORRECT-password-reachable failure into ONE message so the
+            // unlock screen can't be used as a "this password is correct" oracle: a
+            // wrong password yields `Crypto`, while a missing/rolled-back document
+            // (`ArchiveMismatch`), corrupt plaintext (`Json`), or storage error are
+            // reachable ONLY after a successful decrypt, so a distinct message for them
+            // would reveal the password was right (audit O-1; mirrors the FFI collapse).
+            // Structural, password-INDEPENDENT errors (bad magic/version/truncated/
+            // params/too-large, not-found, locked, rekey-pending) keep their specific,
+            // useful messages below — they leak nothing about password correctness.
+            Err(VaultError::Crypto(_) | VaultError::ArchiveMismatch | VaultError::Json(_) | VaultError::Storage(_)) => {
+                self.auth_error = Some("Wrong password(s) or corrupted/unreadable vault.".into());
                 // Wipe the entered passwords on failure too (not just on success), so
                 // they don't linger in memory after a failed attempt — the moment a
                 // user is most likely to step away. Mirrors the TUI, which rebuilds
                 // (and thus zeroizes) its AuthState on a failed unlock.
                 self.wipe_passwords();
             }
-            // `Err(e)` catches every other error variant.
+            // `Err(e)` catches every other (password-independent) error variant.
             Err(e) => {
                 self.auth_error = Some(format!("{e}"));
                 self.wipe_passwords();
@@ -746,25 +758,32 @@ impl GuiApp {
         // Track whether the user requested submission; `|=` ORs in `true` if any
         // password field had Enter pressed (see `password_field`'s return value).
         let mut submit = false;
+        // A built-in Ctrl+C/cut of a master-password field surfaces here so we can arm
+        // the clipboard auto-clear/exit-wipe (the field can't reach `self` itself).
+        let mut copied: Option<Zeroizing<String>> = None;
         egui::Grid::new("auth_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label("Password 1");
             // `&mut self.pw1` lends the field to the widget so typing updates it.
-            submit |= password_field(ui, "auth_pw1", &mut self.pw1);
+            submit |= password_field(ui, "auth_pw1", &mut self.pw1, &mut copied);
             ui.end_row();
             if confirm {
                 ui.label("Confirm password 1");
-                submit |= password_field(ui, "auth_confirm1", &mut self.confirm1);
+                submit |= password_field(ui, "auth_confirm1", &mut self.confirm1, &mut copied);
                 ui.end_row();
             }
             ui.label("Password 2");
-            submit |= password_field(ui, "auth_pw2", &mut self.pw2);
+            submit |= password_field(ui, "auth_pw2", &mut self.pw2, &mut copied);
             ui.end_row();
             if confirm {
                 ui.label("Confirm password 2");
-                submit |= password_field(ui, "auth_confirm2", &mut self.confirm2);
+                submit |= password_field(ui, "auth_confirm2", &mut self.confirm2, &mut copied);
                 ui.end_row();
             }
         });
+        // Route a copied master password through the hardened + armed clipboard path.
+        if let Some(pw) = copied {
+            self.copy_to_clipboard(pw);
+        }
 
         ui.add_space(8.0);
         // `&self.auth_error` borrows the Option so we can read the message
@@ -1768,23 +1787,26 @@ impl GuiApp {
         // Recursive render of one grouped-tree node: child groups (each an
         // expandable CollapsingHeader) followed by this node's leaf accounts (shown
         // by title only). Returns the index into `labels` of a clicked leaf, if any.
-        // `id_path` keeps egui's per-header id stable/unique across the tree.
+        // `path` is the stack of ancestor labels; it is hashed AS A SLICE for each
+        // header's id_salt, which is collision-free (unlike a `/`-joined string, where
+        // owner "a/b" would collide with owner "a" + type "b" and share expand state).
         fn render_acct_node(
             ui: &mut egui::Ui,
             node: &records::AcctNode,
-            id_path: &str,
+            path: &mut Vec<String>,
             cur: Option<&str>,
             labels: &[(String, String)],
         ) -> Option<usize> {
             let mut select = None;
             for child in &node.children {
-                let child_path = format!("{id_path}/{}", child.label);
+                path.push(child.label.clone());
                 let resp = egui::CollapsingHeader::new(&child.label)
-                    .id_salt(("acct_node", &child_path))
-                    .show(ui, |ui| render_acct_node(ui, child, &child_path, cur, labels));
+                    .id_salt(("acct_node", path.as_slice()))
+                    .show(ui, |ui| render_acct_node(ui, child, path, cur, labels));
                 if let Some(s) = resp.body_returned.flatten() {
                     select = Some(s);
                 }
+                path.pop();
             }
             for leaf in &node.leaves {
                 let sel = cur == Some(leaf.id.as_str());
@@ -1811,7 +1833,8 @@ impl GuiApp {
                         }
                     });
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("acct_tree").show(lp, |ui| {
-                        if let Some(s) = render_acct_node(ui, root, "acct", cur.as_deref(), &labels) {
+                        let mut path: Vec<String> = Vec::new();
+                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels) {
                             select = Some(s);
                         }
                     });
@@ -1851,7 +1874,7 @@ impl GuiApp {
                         // history-excluded clipboard path — so a revealed field is no longer
                         // a residue/clipboard-history leak. Read-only: the field is shown but
                         // not editable; reveal + copy stay available (they are reads).
-                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, w, 280.0);
+                        secret_text_edit(ui, "acct_pw", &mut r.password, revealed, w, 280.0, &mut copy_pw);
                         ui.add_enabled(!self.reveal_all, egui::Checkbox::new(&mut self.reveal_pw, "reveal"));
                         // Generate is only useful when you can save; copy is a read.
                         if w && ui.button("🎲").on_hover_text("Generate").clicked() {
@@ -2846,7 +2869,7 @@ fn portal_section(
             // `title` is unique per portal (Property Mgmt / Insurance / HOA), so it is
             // a valid per-field id salt for the secret-field hardening. Copy stays
             // available read-only (it is a read, not an edit).
-            secret_text_edit(ui, title, password, reveal, writable, 260.0);
+            secret_text_edit(ui, title, password, reveal, writable, 260.0, copy_pw);
             if ui.button("📋").on_hover_text("Copy").clicked() {
                 *copy_pw = Some(Zeroizing::new(password.clone()));
             }
@@ -3015,7 +3038,15 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
 ///    [`crate::copy_secret_to_clipboard`] (Linux `exclude_from_history`).
 ///
 /// `id_salt` MUST be unique per field (it pins a stable widget id for the state-scrub).
-fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, revealed: bool, writable: bool, width: f32) -> egui::Response {
+fn secret_text_edit(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut String,
+    revealed: bool,
+    writable: bool,
+    width: f32,
+    copied_out: &mut Option<Zeroizing<String>>,
+) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
     // Read-only: still display the (masked/revealed) value, but it cannot be edited.
     let resp = ui.add_enabled(writable, egui::TextEdit::singleline(value).id(id).password(!revealed).desired_width(width));
@@ -3029,7 +3060,7 @@ fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, reveal
     // produced (you cannot have two focused widgets), so other widgets' copies are
     // untouched.
     if resp.has_focus() {
-        let copied: Vec<String> = ui.ctx().output_mut(|o| {
+        let mut copied: Vec<String> = ui.ctx().output_mut(|o| {
             let mut taken = Vec::new();
             o.commands.retain(|c| {
                 if let egui::OutputCommand::CopyText(t) = c {
@@ -3041,8 +3072,17 @@ fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, reveal
             });
             taken
         });
-        for t in copied {
-            let _ = crate::copy_secret_to_clipboard(&t);
+        // Surface the intercepted secret to the caller so it routes through the app's
+        // `copy_to_clipboard`, which applies the hardened (history-excluded) copy AND
+        // arms the 15s auto-clear + on-exit wipe. Doing the hardened copy directly here
+        // (as before) skipped that arming, leaving a Ctrl+C/cut'd password on the
+        // clipboard indefinitely (audit B-1). There is at most one focused field, so
+        // at most one CopyText; take it and zeroize any stray extras.
+        if let Some(t) = copied.pop() {
+            *copied_out = Some(Zeroizing::new(t));
+        }
+        for mut leftover in copied {
+            leftover.zeroize();
         }
     }
     resp
@@ -3050,12 +3090,19 @@ fn secret_text_edit(ui: &mut egui::Ui, id_salt: &str, value: &mut String, reveal
 
 /// A masked single-line password field; returns true if Enter was pressed. `id_salt`
 /// is unique per field (unlock/create/change-password use four distinct fields).
-fn password_field(ui: &mut egui::Ui, id_salt: &str, value: &mut String) -> bool {
+fn password_field(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    value: &mut String,
+    copied_out: &mut Option<Zeroizing<String>>,
+) -> bool {
     // Always masked (revealed = false); the secret hardening (undo scrub + copy
     // re-route) still applies — a master password is the most sensitive of all.
     // Always editable (`writable = true`): this is the unlock/create field, which
     // exists before any vault is open, so the read-only mode does not apply here.
-    let resp = secret_text_edit(ui, id_salt, value, false, true, 280.0);
+    // `copied_out` surfaces a built-in Ctrl+C of the master password so the caller
+    // arms the auto-clear (otherwise it would linger on the clipboard).
+    let resp = secret_text_edit(ui, id_salt, value, false, true, 280.0, copied_out);
     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
