@@ -3315,7 +3315,12 @@ mod tests {
         let path = tmp_path("byteflip");
         OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
         let good = fs::read(&path).unwrap();
-        for off in 0..good.len() {
+        // Default: flip EVERY byte (exhaustive). Under a long mutation-testing run this
+        // ~3000-open test dominates each mutant's wall-time, so `PASSMGR_TAMPER_SAMPLE`
+        // thins it to a representative stride (header bytes are always hit because the
+        // header is <61 bytes; the stride then samples the ciphertext + tag).
+        let step = if std::env::var_os("PASSMGR_TAMPER_SAMPLE").is_some() { 7 } else { 1 };
+        for off in (0..good.len()).step_by(step) {
             for bit in [0x01u8, 0x80u8] {
                 let mut bad = good.clone();
                 bad[off] ^= bit;
