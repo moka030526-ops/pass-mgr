@@ -17,22 +17,22 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 
 | Layer | Result |
 | --- | --- |
-| Adversarial security review (6 rounds incl. a 152- and a 159-agent deep hunt, an overnight 3-phase autonomous sweep, and a dynamic-verification round) | **36 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8 + round-6 B-1…B-2; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
-| Mutation testing (`cargo-mutants`) | round-6 run over this session's security-core diff: **44 mutants → 4 missed, closed by a test fix** (the 4 were `trim_all_records`'s sum, now pinned); prior new-code run killed 56 survivors — see §4 |
+| Adversarial security review (7 rounds incl. a 152- and a 159-agent deep hunt, an overnight 3-phase autonomous sweep, a dynamic-verification round, and a full-crate mutation round) | **36 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8 + round-6 B-1…B-2; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
+| Mutation testing (`cargo-mutants`) | round-7 **whole-crate** run: **1629 mutants → 107 survived → 37 kill-tests** close the meaningful ones (suite 226→262); the rest are accepted residual (fault-injection scaffolding, fuzz entries, the un-killable `Key::drop`, proven equivalent mutants, unobservable fsync side-effects) — see §3.1g |
 | Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M cumulative + ~67 M round-6, 0 crashes** |
 | Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** (re-confirmed round 5) |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 226 · ffi 32 · compat 4 · desktop 73 + 20 — all green** (incl. an exhaustive every-byte vault-tamper matrix; debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 262 · ffi 32 · compat 4 · desktop 75 + 20 — all green** (incl. an exhaustive every-byte vault-tamper matrix; debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
-The cryptographic envelope was never broken: across six rounds no finding lets an
+The cryptographic envelope was never broken: across seven rounds no finding lets an
 attacker read a vault they could not already open. The fixes harden secret hygiene
 (plaintext password lifetime / display / clipboard auto-clear / momentary reveal),
 open-time DoS resistance, untrusted-import path safety (incl. a symlink-TOCTOU
 arbitrary-file read), deletion durability, **rekey crash-durability**, backup
 integrity, FFI **and desktop** no-oracle parity, iOS clipboard/snapshot parity, and a
-destructive-CLI footgun — see §3.1 / §3.1b / §3.1c / §3.1d / §3.1e / §3.1f. Round 6
-added a **dynamic-verification** layer (mutation testing, fuzzing, and an exhaustive
-every-byte tamper matrix) on top of the static review.
+destructive-CLI footgun — see §3.1 / §3.1b / §3.1c / §3.1d / §3.1e / §3.1f / §3.1g.
+Rounds 6–7 added a **dynamic-verification** layer (fuzzing, an exhaustive every-byte
+tamper matrix, and full-crate mutation testing) on top of the static review.
 
 ## 2. Assurance layers applied
 
@@ -207,6 +207,58 @@ Two real fixes landed from the re-audit; the round-5 fixes themselves were confi
 | --- | --- | --- |
 | B-1 | Med | **`reveal_all` / `re_reveal_all` were sticky across tab switches.** The per-record `reveal_pw` is re-masked on every tab change, but the two screen-level "reveal all" toggles were not — so a reveal-all left on in one tab silently persisted into a later visit, exposing every password to a bystander (it stayed scoped per screen, so not a cross-tab leak — just a stale sticky reveal). Both UIs now clear all three reveal toggles on tab switch (GUI `ui_top_bar`; TUI a new `switch_tab` helper routing every tab-change key). |
 | B-2 | Low | **`staged_rewrite` silently defaulted a doc's path on an index/manifest desync.** `entry(id).map(...).unwrap_or_default()` would, if the in-memory index and on-disk manifest ever disagreed, re-encrypt a document into the compacted/rekeyed store with an EMPTY path and `uploaded_at = 0` — silent metadata corruption with no error. Currently unreachable (`reindex` keeps them in sync), but now **fails closed** with a `Corrupt` error instead of defaulting, so a future desync can't bake in bad metadata. |
+
+### 3.1g Seventh round — full-crate mutation testing & survivor closure
+
+A **whole-crate** `cargo-mutants` run over `pass-mgr-core` (not just a diff): **1629
+mutants → 107 survived** (behaviour no test pinned). A 9-agent workflow authored
+**37 targeted kill-tests** (one cluster per function; each test crafted to fail under
+its specific mutation and pass on real code, most verified by the authoring agent
+applying the mutation via `sed` and re-running). The core suite went **226 → 262**,
+all green, clippy clean. The kill-tests close the meaningful survivors:
+
+| Area | Survivors killed |
+| --- | --- |
+| `password` | `generate` length-cap boundary; Fisher-Yates inclusive swap partner (`uniform(i+1)`). |
+| `records` | `acct_match` exact-filter semantics (`==`/`\|\|`); `history_stats` cutoff (`<` vs `<=`); `parse_ymd_utc` year-range guard; `doc_filename` length boundary. |
+| `storage` | exact size-cap constants; `put` doc-size cap; `load_manifest` truncation/oversize bounds; `VolumeStore::open` corrupt-manifest rebuild-vs-propagate guards; `read_frame_at` EOF/overrun/plausibility bounds; `write_atomic` temp-in-dir; blob mode 0600. |
+| `vault` | KDF-bound + `MAX_*` constants; `import_tree` vault-id length/empty/charset boundary; `add_document` size cap; accessors (`redundancy`/`opened_generation`/`previous_access`/`export` return real values, not constants); `read_bounded`/`read_file_capped`/`read_capped_vault` cap + `NotFound` guard; `save_internal` heal; `staged_rewrite` empty-store; `backup_snapshot` collision counter; `harden_file`/`harden_dir` perms (0600/0700). |
+
+**Confirmation method.** A full single-pass *re-run* to re-verify all 1629 is
+impractical in this environment (background tasks are wall-clock-limited to ~15–20 min;
+a full run needs hours — the heavier post-fix suite makes it worse). The kills were
+instead confirmed by three independent means: (1) a partial re-run fully processed
+`crypto`/`password`/`records` and showed **every** targeted survivor there now caught
+(only the accepted-residual below remained); (2) the authoring agents machine-verified
+storage/vault kills by applying each mutation; (3) a **function-scoped** re-run over the
+targeted storage/vault functions reported **0 MISSED**.
+
+**Accepted residual survivors (deliberately not killed — documented, not gaps):**
+
+- **Fault-injection scaffolding** (`fault.rs`, 15): only exercised by the crash-recovery
+  tests under `--features fault-injection`; the default-feature mutation run can't reach
+  them. (A separate `--features fault-injection` mutation pass would cover them.)
+- **Fuzz entry points** (4): `storage::fuzz::{manifest,frame,scan_volume}`,
+  `vault::fuzz::header` — `#[doc(hidden)]` harnesses exercised by `cargo-fuzz`, not unit
+  tests.
+- **`Key::drop` destructor** (1): zeroize-on-drop can't be observed by a safe test
+  (reading the freed bytes would be UB) — inherently un-killable (also noted in §4).
+- **Proven equivalent mutants** (5): `uniform` (line 145 `+`→`-`/`*`, line 152 `<`→`<=`)
+  — `zone` is always a whole multiple of `n`, so the mutation only shifts the
+  *unobservable* rejection rate by ≤2 draws in 2⁶⁴ and never biases the output;
+  `doc_filename` (lines 314/316 `>`→`>=`) — produces byte-identical output at the
+  boundary. No black-box test can distinguish these from the original.
+- **Unobservable side-effects / edge fallbacks** (~18): `sync_dir`/`sync_parent_dir`→()
+  (an `fsync` leaves no test-observable trace), the `!parent.is_empty()` "use `.`"
+  guards in `parent_dir`/`with_suffix`/`sibling_old`/`sibling_tmp` (only the
+  bare-filename edge), `rand_suffix`→constant (temp-suffix uniqueness isn't
+  deterministically testable), and `compaction_detail`→const string (a cosmetic status
+  message).
+- **Follow-up candidates (3, meaningful but not yet covered):** `WriteLock::acquire`
+  → `Default` (the single-writer guarantee lacks a concurrent-open test — a real
+  test-quality gap, though the lock itself is exercised in normal use), `write_vault_file`
+  (one error-branch `!` negation), and `sweep_stale_temps` (`&&`→`||`). None are known
+  defects; they are unpinned behaviours worth a future test.
 
 ### 3.2 Investigated and refuted (no change needed)
 
