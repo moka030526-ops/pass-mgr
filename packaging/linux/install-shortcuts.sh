@@ -48,14 +48,41 @@ echo "icons:  $icon_dir"
 apps_dir="$HOME/.local/share/applications"
 mkdir -p "$apps_dir"
 
-render() {  # template -> destination, substituting the placeholders
-  sed -e "s|__BIN__|$bin|g" -e "s|__ICONDIR__|$icon_dir|g" "$1"
+# Escape the binary path for use inside the DOUBLE-QUOTED Exec= value. Per the Desktop
+# Entry spec, inside quotes the reserved chars \ " $ ` must be backslash-escaped (backslash
+# FIRST). Quoting makes a path with spaces a single argument.
+bin_de=$bin
+bin_de=${bin_de//\\/\\\\}
+bin_de=${bin_de//\"/\\\"}
+bin_de=${bin_de//\$/\\\$}
+bin_de=${bin_de//\`/\\\`}
+
+# Generate a .desktop launcher with printf, which inserts every value LITERALLY. We do NOT
+# template via sed or bash `${//}`: BOTH interpret '&' in the replacement as the matched
+# text (sed always; bash 5.2+) and sed's '|' delimiter clashes with a '|' in the path — so a
+# binary path containing '&' or '|' (legal on Linux, e.g. "My Apps/pass & co") produced a
+# corrupt Exec line or aborted the install under `set -e`. printf sidesteps that entirely.
+# Mirrors the committed pass-mgr*.desktop reference templates (kept for manual editing).
+write_desktop() {  # $1=dest $2=Name $3=Comment $4=exec_suffix $5=icon_png
+  printf '%s\n' \
+    '[Desktop Entry]' \
+    'Type=Application' \
+    'Version=1.0' \
+    "Name=$2" \
+    'GenericName=Encrypted estate vault' \
+    "Comment=$3" \
+    "Exec=\"$bin_de\"$4" \
+    "Icon=$icon_dir/$5" \
+    'Terminal=false' \
+    'Categories=Utility;Security;' \
+    'StartupNotify=true' \
+    > "$1"
 }
 
 view_desktop="$apps_dir/pass-mgr.desktop"
 edit_desktop="$apps_dir/pass-mgr-edit.desktop"
-render "$here/pass-mgr.desktop"      > "$view_desktop"
-render "$here/pass-mgr-edit.desktop" > "$edit_desktop"
+write_desktop "$view_desktop" "pass-mgr (View)" "Open the vault read-only (locked vault icon)" "" "pass-mgr-locked.png"
+write_desktop "$edit_desktop" "pass-mgr (Edit)" "Open the vault in edit mode (unlocked vault icon)" " --write" "pass-mgr-unlocked.png"
 chmod +x "$view_desktop" "$edit_desktop"
 echo "menu:   $view_desktop"
 echo "        $edit_desktop"

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Data Protection capability: make NSFileProtectionComplete the app's DEFAULT data-protection
+  class, so EVERY file the app creates — including the vault.pmv, volume blobs, and the
+  atomic-write temp files that the Rust core creates later — is unreadable while the device is
+  locked (after first unlock). Setting the attribute only on the vault directory (ContentView)
+  does NOT propagate to files created afterward, so this entitlement is what actually covers
+  the files that matter.
+
+  Wire it into the Xcode project (on a Mac): set the target's CODE_SIGN_ENTITLEMENTS to this
+  file (Signing & Capabilities → + Capability → Data Protection), then verify with a locked
+  device that vault files report Complete protection.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.default-data-protection</key>
+    <string>NSFileProtectionComplete</string>
+</dict>
+</plist>

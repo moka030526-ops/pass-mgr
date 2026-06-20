@@ -364,7 +364,11 @@ private fun PasswordField(password: String, onCopy: (String) -> Unit) {
         Text("Password", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = if (revealed) password else "•".repeat(password.length.coerceIn(1, 16)),
+                // Fixed-width mask: do NOT key the dot count off password.length, which would
+                // leak the exact length to a shoulder-surfer (FLAG_SECURE only blocks
+                // screenshots/recents, not a person looking at the screen). Show a constant
+                // mask when there is a password, nothing when empty.
+                text = if (revealed) password else if (password.isEmpty()) "" else "••••••••",
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.weight(1f),
             )

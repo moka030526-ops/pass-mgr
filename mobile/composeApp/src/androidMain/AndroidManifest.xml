@@ -3,10 +3,14 @@
 
     <!-- Deliberately offline: no INTERNET permission. The vault never syncs. -->
 
+    <!-- allowBackup/fullBackupContent cover pre-Android-12 backup. On Android 12+
+         (targetSdk 31+) backup AND the newer device-to-device transfer are governed by
+         dataExtractionRules; "@null" left device-transfer at its permissive default, so the
+         encrypted vault could be migrated off-device. Point at explicit deny rules instead. -->
     <application
         android:allowBackup="false"
         android:fullBackupContent="false"
-        android:dataExtractionRules="@null"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="pass-mgr"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

@@ -15,18 +15,33 @@ struct ComposeView: UIViewControllerRepresentable {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try? dir.setResourceValues(values)
-        // Apply Data Protection so the (already password-encrypted) vault files are
-        // ALSO unreadable while the device is locked, instead of inheriting the weaker
-        // default (CompleteUntilFirstUserAuthentication). The old Info.plist
-        // `NSFileProtectionComplete` key was a no-op (audit R-13); set it as a real
-        // file attribute here. For app-wide coverage also add the Data Protection
-        // entitlement (see Info.plist note). Verify on a Mac.
-        try? fm.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: dir.path)
+        // Apply Data Protection so the (already password-encrypted) vault files are ALSO
+        // unreadable while the device is locked, instead of inheriting the weaker default
+        // (CompleteUntilFirstUserAuthentication). The old Info.plist `NSFileProtectionComplete`
+        // key was a no-op (audit R-13). Setting the attribute on the DIRECTORY alone does NOT
+        // propagate to files the Rust core creates later (vault.pmv, volume blobs, atomic-write
+        // temps) — so we (1) re-apply Complete to the dir AND every file already inside it on
+        // each launch (covers files stored in earlier sessions), and (2) rely on the
+        // `com.apple.developer.default-data-protection = NSFileProtectionComplete` entitlement
+        // (iosApp.entitlements) to make FUTURE files default to Complete. Verify on a Mac.
+        applyCompleteProtection(to: dir, using: fm)
 
         return MainViewControllerKt.MainViewController(vaultDir: dir.path)
     }
 
     func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
+
+    /// Recursively set `FileProtectionType.complete` on `dir` and every file already inside it.
+    /// New files created afterward get Complete from the app's data-protection entitlement.
+    private func applyCompleteProtection(to dir: URL, using fm: FileManager) {
+        let attrs: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.complete]
+        try? fm.setAttributes(attrs, ofItemAtPath: dir.path)
+        if let rels = try? fm.subpathsOfDirectory(atPath: dir.path) {
+            for rel in rels {
+                try? fm.setAttributes(attrs, ofItemAtPath: dir.appendingPathComponent(rel).path)
+            }
+        }
+    }
 }
 
 struct ContentView: View {

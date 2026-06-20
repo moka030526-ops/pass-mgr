@@ -85,8 +85,28 @@ android {
 
     buildTypes {
         getByName("release") {
-            // Debug-signed so `assembleRelease` is runnable without a keystore.
-            signingConfig = signingConfigs.getByName("debug")
+            // Sign with a REAL release keystore supplied out-of-repo via Gradle properties or
+            // env (PM_KEYSTORE / PM_KEYSTORE_PASSWORD / PM_KEY_ALIAS / PM_KEY_PASSWORD); never
+            // commit a keystore. The Android debug key is universal and publicly known, so a
+            // debug-signed "release" gives NO authenticity — anyone could ship a trojaned
+            // same-signature update of this vault app. We fall back to the debug key only when
+            // no keystore is configured, with a loud warning, so local `assembleRelease` smoke
+            // builds still work but a distributable build requires a real key.
+            val storePath = (project.findProperty("PM_KEYSTORE") as String?) ?: System.getenv("PM_KEYSTORE")
+            signingConfig = if (!storePath.isNullOrBlank()) {
+                signingConfigs.create("release") {
+                    storeFile = file(storePath)
+                    storePassword = (project.findProperty("PM_KEYSTORE_PASSWORD") as String?) ?: System.getenv("PM_KEYSTORE_PASSWORD")
+                    keyAlias = (project.findProperty("PM_KEY_ALIAS") as String?) ?: System.getenv("PM_KEY_ALIAS")
+                    keyPassword = (project.findProperty("PM_KEY_PASSWORD") as String?) ?: System.getenv("PM_KEY_PASSWORD")
+                }
+            } else {
+                project.logger.warn(
+                    "pass-mgr: no PM_KEYSTORE configured — signing the RELEASE build with the " +
+                        "PUBLIC Android debug key. This APK is for local testing ONLY and must NOT be distributed."
+                )
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }
