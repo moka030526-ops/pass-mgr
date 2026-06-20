@@ -39,8 +39,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.passmgr.ffi.Vault
@@ -139,6 +141,11 @@ private fun UnlockScreen(vaultDir: String, onUnlocked: (Vault) -> Unit) {
             label = { Text("First password") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
+            // KeyboardType.Password tells the IME this is a secret field (inputType
+            // textPassword + IME_FLAG_NO_PERSONALIZED_LEARNING) so the soft keyboard does
+            // NOT add the master password to its dictionary / next-word model or suggest it.
+            // The visual mask alone does not change IME behavior.
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(8.dp))
@@ -148,6 +155,7 @@ private fun UnlockScreen(vaultDir: String, onUnlocked: (Vault) -> Unit) {
             label = { Text("Second password") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(20.dp))
@@ -193,8 +201,10 @@ private fun friendlyError(e: Throwable): String = when (e) {
         "Wrong passwords, or the vault is damaged. Re-check both passwords and their order."
     is VaultException.RekeyPending ->
         "An interrupted password change is pending. Finish it on the desktop app, then try again."
-    is VaultException -> e.message ?: "Could not open the vault."
-    else -> e.message ?: "Unexpected error."
+    // The UniFFI-generated VaultException subclasses return an EMPTY message (not null),
+    // so a plain `?:` would show a blank error for Io/Internal/Locked. Treat blank as missing.
+    is VaultException -> e.message?.takeIf { it.isNotBlank() } ?: "Could not open the vault."
+    else -> e.message?.takeIf { it.isNotBlank() } ?: "Unexpected error."
 }
 
 @Composable

@@ -327,14 +327,18 @@ pub fn doc_filename(name: &str) -> String {
         .collect();
     // Cap at 120 bytes, truncating on a UTF-8 char boundary. A raw `truncate(120)`
     // PANICS when byte 120 lands mid-character (multibyte name: accented Latin, CJK,
-    // emoji, …), so step the cut back to the nearest boundary first.
-    if out.len() > 120 {
-        let mut cut = 120;
-        while cut > 0 && !out.is_char_boundary(cut) {
-            cut -= 1;
+    // emoji, …), so step the cut back to the nearest boundary first. Inner helper so the
+    // cap can be re-applied AFTER the reserved-name prefix below (which can add a byte).
+    fn cap_120(s: &mut String) {
+        if s.len() > 120 {
+            let mut cut = 120;
+            while cut > 0 && !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            s.truncate(cut);
         }
-        out.truncate(cut);
     }
+    cap_120(&mut out);
     // Strip leading/trailing dots and dashes (whitespace is already mapped to `-`),
     // so a dot/space-only name collapses to the fallback rather than "--..".
     let trimmed = out.trim_matches(|c: char| c == '.' || c == '-');
@@ -343,11 +347,16 @@ pub fn doc_filename(name: &str) -> String {
     }
     // Neutralize a Windows reserved device name so the stored (and later exported) file is a
     // real, distinct file on Windows rather than the CON/NUL/COM1/… device. Harmless on Unix.
-    if is_windows_reserved_name(trimmed) {
-        format!("_{trimmed}")
-    } else {
-        trimmed.to_string()
+    let mut out = if is_windows_reserved_name(trimmed) { format!("_{trimmed}") } else { trimmed.to_string() };
+    // The reserved-name '_' prefix can push a name that was already at the 120-byte cap to
+    // 121, so re-cap (on a char boundary) and re-trim any trailing dot/dash the cut exposed,
+    // keeping BOTH the length and no-edge-dot invariants. (Caught by the doc_paths fuzz target.)
+    if out.len() > 120 {
+        cap_120(&mut out);
+        let keep = out.trim_end_matches(['.', '-']).len();
+        out.truncate(keep);
     }
+    if out.is_empty() { "file".to_string() } else { out }
 }
 
 /// Resolve the upload filename: the user-typed `name` if non-empty (trimmed), else the
@@ -2463,6 +2472,12 @@ mod tests {
         assert_eq!(doc_filename("report-con.pdf"), "report-con.pdf");
         assert!(is_windows_reserved_name("aux") && is_windows_reserved_name("PRN.doc"));
         assert!(!is_windows_reserved_name("auxiliary") && !is_windows_reserved_name("lpt"));
+        // Regression (doc_paths fuzz): the reserved-name '_' prefix must not push a name that
+        // was already at the 120-byte cap to 121. A long reserved-stem name stays bounded and
+        // keeps the no-edge-dot + non-empty invariants.
+        let long = doc_filename(&format!("con.{}", "a".repeat(200)));
+        assert!(long.len() <= 120, "reserved+long stays capped: {} bytes", long.len());
+        assert!(long.starts_with("_con") && !long.ends_with('.') && !long.is_empty());
     }
 
     #[test]

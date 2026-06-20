@@ -989,10 +989,13 @@ impl GuiApp {
             });
         });
         // Re-mask passwords when the user switches tabs (see prev_tab above): reveal is
-        // momentary, so a stale "reveal all" must not persist into a later tab visit.
+        // momentary, so a stale "reveal all" must not persist into a later tab visit. Also
+        // clear the shared document-input buffers so a half-typed "Upload from" path / name /
+        // subfolder from one tab does not linger in the next tab's attach form.
         if self.tab != prev_tab {
             self.reveal_all = false;
             self.re_reveal_all = false;
+            self.clear_doc_inputs();
         }
     }
 

@@ -2633,7 +2633,7 @@ impl App {
         // type). Here it gathers every tab's title into a list for the tab bar.
         let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
             .select(self.tab.index())
-            .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-5) "))
+            .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-7) "))
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD));
         frame.render_widget(tabs, chunks[0]);
 
