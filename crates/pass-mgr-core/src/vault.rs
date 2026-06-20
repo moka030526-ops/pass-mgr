@@ -5152,4 +5152,25 @@ mod tests {
         );
         cleanup(&path);
     }
+
+    #[test]
+    fn mut_sweep_stale_temps_needs_prefix_and_tmp_suffix() {
+        // sweep_stale_temps removes a file only if it BOTH starts with the vault prefix
+        // AND ends in ".tmp" (the `&&` at line ~1665). An `||` would also wipe unrelated
+        // "*.tmp" files and (worse) the live ".vault.pmv.*" data — so a file matching only
+        // ONE clause must survive. (Kills the `&&` -> `||` mutant — verified by applying it.)
+        let base = tmp_path("sweeptmp"); // tmp_path already created the dir
+        let dir = parent_dir(&base);
+        let swept = dir.join(format!(".{VAULT_FILE}.abc123.tmp")); // prefix AND .tmp -> removed
+        let keep_tmp_only = dir.join("unrelated.tmp"); // .tmp only -> kept (|| would delete)
+        let keep_prefix_only = dir.join(format!(".{VAULT_FILE}.mirror")); // prefix only -> kept
+        for f in [&swept, &keep_tmp_only, &keep_prefix_only] {
+            fs::write(f, b"x").unwrap();
+        }
+        sweep_stale_temps(&dir);
+        assert!(!swept.exists(), "a genuine .vault.pmv.*.tmp temp is swept");
+        assert!(keep_tmp_only.exists(), "an unrelated *.tmp must survive (kills && -> ||)");
+        assert!(keep_prefix_only.exists(), "a non-.tmp vault sibling must survive (kills && -> ||)");
+        cleanup(&base);
+    }
 }

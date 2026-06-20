@@ -18,11 +18,11 @@ the estate-vault codebase (workspace: `pass-mgr-core`, `pass-mgr-desktop`,
 | Layer | Result |
 | --- | --- |
 | Adversarial security review (7 rounds incl. a 152- and a 159-agent deep hunt, an overnight 3-phase autonomous sweep, a dynamic-verification round, and a full-crate mutation round) | **36 real defects found and fixed** (F-1…F-15 + round-4 R-1…R-14 + round-5 A-1…A-8 + round-6 B-1…B-2; 7 HIGH total, the rest MED/LOW); candidate findings in §3.2 investigated and refuted |
-| Mutation testing (`cargo-mutants`) | round-7 **whole-crate** run: **1629 mutants → 107 survived → 37 kill-tests** close the meaningful ones (suite 226→262); the rest are accepted residual (fault-injection scaffolding, fuzz entries, the un-killable `Key::drop`, proven equivalent mutants, unobservable fsync side-effects) — see §3.1g |
+| Mutation testing (`cargo-mutants`) | round-7 **whole-crate** run: **1629 mutants → 107 survived → 37 kill-tests** close the meaningful ones (suite 226→263); the rest are accepted residual (fault-injection scaffolding, fuzz entries, the un-killable `Key::drop`, proven equivalent mutants, unobservable fsync side-effects) — see §3.1g |
 | Fuzzing (`cargo-fuzz`, 5 targets incl. `doc_paths`) | **≈183 M cumulative + ~67 M round-6, 0 crashes** |
 | Supply-chain (`cargo-audit` + `cargo-deny`) | **0 advisories across 595 deps; bans/licenses/sources clean** (re-confirmed round 5) |
 | Lints (`cargo clippy -D warnings`, all targets/features) | **clean** |
-| Test suite | **core 262 · ffi 32 · compat 4 · desktop 75 + 20 — all green** (incl. an exhaustive every-byte vault-tamper matrix; debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
+| Test suite | **core 263 · ffi 32 · compat 4 · desktop 75 + 20 — all green** (incl. an exhaustive every-byte vault-tamper matrix; debug + `--release`; `--no-default-features` swaps the single-writer test for the no-op-lock test) |
 
 The cryptographic envelope was never broken: across seven rounds no finding lets an
 attacker read a vault they could not already open. The fixes harden secret hygiene
@@ -254,11 +254,20 @@ targeted storage/vault functions reported **0 MISSED**.
   bare-filename edge), `rand_suffix`→constant (temp-suffix uniqueness isn't
   deterministically testable), and `compaction_detail`→const string (a cosmetic status
   message).
-- **Follow-up candidates (3, meaningful but not yet covered):** `WriteLock::acquire`
-  → `Default` (the single-writer guarantee lacks a concurrent-open test — a real
-  test-quality gap, though the lock itself is exercised in normal use), `write_vault_file`
-  (one error-branch `!` negation), and `sweep_stale_temps` (`&&`→`||`). None are known
-  defects; they are unpinned behaviours worth a future test.
+The three "follow-up candidates" were then each resolved (one killed, two shown to be
+non-gaps on closer inspection):
+
+- `sweep_stale_temps` (`&&`→`||`) — **killed** by `mut_sweep_stale_temps_needs_prefix_and_tmp_suffix`
+  (verified: a file matching only one clause — an unrelated `*.tmp`, or a non-`.tmp`
+  `.vault.pmv.*` sibling — must survive the sweep; the test fails under `||`).
+- `WriteLock::acquire` → `Default` — **not a gap**: the survivor is at the
+  `#[cfg(not(feature = "single-writer-lock"))]` *no-op* stub, which the default-feature
+  run doesn't compile (a cfg-phantom), and which equals `Default::default()` for the
+  field-less mobile `WriteLock` anyway. The real `flock` `acquire` had no survivors.
+- `write_vault_file` (`delete !` on the `!parent.is_empty()` guard) — **equivalent
+  mutant**: every caller (`create` at line 312, plus `save`/rekey on an already-open
+  vault dir) pre-creates the parent directory, so `write_vault_file`'s own
+  `create_dir_all` is redundant defense-in-depth and the guard can't change behaviour.
 
 ### 3.2 Investigated and refuted (no change needed)
 
