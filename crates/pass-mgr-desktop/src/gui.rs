@@ -448,6 +448,7 @@ enum Screen {
     Auth,
     Main,
     Config,
+    Help,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1023,6 +1024,9 @@ impl GuiApp {
                     self.cfg_redundancy = self.vault_ref().redundancy();
                     self.screen = Screen::Config;
                 }
+                if ui.button("❓ Help").clicked() {
+                    self.screen = Screen::Help;
+                }
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1042,6 +1046,138 @@ impl GuiApp {
             self.reveal_all = false;
             self.re_reveal_all = false;
         }
+    }
+
+    // --- Help screen ---------------------------------------------------------
+
+    /// In-app help: a sectioned guide (the README, condensed) plus the on-disk
+    /// locations of this vault and the preferences file. Reachable from the top-bar
+    /// "❓ Help" button.
+    fn ui_help(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Help");
+            if ui.button("⬅ Back").clicked() {
+                self.screen = Screen::Main;
+            }
+        });
+        ui.separator();
+
+        // Each section is a collapsible header with a body of short lines. The whole
+        // page scrolls vertically so labels wrap to the window width.
+        let sections: &[(&str, &[&str])] = &[
+            (
+                "What this is",
+                &[
+                    "pass-mgr is an offline, two-password encrypted vault for the records an \
+                     estate's executor or heirs need: account logins, instructions, trust & will \
+                     documents, assets & liabilities, real estate, and tax filings.",
+                    "It is fully local — there is no network code and nothing ever leaves your \
+                     machine. The vault is a directory holding the encrypted vault file plus an \
+                     encrypted document store.",
+                ],
+            ),
+            (
+                "The two passwords",
+                &[
+                    "Opening the vault requires BOTH passwords, in order. They are chained through \
+                     Argon2id key derivation into one XChaCha20-Poly1305 key — neither password \
+                     alone reveals anything, and the order matters.",
+                    "There is NO recovery: if you lose either password the data is unrecoverable by \
+                     design. A wrong password and a corrupted/tampered vault fail the same way (no \
+                     oracle). Change both via 'Change passwords' on the unlock screen.",
+                ],
+            ),
+            (
+                "Read-only vs. writable",
+                &[
+                    "Launched read-only by default; pass --write to make changes. A read-only \
+                     session writes nothing to the vault.",
+                    "In read-only mode the record forms are a VIEW: fields can't be edited, but you \
+                     can still select and copy their text, reveal and copy passwords, export \
+                     documents, and run a backup. The only settings you can change read-only are the \
+                     color theme and the export directory (both are local preferences, not vault \
+                     data).",
+                ],
+            ),
+            (
+                "Tabs & records",
+                &[
+                    "Instructions · Trust & Will · Assets & Liabilities · Accounts · Real Estate · \
+                     Taxes · General Documents. Switch with the top tabs (or 1–7 in the TUI).",
+                    "Accounts can be shown as a grouped tree (owner → type → subtype → title); \
+                     title and owner are required. Filters cross-narrow each other, and the search \
+                     box matches a username OR a title.",
+                ],
+            ),
+            (
+                "Passwords: reveal, generate, copy",
+                &[
+                    "Reveal is a single global toggle per screen ('reveal all') on Accounts and Real \
+                     Estate — there is no per-record reveal, and it clears when you switch tabs.",
+                    "🎲 generates a strong random password (and turns reveal on so you can see it). \
+                     📋 copies a password through a history-excluded clipboard path; the clipboard \
+                     auto-clears after 15 seconds and is wiped on exit.",
+                ],
+            ),
+            (
+                "Documents: attach & export",
+                &[
+                    "Attach a file with 'Upload from' (and an optional subfolder). If you leave the \
+                     Filename blank, the source file's own name is used.",
+                    "Export writes the DECRYPTED document to the directory set in Config → 'Export \
+                     destination', recreating its folder structure there \
+                     (<export dir>/<location>/<filename>). You are not asked for a path each time, \
+                     and an export never overwrites an existing file (it adds a _N suffix).",
+                    "Real Estate has four portal logins (Property Mgmt / Insurance / HOA / Tax), each \
+                     with a URL, username, password, and a free-form comment.",
+                ],
+            ),
+            (
+                "Config",
+                &[
+                    "Color theme (10 palettes) · Asset/Account types & subtypes (add, or delete when \
+                     unused) · Export destination directory · Backup · Storage volume size · Vault \
+                     file redundancy.",
+                    "Backup copies the encrypted vault + document store into a timestamped folder \
+                     (nothing is decrypted). Redundancy keeps extra in-place encrypted copies of the \
+                     small vault file so a damaged one can be recovered — it does NOT replace backups.",
+                ],
+            ),
+            (
+                "Security notes",
+                &[
+                    "Encryption: chained Argon2id → XChaCha20-Poly1305, with the whole file header \
+                     authenticated. Secrets are zeroized in memory and (on desktop) memory-locked.",
+                    "Plaintext only leaves the vault when you explicitly ask (document export, the \
+                     CLI decrypt/extract/export-tree). Keep those copies somewhere you trust and \
+                     delete them when done.",
+                ],
+            ),
+        ];
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("help_scroll").show(ui, |ui| {
+            for (title, body) in sections {
+                egui::CollapsingHeader::new(egui::RichText::new(*title).strong()).default_open(true).show(ui, |ui| {
+                    for line in *body {
+                        ui.label(*line);
+                        ui.add_space(4.0);
+                    }
+                });
+            }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Files on this machine").strong());
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Vault:");
+                ui.label(egui::RichText::new(self.path.display().to_string()).monospace());
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preferences (theme + export directory; non-secret):");
+                let pref = theme_pref_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(unavailable)".into());
+                ui.label(egui::RichText::new(pref).monospace());
+            });
+        });
     }
 
     // --- Config screen -------------------------------------------------------
@@ -2876,6 +3012,10 @@ impl eframe::App for GuiApp {
         }
         if self.screen == Screen::Config {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_config(ui));
+            return;
+        }
+        if self.screen == Screen::Help {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.ui_help(ui));
             return;
         }
 
