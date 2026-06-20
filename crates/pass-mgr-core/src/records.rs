@@ -324,6 +324,22 @@ pub fn doc_filename(name: &str) -> String {
     if trimmed.is_empty() { "file".to_string() } else { trimmed.to_string() }
 }
 
+/// Resolve the upload filename: the user-typed `name` if non-empty (trimmed), else the
+/// **basename of the `source` path** ("if a filename isn't specified, use the same
+/// filename as the file being uploaded"). The result is NOT yet sanitized — callers run
+/// it through [`doc_filename`]. Returns `""` only if both are empty / the source has no
+/// final component, which callers reject.
+pub fn effective_doc_filename(name: &str, source: &str) -> String {
+    let n = name.trim();
+    if !n.is_empty() {
+        return n.to_string();
+    }
+    std::path::Path::new(source.trim())
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
 /// sec)` using Howard Hinnant's `civil_from_days` algorithm. Negative/zero clamps
 /// to the epoch. Shared by the human and filename timestamp formatters so the
@@ -2371,6 +2387,20 @@ mod tests {
         // Emoji (4-byte) near the boundary likewise truncates safely on a boundary.
         let emoji = doc_filename(&"\u{1F600}".repeat(40)); // 160 bytes
         assert!(emoji.len() <= 120 && !emoji.is_empty());
+    }
+
+    #[test]
+    fn effective_doc_filename_falls_back_to_source_basename() {
+        // A given filename wins (trimmed).
+        assert_eq!(effective_doc_filename("report.pdf", "/home/u/anything.bin"), "report.pdf");
+        assert_eq!(effective_doc_filename("  report.pdf  ", "/x/y.bin"), "report.pdf");
+        // Empty/whitespace filename -> the source file's basename ("use the same filename").
+        assert_eq!(effective_doc_filename("", "/home/u/Downloads/deed.pdf"), "deed.pdf");
+        assert_eq!(effective_doc_filename("   ", "relative/w2.png"), "w2.png");
+        assert_eq!(effective_doc_filename("", "bare.txt"), "bare.txt");
+        // Degenerate source (no final component) -> empty, which callers reject.
+        assert_eq!(effective_doc_filename("", "/"), "");
+        assert_eq!(effective_doc_filename("", ""), "");
     }
 
     #[test]

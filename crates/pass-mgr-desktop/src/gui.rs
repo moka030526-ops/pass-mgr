@@ -369,26 +369,39 @@ fn theme_pref_path() -> Option<std::path::PathBuf> {
 /// (mirrors the bounded reads in the storage layer).
 const MAX_PREFS_SIZE: u64 = 64 * 1024;
 
+/// Bounded, symlink-safe read of the prefs JSON object (empty map on any failure), so
+/// each setter can read-modify-write WITHOUT clobbering the other keys (theme vs
+/// export_dir). `symlink_metadata` doesn't follow links — a symlinked prefs file fails
+/// `is_file()` — and the size check rejects an oversized file before reading it.
+fn read_prefs_obj(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_PREFS_SIZE => {}
+        _ => return serde_json::Map::new(),
+    }
+    let Ok(bytes) = std::fs::read(path) else { return serde_json::Map::new() };
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).unwrap_or_default()
+}
+
+/// Best-effort write of the prefs object (a write failure is ignored — prefs are
+/// non-critical and trivially re-picked).
+fn write_prefs_obj(path: &std::path::Path, obj: &serde_json::Map<String, serde_json::Value>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(obj) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
 /// Load the saved theme from the standard preferences path.
 fn load_theme() -> Theme {
     theme_pref_path().map(|p| load_theme_from(&p)).unwrap_or_default()
 }
 
-/// Load the theme from a specific path. Best-effort and bounded: a missing file, a
-/// **symlink**, an over-cap size, or any parse error all fall back to the default —
-/// a UI preference must never block (or slow) startup.
+/// Load the theme from a specific path. Best-effort/bounded: missing/symlinked/over-cap/
+/// unparseable all fall back to the default — a UI preference must never block startup.
 fn load_theme_from(path: &std::path::Path) -> Theme {
-    // `symlink_metadata` does not follow links, so a symlinked prefs file fails the
-    // `is_file()` check; the size check rejects an oversized file BEFORE reading it.
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() && m.len() <= MAX_PREFS_SIZE => {}
-        _ => return Theme::default(),
-    }
-    // `let Ok(x) = expr else { return ... }` (let-else) takes the success value or
-    // runs the diverging `else`, keeping the happy path unindented.
-    let Ok(bytes) = std::fs::read(path) else { return Theme::default() };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Theme::default() };
-    value.get("theme").and_then(|t| t.as_str()).and_then(Theme::from_id).unwrap_or_default()
+    read_prefs_obj(path).get("theme").and_then(|t| t.as_str()).and_then(Theme::from_id).unwrap_or_default()
 }
 
 /// Persist the chosen theme to the standard preferences path.
@@ -398,16 +411,32 @@ fn save_theme(theme: Theme) {
     }
 }
 
-/// Persist the theme to a specific path. Best-effort: a write failure is ignored
-/// (the theme is non-critical and trivially re-picked).
+/// Persist the theme to a specific path, preserving any other prefs keys (export_dir).
 fn save_theme_to(path: &std::path::Path, theme: Theme) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let mut obj = read_prefs_obj(path);
+    obj.insert("theme".into(), serde_json::Value::String(theme.id().to_string()));
+    write_prefs_obj(path, &obj);
+}
+
+/// The saved export-destination directory ("" if unset). Non-secret; kept in the same
+/// prefs file as the theme so it persists AND is settable even in read-only mode — it's
+/// a local-machine preference (where to drop exported documents), not vault content,
+/// which keeps read-only document export working (the heir use case).
+fn load_export_dir() -> String {
+    theme_pref_path().map(|p| load_export_dir_from(&p)).unwrap_or_default()
+}
+fn load_export_dir_from(path: &std::path::Path) -> String {
+    read_prefs_obj(path).get("export_dir").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+fn save_export_dir(dir: &str) {
+    if let Some(path) = theme_pref_path() {
+        save_export_dir_to(&path, dir);
     }
-    let value = serde_json::json!({ "theme": theme.id() });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
-        let _ = std::fs::write(path, bytes);
-    }
+}
+fn save_export_dir_to(path: &std::path::Path, dir: &str) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("export_dir".into(), serde_json::Value::String(dir.to_string()));
+    write_prefs_obj(path, &obj);
 }
 
 // `enum` is a closed set of named alternatives (a tagged union). `#[derive(...)]`
@@ -544,7 +573,10 @@ struct GuiApp {
     doc_subfolder: String,
     doc_filename: String,
     doc_source: String,
-    doc_dest: String,
+    // Prefs-backed export destination directory (replaces the old per-export "Export to"
+    // path prompt). Settable even in read-only mode — it is a local-machine preference,
+    // not vault content — so read-only document export (the heir use case) keeps working.
+    export_dir: String,
     status: String,
     clipboard_dirty: bool,
     // When set, the clipboard should be wiped at/after this instant.
@@ -632,7 +664,7 @@ impl GuiApp {
             doc_subfolder: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
-            doc_dest: String::new(),
+            export_dir: load_export_dir(),
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,
@@ -701,7 +733,24 @@ impl GuiApp {
         self.doc_subfolder.clear();
         self.doc_filename.clear();
         self.doc_source.clear();
-        self.doc_dest.clear();
+    }
+
+    /// Export document `id` into the configured export directory, recreating its volume
+    /// folder structure under it. Used by every tab's Export button — there is no
+    /// per-export path prompt; the destination is the directory set in Config (which is
+    /// editable even in read-only mode, so this works for a read-only heir).
+    fn export_doc_to_config_dir(&mut self, id: &str) {
+        let dir = self.export_dir.trim().to_string();
+        if dir.is_empty() {
+            self.status = "Set an export directory in Config first (Config → Export destination).".into();
+            return;
+        }
+        if let Some(ov) = self.vault.as_ref() {
+            match ov.export_document_into(id, Path::new(&dir)) {
+                Ok(p) => self.status = format!("Exported to {}", p.display()),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
     }
 
     // --- Auth ----------------------------------------------------------------
@@ -1029,6 +1078,7 @@ impl GuiApp {
         let mut add_account = false;
         let mut add_subtype = false;
         let mut do_backup = false;
+        let mut set_export = false;
         let mut set_volume = false;
         let mut set_redundancy = false;
         // Deferred DELETE actions: which category the user clicked × on (handled after
@@ -1145,6 +1195,28 @@ impl GuiApp {
                 );
                 if self.writable && ui.button("Add subtype").clicked() {
                     add_subtype = true;
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Export destination").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Where the per-document Export buttons write the decrypted file. Each export \
+                     is saved under this directory, recreating the document's folder structure from \
+                     inside the vault — you are never asked for a path at export time. Stored as a \
+                     local preference (not in the vault), so it can be set even in read-only mode.",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Export directory:");
+                // Deliberately NOT gated on `writable`: the export dir is a local preference,
+                // so a read-only session (e.g. an heir) can set where to extract documents.
+                ui.add(egui::TextEdit::singleline(&mut self.export_dir).hint_text("/path/to/exports").desired_width(340.0));
+                if ui.button("Set").clicked() {
+                    set_export = true;
                 }
             });
 
@@ -1292,6 +1364,18 @@ impl GuiApp {
                 Ok(CategoryRemoval::NotFound) => format!("“{sub}” was not found under “{ty}”."),
                 Ok(CategoryRemoval::HasSubtypes) => unreachable!("a subtype has no subtypes"),
                 Err(e) => format!("Delete failed: {e}"),
+            };
+        }
+        if set_export {
+            // Persist the export directory to the local prefs file (non-secret; no vault
+            // write, so this works in read-only mode). Trim and normalize the stored value.
+            let dir = self.export_dir.trim().to_string();
+            self.export_dir = dir.clone();
+            save_export_dir(&dir);
+            self.status = if dir.is_empty() {
+                "Export directory cleared.".into()
+            } else {
+                format!("Export directory set to {dir} (used by every Export button).")
             };
         }
         if do_backup {
@@ -1459,7 +1543,6 @@ impl GuiApp {
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
-                    &mut self.doc_dest,
                     self.writable,
                 )
                 .to_single();
@@ -1530,7 +1613,6 @@ impl GuiApp {
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
-                    &mut self.doc_dest,
                     self.writable,
                 )
                 .to_single();
@@ -1639,7 +1721,6 @@ impl GuiApp {
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
-                    &mut self.doc_dest,
                     self.writable,
                 )
                 .to_single();
@@ -2150,7 +2231,6 @@ impl GuiApp {
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
-                    &mut self.doc_dest,
                     writable,
                 ) {
                     DocSectionReq::Upload => ReDocReq::Upload,
@@ -2254,7 +2334,6 @@ impl GuiApp {
                     &mut self.doc_subfolder,
                     &mut self.doc_filename,
                     &mut self.doc_source,
-                    &mut self.doc_dest,
                     writable,
                 ) {
                     DocSectionReq::Upload => TaxDocReq::Upload,
@@ -2305,10 +2384,15 @@ impl GuiApp {
         match req {
             ReDocReq::None => {}
             ReDocReq::Upload => {
-                let name = self.doc_filename.trim().to_string();
                 let src = self.doc_source.trim().to_string();
-                if name.is_empty() || src.is_empty() {
-                    self.status = "Filename and 'upload from' path are required.".into();
+                if src.is_empty() {
+                    self.status = "'Upload from' path is required.".into();
+                    return;
+                }
+                // If no filename is given, default to the source file's own name.
+                let name = records::effective_doc_filename(&self.doc_filename, &src);
+                if name.trim().is_empty() {
+                    self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
                 let address = self.edit_realestate.as_ref().map(|r| r.address.clone()).unwrap_or_default();
@@ -2349,17 +2433,8 @@ impl GuiApp {
                 }
             }
             ReDocReq::Export(i) => {
-                let dest = self.doc_dest.trim().to_string();
-                if dest.is_empty() {
-                    self.status = "Enter an 'export to' path first.".into();
-                    return;
-                }
-                let id = self.edit_realestate.as_ref().and_then(|r| r.documents.get(i).cloned());
-                if let (Some(id), Some(ov)) = (id, self.vault.as_ref()) {
-                    match ov.export_document(&id, Path::new(&dest)) {
-                        Ok(()) => self.status = format!("Exported to {dest}"),
-                        Err(e) => self.status = format!("Export failed: {e}"),
-                    }
+                if let Some(id) = self.edit_realestate.as_ref().and_then(|r| r.documents.get(i).cloned()) {
+                    self.export_doc_to_config_dir(&id);
                 }
             }
             ReDocReq::Remove(i) => {
@@ -2433,9 +2508,15 @@ impl GuiApp {
         match req {
             DocReq::None => {}
             DocReq::Attach => {
-                let (name, src) = (self.doc_filename.clone(), self.doc_source.clone());
-                if name.trim().is_empty() || src.trim().is_empty() {
-                    self.status = "Filename and 'upload from' path are required.".into();
+                let src = self.doc_source.clone();
+                if src.trim().is_empty() {
+                    self.status = "'Upload from' path is required.".into();
+                    return;
+                }
+                // If no filename is given, default to the source file's own name.
+                let name = records::effective_doc_filename(&self.doc_filename, &src);
+                if name.trim().is_empty() {
+                    self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
                 // The auto-group level comes from the record's identifying field; the
@@ -2525,18 +2606,8 @@ impl GuiApp {
                     DocTarget::Asset => self.edit_asset.as_ref().and_then(|r| r.statement.clone()),
                     DocTarget::General => self.edit_general.as_ref().and_then(|r| r.file.clone()),
                 };
-                let dest = self.doc_dest.clone();
-                if dest.trim().is_empty() {
-                    self.status = "Enter an 'export to' path first.".into();
-                    return;
-                }
-                // Tuple pattern: this block runs only if BOTH a file id exists
-                // and the vault is open (both elements are `Some`).
-                if let (Some(id), Some(ov)) = (file_id, self.vault.as_ref()) {
-                    match ov.export_document(&id, Path::new(&dest)) {
-                        Ok(()) => self.status = format!("Exported to {dest}"),
-                        Err(e) => self.status = format!("Export failed: {e}"),
-                    }
+                if let Some(id) = file_id {
+                    self.export_doc_to_config_dir(&id);
                 }
             }
             DocReq::Remove => {
@@ -2594,10 +2665,15 @@ impl GuiApp {
         match req {
             TaxDocReq::None => {}
             TaxDocReq::Upload => {
-                let name = self.doc_filename.trim().to_string();
                 let src = self.doc_source.trim().to_string();
-                if name.is_empty() || src.is_empty() {
-                    self.status = "Filename and 'upload from' path are required.".into();
+                if src.is_empty() {
+                    self.status = "'Upload from' path is required.".into();
+                    return;
+                }
+                // If no filename is given, default to the source file's own name.
+                let name = records::effective_doc_filename(&self.doc_filename, &src);
+                if name.trim().is_empty() {
+                    self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
                 // The folder is derived from the filing year, NOT user-entered.
@@ -2642,17 +2718,8 @@ impl GuiApp {
                 // On failure persist() has already set the "Save failed: …" status.
             }
             TaxDocReq::Export(i) => {
-                let dest = self.doc_dest.trim().to_string();
-                if dest.is_empty() {
-                    self.status = "Enter an 'export to' path first.".into();
-                    return;
-                }
-                let id = self.edit_taxfiling.as_ref().and_then(|r| r.documents.get(i).cloned());
-                if let (Some(id), Some(ov)) = (id, self.vault.as_ref()) {
-                    match ov.export_document(&id, Path::new(&dest)) {
-                        Ok(()) => self.status = format!("Exported to {dest}"),
-                        Err(e) => self.status = format!("Export failed: {e}"),
-                    }
+                if let Some(id) = self.edit_taxfiling.as_ref().and_then(|r| r.documents.get(i).cloned()) {
+                    self.export_doc_to_config_dir(&id);
                 }
             }
             TaxDocReq::Remove(i) => {
@@ -3084,7 +3151,6 @@ fn doc_section(
     subfolder: &mut String,
     filename: &mut String,
     source: &mut String,
-    dest: &mut String,
     writable: bool,
 ) -> DocSectionReq {
     let mut req = DocSectionReq::None;
@@ -3095,7 +3161,9 @@ fn doc_section(
         for (i, label) in attached.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("• {label}"));
-                // Export is a read (always allowed); Remove mutates the vault.
+                // Export is a read (always allowed); Remove mutates the vault. Export
+                // writes into the directory configured in Config, recreating the document's
+                // volume folder structure — there is no per-export path prompt.
                 if ui.button("Export").clicked() {
                     req = DocSectionReq::Export(i);
                 }
@@ -3104,10 +3172,6 @@ fn doc_section(
                 }
             });
         }
-        ui.horizontal(|ui| {
-            ui.label("Export to:");
-            ui.add(egui::TextEdit::singleline(dest).hint_text("/path/to/save/as").desired_width(300.0));
-        });
     }
     if writable {
         ui.separator();
@@ -3495,10 +3559,17 @@ mod tests {
         assert!(vpath.trim_start_matches('/').starts_with("general-documents/passport/"), "got {vpath}");
         assert!(vpath.ends_with("/ids/p.pdf"), "got {vpath}");
 
-        let dest = dir.join("out.pdf");
-        app.doc_dest = dest.to_string_lossy().into();
+        // Export goes to the configured export dir, recreating the volume folder structure.
+        let export_root = dir.join("exports");
+        app.export_dir = export_root.to_string_lossy().into();
         app.handle_doc(DocReq::Export, DocTarget::General);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"passport", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(
+            std::fs::read(&exported).unwrap(),
+            b"passport",
+            "export recreates the volume structure under the config dir (status: {})",
+            app.status
+        );
 
         app.handle_doc(DocReq::Remove, DocTarget::General);
         assert!(app.edit_general.as_ref().unwrap().file.is_none(), "removed");
@@ -3523,11 +3594,14 @@ mod tests {
         assert_eq!(app.edit_realestate.as_ref().unwrap().documents.len(), 1, "uploaded one doc");
         assert_eq!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.len(), 1, "persisted");
 
-        // --- export ---
-        let dest = dir.join("deed-out.txt");
-        app.doc_dest = dest.to_string_lossy().into();
+        // --- export (into the configured export dir, structure preserved) ---
+        let export_root = dir.join("exports");
+        app.export_dir = export_root.to_string_lossy().into();
+        let re_id = app.edit_realestate.as_ref().unwrap().documents[0].clone();
+        let vpath = app.vault.as_ref().unwrap().doc_path(&re_id).unwrap();
         app.handle_re_doc(ReDocReq::Export(0));
-        assert_eq!(std::fs::read(&dest).unwrap(), b"the deed", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&exported).unwrap(), b"the deed", "export recreates structure (status: {})", app.status);
 
         // --- remove ---
         app.handle_re_doc(ReDocReq::Remove(0));
@@ -3552,14 +3626,34 @@ mod tests {
         assert_eq!(app.edit_taxfiling.as_ref().unwrap().documents.len(), 1, "uploaded one doc");
         assert_eq!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.len(), 1, "persisted");
 
-        let dest = dir.join("out.txt");
-        app.doc_dest = dest.to_string_lossy().into();
+        let export_root = dir.join("exports");
+        app.export_dir = export_root.to_string_lossy().into();
+        let tax_id = app.edit_taxfiling.as_ref().unwrap().documents[0].clone();
+        let vpath = app.vault.as_ref().unwrap().doc_path(&tax_id).unwrap();
         app.handle_tax_doc(TaxDocReq::Export(0));
-        assert_eq!(std::fs::read(&dest).unwrap(), b"taxable income", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&exported).unwrap(), b"taxable income", "export recreates structure (status: {})", app.status);
 
         app.handle_tax_doc(TaxDocReq::Remove(0));
         assert!(app.edit_taxfiling.as_ref().unwrap().documents.is_empty(), "removed the doc");
         assert!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.is_empty(), "unlinked");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn upload_with_empty_filename_uses_source_basename_in_gui() {
+        // "If a filename isn't specified, use the same filename as the uploaded file."
+        let (mut app, path) = app_unlocked("guinofname");
+        let dir = path.parent().unwrap().to_path_buf();
+        app.edit_general = Some(GeneralDocument::new().unwrap());
+        let src = dir.join("MyDeed.PDF");
+        std::fs::write(&src, b"x").unwrap();
+        app.doc_filename = String::new(); // no filename given
+        app.doc_source = src.to_string_lossy().into();
+        app.handle_doc(DocReq::Attach, DocTarget::General);
+        let id = app.edit_general.as_ref().unwrap().file.clone().expect("uploaded (status: ");
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
+        assert!(vpath.ends_with("/MyDeed.PDF"), "empty filename falls back to the source basename: {vpath}");
         cleanup(&path);
     }
 

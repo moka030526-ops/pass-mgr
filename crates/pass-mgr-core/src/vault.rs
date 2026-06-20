@@ -1124,6 +1124,41 @@ impl OpenVault {
         write_new_bytes(dest, &data)
     }
 
+    /// Export a stored document into `root`, **recreating its virtual folder structure**
+    /// under it (`<root>/<location>/<filename>`) and creating the intermediate dirs
+    /// (0700). The plaintext file is written 0600; if the target already exists a `_N`
+    /// suffix is used so an export never overwrites. Returns the path written.
+    ///
+    /// The virtual path's components are already sanitized when a document is stored, but
+    /// each is re-cleaned here (drop empty / `.` / `..` / separator-bearing components) as
+    /// defense in depth, so the result can never escape `root`. Used by the UIs so the
+    /// user sets ONE export directory and every export lands in the same tree layout
+    /// instead of being prompted for a path each time.
+    pub fn export_document_into(&self, file_id: &str, root: &Path) -> Result<PathBuf, VaultError> {
+        let vpath =
+            self.doc_path(file_id).ok_or_else(|| StorageError::NotFound(file_id.to_string()))?;
+        let mut dest = root.to_path_buf();
+        for part in vpath.split('/') {
+            let p = part.trim();
+            if p.is_empty() || p == "." || p == ".." || p.contains(['\\', ':', '\0']) {
+                continue; // never let a component traverse out of `root`
+            }
+            dest.push(p);
+        }
+        if dest == root {
+            // Degenerate virtual path — fall back to an id-named file under root.
+            dest.push(format!("{file_id}.bin"));
+        }
+        let data = self.read_document(file_id)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+            harden_dir(parent);
+        }
+        let dest = unique_export_path(dest); // never overwrite an existing export
+        write_new_bytes(&dest, &data)?;
+        Ok(dest)
+    }
+
     /// The virtual path ("/loc/filename") of a stored document, for UI display.
     // `&str` is a borrowed string slice (read-only view); `String` is owned. The
     // `Option<String>` return is `Some(path)` if the id exists, else `None`.
@@ -2086,6 +2121,24 @@ fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultEr
 
 /// Create a brand-new file and write a single buffer (O_EXCL + 0600); removes the
 /// partial file on a write error. Shared by `export_document` and the CLI.
+/// Return `p` if it does not exist, else a sibling with a `_N` suffix, so an export
+/// never silently overwrites an existing file (mirrors the CLI extract's behaviour).
+fn unique_export_path(p: PathBuf) -> PathBuf {
+    if !p.exists() {
+        return p;
+    }
+    let parent = p.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+    let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    for n in 1..10_000 {
+        let cand = parent.join(format!("{stem}_{n}{ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    p // pathological fallback: let the O_EXCL write surface the collision as an error
+}
+
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
     harden_file(path)?;
@@ -3361,6 +3414,28 @@ mod tests {
         assert_eq!(docs.len(), 2, "extract spans every partition");
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn export_document_into_recreates_structure_and_never_overwrites() {
+        let path = tmp_path("exintodir");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("exinto", b"the deed");
+        let id = v.add_document("/real-estate/123main", "deed.pdf", &src).unwrap();
+        let root = parent_dir(&path).join("exports");
+        // First export recreates the document's virtual path under `root`.
+        let p1 = v.export_document_into(&id, &root).unwrap();
+        let vpath = v.doc_path(&id).unwrap();
+        assert_eq!(p1, root.join(vpath.trim_start_matches('/')), "structure recreated under root");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"the deed");
+        // A second export of the same document must NOT overwrite — it gets a `_N` sibling.
+        let p2 = v.export_document_into(&id, &root).unwrap();
+        assert_ne!(p1, p2, "second export never overwrites the first");
+        assert!(p2.file_name().unwrap().to_string_lossy().contains("_1"), "got {p2:?}");
+        assert_eq!(std::fs::read(&p2).unwrap(), b"the deed");
+        std::fs::remove_dir_all(&root).ok();
+        fs::remove_file(&src).ok();
+        cleanup(&path);
     }
 
     #[test]
