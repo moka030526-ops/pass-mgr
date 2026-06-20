@@ -318,6 +318,14 @@ impl OpenVault {
         sync_parent_dir(&dir);
         // Take the single-writer lock before writing anything into the directory.
         let write_lock = Some(WriteLock::acquire(&dir)?);
+        // Re-check existence UNDER the lock. The pre-lock `exists()` above is a TOCTOU: a
+        // competing creator could have written `vault.pmv` between that check and now. Once
+        // we hold the single-writer lock this check is authoritative — without it the later
+        // `save()` would `rename` a fresh, EMPTY vault over the winner's file and destroy it
+        // (data loss), not merely report a confusing error.
+        if path.exists() {
+            return Err(VaultError::AlreadyExists(path));
+        }
         // Discard any stale `.rekey` staging left in this directory. A fresh create
         // gets a brand-new vault id/key, so an unrelated leftover staging must never
         // be rolled forward over it by the next open's `recover_pending_rekey`

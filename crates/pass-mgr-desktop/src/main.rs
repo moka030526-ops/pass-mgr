@@ -305,8 +305,19 @@ fn main() -> ExitCode {
     // specific command name (with `|` allowing aliases like decrypt/export). The
     // chosen arm calls the matching handler, and the resulting `Result` is stored.
     let result = match cmd {
-        Some("decrypt" | "export") => cli_decrypt(vault_dir_arg(1)),
-        Some("manifest") => cli_manifest(vault_dir_arg(1), part),
+        // `decrypt [DIR]` / `manifest [DIR]` — like the sibling commands, reject extra
+        // positionals instead of silently ignoring them (an index-based `.get(1)` dropped
+        // a mistyped/extra arg, masking a mistake about which vault was acted on).
+        Some("decrypt" | "export") => match pos.len() {
+            1 => cli_decrypt(default_vault_path()),
+            2 => cli_decrypt(vault_file(&pos[1])),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr decrypt [DIR]")),
+        },
+        Some("manifest") => match pos.len() {
+            1 => cli_manifest(default_vault_path(), part),
+            2 => cli_manifest(vault_file(&pos[1]), part),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr manifest [DIR] [--part N]")),
+        },
         // `extract [DIR] OUT` — the output directory is always the LAST argument.
         Some("extract") => match pos.len() {
             2 => cli_extract(default_vault_path(), PathBuf::from(&pos[1]), part),
@@ -855,7 +866,20 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
+    // RAII guard: restore cooked/echo mode on EVERY exit path — including a panic unwinding
+    // out of event::read()/crossterm. Without it a panic between enable_raw_mode and the
+    // explicit restore would leave the user's shell in raw, no-echo mode (they'd have to
+    // blindly run `reset`/`stty sane`), and a password typed into a following command could
+    // be mishandled. Mirrors the panic-safe terminal restore ratatui::init() gives the TUI.
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode(); // idempotent: harmless if already restored below
+        }
+    }
+
     enable_raw_mode()?;
+    let _guard = RawModeGuard;
     // Pre-reserve so per-keystroke `push` never grows the buffer: a reallocation frees the
     // old backing store (holding the password prefix) WITHOUT zeroizing it, and `Zeroizing`
     // only wipes the final allocation on drop. 256 covers any realistic passphrase (mirrors
@@ -863,7 +887,7 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     let mut input = Zeroizing::new(String::with_capacity(256));
     // `loop {}` runs forever until a `break` exits it; `break value` makes the loop
     // *evaluate to* that value, which is assigned to `outcome` here.
-    let outcome = loop {
+    let outcome: anyhow::Result<()> = loop {
         match event::read() {
             // Match an `Ok(Event::Key(k))` only when the extra `if` guard holds
             // (a key *press*, not a release/repeat). The inner `match` then
@@ -875,21 +899,26 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
                 KeyCode::Backspace => {
                     input.pop();
                 }
+                // Esc ABORTS the prompt (distinct from Enter-on-empty): return a
+                // cancellation error so the caller stops cleanly rather than proceeding
+                // with an empty password toward, e.g., a destructive `compact` run.
                 KeyCode::Esc => {
                     input.clear();
-                    break Ok(());
+                    break Err(anyhow::anyhow!("input cancelled"));
                 }
                 // `_` is the wildcard arm: ignore every other key.
                 _ => {}
             },
             // Non-key events are ignored; a read error breaks out carrying the error.
             Ok(_) => {}
-            Err(e) => break Err(e),
+            Err(e) => break Err(e.into()),
         }
     };
+    // Restore cooked mode before the trailing newline so it prints normally (the guard is a
+    // panic-path backstop; this explicit call keeps the newline ordering and is idempotent).
     disable_raw_mode()?;
     eprintln!();
-    // Propagate a read error now (after raw mode is restored), then hand back input.
+    // Propagate a cancellation / read error now (after raw mode is restored), then hand back.
     outcome?;
     Ok(input)
 }

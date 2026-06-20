@@ -2192,10 +2192,10 @@ impl GuiApp {
         // Pre-size the password buffer so typing in the egui field doesn't reallocate
         // and strand un-zeroized fragments of the account secret in freed heap. The
         // Account record is ZeroizeOnDrop, but that only wipes the final buffer, not
-        // the copies abandoned by per-keystroke growth. `reserve` is a no-op once the
-        // capacity is sufficient, so this is cheap to call each frame.
+        // the copies abandoned by per-keystroke growth. `presize_secret` is a no-op once
+        // the capacity is sufficient, so this is cheap to call each frame.
         if let Some(r) = self.edit_account.as_mut() {
-            r.password.reserve(128);
+            presize_secret(&mut r.password);
         }
         if generate
             && let Some(r) = self.edit_account.as_mut()
@@ -2342,13 +2342,12 @@ impl GuiApp {
         // (and so reallocates) them — a reallocation frees the old buffer WITHOUT
         // zeroizing, stranding cleartext fragments of a portal password in freed
         // heap. RealEstate is ZeroizeOnDrop, but that only wipes the final buffer,
-        // not abandoned reallocations. Same mitigation as the Accounts password
-        // field; `reserve` is a no-op once capacity is sufficient.
+        // not abandoned reallocations. Same mitigation as the Accounts password field.
         if let Some(r) = self.edit_realestate.as_mut() {
-            r.property_mgmt_password.reserve(128);
-            r.insurance_password.reserve(128);
-            r.hoa_password.reserve(128);
-            r.tax_portal_password.reserve(128);
+            presize_secret(&mut r.property_mgmt_password);
+            presize_secret(&mut r.insurance_password);
+            presize_secret(&mut r.hoa_password);
+            presize_secret(&mut r.tax_portal_password);
         }
         if let Some(pw) = copy_pw {
             self.copy_to_clipboard(pw);
@@ -3085,6 +3084,22 @@ fn account_required_field_error(a: &Account) -> Option<&'static str> {
     }
 }
 
+/// Give a freshly-cloned secret field 128 bytes of spare capacity so later per-keystroke
+/// edits don't reallocate (which frees the old buffer WITHOUT zeroizing, stranding cleartext
+/// in freed heap). Calling `String::reserve` directly on the clone would ITSELF reallocate —
+/// the clone has capacity == len — committing the very leak it means to prevent. So we move
+/// the value into a roomier buffer and zeroize the original. A no-op once headroom exists
+/// (e.g. an empty new-record field), so it is cheap to call every frame.
+fn presize_secret(s: &mut String) {
+    if s.capacity() >= s.len() + 128 {
+        return;
+    }
+    let mut roomy = String::with_capacity(s.len() + 128);
+    roomy.push_str(s);
+    s.zeroize(); // wipe the cloned buffer before it is freed by the move below
+    *s = roomy;
+}
+
 /// A single-line text field that is editable when `writable`, and otherwise shown as
 /// an **immutable but still selectable/copyable** field. egui edits require a *mutable*
 /// `TextBuffer` while selection only needs an interactive widget — so binding a `&str`
@@ -3359,15 +3374,19 @@ fn secret_text_edit(
     // untouched.
     if resp.has_focus() {
         let mut copied: Vec<String> = ui.ctx().output_mut(|o| {
+            // MOVE the secret out of each CopyText command (leaving an empty String) rather
+            // than cloning it: a `retain` that cloned then returned false would DROP the
+            // command's original String — the cleartext password egui staged for the
+            // clipboard — without zeroizing it, stranding it in freed heap. mem::take leaves
+            // an empty String behind, which the retain below then drops harmlessly.
             let mut taken = Vec::new();
-            o.commands.retain(|c| {
+            for c in o.commands.iter_mut() {
                 if let egui::OutputCommand::CopyText(t) = c {
-                    taken.push(t.clone());
-                    false // drop it so eframe's plain set_text never runs
-                } else {
-                    true
+                    taken.push(std::mem::take(t));
                 }
-            });
+            }
+            // Remove the (now-emptied) CopyText commands so eframe's plain set_text never runs.
+            o.commands.retain(|c| !matches!(c, egui::OutputCommand::CopyText(_)));
             taken
         });
         // Surface the intercepted secret to the caller so it routes through the app's

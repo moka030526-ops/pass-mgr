@@ -35,9 +35,15 @@ pub fn vault_file(dir: &str) -> PathBuf {
 /// CLI subcommands to the console binary.
 pub fn resolve_interactive(args: &[String]) -> (PathBuf, bool) {
     let writable = args.iter().any(|a| a == "--write");
+    // Treat ONLY the exact known flags as flags — NOT any '-'-prefixed token. A blanket
+    // `starts_with('-')` filter silently ignored a vault directory whose name begins with
+    // '-' (falling back to the default vault) while the console binary, which strips only the
+    // exact `--write`/`--tui` tokens, treated it as the directory — so `pass-mgr DIR` and
+    // `pass-mgr-gui DIR` could open DIFFERENT vaults. Matching the exact set keeps both
+    // binaries' resolution identical (the module's stated guarantee).
     let path = args
         .iter()
-        .find(|a| !a.starts_with('-'))
+        .find(|a| !matches!(a.as_str(), "--write" | "--tui"))
         .map(|d| vault_file(d))
         .unwrap_or_else(default_vault_path);
     (path, writable)
@@ -73,5 +79,12 @@ mod tests {
         let (p, w) = resolve_interactive(&["/v".into(), "--write".into()]);
         assert_eq!(p, PathBuf::from("/v/vault.pmv"));
         assert!(w);
+
+        // A directory whose NAME begins with '-' is still recognized (only the exact known
+        // flags are treated as flags), so this binary opens the same vault the console
+        // binary would — not the silent default.
+        let (p, w) = resolve_interactive(&["-weird-dir".into()]);
+        assert_eq!(p, PathBuf::from("-weird-dir/vault.pmv"));
+        assert!(!w);
     }
 }
