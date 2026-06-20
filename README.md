@@ -141,12 +141,18 @@ along with everything else.
 
 1. In **Edit mode**, open a **Trust and Will**, **Assets and Liabilities**, or
    **General Documents** entry (these hold one document each).
-2. Optionally type a **Subfolder** to organize the file, set the **Filename** to
-   save it as, then pick the file to **Upload / Attach** from your computer.
+2. Optionally type a **Subfolder** to organize the file, optionally set a **Filename**
+   to save it as, then pick the file to **Upload / Attach** from your computer.
+   *If you leave the Filename blank, the uploaded file keeps its own name.*
 3. Save. The document is now encrypted inside your vault.
 
-To get a document back out later, open the entry and use **Export** to save a copy
-to your computer.
+**Getting documents back out (Export).** First set an **Export destination** folder
+once, in the **Config** screen. After that, the **Export** button on any document
+writes a decrypted copy into that folder, automatically recreating the same folder
+layout it had inside the vault — you're never asked for a path. (Exports never
+overwrite: a repeat export gets a `_1`, `_2`, … suffix.) The export folder is a
+setting on *your computer*, so it can be set and used even when the vault is opened
+**read-only** — handy for a family member extracting documents.
 
 On the **Taxes** and **Real Estate** tabs it works the same way, but each entry can
 hold **several** documents: open (or create) the entry, then upload as many files as
@@ -160,16 +166,25 @@ only the optional subfolder and the filename.
 
 ## Showing or copying a password
 
-- Open an **Accounts** entry. Use **reveal** to show a hidden password.
+- On the **Accounts** (and **Real Estate**) tab, use the single **reveal all**
+  checkbox to show the hidden passwords. It's a momentary switch — it turns itself
+  off when you leave the tab, so passwords don't stay visible by accident.
 - Use **Copy** to copy a password so you can paste it elsewhere. For your safety
   the program **automatically clears the clipboard 15 seconds later** (and when
   you close the program), so a copied password doesn't linger.
 
 ## Changing the colors (theme)
 
-Open the **Config** screen and pick a **Color theme** (Light, Dark, High contrast,
-Solarized, or Sepia). The change applies immediately and is remembered for next
-time. It's only a display preference — it changes nothing about your data.
+Open the **Config** screen and pick a **Color theme** — ten palettes: Light, Dark,
+High contrast, Solarized, Sepia, Nord, Dracula, Gruvbox Dark, Gruvbox Light, and Rosé
+Pine. The change applies immediately and is remembered for next time. It's only a
+display preference — it changes nothing about your data.
+
+## Getting help inside the program
+
+Click **❓ Help** in the top bar for a built-in, sectioned guide (this README in
+short form) plus the exact locations of your vault and the small preferences file on
+this computer.
 
 ## Making a backup (please do this regularly)
 
@@ -293,6 +308,18 @@ Your uploaded documents are stored right next to it, inside `manifest/` and
 useless to anyone without your two passwords — so treat the **whole folder** as one
 unit: back it up together, and don't move or delete pieces of it. Keep it — and your
 backups — safe.
+
+Two small **preferences** (your chosen color theme and your export-destination
+folder) are kept separately, in a tiny **non-secret** `prefs.json` — it holds no vault
+data, so it's fine if it's lost:
+
+| Your system | Where `prefs.json` is |
+|-------------|------------------------|
+| Windows | `C:\Users\<you>\AppData\Roaming\passmgr\pass-mgr\config\prefs.json` |
+| macOS | `~/Library/Application Support/dev.passmgr.pass-mgr/prefs.json` |
+| Linux | `~/.config/pass-mgr/prefs.json` |
+
+(The **❓ Help** screen shows the exact paths for your machine.)
 
 ---
 

@@ -250,10 +250,12 @@ enforced in two layers:
   buffer (an egui edit needs a *mutable* `TextBuffer`, selection needs only an
   interactive widget), so a read-only user can highlight and copy a value but not
   change it (combos/checkboxes are simply disabled); the TUI's `handle_edit_key` drops
-  typing / backspace / choice-cycling unless `writable`. The **only** changeable
-  setting is the color theme (a non-vault preference, §13 / `save_theme`); the
-  backup-destination and document-export paths stay editable because backup and export
-  are themselves read-only-safe operations.
+  typing / backspace / choice-cycling unless `writable`. The changeable settings in
+  read-only mode are the **local, non-secret preferences** kept in `prefs.json` (not the
+  vault) — the **color theme** and the **export directory** — plus the backup-destination
+  field; backup and document export are themselves read-only-safe reads. Storing the
+  export directory as a preference (rather than in the vault) is what lets a read-only
+  session set where to extract documents, so read-only document export keeps working.
 
 Because the category lists now live **inside the vault** (not in external files),
 a read-only session writes **nothing** to disk at all — there are no auxiliary
@@ -613,11 +615,21 @@ currently exposes the first five record types.) The four screens are:
    per record by `referenced_doc_ids`. The attach path enforces the 256-byte
    virtual-path limit (the GUI disables the button with an inline error, the TUI
    rejects the upload key) and persists the record→document link before reclaiming
-   any old blob (crash-safe ordering, §11).
-4. **Config (write mode only).** Edit the category lists (asset types, account
-   types + subtypes) and the **volume size** (`volume_max_size`), and run a
-   `backup`. All edits persist into the encrypted vault — there are no external
-   config files.
+   any old blob (crash-safe ordering, §11). On attach, **a blank filename defaults to
+   the source file's basename** (`records::effective_doc_filename`). In the GUI,
+   **Export** takes no per-document path: it writes the decrypted file into the
+   configured **export directory**, recreating the document's virtual folder structure
+   under it (`<export_dir>/<location>/<filename>`, via `OpenVault::export_document_into`,
+   which re-sanitizes each path component and never overwrites — `_N` suffix).
+4. **Config.** Edit the category lists (asset types, account types + subtypes), the
+   **volume size** (`volume_max_size`), and the **redundancy** depth, and run a
+   `backup` — all **write-mode only**, persisting into the encrypted vault (no external
+   config files). Two items are **local, non-secret preferences** stored in a small
+   `prefs.json` (in the OS config dir) instead of the vault — the **color theme** (10 palettes) and the
+   **export directory** — so both can be changed even in **read-only** mode (the export
+   directory is about the local machine, not vault content, which keeps read-only
+   document export — the heir use case — working). A separate **Help** screen renders a
+   sectioned in-app guide plus the on-disk vault and `prefs.json` paths.
 
 Read-only is the default and is enforced in the core (§4.4), with the UIs hiding
 write controls and showing a read-only badge.
