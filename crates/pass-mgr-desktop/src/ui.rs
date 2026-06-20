@@ -1760,8 +1760,15 @@ impl App {
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
         let subfolder = es.fields[rc + 3].value.clone();
-        if filename.trim().is_empty() || source.trim().is_empty() {
-            self.status = "Doc filename and 'upload from' are required.".into();
+        if source.trim().is_empty() {
+            self.status = "'Upload from' is required.".into();
+            self.edit = Some(es);
+            return;
+        }
+        // If no filename is given, default to the source file's own name.
+        let filename = records::effective_doc_filename(&filename, &source);
+        if filename.trim().is_empty() {
+            self.status = "Doc filename is required (the source path has no file name).".into();
             self.edit = Some(es);
             return;
         }
@@ -1918,8 +1925,15 @@ impl App {
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
         let subfolder = es.fields[rc + 3].value.clone();
-        if filename.trim().is_empty() || source.trim().is_empty() {
-            self.status = "Doc filename and 'upload from' are required.".into();
+        if source.trim().is_empty() {
+            self.status = "'Upload from' is required.".into();
+            self.edit = Some(es);
+            return;
+        }
+        // If no filename is given, default to the source file's own name.
+        let filename = records::effective_doc_filename(&filename, &source);
+        if filename.trim().is_empty() {
+            self.status = "Doc filename is required (the source path has no file name).".into();
             self.edit = Some(es);
             return;
         }
@@ -2038,8 +2052,15 @@ impl App {
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
         let subfolder = es.fields[rc + 3].value.clone();
-        if filename.trim().is_empty() || source.trim().is_empty() {
-            self.status = "Doc filename and 'upload from' are required.".into();
+        if source.trim().is_empty() {
+            self.status = "'Upload from' is required.".into();
+            self.edit = Some(es);
+            return;
+        }
+        // If no filename is given, default to the source file's own name.
+        let filename = records::effective_doc_filename(&filename, &source);
+        if filename.trim().is_empty() {
+            self.status = "Doc filename is required (the source path has no file name).".into();
             self.edit = Some(es);
             return;
         }
@@ -3605,21 +3626,34 @@ mod tests {
     }
 
     #[test]
-    fn re_attach_requires_filename_and_source() {
+    fn re_attach_requires_source_and_defaults_filename_in_tui() {
         let (mut app, path) = app_unlocked("uirereq");
         {
             let v = &mut app.vault.as_mut().unwrap().vault;
-            records::upsert(&mut v.real_estate, RealEstate::new().unwrap());
+            let mut re = RealEstate::new().unwrap();
+            re.address = "1 Main".into();
+            records::upsert(&mut v.real_estate, re);
         }
         app.tab = Tab::RealEstate;
         app.selected = 0;
         app.start_edit(true);
         let rc = app.edit.as_ref().unwrap().record_fields;
-        app.edit.as_mut().unwrap().fields[rc].value = String::new();
-        app.edit.as_mut().unwrap().fields[rc + 1].value = "/some/path".into();
+        // (1) A source is required even when a filename IS given.
+        app.edit.as_mut().unwrap().fields[rc].value = "deed.pdf".into();
+        app.edit.as_mut().unwrap().fields[rc + 1].value = String::new();
         app.attach_re_document();
-        assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "missing filename → no upload");
+        assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "missing source → no upload");
         assert!(app.status.contains("required"), "rejected as a missing-input error");
+        // (2) Empty filename + a real source file → uploads using the source's basename.
+        let src = path.parent().unwrap().join("Deed.PDF");
+        std::fs::write(&src, b"x").unwrap();
+        app.edit.as_mut().unwrap().fields[rc].value = String::new();
+        app.edit.as_mut().unwrap().fields[rc + 1].value = src.to_string_lossy().into();
+        app.attach_re_document();
+        assert_eq!(app.edit.as_ref().unwrap().re_docs.len(), 1, "uploaded with defaulted filename (status: {})", app.status);
+        let id = app.edit.as_ref().unwrap().re_docs[0].clone();
+        let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
+        assert!(vpath.ends_with("/Deed.PDF"), "empty filename used the source basename: {vpath}");
         cleanup(&path);
     }
 
