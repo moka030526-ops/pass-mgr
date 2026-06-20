@@ -399,7 +399,7 @@ enum Screen {
     Help,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum AuthMode {
     Create,
     Unlock,
@@ -465,6 +465,10 @@ struct GuiApp {
     screen: Screen,
     // Auth.
     auth_mode: AuthMode,
+    /// The directory whose `vault.pmv` we open/create — editable on the start page so the
+    /// user can point at a different vault (or, in --write mode, create one in a new dir).
+    /// Kept in sync with `path` (`path == <vault_dir>/vault.pmv`).
+    vault_dir: String,
     pw1: String,
     confirm1: String,
     pw2: String,
@@ -567,6 +571,12 @@ impl GuiApp {
         // `if ... { } else { }` is an expression here: its value initializes
         // `auth_mode` (unlock an existing vault file, else offer to create one).
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
+        // The directory shown (and editable) on the start page — the parent of vault.pmv.
+        let vault_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         // Load the saved theme; `applied_theme` starts equal to it so the first
         // frame doesn't needlessly re-apply/re-save (the same value `run` already set).
         let theme = load_theme();
@@ -575,6 +585,7 @@ impl GuiApp {
             writable,
             screen: Screen::Auth,
             auth_mode,
+            vault_dir,
             // Pre-reserve generous capacity so typing a password never grows (and so
             // reallocates) these buffers, which would strand un-zeroized fragments of
             // the master password in freed heap. `wipe_passwords`/`Drop` wipe the live
@@ -846,6 +857,15 @@ impl GuiApp {
         }
     }
 
+    /// Point the start page at the directory in `self.vault_dir`: re-derive the vault path
+    /// (`<dir>/vault.pmv`) and flip the mode — Unlock if a vault already exists there, else
+    /// Create (which, in --write mode, will create the directory + vault on submit).
+    fn apply_vault_dir(&mut self) {
+        self.path = crate::launch::vault_file(self.vault_dir.trim());
+        self.auth_mode = if self.path.exists() { AuthMode::Unlock } else { AuthMode::Create };
+        self.auth_error = None;
+    }
+
     fn wipe_passwords(&mut self) {
         self.pw1.zeroize();
         self.confirm1.zeroize();
@@ -858,6 +878,27 @@ impl GuiApp {
     fn ui_auth(&mut self, ui: &mut egui::Ui) {
         // `match` used as an expression: it yields a `(heading, help)` pair which
         // we immediately destructure into two named bindings.
+        ui.add_space(28.0);
+        // On the start page (not the in-vault Change-password flow) let the user pick the
+        // vault DIRECTORY. The field is editable in BOTH read-only and --write mode and is
+        // pre-filled with the default/launch directory. Changing it re-derives the vault path
+        // and flips between Unlock (a vault.pmv already exists there) and Create (it doesn't).
+        // Rendered FIRST so the heading/confirm-fields below reflect the just-updated mode.
+        if self.auth_mode != AuthMode::ChangePassword {
+            ui.vertical_centered(|ui| {
+                ui.label("Vault directory");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.vault_dir)
+                        .hint_text("/path/to/vault-folder")
+                        .desired_width(360.0),
+                );
+                if resp.changed() {
+                    self.apply_vault_dir();
+                }
+            });
+            ui.add_space(8.0);
+        }
+
         let (heading, help) = match self.auth_mode {
             AuthMode::Create => ("Create vault", "Choose two passwords. Both are required to open this vault."),
             AuthMode::Unlock => ("Unlock vault", "Enter both passwords to unlock."),
@@ -865,13 +906,19 @@ impl GuiApp {
         };
         let confirm = self.auth_mode != AuthMode::Unlock;
 
-        ui.add_space(28.0);
         // `|ui| { ... }` is a closure (anonymous function). egui passes a child
         // `ui` into it so everything inside is laid out vertically and centered.
         ui.vertical_centered(|ui| {
             ui.heading(heading);
             ui.label(egui::RichText::new(format!("Vault: {}", self.path.display())).weak());
             ui.label(help);
+            // In read-only mode an empty directory can't be created — say so plainly.
+            if self.auth_mode == AuthMode::Create && !self.writable {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 120, 50),
+                    "No vault in this folder. Read-only — relaunch with --write to create one.",
+                );
+            }
         });
         ui.add_space(16.0);
 
@@ -3482,6 +3529,61 @@ mod tests {
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
+    }
+
+    #[test]
+    fn start_page_prefills_vault_dir_and_switches_mode_with_directory() {
+        // The start page pre-fills the vault directory (the default/launch dir) and flips
+        // Unlock<->Create as the directory changes; in --write mode an empty dir creates.
+        let base = std::env::temp_dir().join(format!("passmgr-gui-startdir-{}", nanos()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Launched at a non-existent path -> Create, and vault_dir is pre-filled with the dir.
+        let start = base.join("fresh").join("vault.pmv");
+        let mut app = GuiApp::new(start.clone(), true);
+        assert_eq!(app.auth_mode, AuthMode::Create, "no vault yet -> Create");
+        assert_eq!(app.vault_dir, base.join("fresh").display().to_string(), "dir pre-filled");
+
+        // Point at a brand-new directory and create the vault there.
+        let fresh = base.join("brandnew");
+        app.vault_dir = fresh.display().to_string();
+        app.apply_vault_dir();
+        assert_eq!(app.auth_mode, AuthMode::Create, "empty dir stays Create");
+        app.pw1 = "a".into();
+        app.confirm1 = "a".into();
+        app.pw2 = "b".into();
+        app.confirm2 = "b".into();
+        app.submit_auth();
+        assert!(app.vault.is_some(), "vault created in the new dir; status: {}", app.status);
+        assert!(fresh.join("vault.pmv").exists(), "vault.pmv created on disk");
+
+        // A new app pointed at that now-existing dir resolves to Unlock.
+        let app2 = GuiApp::new(fresh.join("vault.pmv"), true);
+        assert_eq!(app2.auth_mode, AuthMode::Unlock, "existing vault -> Unlock");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn start_page_read_only_cannot_create_in_empty_dir() {
+        // Pointing read-only mode at a directory with no vault: Create mode is shown, but
+        // submit refuses (you can't create a vault read-only) — the field stays usable so
+        // an heir can still point at a real vault to READ.
+        let base = std::env::temp_dir().join(format!("passmgr-gui-rodir-{}", nanos()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut app = GuiApp::new(base.join("empty").join("vault.pmv"), false); // read-only
+        assert_eq!(app.auth_mode, AuthMode::Create);
+        app.pw1 = "a".into();
+        app.confirm1 = "a".into();
+        app.pw2 = "b".into();
+        app.confirm2 = "b".into();
+        app.submit_auth();
+        assert!(app.vault.is_none(), "read-only must not create a vault");
+        assert!(
+            app.auth_error.as_deref().unwrap_or("").contains("--write"),
+            "error explains --write is needed; got {:?}",
+            app.auth_error
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

@@ -570,11 +570,20 @@ Taxes, and General Documents — over four screens. (The read-only mobile viewer
 currently exposes the first five record types.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
-   On a missing vault it switches to a create flow that asks for each password
-   twice to confirm. After unlock it shows the last-opened time and the write
-   `generation` (req. 6; a jump backwards in generation hints at a rollback,
-   §9.12). The same screen drives **change-password** (re-key), which calls
-   `OpenVault::change_password`.
+   The start page also exposes an editable **vault-directory** field (GUI text box;
+   TUI focus-0 row), pre-filled with the launch/default directory, so the user can
+   point at a different vault folder without relaunching. Changing it re-derives the
+   vault path (`<dir>/vault.pmv`, via `launch::vault_file`) and re-evaluates the mode:
+   **Unlock** if a `vault.pmv` already exists there, else **Create**. The field is
+   editable in **both** read-only and `--write` mode (an heir can browse to an
+   existing vault to read it), but creating a vault in an empty directory requires
+   `--write` (read-only shows an inline "relaunch with --write" hint and refuses);
+   `OpenVault::create` makes the directory if it doesn't exist. The mode flip rebuilds
+   the password fields (Create asks for each password twice to confirm). After unlock
+   it shows the last-opened time and the write `generation` (req. 6; a jump backwards
+   in generation hints at a rollback, §9.12). The same screen drives
+   **change-password** (re-key) — which hides the directory field (you are already in
+   a vault) — and calls `OpenVault::change_password`.
 2. **Browse.** The selected tab's records as a list, with per-tab **filters**
    (Accounts by title/type/subtype/owner/"needs review"; Assets by "needs review")
    driven by the in-vault category lists, plus a free-text **search** on the Accounts

@@ -158,7 +158,7 @@ impl Tab {
 
 // --- Auth state --------------------------------------------------------------
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum AuthMode {
     Create,
     Unlock,
@@ -389,6 +389,9 @@ struct App {
     writable: bool,
     screen: Screen,
     auth: AuthState,
+    /// The directory whose `vault.pmv` we open/create — editable on the start page (focus 0
+    /// of the auth screen, unless changing the master passwords). Kept in sync with `path`.
+    auth_dir: String,
     // The unlocked vault, present only after a successful unlock/create
     // (`None` while on the Auth screen).
     vault: Option<OpenVault>,
@@ -458,11 +461,18 @@ impl Drop for App {
 impl App {
     fn new(path: PathBuf, writable: bool) -> Self {
         let mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
+        // The directory shown (and editable) on the start page — the parent of vault.pmv.
+        let auth_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         App {
             path,
             writable,
             screen: Screen::Auth,
             auth: AuthState::new(mode),
+            auth_dir,
             vault: None,
             tab: Tab::Instructions,
             selected: 0,
@@ -745,23 +755,38 @@ impl App {
                 return true;
             }
             // Guarded arm: a typed character that is NOT a Ctrl-combo. `Char(c)`
-            // binds the typed char to `c`; append it to the focused field's value.
+            // binds the typed char to `c`; append it to the focused field. Focus 0 is the
+            // editable vault-directory field (on the start page); focuses 1.. are the
+            // password fields, so subtract the dir slot to index `auth.fields`.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.auth.fields[self.auth.focus].value.push(c);
+                if self.on_auth_dir_field() {
+                    self.auth_dir.push(c);
+                    self.apply_auth_dir();
+                } else {
+                    let idx = self.auth_field_index();
+                    self.auth.fields[idx].value.push(c);
+                }
             }
             KeyCode::Backspace => {
                 // `.pop()` removes the last char (returns an `Option`, ignored here).
-                self.auth.fields[self.auth.focus].value.pop();
+                if self.on_auth_dir_field() {
+                    self.auth_dir.pop();
+                    self.apply_auth_dir();
+                } else {
+                    let idx = self.auth_field_index();
+                    self.auth.fields[idx].value.pop();
+                }
             }
             KeyCode::Tab | KeyCode::Down => {
-                self.auth.focus = (self.auth.focus + 1) % self.auth.fields.len();
+                let total = self.auth_focus_count();
+                self.auth.focus = (self.auth.focus + 1) % total;
             }
             KeyCode::BackTab | KeyCode::Up => {
-                let n = self.auth.fields.len();
-                self.auth.focus = (self.auth.focus + n - 1) % n;
+                let total = self.auth_focus_count();
+                self.auth.focus = (self.auth.focus + total - 1) % total;
             }
             KeyCode::Enter => {
-                if self.auth.focus + 1 < self.auth.fields.len() {
+                if self.auth.focus + 1 < self.auth_focus_count() {
                     self.auth.focus += 1;
                 } else {
                     self.submit_auth();
@@ -770,6 +795,37 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// The start page shows an editable vault-DIRECTORY field at focus 0; the in-vault
+    /// Change-password flow does not (you are already in a vault).
+    fn auth_has_dir_field(&self) -> bool {
+        self.auth.mode != AuthMode::ChangePassword
+    }
+    /// Total focusable rows: the optional dir field plus the password fields.
+    fn auth_focus_count(&self) -> usize {
+        self.auth.fields.len() + usize::from(self.auth_has_dir_field())
+    }
+    /// True when the current focus is on the dir field (focus 0, when shown).
+    fn on_auth_dir_field(&self) -> bool {
+        self.auth_has_dir_field() && self.auth.focus == 0
+    }
+    /// Index into `auth.fields` for the current focus (assumes NOT on the dir field).
+    fn auth_field_index(&self) -> usize {
+        self.auth.focus - usize::from(self.auth_has_dir_field())
+    }
+
+    /// Point the start page at the directory in `auth_dir`: re-derive the vault path
+    /// (`<dir>/vault.pmv`) and flip the mode — Unlock if a vault already exists there, else
+    /// Create. A mode change rebuilds the password fields (Create adds confirm fields),
+    /// which also clears any half-typed passwords; focus stays on the dir field.
+    fn apply_auth_dir(&mut self) {
+        self.path = crate::launch::vault_file(self.auth_dir.trim());
+        let new_mode = if self.path.exists() { AuthMode::Unlock } else { AuthMode::Create };
+        if new_mode != self.auth.mode {
+            self.auth = AuthState::new(new_mode);
+            self.auth.focus = 0; // remain on the directory field
+        }
     }
 
     // Returns `Result<(Zeroizing<String>, Zeroizing<String>), String>`:
@@ -901,11 +957,13 @@ impl App {
             // password-INDEPENDENT errors keep their specific messages in the catch-all.
             Err(VaultError::Crypto(_) | VaultError::ArchiveMismatch | VaultError::Json(_) | VaultError::Storage(_)) => {
                 self.auth = AuthState::new(self.auth.mode);
+                self.auth.focus = usize::from(self.auth_has_dir_field()); // land on the first password, past the dir field
                 self.auth.error = Some("Wrong password(s) or corrupted/unreadable vault.".into());
             }
             // Catch-all for any other (password-independent) error variant.
             Err(e) => {
                 self.auth = AuthState::new(self.auth.mode);
+                self.auth.focus = usize::from(self.auth_has_dir_field());
                 self.auth.error = Some(format!("{e}"));
             }
         }
@@ -2592,8 +2650,33 @@ impl App {
             Line::from(Span::styled(help, Style::default().fg(Color::Gray))),
             Line::from(""),
         ];
+        // Editable vault-DIRECTORY field at focus 0 on the start page (not when changing
+        // passwords). Shown in clear (it is a path, not a secret) and highlighted when focused.
+        let has_dir = self.auth_has_dir_field();
+        if has_dir {
+            let focused = self.auth.focus == 0;
+            let marker = if focused { "> " } else { "  " };
+            let style = if focused {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<22}", "Vault directory"), style),
+                Span::raw(self.auth_dir.clone()),
+            ]));
+            // In read-only mode an empty directory can't be created — say so.
+            if self.auth.mode == AuthMode::Create && !self.writable {
+                lines.push(Line::from(Span::styled(
+                    "  (no vault in this folder; read-only — relaunch with --write to create one)",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+        // Password fields follow; their focus index is offset by the dir field (if shown).
+        let offset = usize::from(has_dir);
         for (i, field) in self.auth.fields.iter().enumerate() {
-            let focused = i == self.auth.focus;
+            let focused = i + offset == self.auth.focus;
             let marker = if focused { "> " } else { "  " };
             // Never render the actual password: show one `*` per character.
             // `.chars().count()` counts Unicode characters (not raw bytes).
@@ -3002,6 +3085,67 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn start_page_vault_dir_field_switches_mode_and_creates() {
+        // The start page exposes an editable vault-directory field at focus 0; it pre-fills
+        // the launch dir, flips Unlock<->Create as the directory changes, and (in --write
+        // mode) creates the vault in a brand-new directory.
+        let base = std::env::temp_dir()
+            .join(format!("passmgr-ui-startdir-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut app = App::new(base.join("fresh").join("vault.pmv"), true);
+        assert_eq!(app.auth.mode, AuthMode::Create, "no vault yet -> Create");
+        assert!(app.auth_has_dir_field(), "dir field shown on the start page");
+        assert_eq!(app.auth_dir, base.join("fresh").display().to_string(), "dir pre-filled");
+        // Focus 0 is the dir field; typing edits the directory, not a password.
+        assert!(app.on_auth_dir_field());
+        app.handle_auth_key(key(KeyCode::Char('X')));
+        assert!(app.auth_dir.ends_with('X'), "typing on focus 0 edits the directory");
+        app.handle_auth_key(key(KeyCode::Backspace));
+
+        // Point at a brand-new directory and create the vault there.
+        let fresh = base.join("brandnew");
+        app.auth_dir = fresh.display().to_string();
+        app.apply_auth_dir();
+        assert_eq!(app.auth.mode, AuthMode::Create);
+        // Create has 4 password fields (pw1, confirm1, pw2, confirm2); the dir field is
+        // separate, so fill auth.fields directly.
+        app.auth.fields[0].value = "a".into();
+        app.auth.fields[1].value = "a".into();
+        app.auth.fields[2].value = "b".into();
+        app.auth.fields[3].value = "b".into();
+        app.submit_auth();
+        assert!(app.vault.is_some(), "vault created in the new dir; error: {:?}", app.auth.error);
+        assert!(fresh.join("vault.pmv").exists(), "vault.pmv created on disk");
+
+        // A fresh App pointed at that now-existing dir resolves to Unlock.
+        let app2 = App::new(fresh.join("vault.pmv"), true);
+        assert_eq!(app2.auth.mode, AuthMode::Unlock, "existing vault -> Unlock");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn start_page_read_only_cannot_create_in_empty_dir_tui() {
+        let base = std::env::temp_dir()
+            .join(format!("passmgr-ui-rodir-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut app = App::new(base.join("empty").join("vault.pmv"), false); // read-only
+        assert_eq!(app.auth.mode, AuthMode::Create);
+        app.auth.fields[0].value = "a".into();
+        app.auth.fields[1].value = "a".into();
+        app.auth.fields[2].value = "b".into();
+        app.auth.fields[3].value = "b".into();
+        app.submit_auth();
+        assert!(app.vault.is_none(), "read-only must not create a vault");
+        assert!(
+            app.auth.error.as_deref().unwrap_or("").contains("--write"),
+            "error explains --write is needed; got {:?}",
+            app.auth.error
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // `#[test]` marks a function the test runner executes; it takes no args and a

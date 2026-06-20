@@ -88,11 +88,22 @@ Choose passwords that are long and memorable to you but hard for others to guess
 
 1. Start the program (Edit shortcut if you want to change things; plain program to
    just look).
-2. Type your **first password**, then your **second password**, in the same order
+2. The start page shows a **Vault directory** box, pre-filled with the default
+   location. Leave it as-is, or point it at a different vault folder (handy if you
+   keep your vault on a USB stick or in a synced folder). The window title updates to
+   show whether that folder already has a vault (**Unlock**) or not (**Create**).
+3. Type your **first password**, then your **second password**, in the same order
    as when you created the vault.
-3. Click **Unlock**. You'll briefly see when the vault was last opened.
+4. Click **Unlock**. You'll briefly see when the vault was last opened.
 
 If a password is wrong it simply says so — try again, checking the order.
+
+**Starting a brand-new vault in a folder of your choice:** open the program in
+**Edit** mode, type (or paste) the folder path into the **Vault directory** box, and
+— if no vault exists there yet — the button changes to **Create vault**. Choose your
+two passwords and create it; the folder is made for you if it doesn't exist. (In the
+plain read-only program you can *point at* any existing vault to view it, but you
+can't create one — relaunch in Edit mode for that.)
 
 ## The six sections (tabs)
 
@@ -455,6 +466,11 @@ pass-mgr compact ./myvault --volume --dry-run             # just report what it 
   the vault folder); **`--no-backup`** skips it. Prompts for the two passwords.
 
 ### Terminal (`--tui`) key bindings
+
+**Unlock / Create:** `Tab`/`↑/↓` move between the **Vault directory** field and the two
+passwords · type to edit · `Enter` next/submit · `Esc` quit. Editing the directory
+switches between **Unlock** (a vault exists there) and **Create** (it doesn't; needs
+`--write`).
 
 **Browse:** `←/→` or `1`–`5` switch tab · `↑/↓` select · `Enter` edit · `n` new ·
 `d` delete · `t`/`s`/`o`/`v` Account filters (type/subtype/owner/review) ·
