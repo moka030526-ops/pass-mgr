@@ -387,10 +387,16 @@ fn cli_decrypt(path: PathBuf) -> anyhow::Result<()> {
     // Pass the path by shared borrow and the passwords as byte slices (`&[u8]`).
     // `.as_bytes()` borrows the string's underlying bytes without copying them.
     let vault = OpenVault::export(&path, pw1.as_bytes(), pw2.as_bytes())?;
-    // Zeroizing so the (secret-bearing) serialized JSON is wiped after printing.
-    // `&vault` lets serde read the value to serialize it without taking ownership.
-    let json = Zeroizing::new(serde_json::to_string_pretty(&vault)?);
-    println!("{}", json.as_str());
+    // Serialize the (secret-bearing) JSON into a single exactly-sized Zeroizing buffer so no
+    // mid-write reallocation strands cleartext in freed heap (see vault::serialize_secret_json),
+    // then write the bytes straight to stdout — converting to a String first would allocate
+    // and then free another full plaintext copy unwiped.
+    let json = vault::serialize_secret_json(&vault, true)?;
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(&json)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
 }
 

@@ -384,7 +384,10 @@ impl VolumeStore {
             uploaded_at, // field shorthand: same as `uploaded_at: uploaded_at`
         });
         manifest.end_offset = start.saturating_add(frame.len() as u64);
-        manifest.seq += 1;
+        // saturating_add: `seq` is deserialized verbatim from the (authenticated) manifest
+        // JSON, so a crafted seq == u64::MAX would otherwise panic here under the release
+        // build's overflow-checks. Matches the saturating discipline used for end_offset.
+        manifest.seq = manifest.seq.saturating_add(1);
         self.commit_manifest(part, &manifest, key)?; // disk commit point; `?` aborts on failure
         // Fault point: a crash here (both volume + manifest committed) is a fully
         // committed put; reopen must show the document.
@@ -415,7 +418,7 @@ impl VolumeStore {
         };
         let mut manifest = self.manifests[loc.partition as usize].clone(); // work on an owned copy
         manifest.entries.retain(|e| e.id != id); // drop this id's entry (blob stays as garbage)
-        manifest.seq += 1;
+        manifest.seq = manifest.seq.saturating_add(1); // see put(): avoid overflow panic on a crafted seq
         self.commit_manifest(loc.partition, &manifest, key)?;
         self.manifests[loc.partition as usize] = manifest;
         self.reindex();

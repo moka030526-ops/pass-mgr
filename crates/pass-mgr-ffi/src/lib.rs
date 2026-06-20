@@ -124,6 +124,7 @@ impl From<CoreVaultError> for VaultError {
             // mapped defensively to a generic internal error.
             CoreVaultError::AlreadyExists(_)
             | CoreVaultError::ReadOnly
+            | CoreVaultError::StillReferenced
             | CoreVaultError::NoSuchPartition(_) => VaultError::Internal,
         }
     }

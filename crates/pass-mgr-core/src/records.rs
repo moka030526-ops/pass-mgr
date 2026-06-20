@@ -299,6 +299,19 @@ pub(crate) fn is_spoofy_format_char(c: char) -> bool {
     )
 }
 
+/// True if `name`'s stem (the part before the first '.') is a Windows reserved DEVICE name
+/// (case-insensitive): CON, PRN, AUX, NUL, COM1–9, LPT1–9. On Windows such a name maps to a
+/// device, not a file, regardless of extension (`con.pdf` opens the console), so it must be
+/// neutralized before becoming a real filesystem path component on export.
+pub(crate) fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let s = stem.to_ascii_uppercase();
+    matches!(s.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (s.len() == 4
+            && (s.starts_with("COM") || s.starts_with("LPT"))
+            && matches!(s.as_bytes()[3], b'1'..=b'9'))
+}
+
 pub fn doc_filename(name: &str) -> String {
     let mut out: String = name
         .chars()
@@ -325,7 +338,16 @@ pub fn doc_filename(name: &str) -> String {
     // Strip leading/trailing dots and dashes (whitespace is already mapped to `-`),
     // so a dot/space-only name collapses to the fallback rather than "--..".
     let trimmed = out.trim_matches(|c: char| c == '.' || c == '-');
-    if trimmed.is_empty() { "file".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        return "file".to_string();
+    }
+    // Neutralize a Windows reserved device name so the stored (and later exported) file is a
+    // real, distinct file on Windows rather than the CON/NUL/COM1/… device. Harmless on Unix.
+    if is_windows_reserved_name(trimmed) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Resolve the upload filename: the user-typed `name` if non-empty (trimmed), else the
@@ -2423,6 +2445,24 @@ mod tests {
         // Emoji (4-byte) near the boundary likewise truncates safely on a boundary.
         let emoji = doc_filename(&"\u{1F600}".repeat(40)); // 160 bytes
         assert!(emoji.len() <= 120 && !emoji.is_empty());
+    }
+
+    #[test]
+    fn doc_filename_neutralizes_windows_reserved_names() {
+        // Reserved device-name stems are prefixed so the stored/exported file is a real file
+        // on Windows, not the device. Case-insensitive; the extension does not save it.
+        assert_eq!(doc_filename("con"), "_con");
+        assert_eq!(doc_filename("CON.pdf"), "_CON.pdf");
+        assert_eq!(doc_filename("nul"), "_nul");
+        assert_eq!(doc_filename("com1.txt"), "_com1.txt");
+        assert_eq!(doc_filename("LPT9"), "_LPT9");
+        // Not reserved: a longer name, a non-1-9 digit, or the name merely containing them.
+        assert_eq!(doc_filename("console.pdf"), "console.pdf");
+        assert_eq!(doc_filename("com0.txt"), "com0.txt");
+        assert_eq!(doc_filename("com10.txt"), "com10.txt");
+        assert_eq!(doc_filename("report-con.pdf"), "report-con.pdf");
+        assert!(is_windows_reserved_name("aux") && is_windows_reserved_name("PRN.doc"));
+        assert!(!is_windows_reserved_name("auxiliary") && !is_windows_reserved_name("lpt"));
     }
 
     #[test]

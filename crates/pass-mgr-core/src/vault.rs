@@ -110,6 +110,8 @@ pub enum VaultError {
     TooLarge,
     #[error("a document referenced by the vault is missing from the document store (possible tampering or rollback)")]
     ArchiveMismatch,
+    #[error("cannot remove a document that a record still references (unlink it from the record first)")]
+    StillReferenced,
     #[error("an interrupted password change is pending; reopen with --write to finish recovery")]
     RekeyPending,
     #[error("vault is open read-only (relaunch with --write to make changes)")]
@@ -521,8 +523,10 @@ impl OpenVault {
 
         fs::create_dir_all(out)?;
         harden_dir(out);
-        // vault.json — pretty for human inspection; the buffer wipes on drop.
-        let vault_json = Zeroizing::new(serde_json::to_vec_pretty(&vault)?);
+        // vault.json — pretty for human inspection; the buffer wipes on drop and is
+        // serialized without a mid-write realloc that would strand cleartext (see
+        // serialize_secret_json).
+        let vault_json = serialize_secret_json(&vault, true)?;
         write_new_bytes(&out.join("vault.json"), &vault_json)?;
 
         let man_dir = out.join("manifest");
@@ -591,6 +595,12 @@ impl OpenVault {
         }
         vault.settings.volume_max_size = vault.settings.volume_max_size.clamp(MIN_VOLUME_MAX_SIZE, MAX_VOLUME_MAX_SIZE);
         vault.settings.redundancy = vault.settings.redundancy.min(MAX_REDUNDANCY);
+        // Drop any tombstones carried in the mirror. The store is rebuilt below by re-putting
+        // only the LIVE manifest entries, so no tombstoned frame can exist in the new tree
+        // (the same reasoning staged_rewrite uses when it clears deleted_docs). Keeping them
+        // would let the set grow unbounded across export/import cycles and, worse, a carried
+        // tombstone whose id collides with a re-imported live blob would silently suppress it.
+        vault.deleted_docs.clear();
         let dir = parent_dir(dest);
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
@@ -700,7 +710,22 @@ impl OpenVault {
         // but ring them in only AFTER the new primary commits (below) — so a FAILED
         // save never shifts/degrades the ring. Skipped on a heal (the outgoing
         // primary is known-bad) and on the first save (nothing to retain yet).
-        let prev = if rotate_ring && depth > 0 { read_capped_vault(&self.path).ok() } else { None };
+        //
+        // Distinguish "no current primary yet" (NotFound → legitimately None, first save)
+        // from a real read error. A blanket `.ok()` would collapse a transient EIO/EACCES —
+        // or a TooLarge corruption signal — on the outgoing primary into None, silently
+        // skipping the ring rotation AND letting us overwrite a primary we could not even
+        // read. Instead, fail the save on any non-NotFound error so the caller retries; the
+        // new primary is not written yet, so nothing is lost.
+        let prev = if rotate_ring && depth > 0 {
+            match read_capped_vault(&self.path) {
+                Ok(bytes) => Some(bytes),
+                Err(VaultError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
 
         // The single authoritative commit point — identical to the non-redundant
         // path. If this fails (e.g. ENOSPC) the whole save fails, the live file is
@@ -872,8 +897,20 @@ impl OpenVault {
         // never silently drops a not-yet-reclaimed blob" guarantee.
         let mut new_store =
             VolumeStore::open(&staging, write_key, &self.vault.id, self.vault.settings.volume_max_size)?;
-        let ids: Vec<String> =
-            self.storage.ids().filter(|id| !self.vault.deleted_docs.iter().any(|d| d == id)).map(|s| s.to_string()).collect();
+        // Keep a blob if it is NOT tombstoned, OR if a record still references it. Dropping
+        // a referenced-but-tombstoned blob would leave a dangling reference in the rewritten
+        // vault (`deleted_docs.clear()` below wipes the tombstone) and brick it on next open
+        // with ArchiveMismatch. That contradictory "referenced AND tombstoned" state should
+        // not arise via the API (remove_document refuses a referenced id), but a crash that
+        // lost the unlink-save while persisting the tombstone, then a manifest-loss rebuild,
+        // can produce it — so reference wins here and the document is healed back to live.
+        let referenced = referenced_doc_ids(&self.vault);
+        let ids: Vec<String> = self
+            .storage
+            .ids()
+            .filter(|id| !self.vault.deleted_docs.iter().any(|d| d == id) || referenced.iter().any(|r| r == id))
+            .map(|s| s.to_string())
+            .collect();
         for id in &ids {
             let bytes = self.storage.read(id, &self.key)?; // decrypt under the CURRENT key
             // `id` came from `self.storage.ids()` (the in-memory index), so its manifest
@@ -1086,29 +1123,37 @@ impl OpenVault {
 
     /// Permanently remove a stored document by id (drops its manifest entry; the
     /// blob lingers as garbage until reclaimed by a `compact` volume rewrite).
+    ///
+    /// Refuses to remove a blob that a record still references: dropping it would save
+    /// a dangling reference and brick the vault on the next open (`referenced ⊄ stored`
+    /// → `ArchiveMismatch`). Callers must unlink the document from its record first
+    /// (the UIs already do); a stray call now fails closed with `StillReferenced`
+    /// instead of corrupting the vault.
     pub fn remove_document(&mut self, file_id: &str) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        self.storage.remove(file_id, &self.key)?;
+        if referenced_doc_ids(&self.vault).iter().any(|r| r == file_id) {
+            return Err(VaultError::StillReferenced);
+        }
         // Tombstone the id so that, if a later manifest-loss rebuild re-admits the
         // still-physically-present frame, the readers below suppress it and the next
         // volume rewrite drops it for good — a lazy delete can't be resurrected
         // (audit R-2). Deduplicated; cleared by `staged_rewrite` after the rewrite.
+        //
+        // Persist the tombstone BEFORE physically dropping the manifest entry, not after:
+        // the two are separate durable commits, and a crash in the gap must fail SAFE. The
+        // tombstone-then-remove order leaves "tombstone without removal" on a crash (the
+        // doc reads as deleted and is idempotently re-removable / dropped by the next
+        // compaction) instead of "removal without tombstone" (the deleted frame silently
+        // resurrects on a later manifest-loss rebuild). Callers persist the record→doc
+        // unlink before calling this; the extra save here makes the tombstone durable too.
         let id = file_id.to_string();
-        let tombstone_added = !self.vault.deleted_docs.contains(&id);
-        if tombstone_added {
+        if !self.vault.deleted_docs.contains(&id) {
             self.vault.deleted_docs.push(id);
-        }
-        // Persist the tombstone NOW. `storage.remove` already durably dropped the manifest
-        // entry, but the callers run their own `save()` BEFORE this method (to durably
-        // unlink the record→doc reference before reclaiming the blob), so without this the
-        // tombstone would live only in memory and be lost on close — defeating the R-2
-        // anti-resurrection guarantee across a restart + manifest-loss rebuild. Only save
-        // when we actually added a tombstone (a no-op re-remove shouldn't rewrite the vault).
-        if tombstone_added {
             self.save()?;
         }
+        self.storage.remove(file_id, &self.key)?;
         Ok(())
     }
 
@@ -1153,7 +1198,19 @@ impl OpenVault {
             if p.is_empty() || p == "." || p == ".." || p.contains(['\\', ':', '\0']) {
                 continue; // never let a component traverse out of `root`
             }
-            dest.push(p);
+            // Defense-in-depth for already-stored docs: neutralize a Windows reserved device
+            // name in any component (`con`, `nul`, `com1`, …) so the export writes a real file
+            // on Windows instead of opening a device or colliding. New docs are already
+            // sanitized at store time by `records::doc_filename`; this covers legacy paths.
+            // Trailing dots/spaces are likewise stripped (silently dropped by the Win32 layer).
+            let p = p.trim_end_matches(['.', ' ']);
+            if records::is_windows_reserved_name(p) {
+                dest.push(format!("_{p}"));
+            } else if p.is_empty() {
+                continue;
+            } else {
+                dest.push(p);
+            }
         }
         if dest == root {
             // Degenerate virtual path — fall back to an id-named file under root.
@@ -1549,6 +1606,14 @@ fn decode_vault_with_key(raw: &[u8], key: &Key) -> Result<(Vault, Header), Vault
     // Decrypt into a `Zeroizing` buffer so the plaintext JSON is wiped on drop.
     let plaintext = Zeroizing::new(crypto::decrypt(key, &header.nonce, ciphertext, &aad)?);
     let vault: Vault = serde_json::from_slice(&plaintext)?;
+    // Defense-in-depth / forward-compat: the header byte is the authoritative version gate
+    // (Header::parse), but the AEAD-authenticated JSON body carries its own `version` too.
+    // Assert they agree so the two signals can't diverge silently — a future version-
+    // conditional decode must never be fed a body whose version disagrees with the header.
+    // Mirrors the equivalent check on the import path.
+    if vault.version != FORMAT_VERSION {
+        return Err(VaultError::BadVersion(vault.version));
+    }
     Ok((vault, header))
 }
 
@@ -1585,34 +1650,63 @@ fn decrypt_with_redundancy(
     // candidates from forcing one expensive chained derivation per salt on every open.
     const MAX_RECOVERY_SALTS: usize = 3;
     let mut keys: Vec<Key> = Vec::new();
-    let mut tried_salts: Vec<[u8; SALT_LEN]> = Vec::new();
+    let mut key_salts: Vec<[u8; SALT_LEN]> = Vec::new();
+    // Remember, per candidate, the index into `keys` of the key derived from THAT
+    // candidate's own header salt (None if its header is unreadable or its salt was
+    // dropped at the cap). PASS 2 uses this to try the right key first and avoid the
+    // full candidates × keys cross-product.
+    let mut cand_key: Vec<Option<usize>> = Vec::with_capacity(candidates.len());
     for c in &candidates {
-        if tried_salts.len() >= MAX_RECOVERY_SALTS {
-            break; // refuse to derive past the bound (planted distinct-salt DoS guard)
+        let Ok(header) = read_header_of(c) else {
+            cand_key.push(None);
+            continue;
+        };
+        if let Some(pos) = key_salts.iter().position(|s| s == &header.salt) {
+            cand_key.push(Some(pos)); // key for this salt already derived
+            continue;
         }
-        let Ok(header) = read_header_of(c) else { continue };
-        if tried_salts.contains(&header.salt) {
-            continue; // already derived a key for this salt
+        if keys.len() >= MAX_RECOVERY_SALTS {
+            cand_key.push(None); // refuse to derive past the bound (planted distinct-salt DoS guard)
+            continue;
         }
-        tried_salts.push(header.salt);
-        if let Ok(key) = crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) {
-            keys.push(key);
+        match crypto::derive_key_chained(pw1, pw2, &header.salt, &header.params) {
+            Ok(key) => {
+                keys.push(key);
+                key_salts.push(header.salt);
+                cand_key.push(Some(keys.len() - 1));
+            }
+            Err(_) => cand_key.push(None),
         }
     }
     if keys.is_empty() {
         return Err(primary_err); // no candidate header parsed / wrong password
     }
 
-    // PASS 2 — try the derived keys against each candidate, holding AT MOST ONE
-    // candidate buffer in memory at a time. The previous version collected EVERY
-    // candidate into RAM up front, so an attacker who planted many max-size (256 MiB)
-    // copies could exhaust memory and OOM-kill the process on every open. Candidates
-    // are mirror-first then older generations, keeping the recovery notice honest; a
-    // candidate whose own header salt is damaged still recovers here if its body
-    // decrypts under a sibling's salt-derived key.
-    for c in &candidates {
-        let Ok(raw) = read_capped_vault(c) else { continue };
-        for i in 0..keys.len() {
+    // PASS 2 — try keys against each candidate, holding AT MOST ONE candidate buffer in
+    // memory at a time (an earlier version slurped every candidate up front, risking OOM
+    // from planted max-size copies). Each candidate is first tried against the key derived
+    // from its OWN salt (the expected match); only the two most-likely-current copies
+    // (mirror, bak1) additionally fall back to the sibling keys, covering a copy whose
+    // header salt is damaged but whose body decrypts under another generation's key. This
+    // bounds the work to ~O(candidates) full AEAD decrypts instead of O(candidates × keys),
+    // closing a CPU-amplification DoS where a vault-dir-write attacker plants many max-size
+    // distinct-salt copies to make every open grind through gigabytes of crypto.
+    let bak1 = bak_path(path, 1);
+    for (idx, c) in candidates.iter().enumerate() {
+        let Ok(raw) = read_capped_vault_nofollow(c) else { continue };
+        let allow_siblings = *c == mirror || *c == bak1;
+        let mut order: Vec<usize> = Vec::new();
+        if let Some(k) = cand_key[idx] {
+            order.push(k);
+        }
+        if allow_siblings {
+            for k in 0..keys.len() {
+                if Some(k) != cand_key[idx] {
+                    order.push(k);
+                }
+            }
+        }
+        for i in order {
             if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[i]) {
                 let key = keys.swap_remove(i); // take ownership of the matching key
                 // Wording is keyed on the SOURCE only as a coarse hint — NOT a
@@ -1648,10 +1742,47 @@ fn decrypt_with_redundancy(
 /// attacker-inflated) file into memory.
 fn read_header_of(path: &Path) -> Result<Header, VaultError> {
     use std::io::Read;
-    let mut f = fs::File::open(path)?;
+    // O_NOFOLLOW: recovery candidates (mirror/bakN) live in the same vault directory the
+    // storage layer already treats as attacker-reachable; every other read of that dir uses
+    // O_NOFOLLOW (read_bounded, append_frame, the lock). This was the lone recovery read that
+    // followed a final-component symlink — close it so a planted `vault.pmv.mirror -> /etc/…`
+    // can't redirect the read. (On non-unix, a plain open.)
+    let mut f = open_read_nofollow(path)?;
     let mut buf = [0u8; HEADER_LEN];
     f.read_exact(&mut buf)?;
     Header::parse(&buf)
+}
+
+/// Open a file for reading WITHOUT following a final-component symlink (O_NOFOLLOW on unix;
+/// plain open elsewhere). Used by the redundancy-recovery candidate reads, whose paths sit
+/// in the attacker-reachable vault directory — matching the discipline in `read_bounded`
+/// and `storage::append_frame`.
+fn open_read_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::open(path)
+    }
+}
+
+/// Like [`read_capped_vault`] but O_NOFOLLOW (for attacker-reachable recovery candidates).
+fn read_capped_vault_nofollow(path: &Path) -> Result<Vec<u8>, VaultError> {
+    use std::io::Read;
+    let f = match open_read_nofollow(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VaultError::NotFound(path.to_path_buf())),
+        Err(e) => return Err(e.into()),
+    };
+    let mut buf = Vec::new();
+    f.take(MAX_VAULT_SIZE.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_VAULT_SIZE {
+        return Err(VaultError::TooLarge);
+    }
+    Ok(buf)
 }
 
 // --- In-place redundancy file management (§12.8) -----------------------------
@@ -1698,9 +1829,10 @@ fn write_bytes_atomic(dst: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 }
 
 /// Remove stale `*.tmp` siblings left by a crash mid atomic-write — `.vault.pmv*.tmp`
-/// (primary/mirror/bak temps) in the vault dir and `.manifest*.tmp` in `manifest/`.
-/// Best-effort, writable opens only. The temps are encrypted (no plaintext leak), but
-/// sweeping keeps the directory tidy and avoids old-key temps lingering after a rekey.
+/// (primary/mirror/bak temps) in the vault dir and `.manifest*.tmp` in `manifest/` —
+/// AND any orphaned `.<name>.old` directory trees from a rekey. Best-effort, writable
+/// opens only. The temps are encrypted (no plaintext leak), but sweeping keeps the
+/// directory tidy and avoids OLD-KEY material lingering after a rekey.
 fn sweep_stale_temps(dir: &Path) {
     let sweep = |d: &Path, prefix: &str| {
         if let Ok(rd) = fs::read_dir(d) {
@@ -1715,6 +1847,17 @@ fn sweep_stale_temps(dir: &Path) {
     };
     sweep(dir, &format!(".{VAULT_FILE}")); // .vault.pmv* / .vault.pmv.mirror* / .vault.pmv.bakN*
     sweep(&dir.join("manifest"), ".manifest"); // .manifest.N* manifest-commit temps
+    // Reap orphaned `.volume.old` / `.manifest.old` trees. `replace_dir`'s OWN cleanup of
+    // its `.old` sibling runs at the START of the next commit, but only on a RE-ENTRANT
+    // rekey (staging still present). If the trailing best-effort `remove_dir_all` failed
+    // AFTER the rekey fully committed (staging gone), recover_pending_rekey returns early on
+    // later opens and replace_dir is never re-entered — so an `.old` dir full of OLD-KEY
+    // ciphertext would linger forever, defeating change_password's forward secrecy. Reaping
+    // it on every writable open closes that gap. The live dirs (`volume`/`manifest`) have no
+    // `.old` suffix, so this can never touch them.
+    for sub in ["volume", "manifest"] {
+        let _ = fs::remove_dir_all(sibling_old(&dir.join(sub)));
+    }
 }
 
 /// Remove every retained generation numbered above `depth` (e.g. after the depth is
@@ -1787,6 +1930,44 @@ fn redundancy_candidates(primary: &Path) -> Vec<PathBuf> {
 
 /// Encrypt `vault` under `key` and write it atomically to `path` (new nonce, full
 /// header as AAD, temp → fsync → rename → dir fsync).
+/// Serialize a SECRET-bearing value (the decrypted `Vault`) to JSON in a single,
+/// exactly-sized [`Zeroizing`] buffer so the plaintext (every password) is never stranded
+/// in freed heap. `serde_json::to_vec`/`to_string_pretty` start from an empty `Vec` and
+/// grow it by reallocation, freeing each smaller buffer WITHOUT zeroizing — leaving partial
+/// cleartext JSON fragments behind on every save/export/decrypt. To avoid that we measure
+/// the exact serialized length first (a counting pass that holds NO plaintext buffer), then
+/// serialize once into a buffer pre-sized to exactly that length, so it never reallocates.
+/// `pub` so the desktop CLI's `decrypt` can reuse the same hardened path.
+pub fn serialize_secret_json<T: serde::Serialize>(value: &T, pretty: bool) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+    // A `Write` sink that only counts bytes — no allocation, so the measuring pass can't
+    // strand plaintext.
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    if pretty {
+        serde_json::to_writer_pretty(&mut counter, value)?;
+    } else {
+        serde_json::to_writer(&mut counter, value)?;
+    }
+    // capacity == exact len => the second (real) pass never grows the Vec, so no smaller
+    // buffer is ever freed unwiped. The whole buffer is zeroized on drop.
+    let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(counter.0));
+    if pretty {
+        serde_json::to_writer_pretty(&mut *buf, value)?;
+    } else {
+        serde_json::to_writer(&mut *buf, value)?;
+    }
+    Ok(buf)
+}
+
 fn write_vault_file(
     path: &Path,
     vault: &Vault,
@@ -1794,10 +1975,10 @@ fn write_vault_file(
     salt: &[u8; SALT_LEN],
     params: KdfParams,
 ) -> Result<(), VaultError> {
-    // Serialize the vault to JSON bytes (wiped on drop), pick a fresh random nonce,
-    // and build the header. `*salt` dereferences the `&[u8; N]` borrow to copy the
-    // array by value into the new `Header`.
-    let plaintext = Zeroizing::new(serde_json::to_vec(vault)?);
+    // Serialize the vault to JSON bytes (wiped on drop, no realloc strand), pick a fresh
+    // random nonce, and build the header. `*salt` dereferences the `&[u8; N]` borrow to
+    // copy the array by value into the new `Header`.
+    let plaintext = serialize_secret_json(vault, false)?;
     let nonce = crypto::random_bytes::<NONCE_LEN>()?;
     let header = Header { params, salt: *salt, nonce };
     let header_bytes = header.to_bytes();
@@ -2521,6 +2702,85 @@ mod tests {
         let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
         assert!(re.vault.deleted_docs.iter().any(|d| d == &id), "tombstone persisted across reopen");
         assert!(re.is_tombstoned(&id), "reopened handle treats the id as deleted");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn serialize_secret_json_matches_serde_and_never_reallocates() {
+        // The zero-reallocation serializer must produce byte-identical JSON to serde_json
+        // (so nothing else changes) AND end up with capacity == len (the measuring pass sized
+        // it exactly, so the real pass never grew/freed an intermediate cleartext buffer).
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        let mut acc = records::Account::new().unwrap();
+        acc.title = "Bank".into();
+        acc.owner = "Alice".into();
+        acc.password = "s3cret-with-some-length-to-force-growth".into();
+        records::upsert(&mut vault.accounts, acc);
+
+        let compact = serialize_secret_json(&vault, false).unwrap();
+        assert_eq!(&compact[..], serde_json::to_vec(&vault).unwrap().as_slice(), "compact matches serde");
+        assert_eq!(compact.capacity(), compact.len(), "exact capacity => no realloc strand");
+
+        let pretty = serialize_secret_json(&vault, true).unwrap();
+        assert_eq!(&pretty[..], serde_json::to_vec_pretty(&vault).unwrap().as_slice(), "pretty matches serde");
+        assert_eq!(pretty.capacity(), pretty.len(), "exact capacity => no realloc strand");
+    }
+
+    #[test]
+    fn remove_document_refuses_a_still_referenced_id() {
+        // Regression (deep-hunt): removing a blob a record still references would save a
+        // dangling reference and brick the vault on next open. remove_document must refuse.
+        let path = tmp_path("stillref");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("stillref", &[9u8; 200]);
+        let id = v.add_document("general-documents/x", "doc.pdf", &src).unwrap();
+        let mut g = records::GeneralDocument::new().unwrap();
+        g.title = "X".into();
+        g.file = Some(id.clone());
+        records::upsert(&mut v.vault.general_documents, g);
+        v.save().unwrap();
+
+        // Still referenced -> refused, vault untouched.
+        assert!(matches!(v.remove_document(&id), Err(VaultError::StillReferenced)));
+        assert!(v.has_document(&id), "blob retained after refused removal");
+        // Unlink first, then it succeeds and the vault still opens cleanly.
+        v.vault.general_documents[0].file = None;
+        v.save().unwrap();
+        v.remove_document(&id).unwrap();
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(!re.has_document(&id), "removed after unlink");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn compact_heals_a_referenced_but_tombstoned_blob_instead_of_bricking() {
+        // Regression (deep-hunt): a crash-derived "referenced AND tombstoned" state must not
+        // make compact/rekey drop the blob (which would brick the next open). Reference wins:
+        // the document is kept and the vault stays openable.
+        let path = tmp_path("refxtomb");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("refxtomb", &[1u8; 220]);
+        let id = v.add_document("general-documents/x", "doc.pdf", &src).unwrap();
+        let mut g = records::GeneralDocument::new().unwrap();
+        g.title = "X".into();
+        g.file = Some(id.clone());
+        records::upsert(&mut v.vault.general_documents, g);
+        // Force the contradictory state directly (the API now refuses to create it): the doc
+        // is referenced by the record AND carries a tombstone.
+        v.vault.deleted_docs.push(id.clone());
+        v.save().unwrap();
+
+        v.compact(&volume_opts()).unwrap();
+        assert!(v.has_document(&id), "referenced blob survived compaction (reference wins)");
+        assert!(v.vault.deleted_docs.is_empty(), "tombstones cleared after rewrite");
+        assert_eq!(&*v.read_document(&id).unwrap(), &[1u8; 220][..], "content intact");
+        drop(v);
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.has_document(&id), "vault reopens cleanly, document healed back to live");
         cleanup(&path);
         fs::remove_file(&src).ok();
     }
