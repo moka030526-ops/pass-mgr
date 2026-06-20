@@ -1616,6 +1616,68 @@ mirror (§6.3). Each fix carries a regression test (see `HARDENING.md`).
   the redundancy-recovery notice no longer cries "data lost" when the recovered copy
   is in fact the current generation.
 
+#### 13.2.9 Deep overnight hunt (round 5)
+
+A further multi-agent hunt (a six-dimension sweep plus a 106-agent, 10-dimension
+"deepest dive" — each finding triple-verified by independent adversarial skeptics)
+produced a first batch of 9 secret-hygiene/correctness fixes and a second batch of
+~24 confirmed findings. `cargo audit` + `cargo deny` were clean (0 advisories across
+595 deps). The material fixes (each with a regression test where testable):
+
+- **`remove_document` fails closed on a still-referenced id.** It now returns
+  `VaultError::StillReferenced` instead of dropping a blob a record still references —
+  which would persist a dangling reference and brick the vault on next open
+  (`referenced ⊄ stored` → `ArchiveMismatch`). It also persists the tombstone **before**
+  dropping the manifest entry, so a crash in the gap leaves a recoverable
+  "tombstone-without-removal" rather than a silently-resurrectable "removal-without-tombstone".
+- **`staged_rewrite` heals a "referenced AND tombstoned" blob (reference wins).** A
+  crash that lost the unlink-save while persisting a tombstone, then a manifest-loss
+  rebuild, could leave a blob both referenced and tombstoned; compaction/rekey now keeps
+  it (and clears the tombstone) instead of dropping it and bricking the vault.
+- **Whole-vault serialization no longer strands plaintext.** `serialize_secret_json`
+  sizes the buffer exactly (a counting pass) then serializes once with no reallocation,
+  so `serde_json` no longer frees partial cleartext-JSON buffers (every password)
+  unscrubbed on each save / `export_tree` / CLI `decrypt`.
+- **Recovery is bounded and symlink-safe.** `decrypt_with_redundancy` tries each
+  candidate against the key derived from its **own** salt first (sibling fallback only
+  for mirror + bak1), bounding work to ~O(candidates) AEAD decrypts instead of
+  O(candidates × keys) — a CPU-amplification guard for a dir-write attacker who plants
+  many max-size distinct-salt copies. The candidate reads now open `O_NOFOLLOW` (the
+  last vault reads that followed a symlink in the attacker-reachable dir).
+- **Rekey forward secrecy: orphaned `.old` trees are reaped.** `sweep_stale_temps` now
+  removes `.volume.old`/`.manifest.old` left if a rekey's best-effort cleanup failed
+  post-commit (old-key ciphertext was otherwise lingering forever).
+- **Smaller correctness/robustness fixes.** `decode_vault_with_key` validates the
+  AEAD-authenticated JSON-body version (was header byte only); `import_tree` clears
+  carried-over tombstones; `manifest.seq` uses `saturating_add`; `doc_filename` /
+  `export_document_into` neutralize Windows reserved device names + trailing dots/spaces;
+  `save_internal` distinguishes a missing primary from a real read error instead of
+  swallowing it; `create()` re-checks existence **under the lock** (a pre-lock TOCTOU
+  could otherwise let a second concurrent creator overwrite the winner's vault).
+- **UI secret-residue + terminal/CLI safety.** The cloned-password edit buffers use
+  `presize_secret` (calling `reserve` on a just-cloned `String` itself reallocated and
+  stranded the cleartext); the hardened Ctrl+C moves the secret out of egui's `CopyText`
+  command instead of cloning-then-dropping the original unwiped; the no-echo password
+  prompt restores cooked mode on panic (RAII guard) and treats **Esc as cancel**; the
+  GUI launcher and console binary resolve a `-`-prefixed vault directory identically;
+  and `decrypt`/`manifest` reject extra positional args.
+- **Mobile/packaging.** Android `dataExtractionRules` now excludes the vault from
+  device-to-device transfer (not just cloud backup); the release build requires a real
+  out-of-repo keystore (debug key only with a loud warning); iOS adds a Data-Protection
+  entitlement + recursive `FileProtectionType.complete`; the masked password renders a
+  fixed-width dot count (no length leak); and `install-shortcuts.sh` generates `.desktop`
+  files with `printf` (literal) and a spec-quoted `Exec=` instead of metacharacter-fragile
+  `sed`.
+
+**Accepted (documented) limitations from this round.** Per-partition rollback of authentic
+at-rest state stays out of scope (§9.12): the headline exploit is moot because every
+document gets a fresh random id, so rolling a partition back fails the `referenced ⊆ stored`
+check (adds) or is suppressed by the authenticated tombstone (deletes). The Android
+clipboard wipe remains in-process best-effort (§9.3) — clearing on `onStop` would fire on
+every background-to-paste and break the copy workflow. New private directories are created
+then hardened to `0700` (`harden_dir`), a sub-millisecond default-umask window; contents are
+created `O_EXCL 0600`, so this is a directory-listing-visibility nit, not a content exposure.
+
 ### 13.3 Windows GUI subsystem — the two-binary split
 
 **Symptom.** On Windows, launching the app showed **two windows**: a command/console
