@@ -235,7 +235,12 @@ pub struct RealEstate {
 // --- core -> DTO mappers ---------------------------------------------------
 
 fn map_change(c: &records::Change) -> Change {
-    Change { at: c.at, action: c.action.clone(), detail: c.detail.clone() }
+    // Mask secret (password) before/after values via the core's audited helper, so the
+    // FFI never ships cleartext old/new passwords across the boundary. `detail` for a
+    // password field is `password: "old" -> "new"`; `display_detail` rewrites it to
+    // `password: <hidden> -> <hidden>` and passes every non-secret detail through
+    // unchanged (audit-log entries hold no passwords, so this is a no-op for them).
+    Change { at: c.at, action: c.action.clone(), detail: records::display_detail(&c.detail) }
 }
 
 fn map_instruction(r: &records::Instruction) -> Instruction {
@@ -442,9 +447,10 @@ impl Vault {
             .ok_or(VaultError::RecordNotFound)
     }
 
-    /// A record's edit history, newest concerns last. Fetched explicitly (never
-    /// bundled into the record DTO) because `detail` can contain cleartext
-    /// old/new passwords — the host can gate or redact it.
+    /// A record's edit history, newest concerns last. Fetched explicitly (never bundled
+    /// into the record DTO). Secret (password) before/after values are MASKED here via
+    /// the core's `display_detail` (see `map_change`), so no cleartext password ever
+    /// crosses the FFI boundary; the host may still choose to gate the whole history.
     pub fn get_history(&self, kind: RecordKind, id: String) -> Result<Vec<Change>, VaultError> {
         let ov = self.lock();
         let v = &ov.vault;
@@ -850,9 +856,16 @@ mod tests {
         let v = open_full_dir(&dir, b"one", b"two");
         let hist = v.get_history(RecordKind::Account, id).unwrap();
         assert!(hist.iter().any(|c| c.action == "created"));
+        let pw_edit = hist
+            .iter()
+            .find(|c| c.action == "updated" && c.detail.contains("password"))
+            .expect("the password edit is in history");
+        // The cleartext old/new values must be MASKED across the FFI boundary.
+        assert!(pw_edit.detail.contains("<hidden>"), "secret values masked: {}", pw_edit.detail);
         assert!(
-            hist.iter().any(|c| c.action == "updated" && c.detail.contains("password")),
-            "the password edit is in history"
+            !pw_edit.detail.contains("\"old\"") && !pw_edit.detail.contains("\"new\""),
+            "no cleartext password leaks through get_history: {}",
+            pw_edit.detail
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -850,7 +850,11 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     enable_raw_mode()?;
-    let mut input = Zeroizing::new(String::new());
+    // Pre-reserve so per-keystroke `push` never grows the buffer: a reallocation frees the
+    // old backing store (holding the password prefix) WITHOUT zeroizing it, and `Zeroizing`
+    // only wipes the final allocation on drop. 256 covers any realistic passphrase (mirrors
+    // the GUI's `reserve` mitigation on its secret fields).
+    let mut input = Zeroizing::new(String::with_capacity(256));
     // `loop {}` runs forever until a `break` exits it; `break value` makes the loop
     // *evaluate to* that value, which is assigned to `outcome` here.
     let outcome = loop {

@@ -174,6 +174,10 @@ pub fn account_tree<'a>(accounts: impl IntoIterator<Item = &'a Account>) -> Acct
         // Descend (creating as needed) along the non-empty grouping values.
         let mut node = &mut root;
         for level in [&a.owner, &a.account_type, &a.account_subtype] {
+            // Group by the TRIMMED value and skip whitespace-only levels: a stray " "
+            // (e.g. legacy/imported data not yet re-saved) must not create a blank node,
+            // nor split " " and "  " into separate groups (`child_mut` matches exactly).
+            let level = level.trim();
             if !level.is_empty() {
                 node = node.child_mut(level);
             }
@@ -599,12 +603,17 @@ pub trait Record: Clone {
 fn trim_strings_in_place(fields: &mut [&mut String]) -> bool {
     let mut changed = false;
     for f in fields {
-        // `f.trim().to_string()` copies the trimmed slice into a fresh String,
-        // ending the borrow of `**f` before the assignment below.
-        let trimmed = f.trim().to_string();
-        if trimmed != **f {
+        // `trim()` only strips leading/trailing whitespace, so the value changed iff the
+        // trimmed length differs — checked WITHOUT allocating. The previous code always
+        // built `f.trim().to_string()` and, on the common already-trimmed path, dropped
+        // that plain (non-zeroized) `String` copy of the secret, stranding a plaintext
+        // password in freed heap (contradicting this fn's own contract). Allocate only on
+        // a real change, and MOVE the new buffer into the field so no transient copy is
+        // left unwiped (the live value is wiped later by the record's ZeroizeOnDrop).
+        if f.trim().len() != f.len() {
+            let new = f.trim().to_string();
             f.zeroize();
-            **f = trimmed;
+            **f = new;
             changed = true;
         }
     }
@@ -629,11 +638,12 @@ pub fn upsert<R: Record>(list: &mut Vec<R>, mut rec: R) {
             // `&rec` lends the new record to `diff` (which only needs to read it).
             let changes = list[i].diff(&rec, now);
             rec.set_created_at(list[i].created_at()); // keep original creation time
-            // `.clone()` copies the old history out so we can rebuild it.
-            let mut history = list[i].history_mut().clone();
+            // MOVE the old history out (`std::mem::take` leaves an empty Vec in its
+            // place) rather than cloning it: the clone duplicated every prior `Change`,
+            // including cleartext old/new password values, and was O(n²) over a growing
+            // history. Append the new diffs and install on the replacement record.
+            let mut history = std::mem::take(list[i].history_mut());
             history.extend(changes); // old history + the new diffs
-            // `*rec.history_mut() = history` writes through the mutable borrow,
-            // replacing the record's history with the combined list.
             *rec.history_mut() = history;
             list[i] = rec; // replace the slot (the old record is dropped & wiped)
         }
@@ -1690,6 +1700,32 @@ mod tests {
         let email_top = &root.children[2];
         assert_eq!(email_top.label, "Email");
         assert_eq!(email_top.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(), ["Orphan mail"]);
+    }
+
+    #[test]
+    fn account_tree_treats_whitespace_only_levels_as_empty() {
+        // Regression (deep-hunt): a whitespace-only grouping value (e.g. legacy/imported
+        // data not yet re-saved) must NOT create a blank group node, and " " vs "  " must
+        // not split into two groups. Both should behave exactly like an empty level.
+        let mk = |owner: &str, title: &str| {
+            let mut a = Account::new().unwrap();
+            a.owner = owner.into();
+            a.account_type = "Email".into();
+            a.title = title.into();
+            a
+        };
+        let accts = vec![mk(" ", "Spacey one"), mk("  ", "Spacey two"), mk("", "Empty owner")];
+        let root = account_tree(&accts);
+        // No top-level OWNER groups: every owner is blank/whitespace, so all three are
+        // grouped only by their (real) type "Email" promoted to the top level.
+        assert_eq!(root.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Email"]);
+        assert!(root.children.iter().all(|c| !c.label.trim().is_empty()), "no blank group node");
+        let email = &root.children[0];
+        assert_eq!(
+            email.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["Empty owner", "Spacey one", "Spacey two"],
+            "all three land under the single Email group, none under a whitespace owner"
+        );
     }
 
     #[test]

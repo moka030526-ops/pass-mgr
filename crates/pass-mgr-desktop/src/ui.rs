@@ -1079,10 +1079,18 @@ impl App {
             KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
             KeyCode::BackTab | KeyCode::Up => self.cfg_focus = (self.cfg_focus + CFG_FIELDS - 1) % CFG_FIELDS,
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Only allow editing a field whose action is reachable in this mode: in
+            // read-only that's just backup-dest (5) and export-dir (7), matching the
+            // `submit_config` allow-list. The write-only fields stay inert (the GUI hides
+            // them outright), so a read-only user can't type into a control that can never
+            // apply. (These buffers are App state, never vault content.)
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (self.writable || matches!(self.cfg_focus, 5 | 7)) =>
+            {
                 self.cfg_field_mut().push(c);
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if self.writable || matches!(self.cfg_focus, 5 | 7) => {
                 self.cfg_field_mut().pop();
             }
             KeyCode::Enter => self.submit_config(),
@@ -4206,6 +4214,34 @@ mod tests {
         app.submit_config();
         assert_eq!(app.vault.as_ref().unwrap().volume_max_size(), 8 * 1024 * 1024);
         assert!(app.status.contains("MiB"), "status was: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_config_typing_gated_to_export_and_backup_fields() {
+        // Regression (deep-hunt): in read-only, typing must only edit the fields whose
+        // action is reachable read-only — backup dest (5) and export dir (7). The
+        // write-only fields (volume size, etc.) must stay inert, matching submit_config's
+        // allow-list and the GUI which hides them.
+        let (mut app, path) = app_read_only("rocfgtype");
+        app.handle_key(key(KeyCode::Char('c'))); // Config
+        assert_eq!(app.screen, Screen::Config);
+
+        // Write-only field (volume size, focus 4): typing is ignored.
+        app.cfg_focus = 4;
+        for c in "8".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.cfg_volume_size.is_empty(), "read-only can't type into the volume-size field");
+
+        // Export dir (focus 7): typing IS allowed (a local, non-vault preference).
+        app.cfg_focus = 7;
+        for c in "/tmp/exp".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.cfg_export_dir, "/tmp/exp", "read-only can edit the export directory");
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.cfg_export_dir, "/tmp/ex", "backspace works on the export-dir field");
         cleanup(&path);
     }
 

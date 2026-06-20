@@ -728,7 +728,13 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut f = opts.open(path)?;
-    harden_file(path); // belt-and-suspenders chmod (no-op on non-unix)
+    // Belt-and-suspenders chmod to 0600 (no-op on non-unix) via the OPEN descriptor
+    // (fchmod), NOT by path. A by-path chmod here would re-resolve `path` and follow a
+    // symlink, reintroducing the chmod-through-symlink TOCTOU that the O_NOFOLLOW open
+    // above just closed — on a non-first append `vol.<N>` already exists, so a same-UID
+    // attacker could swap in a symlink between the open and a by-path chmod. fchmod acts
+    // on the file we actually opened, with no path resolution.
+    harden_file_fd(&f);
     f.seek(SeekFrom::Start(start))?;
     crate::fault::point("volume.write")?; // inject ENOSPC before the volume append
     f.write_all(frame)?; // `frame: &[u8]` is borrowed, not consumed
@@ -813,17 +819,15 @@ fn sync_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) {} // no-op; `_dir` underscore-prefix marks it intentionally unused
 
+/// Tighten an ALREADY-OPEN file to 0600 via its descriptor (fchmod), with no path
+/// re-resolution — so it cannot be tricked into chmod-ing a symlink target. Best-effort.
 #[cfg(unix)]
-fn harden_file(path: &Path) {
-    use std::os::unix::fs::PermissionsExt; // brings `set_mode` into scope
-    if let Ok(meta) = fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o600); // owner read/write only
-        let _ = fs::set_permissions(path, perms);
-    }
+fn harden_file_fd(f: &File) {
+    use std::os::unix::fs::PermissionsExt; // brings `from_mode` into scope
+    let _ = f.set_permissions(fs::Permissions::from_mode(0o600)); // owner read/write only
 }
 #[cfg(not(unix))]
-fn harden_file(_path: &Path) {} // no-op off unix (permission bits don't apply the same way)
+fn harden_file_fd(_f: &File) {} // no-op off unix (permission bits don't apply the same way)
 
 #[cfg(unix)]
 fn harden_dir(dir: &Path) {
@@ -1760,28 +1764,29 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    // Kills: storage.rs harden_file (line ~817) body -> ().
+    // Kills: storage.rs harden_file_fd body -> ().
     // The volume append path opens vol.<N> with create-time mode 0600, so a freshly
-    // created file would be 0600 even with the mutant. We therefore call harden_file
-    // directly on a file we deliberately created at 0644: only harden_file's set_mode
+    // created file would be 0600 even with the mutant. We therefore call harden_file_fd
+    // directly on a file we deliberately created at 0644: only its set_permissions call
     // can pull it to 0600. With the body replaced by `()`, the file stays 0644.
     #[cfg(unix)]
     #[test]
     fn mut_harden_file_chmods_to_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("hardenfile");
-        let f = dir.join("blob.bin");
-        fs::write(&f, b"x").unwrap();
-        let mut p = fs::metadata(&f).unwrap().permissions();
+        let path = dir.join("blob.bin");
+        fs::write(&path, b"x").unwrap();
+        let mut p = fs::metadata(&path).unwrap().permissions();
         p.set_mode(0o644);
-        fs::set_permissions(&f, p).unwrap();
-        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o644);
+        fs::set_permissions(&path, p).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
 
-        harden_file(&f);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        harden_file_fd(&f);
         assert_eq!(
-            fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
-            "harden_file must chmod the file to 0600"
+            "harden_file_fd must chmod the file to 0600"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

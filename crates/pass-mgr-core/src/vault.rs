@@ -1096,8 +1096,18 @@ impl OpenVault {
         // volume rewrite drops it for good — a lazy delete can't be resurrected
         // (audit R-2). Deduplicated; cleared by `staged_rewrite` after the rewrite.
         let id = file_id.to_string();
-        if !self.vault.deleted_docs.contains(&id) {
+        let tombstone_added = !self.vault.deleted_docs.contains(&id);
+        if tombstone_added {
             self.vault.deleted_docs.push(id);
+        }
+        // Persist the tombstone NOW. `storage.remove` already durably dropped the manifest
+        // entry, but the callers run their own `save()` BEFORE this method (to durably
+        // unlink the record→doc reference before reclaiming the blob), so without this the
+        // tombstone would live only in memory and be lost on close — defeating the R-2
+        // anti-resurrection guarantee across a restart + manifest-loss rebuild. Only save
+        // when we actually added a tombstone (a no-op re-remove shouldn't rewrite the vault).
+        if tombstone_added {
+            self.save()?;
         }
         Ok(())
     }
@@ -2479,6 +2489,38 @@ mod tests {
         assert_eq!(v.compact_dry_run(&opts).bytes_reclaimed, 0, "orphan is still a live frame");
         v.compact(&opts).unwrap();
         assert_eq!(&*v.read_document(&id).unwrap(), &vec![5u8; 300][..], "orphan blob preserved");
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn remove_document_persists_tombstone_across_reopen() {
+        // Regression (deep-hunt): `remove_document` must make its anti-resurrection
+        // tombstone DURABLE. The UI flow saves the record→doc unlink BEFORE calling
+        // remove_document, so if remove_document only pushed the tombstone in memory it
+        // would be lost on close — and a later manifest-loss rebuild could resurrect the
+        // deleted frame. Here we mimic that flow (no further save after remove_document)
+        // and assert the tombstone survives a reopen.
+        let path = tmp_path("tombstone");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let src = write_src("tombstone", &vec![7u8; 256]);
+        let id = v.add_document("general-documents/x", "doc.pdf", &src).unwrap();
+        let mut g = records::GeneralDocument::new().unwrap();
+        g.title = "X".into();
+        g.file = Some(id.clone());
+        records::upsert(&mut v.vault.general_documents, g);
+        v.save().unwrap(); // UI persists the link first...
+
+        // ...then unlinks + reclaims. Persist the unlink, then remove the blob WITHOUT a
+        // further save (exactly the UI ordering).
+        v.vault.general_documents[0].file = None;
+        v.save().unwrap();
+        v.remove_document(&id).unwrap();
+        drop(v);
+
+        let re = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(re.vault.deleted_docs.iter().any(|d| d == &id), "tombstone persisted across reopen");
+        assert!(re.is_tombstoned(&id), "reopened handle treats the id as deleted");
         cleanup(&path);
         fs::remove_file(&src).ok();
     }

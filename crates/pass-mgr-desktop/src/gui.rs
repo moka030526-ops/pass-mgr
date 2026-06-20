@@ -2348,6 +2348,7 @@ impl GuiApp {
             r.property_mgmt_password.reserve(128);
             r.insurance_password.reserve(128);
             r.hoa_password.reserve(128);
+            r.tax_portal_password.reserve(128);
         }
         if let Some(pw) = copy_pw {
             self.copy_to_clipboard(pw);
