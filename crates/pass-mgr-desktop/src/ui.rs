@@ -427,6 +427,10 @@ struct App {
     cfg_volume_size: String,
     cfg_backup_dest: String,
     cfg_redundancy: String,
+    // Prefs-backed export destination directory (shared with the GUI via prefs.json).
+    // Document Export writes here, recreating the in-vault folder structure; settable
+    // in read-only mode since it is a local preference, not vault content.
+    cfg_export_dir: String,
     status: String,
     clipboard_dirty: bool,
     // When set, the clipboard should be wiped at/after this instant (auto-clear
@@ -483,6 +487,7 @@ impl App {
             cfg_volume_size: String::new(),
             cfg_backup_dest: String::new(),
             cfg_redundancy: String::new(),
+            cfg_export_dir: crate::load_export_dir(),
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,
@@ -1069,7 +1074,7 @@ impl App {
 
     fn handle_config_key(&mut self, key: KeyEvent) -> bool {
         // A local `const` (compile-time constant) for the field count.
-        const CFG_FIELDS: usize = 7;
+        const CFG_FIELDS: usize = 8;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
@@ -1099,17 +1104,19 @@ impl App {
             3 => &mut self.cfg_subtype_name,
             4 => &mut self.cfg_volume_size,
             5 => &mut self.cfg_backup_dest,
-            _ => &mut self.cfg_redundancy,
+            6 => &mut self.cfg_redundancy,
+            _ => &mut self.cfg_export_dir,
         }
     }
 
     /// Perform the focused config action: add a type/subtype, set the volume
     /// size, or run a backup.
     fn submit_config(&mut self) {
-        // Backup (focus 5) is a read/copy and always allowed; the type/subtype
-        // adds and the volume-size change (focus 0..4) mutate the vault and need
-        // --write.
-        if self.cfg_focus != 5 && !self.require_writable() {
+        // Backup (focus 5) is a read/copy and the export directory (focus 7) is a
+        // local non-vault preference — both are always allowed, even read-only. The
+        // type/subtype adds and the volume-size/redundancy changes (focus 0..4, 6)
+        // mutate the vault and need --write.
+        if self.cfg_focus != 5 && self.cfg_focus != 7 && !self.require_writable() {
             return;
         }
         match self.cfg_focus {
@@ -1188,7 +1195,7 @@ impl App {
                 }
             }
             // Vault file redundancy depth (0 = off). See `docs/DESIGN.md` §12.8.
-            _ => match self.cfg_redundancy.trim().parse::<u32>() {
+            6 => match self.cfg_redundancy.trim().parse::<u32>() {
                 Ok(depth) => match self.vault.as_mut().expect("vault open on config").set_redundancy(depth) {
                     Ok(()) => {
                         let applied = self.vault_ref().redundancy();
@@ -1203,6 +1210,19 @@ impl App {
                 },
                 _ => self.status = "Enter a whole number (0 = off).".into(),
             },
+            // Document export directory — a local, non-vault preference (prefs.json),
+            // so it is settable even read-only. Documents export into this directory,
+            // recreating their volume folder structure. An empty value clears it.
+            _ => {
+                let dir = self.cfg_export_dir.trim().to_string();
+                self.cfg_export_dir = dir.clone();
+                crate::save_export_dir(&dir);
+                self.status = if dir.is_empty() {
+                    "Export directory cleared.".into()
+                } else {
+                    format!("Export directory set to {dir}")
+                };
+            }
         }
     }
 
@@ -1526,16 +1546,16 @@ impl App {
         let record_fields = fields.len();
         // Uniform document-upload inputs for every document-bearing tab. The stored
         // location is auto-derived as <root>/<auto-group>/<timestamp>[/<subfolder>];
-        // the user controls only the filename and the optional subfolder. The
-        // multi-document tabs additionally get a "Doc #" selecting which listed
-        // document Ctrl+E / Ctrl+K act on. Field order after `record_fields` (rc):
-        //   rc+0 filename · rc+1 upload-from · rc+2 export-to · rc+3 subfolder ·
-        //   rc+4 doc# (multi-document tabs only).
+        // the user controls only the filename and the optional subfolder. There is no
+        // per-export path: Ctrl+E exports into the configured export directory (set in
+        // Config), recreating the document's folder structure there. The multi-document
+        // tabs additionally get a "Doc #" selecting which listed document Ctrl+E / Ctrl+K
+        // act on. Field order after `record_fields` (rc):
+        //   rc+0 filename · rc+1 upload-from · rc+2 subfolder · rc+3 doc# (multi only).
         let multi = matches!(tab, Tab::Taxes | Tab::RealEstate);
         if tab_has_docs(tab) || multi {
             fields.push(Field::text("Doc filename", String::new()));
             fields.push(Field::text("Upload from", String::new()));
-            fields.push(Field::text("Export to", String::new()));
             fields.push(Field::text("Subfolder (optional)", String::new()));
             if multi {
                 fields.push(Field::text("Doc # (export/remove)", String::new()));
@@ -1759,7 +1779,7 @@ impl App {
         let rc = es.record_fields;
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
-        let subfolder = es.fields[rc + 3].value.clone();
+        let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();
             self.edit = Some(es);
@@ -1813,11 +1833,10 @@ impl App {
         // not become an orphan in the archive.
         // `.replace(id)` stores the new id and returns the OLD one (as an Option).
         let previous = es.attached_file_id.replace(id);
-        // Clear the consumed upload inputs (filename, upload-from, subfolder),
-        // leaving the "Export to" field (rc+2) for a later export.
+        // Clear the consumed upload inputs (filename, upload-from, subfolder).
         es.fields[rc].value.clear();
         es.fields[rc + 1].value.clear();
-        es.fields[rc + 3].value.clear();
+        es.fields[rc + 2].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1886,29 +1905,37 @@ impl App {
         self.edit = Some(es);
     }
 
-    fn export_document(&mut self) {
-        // Shared borrow here (`.as_ref()`) since export only reads the buffer.
-        let Some(es) = self.edit.as_ref() else { return };
-        if !es.has_docs() {
-            return;
-        }
-        let rc = es.record_fields;
-        let dest = es.fields[rc + 2].value.clone();
-        // let-else: require an attached document, or report and bail.
-        let Some(id) = es.attached_file_id.clone() else {
-            self.status = "No document attached to export.".into();
-            return;
-        };
-        if dest.trim().is_empty() {
-            self.status = "Enter an 'export to' path first.".into();
+    /// Export document `id` into the configured export directory (`cfg_export_dir`),
+    /// recreating its volume folder structure under it. There is no per-export path
+    /// prompt; the directory is set in Config and is settable even in read-only mode
+    /// (it is a local preference), so a read-only user can still extract documents.
+    fn export_doc_to_config_dir(&mut self, id: &str) {
+        let dir = self.cfg_export_dir.trim().to_string();
+        if dir.is_empty() {
+            self.status = "Set an export directory in Config first (Config → Export directory).".into();
             return;
         }
         if let Some(ov) = self.vault.as_ref() {
-            match ov.export_document(&id, Path::new(&dest)) {
-                Ok(()) => self.status = format!("Exported to {dest}"),
+            match ov.export_document_into(id, Path::new(&dir)) {
+                Ok(p) => self.status = format!("Exported to {}", p.display()),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
         }
+    }
+
+    fn export_document(&mut self) {
+        let id = {
+            let Some(es) = self.edit.as_ref() else { return };
+            if !es.has_docs() {
+                return;
+            }
+            let Some(id) = es.attached_file_id.clone() else {
+                self.status = "No document attached to export.".into();
+                return;
+            };
+            id
+        };
+        self.export_doc_to_config_dir(&id);
     }
 
     /// Upload a document into the current tax filing's `taxes/<year>/` folder and
@@ -1924,7 +1951,7 @@ impl App {
         let year = es.fields[0].value.clone();
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
-        let subfolder = es.fields[rc + 3].value.clone();
+        let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();
             self.edit = Some(es);
@@ -1964,7 +1991,7 @@ impl App {
         es.tax_docs.push(id);
         es.fields[rc].value.clear(); // filename
         es.fields[rc + 1].value.clear(); // upload-from
-        es.fields[rc + 3].value.clear(); // subfolder
+        es.fields[rc + 2].value.clear(); // subfolder
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -1977,29 +2004,22 @@ impl App {
         self.edit = Some(es);
     }
 
-    /// Export the tax document whose 1-based number is in the "Doc #" field.
+    /// Export the tax document whose 1-based number is in the "Doc #" field, into the
+    /// configured export directory (recreating its folder structure there).
     fn export_tax_document(&mut self) {
-        let Some(es) = self.edit.as_ref() else { return };
-        if es.tab != Tab::Taxes {
-            return;
-        }
-        let rc = es.record_fields;
-        let dest = es.fields[rc + 2].value.clone();
-        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.tax_docs.len()) else {
-            self.status = format!("Enter a document # between 1 and {}.", es.tax_docs.len());
-            return;
-        };
-        if dest.trim().is_empty() {
-            self.status = "Enter an 'export to' path first.".into();
-            return;
-        }
-        let id = es.tax_docs[idx].clone();
-        if let Some(ov) = self.vault.as_ref() {
-            match ov.export_document(&id, Path::new(&dest)) {
-                Ok(()) => self.status = format!("Exported to {dest}"),
-                Err(e) => self.status = format!("Export failed: {e}"),
+        let id = {
+            let Some(es) = self.edit.as_ref() else { return };
+            if es.tab != Tab::Taxes {
+                return;
             }
-        }
+            let rc = es.record_fields;
+            let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
+                self.status = format!("Enter a document # between 1 and {}.", es.tax_docs.len());
+                return;
+            };
+            es.tax_docs[idx].clone()
+        };
+        self.export_doc_to_config_dir(&id);
     }
 
     /// Remove (and reclaim) the tax document whose 1-based number is in "Doc #".
@@ -2011,13 +2031,13 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.tax_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.tax_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {} to remove.", es.tax_docs.len());
             self.edit = Some(es);
             return;
         };
         let id = es.tax_docs.remove(idx);
-        es.fields[rc + 4].value.clear();
+        es.fields[rc + 3].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -2051,7 +2071,7 @@ impl App {
         let address = es.fields[0].value.clone();
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
-        let subfolder = es.fields[rc + 3].value.clone();
+        let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();
             self.edit = Some(es);
@@ -2091,7 +2111,7 @@ impl App {
         es.re_docs.push(id);
         es.fields[rc].value.clear(); // filename
         es.fields[rc + 1].value.clear(); // upload-from
-        es.fields[rc + 3].value.clear(); // subfolder
+        es.fields[rc + 2].value.clear(); // subfolder
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -2104,29 +2124,22 @@ impl App {
         self.edit = Some(es);
     }
 
-    /// Export the property document whose 1-based number is in the "Doc #" field.
+    /// Export the property document whose 1-based number is in the "Doc #" field, into
+    /// the configured export directory (recreating its folder structure there).
     fn export_re_document(&mut self) {
-        let Some(es) = self.edit.as_ref() else { return };
-        if es.tab != Tab::RealEstate {
-            return;
-        }
-        let rc = es.record_fields;
-        let dest = es.fields[rc + 2].value.clone();
-        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.re_docs.len()) else {
-            self.status = format!("Enter a document # between 1 and {}.", es.re_docs.len());
-            return;
-        };
-        if dest.trim().is_empty() {
-            self.status = "Enter an 'export to' path first.".into();
-            return;
-        }
-        let id = es.re_docs[idx].clone();
-        if let Some(ov) = self.vault.as_ref() {
-            match ov.export_document(&id, Path::new(&dest)) {
-                Ok(()) => self.status = format!("Exported to {dest}"),
-                Err(e) => self.status = format!("Export failed: {e}"),
+        let id = {
+            let Some(es) = self.edit.as_ref() else { return };
+            if es.tab != Tab::RealEstate {
+                return;
             }
-        }
+            let rc = es.record_fields;
+            let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
+                self.status = format!("Enter a document # between 1 and {}.", es.re_docs.len());
+                return;
+            };
+            es.re_docs[idx].clone()
+        };
+        self.export_doc_to_config_dir(&id);
     }
 
     /// Remove (and reclaim) the property document whose 1-based number is in "Doc #".
@@ -2137,13 +2150,13 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let Some(idx) = parse_doc_index(&es.fields[rc + 4].value, es.re_docs.len()) else {
+        let Some(idx) = parse_doc_index(&es.fields[rc + 3].value, es.re_docs.len()) else {
             self.status = format!("Enter a document # between 1 and {} to remove.", es.re_docs.len());
             self.edit = Some(es);
             return;
         };
         let id = es.re_docs.remove(idx);
-        es.fields[rc + 4].value.clear();
+        es.fields[rc + 3].value.clear();
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);
@@ -2488,6 +2501,7 @@ impl App {
             ("Volume size (MiB)", &self.cfg_volume_size),
             ("Backup destination dir", &self.cfg_backup_dest),
             ("Vault redundancy (0=off)", &self.cfg_redundancy),
+            ("Export directory", &self.cfg_export_dir),
         ];
         let cats = self.vault_ref().categories();
         let mut lines = vec![
@@ -2518,6 +2532,13 @@ impl App {
             match self.vault_ref().redundancy() {
                 0 => "Vault redundancy: off (set N>0 to keep a mirror + N prior copies; not a backup)".to_string(),
                 n => format!("Vault redundancy: {n} (mirror + {n} prior generation(s); not a backup)"),
+            },
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            match self.cfg_export_dir.trim() {
+                "" => "Export directory: (unset — set one to export documents)".to_string(),
+                d => format!("Export directory: {d} (documents export here, recreating their folders)"),
             },
             Style::default().fg(Color::Gray),
         )));
@@ -3357,22 +3378,23 @@ mod tests {
         assert_eq!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.len(), 1, "and persisted it");
 
         // --- export: an out-of-range number exports nothing ---
-        let dest = dir.join("out.txt");
-        {
-            let es = app.edit.as_mut().unwrap();
-            es.fields[rc + 2].value = dest.to_string_lossy().into(); // export to
-            es.fields[rc + 4].value = "2".into(); // doc # (only 1 exists)
-        }
+        // Export goes to the configured export dir, recreating the volume folder structure.
+        let export_root = dir.join("exports");
+        app.cfg_export_dir = export_root.to_string_lossy().into();
+        let tax_id = app.vault.as_ref().unwrap().vault.tax_filings[0].documents[0].clone();
+        let vpath = app.vault.as_ref().unwrap().doc_path(&tax_id).unwrap();
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "2".into(); // doc # (only 1 exists)
         app.export_tax_document();
-        assert!(!dest.exists(), "out-of-range doc # exports nothing");
+        assert!(!export_root.exists(), "out-of-range doc # exports nothing");
         assert!(app.status.contains("between 1 and 1"));
 
-        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
         app.export_tax_document();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"taxable income", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&exported).unwrap(), b"taxable income", "exported bytes round-trip (status: {})", app.status);
 
         // --- remove ---
-        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
         app.remove_tax_document();
         assert!(app.edit.as_ref().unwrap().tax_docs.is_empty(), "removed the document");
         assert!(app.vault.as_ref().unwrap().vault.tax_filings[0].documents.is_empty(), "and unlinked it");
@@ -3405,16 +3427,17 @@ mod tests {
         assert_eq!(app.edit.as_ref().unwrap().re_docs.len(), 1, "attached one document");
         assert_eq!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.len(), 1, "and persisted it");
 
-        let dest = dir.join("deed-out.txt");
-        {
-            let es = app.edit.as_mut().unwrap();
-            es.fields[rc + 2].value = dest.to_string_lossy().into();
-            es.fields[rc + 4].value = "1".into();
-        }
+        // Export into the configured export dir, recreating the volume folder structure.
+        let export_root = dir.join("exports");
+        app.cfg_export_dir = export_root.to_string_lossy().into();
+        let re_id = app.vault.as_ref().unwrap().vault.real_estate[0].documents[0].clone();
+        let vpath = app.vault.as_ref().unwrap().doc_path(&re_id).unwrap();
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
         app.export_re_document();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"the deed", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&exported).unwrap(), b"the deed", "exported bytes round-trip (status: {})", app.status);
 
-        app.edit.as_mut().unwrap().fields[rc + 4].value = "1".into();
+        app.edit.as_mut().unwrap().fields[rc + 3].value = "1".into();
         app.remove_re_document();
         assert!(app.edit.as_ref().unwrap().re_docs.is_empty(), "removed the document");
         assert!(app.vault.as_ref().unwrap().vault.real_estate[0].documents.is_empty(), "and unlinked it");
@@ -3441,7 +3464,7 @@ mod tests {
             let es = app.edit.as_mut().unwrap();
             es.fields[rc].value = "passport.pdf".into(); // filename
             es.fields[rc + 1].value = src.to_string_lossy().into(); // upload from
-            es.fields[rc + 3].value = "ids".into(); // subfolder
+            es.fields[rc + 2].value = "ids".into(); // subfolder
         }
         app.attach_document();
         let id = app.edit.as_ref().unwrap().attached_file_id.clone();
@@ -3458,10 +3481,12 @@ mod tests {
         assert_eq!(parts[3], "ids", "user subfolder");
         assert_eq!(parts[4], "passport.pdf", "user filename");
 
-        let dest = dir.join("out.pdf");
-        app.edit.as_mut().unwrap().fields[rc + 2].value = dest.to_string_lossy().into();
+        // Export into the configured export dir, recreating the volume folder structure.
+        let export_root = dir.join("exports");
+        app.cfg_export_dir = export_root.to_string_lossy().into();
         app.export_document();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"passport bytes", "exported bytes round-trip");
+        let exported = export_root.join(vpath.trim_start_matches('/'));
+        assert_eq!(std::fs::read(&exported).unwrap(), b"passport bytes", "exported bytes round-trip (status: {})", app.status);
 
         app.detach_document();
         assert!(app.edit.as_ref().unwrap().attached_file_id.is_none(), "detached");

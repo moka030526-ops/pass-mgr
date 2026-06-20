@@ -357,86 +357,34 @@ fn visuals_for(theme: Theme) -> egui::Visuals {
     }
 }
 
-/// Path to the small non-secret GUI preferences file (theme choice) in the
-/// per-user config directory. `None` if no config dir is available.
-fn theme_pref_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "passmgr", "pass-mgr").map(|d| d.config_dir().join("prefs.json"))
-}
-
-/// Hard cap on the preferences file size. It holds one short JSON object, so a
-/// larger file is corrupt or hostile; bounding the read before allocating means a
-/// huge or symlinked `prefs.json` can never stall or OOM the UI thread at startup
-/// (mirrors the bounded reads in the storage layer).
-const MAX_PREFS_SIZE: u64 = 64 * 1024;
-
-/// Bounded, symlink-safe read of the prefs JSON object (empty map on any failure), so
-/// each setter can read-modify-write WITHOUT clobbering the other keys (theme vs
-/// export_dir). `symlink_metadata` doesn't follow links — a symlinked prefs file fails
-/// `is_file()` — and the size check rejects an oversized file before reading it.
-fn read_prefs_obj(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() && m.len() <= MAX_PREFS_SIZE => {}
-        _ => return serde_json::Map::new(),
-    }
-    let Ok(bytes) = std::fs::read(path) else { return serde_json::Map::new() };
-    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).unwrap_or_default()
-}
-
-/// Best-effort write of the prefs object (a write failure is ignored — prefs are
-/// non-critical and trivially re-picked).
-fn write_prefs_obj(path: &std::path::Path, obj: &serde_json::Map<String, serde_json::Value>) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec_pretty(obj) {
-        let _ = std::fs::write(path, bytes);
-    }
-}
+// The color theme is stored in the shared, non-secret `prefs.json` alongside the
+// export directory (see `crate::prefs_path` / `crate::read_prefs_obj` in lib.rs). The
+// theme accessors live here because they reference the GUI-only `Theme` type; the
+// generic prefs primitives and the export-dir accessors are shared in `crate`.
 
 /// Load the saved theme from the standard preferences path.
 fn load_theme() -> Theme {
-    theme_pref_path().map(|p| load_theme_from(&p)).unwrap_or_default()
+    crate::prefs_path().map(|p| load_theme_from(&p)).unwrap_or_default()
 }
 
 /// Load the theme from a specific path. Best-effort/bounded: missing/symlinked/over-cap/
 /// unparseable all fall back to the default — a UI preference must never block startup.
 fn load_theme_from(path: &std::path::Path) -> Theme {
-    read_prefs_obj(path).get("theme").and_then(|t| t.as_str()).and_then(Theme::from_id).unwrap_or_default()
+    crate::read_prefs_obj(path).get("theme").and_then(|t| t.as_str()).and_then(Theme::from_id).unwrap_or_default()
 }
 
 /// Persist the chosen theme to the standard preferences path.
 fn save_theme(theme: Theme) {
-    if let Some(path) = theme_pref_path() {
+    if let Some(path) = crate::prefs_path() {
         save_theme_to(&path, theme);
     }
 }
 
 /// Persist the theme to a specific path, preserving any other prefs keys (export_dir).
 fn save_theme_to(path: &std::path::Path, theme: Theme) {
-    let mut obj = read_prefs_obj(path);
+    let mut obj = crate::read_prefs_obj(path);
     obj.insert("theme".into(), serde_json::Value::String(theme.id().to_string()));
-    write_prefs_obj(path, &obj);
-}
-
-/// The saved export-destination directory ("" if unset). Non-secret; kept in the same
-/// prefs file as the theme so it persists AND is settable even in read-only mode — it's
-/// a local-machine preference (where to drop exported documents), not vault content,
-/// which keeps read-only document export working (the heir use case).
-fn load_export_dir() -> String {
-    theme_pref_path().map(|p| load_export_dir_from(&p)).unwrap_or_default()
-}
-fn load_export_dir_from(path: &std::path::Path) -> String {
-    read_prefs_obj(path).get("export_dir").and_then(|v| v.as_str()).unwrap_or("").to_string()
-}
-fn save_export_dir(dir: &str) {
-    if let Some(path) = theme_pref_path() {
-        save_export_dir_to(&path, dir);
-    }
-}
-fn save_export_dir_to(path: &std::path::Path, dir: &str) {
-    let mut obj = read_prefs_obj(path);
-    obj.insert("export_dir".into(), serde_json::Value::String(dir.to_string()));
-    write_prefs_obj(path, &obj);
+    crate::write_prefs_obj(path, &obj);
 }
 
 // `enum` is a closed set of named alternatives (a tagged union). `#[derive(...)]`
@@ -665,7 +613,7 @@ impl GuiApp {
             doc_subfolder: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
-            export_dir: load_export_dir(),
+            export_dir: crate::load_export_dir(),
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,
@@ -1174,7 +1122,7 @@ impl GuiApp {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("Preferences (theme + export directory; non-secret):");
-                let pref = theme_pref_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(unavailable)".into());
+                let pref = crate::prefs_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(unavailable)".into());
                 ui.label(egui::RichText::new(pref).monospace());
             });
         });
@@ -1507,7 +1455,7 @@ impl GuiApp {
             // write, so this works in read-only mode). Trim and normalize the stored value.
             let dir = self.export_dir.trim().to_string();
             self.export_dir = dir.clone();
-            save_export_dir(&dir);
+            crate::save_export_dir(&dir);
             self.status = if dir.is_empty() {
                 "Export directory cleared.".into()
             } else {
@@ -3809,7 +3757,7 @@ mod tests {
         std::fs::write(&p, br#"{"theme":"nope"}"#).unwrap();
         assert_eq!(load_theme_from(&p), Theme::Light);
         // Over-cap file is rejected before the body is parsed (DoS guard).
-        std::fs::write(&p, vec![b'{'; (MAX_PREFS_SIZE as usize) + 1]).unwrap();
+        std::fs::write(&p, vec![b'{'; (crate::MAX_PREFS_SIZE as usize) + 1]).unwrap();
         assert_eq!(load_theme_from(&p), Theme::Light);
         // Missing file -> default.
         assert_eq!(load_theme_from(&dir.join("absent.json")), Theme::Light);

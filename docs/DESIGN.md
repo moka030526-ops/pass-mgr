@@ -616,20 +616,27 @@ currently exposes the first five record types.) The four screens are:
    virtual-path limit (the GUI disables the button with an inline error, the TUI
    rejects the upload key) and persists the record→document link before reclaiming
    any old blob (crash-safe ordering, §11). On attach, **a blank filename defaults to
-   the source file's basename** (`records::effective_doc_filename`). In the GUI,
-   **Export** takes no per-document path: it writes the decrypted file into the
-   configured **export directory**, recreating the document's virtual folder structure
-   under it (`<export_dir>/<location>/<filename>`, via `OpenVault::export_document_into`,
-   which re-sanitizes each path component and never overwrites — `_N` suffix).
+   the source file's basename** (`records::effective_doc_filename`). In **both
+   front-ends**, **Export** takes no per-document path: it writes the decrypted file
+   into the configured **export directory**, recreating the document's virtual folder
+   structure under it (`<export_dir>/<location>/<filename>`, via
+   `OpenVault::export_document_into`, which re-sanitizes each path component and never
+   overwrites — `_N` suffix). The GUI exposes one global **Export** button per page; the
+   TUI exports the document whose 1-based number is in the **Doc #** field (`Ctrl+E`).
+   Both read the export directory from the shared `prefs.json` (see Config below).
 4. **Config.** Edit the category lists (asset types, account types + subtypes), the
    **volume size** (`volume_max_size`), and the **redundancy** depth, and run a
    `backup` — all **write-mode only**, persisting into the encrypted vault (no external
    config files). Two items are **local, non-secret preferences** stored in a small
-   `prefs.json` (in the OS config dir) instead of the vault — the **color theme** (10 palettes) and the
-   **export directory** — so both can be changed even in **read-only** mode (the export
-   directory is about the local machine, not vault content, which keeps read-only
-   document export — the heir use case — working). A separate **Help** screen renders a
-   sectioned in-app guide plus the on-disk vault and `prefs.json` paths.
+   `prefs.json` (in the OS config dir) instead of the vault — the **color theme** (10
+   palettes, GUI) and the **export directory** — so both can be changed even in
+   **read-only** mode (the export directory is about the local machine, not vault
+   content, which keeps read-only document export — the heir use case — working). The
+   **export directory** field appears in **both UIs' Config** screen and is the one
+   write-mode-exempt Config control (the TUI carves out its Config focus index 7
+   alongside the always-allowed `backup`; the GUI renders it outside the writable gate).
+   A separate **Help** screen renders a sectioned in-app guide plus the on-disk vault
+   and `prefs.json` paths.
 
 Read-only is the default and is enforced in the core (§4.4), with the UIs hiding
 write controls and showing a read-only badge.

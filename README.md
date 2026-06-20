@@ -458,12 +458,17 @@ pass-mgr compact ./myvault --volume --dry-run             # just report what it 
 
 **Browse:** `←/→` or `1`–`5` switch tab · `↑/↓` select · `Enter` edit · `n` new ·
 `d` delete · `t`/`s`/`o`/`v` Account filters (type/subtype/owner/review) ·
-`p` change passwords · `q` quit.
+`c` Config · `p` change passwords · `q` quit.
 
 **Edit:** `Tab`/`↑`/`↓` move between fields · `←/→` cycle a dropdown · `Ctrl+S`
 save · `Ctrl+G` generate password · `Ctrl+R` reveal · `Ctrl+Y` copy (auto-clears
-after 15s and on exit) · `Ctrl+U` upload document · `Ctrl+E` export document ·
-`Ctrl+K` detach document · `Esc` cancel.
+after 15s and on exit) · `Ctrl+U` upload document · `Ctrl+E` export document (to the
+**Export directory** set in Config) · `Ctrl+K` detach document · `Esc` cancel.
+
+**Config (`c`):** `Tab`/`↑/↓` move between fields · type to edit · `Enter` apply
+(add a type/subtype, set the volume size or redundancy, run a backup, or set the
+**Export directory**) · `Del` delete the focused type/subtype (if unused) · `Esc`
+back. The **Export directory** and **backup** are usable even in read-only mode.
 
 ## How it works & security
 

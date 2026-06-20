@@ -44,3 +44,136 @@ pub(crate) fn copy_secret_to_clipboard(text: &str) -> Result<(), arboard::Error>
         cb.set_text(text.to_owned())
     }
 }
+
+// --- Local, non-secret preferences (shared by the GUI and TUI) ---------------
+//
+// A tiny `prefs.json` in the OS config dir holds UI preferences that are NOT vault
+// content — the GUI color theme and the document **export directory**. Keeping the
+// export directory here (rather than in the encrypted vault) is deliberate: it is a
+// local-machine preference, so it can be changed even in a READ-ONLY session, which
+// is what lets a read-only user (an heir) set where to extract documents. Both
+// front-ends read/write the same file through these helpers, and every write is a
+// read-modify-write so the theme and export-dir keys never clobber each other.
+
+use std::path::{Path, PathBuf};
+
+/// Hard cap on the prefs file size. It holds one short JSON object, so a larger file
+/// is corrupt or hostile; bounding the read before allocating means a huge or
+/// symlinked `prefs.json` can never stall or OOM the UI at startup.
+pub(crate) const MAX_PREFS_SIZE: u64 = 64 * 1024;
+
+/// Standard preferences path (`<config dir>/pass-mgr/prefs.json`), or `None` if the
+/// platform has no config dir.
+pub(crate) fn prefs_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "passmgr", "pass-mgr").map(|d| d.config_dir().join("prefs.json"))
+}
+
+/// Bounded, symlink-safe read of the prefs JSON object (empty map on any failure), so
+/// a setter can read-modify-write without clobbering other keys. `symlink_metadata`
+/// doesn't follow links — a symlinked prefs file fails `is_file()` — and the size
+/// check rejects an oversized file before reading.
+pub(crate) fn read_prefs_obj(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_PREFS_SIZE => {}
+        _ => return serde_json::Map::new(),
+    }
+    let Ok(bytes) = std::fs::read(path) else { return serde_json::Map::new() };
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes).unwrap_or_default()
+}
+
+/// Best-effort write of the prefs object (a write failure is ignored — prefs are
+/// non-critical and trivially re-picked).
+pub(crate) fn write_prefs_obj(path: &Path, obj: &serde_json::Map<String, serde_json::Value>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(obj) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+/// The saved export-destination directory ("" if unset).
+pub(crate) fn load_export_dir() -> String {
+    prefs_path().map(|p| load_export_dir_from(&p)).unwrap_or_default()
+}
+pub(crate) fn load_export_dir_from(path: &Path) -> String {
+    read_prefs_obj(path).get("export_dir").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+/// Persist the export-destination directory, preserving any other prefs keys (theme).
+pub(crate) fn save_export_dir(dir: &str) {
+    if let Some(path) = prefs_path() {
+        save_export_dir_to(&path, dir);
+    }
+}
+pub(crate) fn save_export_dir_to(path: &Path, dir: &str) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("export_dir".into(), serde_json::Value::String(dir.to_string()));
+    write_prefs_obj(path, &obj);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Hermetic prefs round-trip via the path-parametrized helpers (never touches the
+    // real `~/.config` prefs). Uses a nanosecond-tagged temp dir for isolation.
+    fn tmp_prefs_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pmprefs-export-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn export_dir_round_trips_and_defaults_empty() {
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        // Absent file -> empty string (unset).
+        assert_eq!(load_export_dir_from(&p), "");
+        // Save then load round-trips.
+        save_export_dir_to(&p, "/srv/exports");
+        assert_eq!(load_export_dir_from(&p), "/srv/exports");
+        // Re-saving overwrites the value.
+        save_export_dir_to(&p, "/other");
+        assert_eq!(load_export_dir_from(&p), "/other");
+        // Clearing it (empty string) is preserved as empty.
+        save_export_dir_to(&p, "");
+        assert_eq!(load_export_dir_from(&p), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_dir_save_preserves_other_prefs_keys() {
+        // The read-modify-write must not clobber a co-resident key (e.g. the GUI theme).
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        std::fs::write(&p, br#"{"theme":"solarized"}"#).unwrap();
+        save_export_dir_to(&p, "/exports");
+        let obj = read_prefs_obj(&p);
+        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("solarized"), "theme key preserved");
+        assert_eq!(obj.get("export_dir").and_then(|v| v.as_str()), Some("/exports"), "export_dir written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_prefs_obj_is_bounded_and_symlink_safe() {
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        // Over-cap file is rejected before the body is parsed (DoS guard) -> empty map.
+        std::fs::write(&p, vec![b'{'; (MAX_PREFS_SIZE as usize) + 1]).unwrap();
+        assert!(read_prefs_obj(&p).is_empty(), "over-cap prefs rejected");
+        // A symlinked prefs file is refused even if its target is valid.
+        #[cfg(unix)]
+        {
+            let real = dir.join("real.json");
+            std::fs::write(&real, br#"{"export_dir":"/x"}"#).unwrap();
+            let link = dir.join("link.json");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(read_prefs_obj(&link).is_empty(), "symlinked prefs refused");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
