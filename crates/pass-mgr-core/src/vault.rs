@@ -1690,53 +1690,36 @@ fn decrypt_with_redundancy(
         return Err(primary_err); // no candidate header parsed / wrong password
     }
 
-    // PASS 2 — try keys against each candidate, holding AT MOST ONE candidate buffer in
-    // memory at a time (an earlier version slurped every candidate up front, risking OOM
-    // from planted max-size copies). Each candidate is first tried against the key derived
-    // from its OWN salt (the expected match); only the two most-likely-current copies
-    // (mirror, bak1) additionally fall back to the sibling keys, covering a copy whose
-    // header salt is damaged but whose body decrypts under another generation's key. This
-    // bounds the work to ~O(candidates) full AEAD decrypts instead of O(candidates × keys),
-    // closing a CPU-amplification DoS where a vault-dir-write attacker plants many max-size
-    // distinct-salt copies to make every open grind through gigabytes of crypto.
-    let bak1 = bak_path(path, 1);
+    // PASS 2 — try EACH candidate against ONLY the key derived from its OWN header salt,
+    // holding at most one candidate buffer in memory at a time (an earlier version slurped
+    // every candidate up front, risking OOM from planted max-size copies). Trying a
+    // different-salt ("sibling") key is pointless and was removed: the salt is part of the
+    // AEAD associated data (`Header::to_bytes` covers bytes 21..37), so for any candidate a
+    // wrong-salt key fails the tag AND a corrupted-salt header makes its body undecryptable
+    // under any key — there is no cross-salt recovery to be had. This bounds recovery to
+    // EXACTLY O(candidates) full AEAD decrypts, closing a CPU-amplification DoS where a
+    // vault-dir-write attacker plants many max-size distinct-salt copies.
     for (idx, c) in candidates.iter().enumerate() {
         let Ok(raw) = read_capped_vault_nofollow(c) else { continue };
-        let allow_siblings = *c == mirror || *c == bak1;
-        let mut order: Vec<usize> = Vec::new();
-        if let Some(k) = cand_key[idx] {
-            order.push(k);
-        }
-        if allow_siblings {
-            for k in 0..keys.len() {
-                if Some(k) != cand_key[idx] {
-                    order.push(k);
-                }
-            }
-        }
-        for i in order {
-            if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[i]) {
-                let key = keys.swap_remove(i); // take ownership of the matching key
-                // Wording is keyed on the SOURCE only as a coarse hint — NOT a
-                // generation claim. After a rekey/compact, `refresh_redundancy_copies`
-                // rewrites the mirror AND bak1 at the CURRENT generation, so a bak is
-                // frequently the same generation as the lost primary; asserting it is an
-                // "earlier generation — data lost" cried wolf (audit R-12). Both notices
-                // now say only that the latest change *may* be missing (true in both
-                // cases — we recovered the newest readable copy, but cannot know whether
-                // an interrupted save left the unreadable primary newer).
-                let notice = if *c == mirror {
-                    "The main vault file was unreadable and was recovered from its mirror copy \
-                     (normally the latest state — but if a save was interrupted before the \
-                     mirror was written, the most recent change may be missing). Re-save, and \
-                     refresh your off-device backups.".to_string()
-                } else {
-                    "The main vault file and its mirror were unreadable; recovered from a \
-                     redundant copy. If a recent save was interrupted, the most recent \
-                     change(s) may be missing. Re-save, and refresh your off-device backups.".to_string()
-                };
-                return Ok((vault, hdr, key, Some(notice)));
-            }
+        let Some(k) = cand_key[idx] else { continue }; // header unreadable / salt past the cap
+        if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[k]) {
+            let key = keys.swap_remove(k); // take ownership of the matching key
+            // Wording is keyed on the SOURCE only as a coarse hint — NOT a generation claim.
+            // After a rekey/compact, `refresh_redundancy_copies` rewrites the mirror AND bak1
+            // at the CURRENT generation, so a bak is frequently the same generation as the
+            // lost primary; asserting it is an "earlier generation — data lost" cried wolf
+            // (audit R-12). Both notices say only that the latest change *may* be missing.
+            let notice = if *c == mirror {
+                "The main vault file was unreadable and was recovered from its mirror copy \
+                 (normally the latest state — but if a save was interrupted before the \
+                 mirror was written, the most recent change may be missing). Re-save, and \
+                 refresh your off-device backups.".to_string()
+            } else {
+                "The main vault file and its mirror were unreadable; recovered from a \
+                 redundant copy. If a recent save was interrupted, the most recent \
+                 change(s) may be missing. Re-save, and refresh your off-device backups.".to_string()
+            };
+            return Ok((vault, hdr, key, Some(notice)));
         }
         // `raw` is dropped here before the next candidate is read (bounded memory).
     }
@@ -3059,6 +3042,35 @@ mod tests {
     }
 
     #[test]
+    fn salt_is_authenticated_so_a_salt_damaged_copy_is_unrecoverable() {
+        // The salt lives in the AEAD associated data (Header::to_bytes covers bytes 21..37),
+        // so corrupting a COPY's header salt makes its body undecryptable under ANY key (wrong
+        // key from the bad salt, and a wrong AAD even with a sibling key). This pins WHY
+        // recovery only uses each candidate's own-salt key (no cross-salt "sibling" fallback):
+        // here the live primary AND the mirror's salt are damaged, leaving no intact-header
+        // copy, so the open must FAIL closed rather than appear to recover.
+        let path = tmp_path("redsaltauth");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p"));
+        v.save().unwrap();
+        drop(v);
+        let flip = |p: &Path, off: usize| {
+            let mut b = fs::read(p).unwrap();
+            b[off] ^= 0xff;
+            fs::write(p, &b).unwrap();
+        };
+        flip(&path, 70); // primary body -> recovery runs
+        flip(&mirror_path(&path), 21); // mirror header SALT -> body authenticated under the old salt, unrecoverable
+        flip(&bak_path(&path, 1), 70); // the only other copy: body corrupt -> not recoverable either
+        assert!(
+            OpenVault::open(path.clone(), b"a", b"b").is_err(),
+            "a salt-damaged copy cannot be recovered (salt is authenticated); with no intact copy, open fails closed"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn recovers_from_generation_when_primary_and_mirror_corrupt() {
         let path = tmp_path("redbak");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
@@ -3745,6 +3757,49 @@ mod tests {
         assert_eq!(std::fs::read(&p2).unwrap(), b"the deed");
         std::fs::remove_dir_all(&root).ok();
         fs::remove_file(&src).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_document_into_never_escapes_root_for_adversarial_names() {
+        // Security invariant: no matter what the (user-controlled) document filename/location
+        // is, the export path stays strictly UNDER `root` and writes a real file. Covers
+        // traversal, separators, reserved device names, and unicode.
+        let path = tmp_path("exadv");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let root = parent_dir(&path).join("exports");
+        let canon_root = {
+            fs::create_dir_all(&root).unwrap();
+            root.canonicalize().unwrap()
+        };
+        let names = [
+            "../../../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "a/b/c.pdf",
+            "con.pdf",
+            "nul",
+            "  ...  ",
+            "deed\u{202e}fdp.exe",
+            &"x".repeat(400),
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let src = write_src(&format!("exadv-{i}"), b"payload");
+            // The UI sanitizes the filename (records::doc_filename) before add_document, so do
+            // that here too; and inject traversal via the LOCATION (a defense-in-depth check
+            // that export drops `..`/separators even when the stored virtual path carries them).
+            let fname = records::doc_filename(name);
+            let loc = format!("/general-documents/../../sneaky/{}", records::doc_slug(name, "fb"));
+            let Ok(id) = v.add_document(&loc, &fname, &src) else {
+                fs::remove_file(&src).ok();
+                continue; // a path rejected at store time is itself a safe outcome
+            };
+            let dest = v.export_document_into(&id, &root).unwrap();
+            let canon_dest = dest.canonicalize().unwrap();
+            assert!(canon_dest.starts_with(&canon_root), "escaped root: name={name:?} -> {canon_dest:?}");
+            assert_eq!(std::fs::read(&canon_dest).unwrap(), b"payload", "exported content intact for {name:?}");
+            fs::remove_file(&src).ok();
+        }
+        std::fs::remove_dir_all(&root).ok();
         cleanup(&path);
     }
 
