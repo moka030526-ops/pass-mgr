@@ -487,4 +487,58 @@ mod tests {
         let b = derive_key_chained(b"x", b"y", salt, &fast()).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
     }
+
+
+    // --- mutation-testing kill-tests (round 7: cargo-mutants survivor closure) ---
+    #[test]
+    fn mut_kdf_validate_upper_bounds_at_exact_max() {
+        // Pin each KDF ceiling at its exact value AND pin the `>` comparison in
+        // validate(): a params set sitting EXACTLY on each ceiling must validate
+        // (real: `max > max` is false), while one-over must be rejected. This kills
+        // the const `*`->`+`/`/` mutations (the resolved literal differs) together
+        // with the `>`->`>=`/`==` comparison mutants (which would reject the at-max
+        // case). Each parameter is exercised independently.
+        assert_eq!(KdfParams::MAX_M_COST, 524_288u32, "m_cost ceiling is 512 MiB in KiB");
+        assert_eq!(KdfParams::MAX_T_COST, 16u32);
+        assert_eq!(KdfParams::MAX_P_COST, 16u32);
+        assert_eq!(KdfParams::MIN_M_COST, 8u32);
+
+        // Exactly on the ceiling: must pass.
+        assert!(
+            KdfParams { m_cost: KdfParams::MAX_M_COST, t_cost: 1, p_cost: 1 }.validate().is_ok(),
+            "m_cost == MAX must validate"
+        );
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: KdfParams::MAX_T_COST, p_cost: 1 }.validate().is_ok(),
+            "t_cost == MAX must validate"
+        );
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: 1, p_cost: KdfParams::MAX_P_COST }.validate().is_ok(),
+            "p_cost == MAX must validate"
+        );
+
+        // One over each ceiling: must be rejected.
+        assert!(
+            KdfParams { m_cost: KdfParams::MAX_M_COST + 1, t_cost: 1, p_cost: 1 }.validate().is_err(),
+            "m_cost == MAX + 1 must be rejected"
+        );
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: KdfParams::MAX_T_COST + 1, p_cost: 1 }.validate().is_err(),
+            "t_cost == MAX + 1 must be rejected"
+        );
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: 1, p_cost: KdfParams::MAX_P_COST + 1 }.validate().is_err(),
+            "p_cost == MAX + 1 must be rejected"
+        );
+
+        // Exactly on the m_cost floor passes; one under is rejected (guards MIN_M_COST).
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: 1, p_cost: 1 }.validate().is_ok(),
+            "m_cost == MIN must validate"
+        );
+        assert!(
+            KdfParams { m_cost: KdfParams::MIN_M_COST - 1, t_cost: 1, p_cost: 1 }.validate().is_err(),
+            "m_cost == MIN - 1 must be rejected"
+        );
+    }
 }

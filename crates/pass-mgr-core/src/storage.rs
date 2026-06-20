@@ -1452,4 +1452,337 @@ mod tests {
             let _ = scan_volume(&mut cur, bytes.len() as u64, &key, &aad);
         }
     }
+
+
+    // --- mutation-testing kill-tests (round 7: cargo-mutants survivor closure) ---
+    #[test]
+    fn mut_const_size_caps_have_exact_values() {
+        // Kills the `*` -> `+` mutants on lines 58/62/64: pin the EXACT byte values
+        // of the module size caps. With `+`, e.g. MAX_DOC_SIZE would be 64+1024+1024
+        // = 3072 instead of 67108864, so each equality below fails under the mutant.
+        assert_eq!(MAX_DOC_SIZE, 64 * 1024 * 1024);
+        assert_eq!(MAX_DOC_SIZE, 67_108_864u64);
+        assert_eq!(DEFAULT_VOLUME_MAX_SIZE, 256 * 1024 * 1024);
+        assert_eq!(DEFAULT_VOLUME_MAX_SIZE, 268_435_456u64);
+        assert_eq!(MAX_MANIFEST_SIZE, 256 * 1024 * 1024);
+        assert_eq!(MAX_MANIFEST_SIZE, 268_435_456u64);
+    }
+
+    #[test]
+    fn mut_put_rejects_at_doc_size_boundary() {
+        // Pins the MAX_DOC_SIZE cap on line 354 (`bytes.len() as u64 > MAX_DOC_SIZE`):
+        //   - a doc of EXACTLY MAX_DOC_SIZE must be ACCEPTED  (kills `>` -> `>=`)
+        //   - a doc of MAX_DOC_SIZE + 1   must be REJECTED  (kills `>` -> `==`)
+        let dir = tmp_dir("dcap");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        // One allocation of cap+1 bytes, reused as both slices.
+        let buf = vec![0u8; MAX_DOC_SIZE as usize + 1];
+        // Over-cap by one byte: real code rejects with TooLarge before any write.
+        assert!(
+            matches!(s.put("over", "/o", &buf[..], 1, &key), Err(StorageError::TooLarge)),
+            "a document of MAX_DOC_SIZE + 1 must be rejected (kills `>` -> `==`)"
+        );
+        // Exactly at the cap: real code accepts it (kills `>` -> `>=`).
+        s.put("atcap", "/c", &buf[..MAX_DOC_SIZE as usize], 2, &key)
+            .expect("a document of exactly MAX_DOC_SIZE must be accepted (kills `>` -> `>=`)");
+        assert!(s.contains("atcap"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_load_manifest_truncation_boundary_is_nonce_len() {
+        // Pins line 478 (`raw.len() < NONCE_LEN`):
+        //   - NONCE_LEN - 1 bytes  -> Corrupt("truncated")   (reject side)
+        //   - EXACTLY NONCE_LEN    -> NOT the truncated branch; it proceeds to decrypt
+        //     an empty ciphertext, which fails AEAD verification -> Crypto.
+        // Under `<` -> `<=`, the NONCE_LEN-exact file would be rejected as Corrupt,
+        // so the `Crypto` assertion below would fail. That distinguishes the mutant.
+        let dir = tmp_dir("manlen");
+        let key = fast_key();
+        let s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        std::fs::create_dir_all(dir.join("manifest")).unwrap();
+        let mpath = dir.join("manifest/manifest.0");
+
+        // One byte short of a nonce: truncated on either operator.
+        std::fs::write(&mpath, vec![0u8; NONCE_LEN - 1]).unwrap();
+        assert!(
+            matches!(s.load_manifest(0, &key), Err(StorageError::Corrupt(_))),
+            "a sub-nonce manifest is truncated/corrupt"
+        );
+
+        // Exactly NONCE_LEN bytes: real code does NOT take the truncated branch; it
+        // decrypts an empty ciphertext, which fails -> Crypto (NOT Corrupt).
+        std::fs::write(&mpath, vec![0u8; NONCE_LEN]).unwrap();
+        assert!(
+            matches!(s.load_manifest(0, &key), Err(StorageError::Crypto(_))),
+            "a manifest of exactly NONCE_LEN bytes must reach decrypt (kills `<` -> `<=`)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_load_manifest_rejects_oversize_before_read() {
+        // Pins line 474 (`meta.len() > MAX_MANIFEST_SIZE`) on the over-cap side:
+        // a (sparse) manifest of MAX_MANIFEST_SIZE + 1 bytes is rejected with
+        // TooLarge BEFORE the file is read into memory. Under `>` -> `==`, cap+1 is
+        // not equal to the cap, so the guard would be false and the file would be
+        // read (no TooLarge), failing this assertion.
+        let dir = tmp_dir("manbig");
+        let key = fast_key();
+        let s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        std::fs::create_dir_all(dir.join("manifest")).unwrap();
+        let mpath = dir.join("manifest/manifest.0");
+        // Sparse allocation: logical length cap+1, ~no physical bytes / no big read.
+        let f = OpenOptions::new().write(true).create(true).truncate(true).open(&mpath).unwrap();
+        f.set_len(MAX_MANIFEST_SIZE + 1).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        assert!(
+            matches!(s.load_manifest(0, &key), Err(StorageError::TooLarge)),
+            "an over-cap manifest must be rejected with TooLarge (kills `>` -> `==`)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_open_corrupt_manifest_with_volume_is_rebuilt() {
+        // Pins line 196 guard `vpath.exists()` toward `true`: a CORRUPT (Corrupt/
+        // Crypto/Json) manifest WITH its volume present must be rebuilt, so open
+        // succeeds and the document is recoverable. Under guard -> `false`, the
+        // rebuild arm is skipped, the corrupt manifest falls through to the
+        // `Err(e) => return Err(e)` arm, and open() fails.
+        let dir = tmp_dir("open-corrupt-rebuild");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap();
+        // Corrupt the manifest in place; the volume (vol.0) stays intact.
+        std::fs::write(dir.join("manifest/manifest.0"), b"garbage").unwrap();
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE)
+            .expect("corrupt manifest + present volume must rebuild (kills line 196 guard -> false)");
+        assert!(s2.contains("a"), "document recovered by volume rebuild");
+        assert_eq!(&*s2.read("a", &key).unwrap(), b"alpha");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_open_corrupt_manifest_without_volume_propagates() {
+        // Pins line 196 guard `vpath.exists()` toward `true`: when a manifest is
+        // present-but-corrupt and its volume is ABSENT, open must PROPAGATE the
+        // corruption error (Corrupt), NOT attempt a rebuild. Under guard -> `true`,
+        // the rebuild arm runs, File::open on the missing volume fails, and open
+        // returns an Io error instead of Corrupt.
+        let dir = tmp_dir("open-corrupt-novol");
+        let key = fast_key();
+        std::fs::create_dir_all(dir.join("manifest")).unwrap();
+        // Sub-nonce garbage -> load_manifest returns Corrupt("truncated").
+        std::fs::write(dir.join("manifest/manifest.0"), b"garbage").unwrap();
+        // No volume/ dir at all: vpath does not exist.
+        // `let-else` instead of `.unwrap_err()` (VolumeStore isn't Debug).
+        let Err(err) = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE) else {
+            panic!("a corrupt manifest with no volume must error, not rebuild (kills line 196 guard -> true)");
+        };
+        assert!(
+            matches!(err, StorageError::Corrupt(_)),
+            "a corrupt manifest with no volume must propagate Corrupt, not rebuild; got {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mut_open_non_corruption_error_with_present_manifest_is_not_rebuilt() {
+        // Pins line 206 (`vpath.exists() && !mpath.exists()`): a manifest that is
+        // PRESENT but fails load for a NON-corruption reason (an I/O error, here a
+        // path that is a directory -> EISDIR on read) must NOT be silently rebuilt
+        // over via a lossy volume scan; the error is propagated and open() fails.
+        // Under `&&` -> `||` (or the guard -> true), `vpath.exists() || !mpath.exists()`
+        // is true (the volume is present), the manifest is rebuilt, and open()
+        // succeeds instead — which this test detects as a failure.
+        let dir = tmp_dir("open-iofail");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"alpha", 1, &key).unwrap(); // valid vol.0 + manifest.0
+        // Replace manifest.0 (a file) with a directory: it still "exists" (mpath
+        // present) but fs::read on it errors with Io, not a corruption variant.
+        let mpath = dir.join("manifest/manifest.0");
+        std::fs::remove_file(&mpath).unwrap();
+        std::fs::create_dir(&mpath).unwrap();
+        assert!(mpath.exists(), "manifest path still present (as a directory)");
+        assert!(dir.join("volume/vol.0").exists(), "volume present");
+        assert!(
+            VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).is_err(),
+            "a present manifest with a non-corruption (I/O) error must propagate, not rebuild \
+             (kills line 206 `&&` -> `||` and the guard -> true)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_read_frame_at_eof_and_overrun_bounds() {
+        // Pins the EOF bounds in read_frame_at against three mutation clusters:
+        //   * line 632 `end > file_len`  -> `==` / `>=`  (the 4-byte prefix bound)
+        //   * line 647 `end > file_len`  -> `==` / `>=`  (the whole-frame bound)
+        //   * line 646 `+ frame_len`     -> `-` / `*` / `/` (the overrun offset math)
+        // Strategy: build one genuine, fully-valid frame, then probe file_len at the
+        // exact byte boundaries so a one-step operator change flips parse<->reject.
+        let dir = tmp_dir("mut-eof");
+        let key = fast_key();
+        let aad = volume_aad("v", 0);
+        let frame = encode_frame(&key, "v", 0, "id", "/p", b"payload").unwrap();
+        let vol = dir.join("vol");
+        append_frame(&vol, 0, &frame).unwrap();
+        let mut f = File::open(&vol).unwrap();
+        let total = f.metadata().unwrap().len(); // == 4 + frame_len, the full frame size
+
+        // (1) file_len EXACTLY equal to the frame size must PARSE. Kills line 647
+        //     `>` -> `>=`/`==` (they would reject at `end == file_len`) and line 646
+        //     `+` -> `-` (underflow -> None -> reject) and `+` -> `*` (4*frame_len
+        //     overshoots `total` -> reject). All of those would turn this Ok into Err.
+        let (id, path, body) = read_frame_at(&mut f, total, 0, 0, &key, &aad).unwrap();
+        assert_eq!((id.as_str(), path.as_str(), &body[..]), ("id", "/p", &b"payload"[..]));
+
+        // (2) file_len one byte SHORT must be rejected as an overrun. The real file
+        //     still holds every byte, so only the bound (not read_exact) can catch it.
+        //     Kills line 646 `+` -> `/`: `4 / frame_len == 0 <= total-1` would wrongly
+        //     pass the check, then read_exact would succeed and the frame would decrypt.
+        match read_frame_at(&mut f, total - 1, 0, 0, &key, &aad) {
+            Err(StorageError::Corrupt(m)) => assert_eq!(m, "frame overruns EOF", "one byte short overruns"),
+            other => panic!("expected Corrupt overrun at total-1, got {other:?}"),
+        }
+
+        // (3) file_len == 4 (only the prefix is in bounds). The real code does NOT
+        //     reject at line 632 (`4 > 4` is false): it reads the prefix, then the
+        //     whole-frame check at 644 rejects with "frame overruns EOF". A `>=`/`==`
+        //     mutation at line 632 would instead reject early with the DIFFERENT
+        //     message "frame offset past EOF", so the message pins the operator.
+        match read_frame_at(&mut f, 4, 0, 0, &key, &aad) {
+            Err(StorageError::Corrupt(m)) => assert_eq!(m, "frame overruns EOF", "prefix bound is `>`, not `>=`/`==`"),
+            other => panic!("expected Corrupt overrun at file_len=4, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_read_frame_at_lower_plausibility_bound() {
+        // Pins line 641 col 18 `frame_len < NONCE_LEN` -> `<=`. At the exact boundary
+        // frame_len == NONCE_LEN the real code must NOT reject as "implausible"; it
+        // proceeds (empty ciphertext) and fails later in AEAD decryption. A `<=`
+        // mutant would short-circuit with "implausible frame length" at the boundary.
+        let dir = tmp_dir("mut-lower");
+        let key = fast_key();
+        let aad = volume_aad("v", 0);
+        let vol = dir.join("vol");
+        // frame_len == NONCE_LEN (24): a body of exactly the nonce, zero ciphertext.
+        let mut raw = (NONCE_LEN as u32).to_le_bytes().to_vec();
+        raw.extend_from_slice(&[0u8; NONCE_LEN]);
+        std::fs::write(&vol, &raw).unwrap();
+        let mut f = File::open(&vol).unwrap();
+        let len = f.metadata().unwrap().len(); // == 4 + NONCE_LEN, so no overrun
+        match read_frame_at(&mut f, len, 0, 0, &key, &aad) {
+            // Real behaviour: reaches decrypt (empty ct) and fails there, NOT at the
+            // plausibility check.
+            Err(StorageError::Corrupt(m)) => {
+                assert_ne!(m, "implausible frame length", "frame_len == NONCE_LEN is the inclusive lower edge")
+            }
+            Err(_) => {} // a non-Corrupt error (e.g. Crypto) is exactly the real path
+            Ok(_) => panic!("frame_len == NONCE_LEN has empty ciphertext and must not parse"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mut_read_frame_at_upper_plausibility_bound() {
+        // Pins line 641 col 50 `frame_len > MAX_DOC_SIZE + 4096` -> `==`/`>=` and
+        // col 65 the `MAX_DOC_SIZE + 4096` addend -> `-`/`*`. Each probe writes only a
+        // 4-byte length prefix and calls with file_len = 4, so whichever branch does
+        // NOT reject at 641 instead rejects at the overrun check (644) -- no huge
+        // allocation is ever reached. The resulting Corrupt message names the branch.
+        let dir = tmp_dir("mut-upper");
+        let key = fast_key();
+        let aad = volume_aad("v", 0);
+        let probe = |frame_len: u64| -> StorageError {
+            let vol = dir.join(format!("vol-{frame_len}"));
+            std::fs::write(&vol, (frame_len as u32).to_le_bytes()).unwrap();
+            let mut f = File::open(&vol).unwrap();
+            read_frame_at(&mut f, 4, 0, 0, &key, &aad).expect_err("4-byte file cannot hold a frame body")
+        };
+        let msg = |e: StorageError| match e {
+            StorageError::Corrupt(m) => m,
+            other => panic!("expected Corrupt, got {other:?}"),
+        };
+
+        // (a) frame_len == real bound: NOT "implausible" (real uses strict `>`), so it
+        //     falls through to the overrun check. `>=`/`==` mutants would reject here
+        //     with "implausible frame length"; the `+`->`-` mutant lowers the bound so
+        //     a value == real bound would also become "implausible".
+        assert_eq!(msg(probe(MAX_DOC_SIZE + 4096)), "frame overruns EOF", "real upper edge is exclusive");
+
+        // (b) frame_len == MAX_DOC_SIZE: below the real bound (not implausible), but a
+        //     `+`->`-` mutant (bound = MAX_DOC_SIZE - 4096) would flag it implausible.
+        assert_eq!(msg(probe(MAX_DOC_SIZE)), "frame overruns EOF", "addend is `+`, not `-`");
+
+        // (c) frame_len far above the real bound but far below MAX_DOC_SIZE*4096: the
+        //     real code rejects it as implausible. A `+`->`*` mutant inflates the bound
+        //     so high that this value passes 641 and only trips the overrun check.
+        assert_eq!(msg(probe(100_000_000)), "implausible frame length", "addend is `+`, not `*`");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(unix, feature = "fault-injection"))]
+    #[test]
+    fn mut_write_atomic_puts_temp_in_target_dir() {
+        // Pins line 751 `path.parent().filter(|p| !p.as_os_str().is_empty())`: deleting
+        // the `!` makes `dir = None` for a normal path, so the temp is created in CWD
+        // instead of beside the target. We make the target's parent dir read-only and
+        // arm the `atomic.write` fault point (which fires only AFTER the temp is opened):
+        //   * real (`!`): temp is `parent/.name.tmp` in a read-only dir -> create_new
+        //     open fails with EACCES BEFORE the fault point -> the injected ENOSPC is
+        //     never produced.
+        //   * mutant (no `!`): temp is `.name.tmp` in (writable) CWD -> open succeeds ->
+        //     the fault point fires -> error message is the injected ENOSPC.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp_dir("mut-atomic");
+        let target = base.join("manifest.x");
+        crate::fault::fail_at("atomic.write", 1);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = write_atomic(&target, b"payload").expect_err("write_atomic must fail here");
+        // Restore perms so cleanup (and any later test on this thread) is unaffected.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::fault::clear();
+        // Real code never reached the fault point (open failed in the read-only dir).
+        // The mutant did reach it, so it would carry the injected-ENOSPC text.
+        assert!(matches!(err, StorageError::Io(_)), "expected an I/O error, got {err:?}");
+        assert!(
+            !format!("{err}").contains("injected"),
+            "temp must be created in the (read-only) target dir, not CWD: got {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // Kills: storage.rs harden_file (line ~817) body -> ().
+    // The volume append path opens vol.<N> with create-time mode 0600, so a freshly
+    // created file would be 0600 even with the mutant. We therefore call harden_file
+    // directly on a file we deliberately created at 0644: only harden_file's set_mode
+    // can pull it to 0600. With the body replaced by `()`, the file stays 0644.
+    #[cfg(unix)]
+    #[test]
+    fn mut_harden_file_chmods_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("hardenfile");
+        let f = dir.join("blob.bin");
+        fs::write(&f, b"x").unwrap();
+        let mut p = fs::metadata(&f).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&f, p).unwrap();
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o644);
+
+        harden_file(&f);
+        assert_eq!(
+            fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "harden_file must chmod the file to 0600"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

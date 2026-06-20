@@ -2635,4 +2635,79 @@ mod tests {
             prop_assert!(dir.split('/').all(|c| !c.is_empty()));
         }
     }
+
+
+    // --- mutation-testing kill-tests (round 7: cargo-mutants survivor closure) ---
+    #[test]
+    fn mut_acct_match_subtype_and_title_filters_are_exact() {
+        let mk = |t: &str, st: &str, o: &str, ti: &str| {
+            let mut a = Account::new().unwrap();
+            a.account_type = t.into();
+            a.account_subtype = st.into();
+            a.owner = o.into();
+            a.title = ti.into();
+            a
+        };
+        let accts = vec![mk("Financial", "IRA", "Alice", "Retire"), mk("Financial", "Bank", "Bob", "Checking")];
+
+        // subtype=IRA constrains the owners facet to ONLY the IRA account's owner.
+        // Kills line-76 `||`->`&&` (which would yield []) and `==`->`!=` (which would yield ["Bob"]).
+        let by_st = account_facets(&accts, "", "IRA", "", "", "", false);
+        assert_eq!(by_st.owners, vec!["Alice"], "subtype=IRA keeps only the IRA account's owner");
+
+        // title=Retire constrains owners to that one account. Kills line-78 `==`->`!=`
+        // (which would yield ["Bob"]).
+        let by_ti = account_facets(&accts, "", "", "", "Retire", "", false);
+        assert_eq!(by_ti.owners, vec!["Alice"], "title=Retire keeps only that account's owner");
+
+        // A subtype value present on no account leaves the cross-filtered facet empty,
+        // pinning the exact-match semantics (an inverted `==` would surface everything).
+        let none = account_facets(&accts, "", "Brokerage", "", "", "", false);
+        assert!(none.owners.is_empty(), "an unmatched subtype leaves no owners");
+    }
+
+    #[test]
+    fn mut_history_stats_cutoff_is_strictly_older() {
+        // Entry exactly AT the cutoff must be KEPT (not counted as removable): the
+        // predicate is `at < cutoff`. If `<` became `<=`, the at=1000 entry would also
+        // be counted and the total would be 2.
+        let mut vault = Vault::default();
+        let mut a = Account::default();
+        a.history = vec![
+            Change { at: 999, action: "u".into(), detail: String::new() },
+            Change { at: 1000, action: "u".into(), detail: String::new() },
+            Change { at: 1001, action: "u".into(), detail: String::new() },
+        ];
+        vault.accounts.push(a);
+        assert_eq!(
+            history_stats(&vault, Some(1000), false),
+            1,
+            "only at < cutoff is removable; at == cutoff is kept (would be 2 if `<` became `<=`)"
+        );
+    }
+
+    #[test]
+    fn mut_parse_ymd_utc_year_out_of_range_rejected_at_guard() {
+        // A year beyond the 1970..=9999 guard, with a valid month/day that DOES
+        // round-trip through the civil math, so ONLY the range guard rejects it. If the
+        // first `||` (between the year and month checks) became `&&`, this would parse.
+        assert_eq!(parse_ymd_utc("10000-01-01"), None, "year > 9999 rejected by the range guard");
+        // The in-range upper bound is still accepted (pins the guard's other side).
+        assert!(parse_ymd_utc("9999-12-31").is_some(), "the in-range upper bound is accepted");
+    }
+
+    #[test]
+    fn mut_doc_filename_boundary_at_120_bytes() {
+        // Boundary documentation around the 120-byte cap (see notes: the `>`->`>=`
+        // mutants here are equivalent — output is byte-identical either way).
+        let exact = doc_filename(&"x".repeat(120));
+        assert_eq!(exact.len(), 120, "exactly 120 bytes is kept whole");
+        let over = doc_filename(&"x".repeat(121));
+        assert_eq!(over.len(), 120, "121 bytes is capped to 120");
+        // A multibyte name whose 120th byte lands mid-character truncates on a char
+        // boundary (never panics) and keeps a real prefix rather than collapsing.
+        let multibyte = doc_filename(&format!("file_{}", "\u{6570}".repeat(50)));
+        assert!(multibyte.len() <= 120 && multibyte.is_char_boundary(multibyte.len()));
+        assert!(multibyte.starts_with("file_"));
+    }
 }

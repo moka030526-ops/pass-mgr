@@ -380,4 +380,54 @@ mod tests {
             }
         }
     }
+
+
+    // --- mutation-testing kill-tests (round 7: cargo-mutants survivor closure) ---
+    #[test]
+    fn mut_generate_accepts_exactly_max_length() {
+        // Boundary: length == MAX_LENGTH must be ACCEPTED (the guard is strict `>`).
+        // Mutating `>` to `>=` (line 171) would reject this exact value with TooLong,
+        // so the unwrap below would panic and the length assertion would never pass.
+        let opts = GenOptions { length: MAX_LENGTH, ..Default::default() };
+        let pw = generate(&opts).unwrap();
+        assert_eq!(pw.len(), MAX_LENGTH);
+        // And one past the cap is still refused, pinning the cap location itself.
+        let over = GenOptions { length: MAX_LENGTH + 1, ..Default::default() };
+        assert!(matches!(generate(&over), Err(GenError::TooLong)));
+    }
+
+    #[test]
+    fn mut_generate_shuffle_uses_inclusive_swap_partner() {
+        // Pins the Fisher-Yates index `uniform(i + 1)` (line 211) against the
+        // `i * 1` mutation. With length 2 and only lower+upper enabled, the
+        // pre-shuffle buffer is exactly [lower, upper] (classes() pushes LOWER then
+        // UPPER). The only shuffle step is i == 1: real code draws uniform(2) -> j in
+        // {0,1}, so when j == 1 there is NO swap and index 0 stays lowercase. The
+        // `* 1` mutation draws uniform(1) -> j == 0 always, forcing swap(1,0) every
+        // time, so index 0 would ALWAYS be uppercase. Observing a lowercase at index
+        // 0 even once distinguishes the two (false-negative prob ~ 2^-256).
+        let opts = GenOptions {
+            length: 2,
+            lowercase: true,
+            uppercase: true,
+            digits: false,
+            symbols: false,
+        };
+        let mut saw_lower_at_0 = false;
+        let mut saw_upper_at_0 = false;
+        for _ in 0..256 {
+            let pw = generate(&opts).unwrap();
+            let b0 = pw.as_bytes()[0];
+            if b0.is_ascii_lowercase() {
+                saw_lower_at_0 = true;
+            }
+            if b0.is_ascii_uppercase() {
+                saw_upper_at_0 = true;
+            }
+        }
+        // Real code yields both outcomes (~50/50); the `* 1` mutant never leaves a
+        // lowercase at index 0, so this fails under the mutation.
+        assert!(saw_lower_at_0, "index 0 must sometimes stay lowercase (uniform(i+1), not uniform(i))");
+        assert!(saw_upper_at_0, "index 0 must sometimes be uppercase too (sanity)");
+    }
 }

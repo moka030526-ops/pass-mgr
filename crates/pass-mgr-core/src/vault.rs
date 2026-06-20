@@ -4709,4 +4709,447 @@ mod tests {
             cleanup(&path);
         }
     }
+
+
+    // --- mutation-testing kill-tests (round 7: cargo-mutants survivor closure) ---
+    #[test]
+    fn mut_module_size_consts_have_exact_values() {
+        // Pin the DoS-guard / clamp constants to their exact byte counts. A mutation
+        // that swaps one of the `*` in `256 * 1024 * 1024` etc. for `+` or `/` changes
+        // the value, so asserting against the resolved integer literal (NOT the same
+        // arithmetic, which would mutate identically) kills it.
+        assert_eq!(MAX_VAULT_SIZE, 268_435_456u64, "MAX_VAULT_SIZE must be exactly 256 MiB");
+        assert_eq!(MIN_VOLUME_MAX_SIZE, 65_536u64, "MIN_VOLUME_MAX_SIZE must be exactly 64 KiB");
+        assert_eq!(MAX_VOLUME_MAX_SIZE, 68_719_476_736u64, "MAX_VOLUME_MAX_SIZE must be exactly 64 GiB");
+    }
+
+    #[test]
+    fn mut_import_tree_vault_id_length_boundary() {
+        // import_tree line: `id.is_empty() || id.len() > 64 || !alphanumeric`.
+        // An id of EXACTLY 64 ascii-alnum chars must be accepted (real: `64 > 64`
+        // is false). The `>`->`==`/`>=` mutants would reject 64 -> import fails, so a
+        // SUCCESSFUL import at exactly 64 distinguishes the real operator from them.
+        let id64: String = "a".repeat(64);
+        assert_eq!(id64.len(), 64);
+        let src = tmp_src("idlen64");
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = id64;
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let dest = tmp_path("impidlen64");
+        let v = OpenVault::import_tree(&src, &dest, b"a", b"b", fast())
+            .expect("a 64-char alphanumeric mirror id must import successfully");
+        drop(v);
+        let _ = fs::remove_dir_all(&src);
+        cleanup(&dest);
+    }
+
+    #[test]
+    fn mut_import_tree_vault_id_over_length_rejected() {
+        // An id of 65 ascii-alnum chars violates ONLY the `id.len() > 64` clause
+        // (not is_empty, not the alnum check). Real code rejects it. The `||`->`&&`
+        // mutant (col 32) would make the chain require is_empty too -> false -> the id
+        // passes and the 65-char (still a valid filename) import SUCCEEDS, so a
+        // REJECTION here kills `||`->`&&`. The `>`->`==`/`>=` mutants still reject 65,
+        // so this test isolates the OR-vs-AND change.
+        let id65: String = "a".repeat(65);
+        assert_eq!(id65.len(), 65);
+        let src = tmp_src("idlen65");
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = id65;
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let dest = tmp_path("impidlen65");
+        let res = OpenVault::import_tree(&src, &dest, b"a", b"b", fast());
+        assert!(res.is_err(), "a 65-char mirror id exceeds the 64-char cap and must be rejected");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(parent_dir(&dest));
+    }
+
+    #[test]
+    fn mut_import_tree_empty_vault_id_rejected() {
+        // The empty-id case violates ONLY the `id.is_empty()` clause. Real code rejects
+        // it. The `||`->`&&` mutant would require all three clauses, so an empty id
+        // (len 0 > 64 is false) would NOT be rejected here -> complements the 65-char
+        // test from the other side of the OR.
+        let src = tmp_src("idempty");
+        let mut vault = Vault::default();
+        vault.version = FORMAT_VERSION;
+        vault.id = String::new();
+        fs::write(src.join("vault.json"), serde_json::to_vec(&vault).unwrap()).unwrap();
+        let dest = tmp_path("impidempty");
+        let res = OpenVault::import_tree(&src, &dest, b"a", b"b", fast());
+        assert!(res.is_err(), "an empty mirror id must be rejected");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(parent_dir(&dest));
+    }
+
+    #[test]
+    fn mut_add_document_size_cap_boundary() {
+        // add_document line: `if meta.len() > MAX_DOC_SIZE { TooLarge }`.
+        // A file of EXACTLY MAX_DOC_SIZE must be accepted (real: `cap > cap` is false;
+        // read_file_capped also lets exactly `cap` bytes through). The `>`->`==` and
+        // `>`->`>=` mutants would reject the at-cap file, so a SUCCESSFUL add at exactly
+        // the cap kills both. A file ONE byte over must be rejected with TooLarge,
+        // confirming the upper side of the boundary.
+        let path = tmp_path("docsizecap");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+
+        let at_cap = vec![0u8; MAX_DOC_SIZE as usize];
+        let at_cap_src = write_src("atcap", &at_cap);
+        let id = v
+            .add_document("/d", "atcap.bin", &at_cap_src)
+            .expect("a document of exactly MAX_DOC_SIZE must be accepted");
+        assert_eq!(v.read_document(&id).unwrap().len(), MAX_DOC_SIZE as usize, "at-cap doc round-trips");
+
+        let over_cap = vec![0u8; MAX_DOC_SIZE as usize + 1];
+        let over_cap_src = write_src("overcap", &over_cap);
+        let res = v.add_document("/d", "overcap.bin", &over_cap_src);
+        assert!(matches!(res, Err(VaultError::TooLarge)), "one byte over MAX_DOC_SIZE must be TooLarge");
+
+        let _ = fs::remove_file(&at_cap_src);
+        let _ = fs::remove_file(&over_cap_src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_redundancy_returns_the_set_depth_not_zero() {
+        // Kills vault.rs:773 (redundancy() body replaced with 0). The default depth
+        // is 0, so we must assert a NON-zero configured value is returned: set it to
+        // 3 (below MAX_REDUNDANCY=10, so no clamping) and require the getter echoes 3.
+        let path = tmp_path("mut-redun");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        assert_eq!(v.redundancy(), 0, "precondition: off by default");
+        v.set_redundancy(3).unwrap();
+        // The mutant returns 0; the real getter returns the stored 3.
+        assert_eq!(v.redundancy(), 3, "redundancy() must return the configured depth, not 0");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_opened_generation_returns_real_prior_generation_not_one() {
+        // Kills vault.rs:1028 (opened_generation() replaced with 1). A freshly
+        // created vault already has generation 1, so a test that only reaches gen 1
+        // could not distinguish the mutant. We save twice more so the persisted
+        // generation is well above 1, then reopen and require the getter matches it.
+        let path = tmp_path("mut-opengen");
+        let mut created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        created.save().unwrap();
+        created.save().unwrap();
+        let g = created.vault.generation;
+        assert!(g > 1, "precondition: persisted generation must exceed 1 to expose the mutant (got {g})");
+        drop(created); // release the single-writer lock before reopening
+
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        // opened_generation() reports the generation read off disk at open time
+        // (before this open's own save bumps it). The mutant would return 1.
+        assert_eq!(reopened.opened_generation(), g, "opened_generation() must surface the real prior generation, not 1");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_previous_access_returns_real_prior_timestamp_not_0_1_neg1() {
+        // Kills vault.rs:1024 (previous_access() replaced with 0 / 1 / -1). On create
+        // last_opened_at is stamped with unix_now() and persisted; on reopen that real
+        // timestamp becomes previous_access. A genuine timestamp is a large positive
+        // value (>= ~1.7e9), so it is distinct from every constant the mutant returns.
+        let path = tmp_path("mut-prevaccess");
+        let before = records::unix_now();
+        let created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        drop(created); // persist + release the lock
+
+        let after = records::unix_now();
+        let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        let prev = reopened.previous_access();
+        // Must be the genuine create-time timestamp, not 0, 1, or -1.
+        assert!(prev > 1, "previous_access() must be a real timestamp, not 0/1/-1 (got {prev})");
+        assert!(
+            prev >= before && prev <= after,
+            "previous_access() ({prev}) must fall in [{before}, {after}] — the create-time stamp"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_export_returns_real_vault_records_not_default() {
+        // Kills vault.rs:458 (export() replaced with Ok(Default::default())). A
+        // Default Vault has an empty account list, an empty id, and generation 0, so
+        // we seed a known account and require export() round-trips the REAL contents.
+        let path = tmp_path("mut-export");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("octocat", "hunter2"));
+        v.save().unwrap();
+        drop(v); // release the single-writer lock before the associated-fn export
+
+        let exported = OpenVault::export(&path, b"a", b"b").unwrap();
+        // A Default::default() Vault would have none of these.
+        assert_eq!(exported.accounts.len(), 1, "export must return the real records, not an empty Default");
+        assert_eq!(exported.accounts[0].username, "octocat");
+        assert_eq!(exported.accounts[0].password, "hunter2");
+        assert!(!exported.id.is_empty(), "real vault has a non-empty id; a Default does not");
+        assert!(exported.generation >= 1, "real vault has a bumped generation; a Default is 0");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_read_bounded_cap_boundary() {
+        // `read_bounded(path, max)` rejects only when len > max. Pin the exact edge:
+        // a file of EXACTLY `max` bytes reads OK (kills `> -> >=`, which would reject
+        // len == max), and one byte over is TooLarge (kills dropping the rejection).
+        let max: u64 = 16;
+        let exact = write_src("rb_exact", &vec![0xABu8; max as usize]);
+        let got = read_bounded(&exact, max).expect("a file of exactly `max` bytes must read OK");
+        assert_eq!(got.len() as u64, max);
+        assert_eq!(got, vec![0xABu8; max as usize]);
+        fs::remove_file(&exact).ok();
+
+        let over = write_src("rb_over", &vec![0xCDu8; (max + 1) as usize]);
+        assert!(
+            matches!(read_bounded(&over, max), Err(VaultError::TooLarge)),
+            "one byte over `max` must be TooLarge"
+        );
+        fs::remove_file(&over).ok();
+    }
+
+    #[test]
+    fn mut_read_file_capped_cap_boundary() {
+        // `read_file_capped(path, max)` rejects only when len > max. The exact-cap-OK
+        // case kills both `> -> >=` (would reject len == max) and `> -> ==` (would
+        // reject len == max as well); the cap+1 case confirms over-size is rejected.
+        let max: u64 = 24;
+        let exact = write_src("rfc_exact", &vec![0x11u8; max as usize]);
+        let got = read_file_capped(&exact, max).expect("a file of exactly `max` bytes must read OK");
+        assert_eq!(got.len() as u64, max);
+        assert_eq!(got, vec![0x11u8; max as usize]);
+        fs::remove_file(&exact).ok();
+
+        let over = write_src("rfc_over", &vec![0x22u8; (max + 1) as usize]);
+        assert!(
+            matches!(read_file_capped(&over, max), Err(VaultError::TooLarge)),
+            "one byte over `max` must be TooLarge"
+        );
+        fs::remove_file(&over).ok();
+    }
+
+    #[test]
+    fn mut_read_capped_vault_notfound_guard() {
+        // The NotFound guard (the `Err(e) if e.kind() == NotFound => NotFound` arm):
+        // a missing vault path maps specifically to VaultError::NotFound, while a
+        // present, readable file does NOT take that arm (it returns its bytes). This
+        // pins the guard: deleting it would surface a raw Io error for the missing
+        // case, and a guard that always fired would wrongly reject the present file.
+        let missing = tmp_path("rcv_missing"); // dir exists, vault.pmv does not
+        assert!(!missing.exists());
+        assert!(
+            matches!(read_capped_vault(&missing), Err(VaultError::NotFound(p)) if p == missing),
+            "a missing vault file must map to NotFound with the queried path"
+        );
+
+        // A present vault file is read back verbatim (NOT NotFound, NOT an error).
+        let present = tmp_path("rcv_present");
+        OpenVault::create(present.clone(), b"a", b"b", fast()).unwrap();
+        let on_disk = fs::read(&present).unwrap();
+        let via = read_capped_vault(&present).expect("a present vault must read OK");
+        assert_eq!(via, on_disk, "present file must be returned verbatim");
+        assert!(!via.is_empty());
+        cleanup(&present);
+        cleanup(&missing);
+    }
+
+    #[test]
+    fn mut_save_internal_heal_does_not_ring_corrupt_primary() {
+        // save_internal line 703: `if rotate_ring && depth > 0`. On a recovery HEAL
+        // open the save runs with rotate_ring=FALSE, so the (corrupt) outgoing
+        // primary must NOT be ringed into bak1 — prev stays None and the good prior
+        // generation in bak1 is preserved untouched. Mutating `&&` to `||` makes the
+        // condition true on a heal (depth>0), so prev=Some(corrupt-primary) and
+        // rotate_generations overwrites bak1 with the un-decryptable primary bytes.
+        let path = tmp_path("muthealring");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap(); // depth 1: one prior generation + a mirror
+        records::upsert(&mut v.vault.accounts, sample_account("keep-me", "p")); // state A
+        v.save().unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("newer", "p")); // state B
+        v.save().unwrap();
+        drop(v);
+
+        // After the two saves bak1 holds state A (the prior generation). Snapshot it.
+        let bak1_before = fs::read(bak_path(&path, 1)).unwrap();
+
+        // Corrupt BOTH the live file and the same-generation mirror so the open must
+        // recover from bak1 (state A) and then HEAL the live tree (rotate_ring=false).
+        let sentinel: &[u8] = b"not a vault at all";
+        fs::write(&path, sentinel).unwrap();
+        fs::write(mirror_path(&path), b"corrupt mirror").unwrap();
+
+        let v2 = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert!(v2.recovery_notice().is_some(), "the open must have recovered + healed");
+        drop(v2);
+
+        // The heal must not have ringed the corrupt outgoing primary into bak1.
+        let bak1_after = fs::read(bak_path(&path, 1)).unwrap();
+        assert_ne!(
+            bak1_after, sentinel,
+            "heal ringed the corrupt primary into bak1 (the `&&`->`||` mutant): bak1 is now garbage"
+        );
+        assert_eq!(bak1_before, bak1_after, "heal left the good prior generation in bak1 untouched");
+        // bak1 is still a real, decryptable vault holding state A (not state B).
+        let (recovered, _h, _k) = decode_vault_bytes(&bak1_after, b"a", b"b").unwrap();
+        let users: Vec<&str> = recovered.accounts.iter().map(|a| a.username.as_str()).collect();
+        assert!(users.contains(&"keep-me"), "bak1 still decrypts to the prior generation");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_staged_rewrite_empty_store_creates_no_volume_dirs() {
+        // staged_rewrite line 897: `if self.storage.partition_count() > 0`. A vault
+        // with NO documents has zero partitions and (crucially) NO live volume/ or
+        // manifest/ dirs. With `> 0` (false) the rewrite must NOT materialize empty
+        // staged volume/manifest dirs, so after a change_password (which always runs
+        // staged_rewrite) the tree still has no volume/manifest dirs. Mutating `>` to
+        // `>=` makes the condition true at count==0, creating empty staged dirs that
+        // commit_rekey then swaps INTO the live tree.
+        let path = tmp_path("mutstageempty");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let dir = parent_dir(&path);
+        assert_eq!(v.storage.partition_count(), 0, "an empty vault has zero partitions");
+        assert!(!dir.join("volume").exists(), "empty vault: no live volume dir to begin with");
+        assert!(!dir.join("manifest").exists(), "empty vault: no live manifest dir to begin with");
+
+        v.change_password(b"c", b"d").unwrap(); // runs staged_rewrite with partition_count()==0
+        drop(v);
+
+        assert!(
+            !dir.join("volume").exists(),
+            "staged_rewrite created an empty volume dir at count==0 (the `>`->`>=` mutant)"
+        );
+        assert!(
+            !dir.join("manifest").exists(),
+            "staged_rewrite created an empty manifest dir at count==0 (the `>`->`>=` mutant)"
+        );
+        // And the rekey still committed: the new passwords open, the old ones don't.
+        assert!(OpenVault::open(path.clone(), b"a", b"b").is_err(), "old password rejected after rekey");
+        assert!(OpenVault::open(path.clone(), b"c", b"d").is_ok(), "new password opens the rekeyed vault");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mut_backup_snapshot_collision_counter_increments() {
+        // backup_snapshot line 1967: `n += 1`. Three backups into the SAME dest within
+        // one timestamp-second must yield `backup-<stamp>`, `backup-<stamp>_1`, then
+        // `backup-<stamp>_2` — proving the collision counter is incremented by 1 each
+        // probe. Mutating `+= 1` to `-= 1` makes the third name `_0` (not `_2`);
+        // `*= 1` pins n at 1 and spins forever on the already-present `_1` (timeout-kill).
+        let path = tmp_path("mutbkpcollide");
+        let v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        drop(v);
+        let src_dir = parent_dir(&path);
+        let dest = std::env::temp_dir().join(format!("pmmutbkp-{}", nanos()));
+
+        // Retry the whole 3-call sequence into a fresh dest if a wall-clock second
+        // boundary splits the stamps (rare); this keeps the assertion deterministic
+        // without depending on absolute timing.
+        let mut third_name = String::new();
+        let mut stamp = String::new();
+        for attempt in 0..20 {
+            let d = dest.join(format!("try{attempt}"));
+            let b1 = backup_snapshot(&path, &src_dir, &d).unwrap();
+            let b2 = backup_snapshot(&path, &src_dir, &d).unwrap();
+            let b3 = backup_snapshot(&path, &src_dir, &d).unwrap();
+            let name = |p: &Path| p.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+            let (n1, n2, n3) = (name(&b1), name(&b2), name(&b3));
+            // All three share the stamp only if no second boundary was crossed.
+            let s = n1.clone(); // "backup-<stamp>"
+            if n2 == format!("{s}_1") && n3.starts_with(&format!("{s}_")) {
+                stamp = s;
+                third_name = n3;
+                break;
+            }
+        }
+        assert!(!third_name.is_empty(), "could not get three same-stamp backups in 20 tries");
+        assert_eq!(
+            third_name,
+            format!("{stamp}_2"),
+            "third colliding backup must be `_2` — proves `n += 1` increments the collision counter"
+        );
+
+        fs::remove_dir_all(&dest).ok();
+        cleanup(&path);
+    }
+
+    // Kills: vault.rs harden_file (line ~2037) body -> Ok(()).
+    // harden_file must actually chmod the file to 0600. We deliberately loosen the
+    // perms first (to 0644) so create_new_0600's creation-time 0600 cannot mask the
+    // mutant; only harden_file's set_mode call can pull it back to 0600. If the body
+    // is replaced with `Ok(())`, the file stays 0644 and the assert fails.
+    #[cfg(unix)]
+    #[test]
+    fn mut_harden_file_chmods_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("hardenfile");
+        let _v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // Loosen to 0644 so only harden_file can restore 0600.
+        let mut p = fs::metadata(&path).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&path, p).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+
+        harden_file(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "harden_file must chmod the file to 0600"
+        );
+        cleanup(&path);
+    }
+
+    // Kills: vault.rs harden_dir (line ~2051) body -> ().
+    // Direct-call form: loosen the vault dir to 0755, then harden_dir must restore
+    // 0700. A no-op body leaves it at 0755 and fails.
+    #[cfg(unix)]
+    #[test]
+    fn mut_harden_dir_chmods_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("hardendir");
+        let _v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let dir = parent_dir(&path);
+        let mut p = fs::metadata(&dir).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&dir, p).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+
+        harden_dir(&dir);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "harden_dir must chmod the directory to 0700"
+        );
+        cleanup(&path);
+    }
+
+    // Integration backstop for harden_dir (line ~2051): a freshly created vault's
+    // parent directory is created with create_dir_all at the umask (typically 0755)
+    // and is tightened to 0700 ONLY by harden_dir. With the body mutated to `()`,
+    // the directory keeps its umask perms and this assert catches it. (Also pins the
+    // created vault.pmv at 0600 for good measure.)
+    #[cfg(unix)]
+    #[test]
+    fn mut_create_vault_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("createperm");
+        let _v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let dir = parent_dir(&path);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "create() must harden the vault directory to 0700"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "create() must leave vault.pmv at 0600"
+        );
+        cleanup(&path);
+    }
 }
