@@ -355,6 +355,34 @@ The build produces **two programs**: `pass-mgr-gui` (the graphical app) and
 way; the split matters on Windows (next), where the GUI build avoids popping a
 console window.
 
+These default Linux builds are **not** fully standalone files: the graphical app
+loads your desktop's OpenGL/X11/Wayland libraries at runtime. You can still hand
+someone just the binary and it runs **on a normal desktop of the same OS + CPU**
+(it borrows the system's own libraries — you don't ship any). For a build you can
+drop on *any* Linux box with nothing installed, see the next section.
+
+#### A single, fully self-contained Linux file (static, terminal-only)
+
+The terminal/CLI program can be built as **one statically-linked file with zero
+external dependencies** — no shared libraries, no glibc, nothing to install — using
+the musl target with the GUI/clipboard features turned off:
+
+```bash
+rustup target add x86_64-unknown-linux-musl                 # one-time
+cargo build --release -p pass-mgr --bin pass-mgr \
+  --no-default-features --target x86_64-unknown-linux-musl
+# -> target/x86_64-unknown-linux-musl/release/pass-mgr  (~2 MB, fully static)
+
+ldd target/x86_64-unknown-linux-musl/release/pass-mgr       # => "statically linked"
+```
+
+Copy that one file to any x86-64 Linux machine and run `pass-mgr --tui` (or the CLI
+subcommands) — it needs no libraries at all. The trade-offs of this minimal build:
+**no graphical window** (terminal UI only) and **no OS-clipboard copy** (the on-screen
+copy becomes a no-op — fine over SSH, where there's no clipboard anyway). The
+graphical app cannot be made fully static: it fundamentally needs the host's graphics
+drivers, which can't be bundled into a portable file.
+
 If the build complains about missing system libraries, install the dev headers:
 
 ```bash
@@ -393,11 +421,18 @@ run with nothing to install.
 
 ```bash
 rustup target add x86_64-pc-windows-gnu      # one-time
-sudo apt install mingw-w64                    # one-time: the cross-linker
-cargo build --release --target x86_64-pc-windows-gnu
+sudo apt install mingw-w64                    # one-time: the cross-linker + dlltool
+# `+crt-static` folds the MinGW runtime (libgcc/libwinpthread) INTO the .exe, so you
+# don't have to ship those DLLs beside it:
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo build --release --target x86_64-pc-windows-gnu
 # -> target/x86_64-pc-windows-gnu/release/pass-mgr-gui.exe  (graphical, no console)
 # -> target/x86_64-pc-windows-gnu/release/pass-mgr.exe      (command-line / --tui)
 ```
+
+(Building **on Windows** with the default MSVC toolchain is simpler and already
+produces single self-contained `.exe`s — `crt-static` is preset in `.cargo/config.toml`.
+Use the GNU cross-build only when you must produce a Windows `.exe` from Linux.)
 
 ## Command-line options (advanced)
 

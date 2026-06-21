@@ -10,14 +10,31 @@ publish = false # private application crate — never published to a registry
 # desktop shell (CLI + ratatui TUI + egui GUI) over it.
 default-run = "pass-mgr"
 
+# Explicit binaries so the windowed one can REQUIRE the `gui` feature: a
+# `--no-default-features` build then produces ONLY the console `pass-mgr` (a
+# terminal/CLI binary with no GUI/clipboard deps), which can be statically linked
+# (musl) into a single self-contained file. See [features].
+[[bin]]
+name = "pass-mgr"
+path = "src/main.rs"
+
+[[bin]]
+name = "pass-mgr-gui"
+path = "src/bin/pass-mgr-gui.rs"
+required-features = ["gui"]
+
 [dependencies]
 pass-mgr-core = { path = "../pass-mgr-core" }
 anyhow = "1.0.102"
 # Clipboard only; disable the default `image-data` feature (pulls a PNG/deflate
-# image stack we never use) to shrink the dependency/attack surface.
-arboard = { version = "3.6.1", default-features = false }
+# image stack we never use) to shrink the dependency/attack surface. Optional and
+# behind the `clipboard` feature: on Linux arboard dynamically loads the X11/Wayland
+# libraries, so a fully-static (musl) build leaves it out.
+arboard = { version = "3.6.1", default-features = false, optional = true }
 directories = "6.0.0"
-eframe = "0.34.3"
+# The egui windowed GUI. Optional + behind the `gui` feature so a terminal-only build
+# (and a static musl binary) doesn't pull in eframe and the desktop graphics stack.
+eframe = { version = "0.34.3", optional = true }
 ratatui = "0.30.1"
 serde_json = "1.0.150"
 zeroize = { version = "1.9.0", features = ["derive"] }
@@ -29,6 +46,18 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 libc = "0.2"
 
 [features]
+# ON by default: the full desktop build (egui GUI + OS clipboard). Build a minimal,
+# self-contained terminal/CLI binary with `--no-default-features` (optionally add back
+# `clipboard` for OS copy on a non-static build):
+#   cargo build --release -p pass-mgr --bin pass-mgr --no-default-features
+default = ["gui"]
+# The egui windowed GUI. Pulls eframe (and, transitively, the desktop graphics stack)
+# and implies `clipboard`. Required by the `pass-mgr-gui` binary.
+gui = ["dep:eframe", "clipboard"]
+# OS clipboard integration (arboard). On Linux this dynamically loads X11/Wayland, so a
+# fully-static (musl) build must leave it OFF; the terminal UI still works (copy is a
+# no-op with an explanatory status).
+clipboard = ["dep:arboard"]
 # Forward crash-safety fault injection down into pass-mgr-core so the hidden
 # `__crashop` subcommand (and tests/crash_recovery.rs) exercise the real fault
 # points. OFF by default. Enable with:

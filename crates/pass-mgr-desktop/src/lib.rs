@@ -19,9 +19,11 @@
 // `crate::records`, … paths in the binaries and front-ends resolve unchanged.
 pub use pass_mgr_core::{crypto, fault, password, records, storage, types, vault};
 
-pub mod gui; // graphical front-end (drives the same vault API as `ui`)
+#[cfg(feature = "gui")]
+pub mod gui; // graphical front-end (drives the same vault API as `ui`); behind `gui`
 pub mod launch; // vault-path/flag resolution shared by the console + windowed binaries
-pub mod single_instance; // GUI single-instance guard (coalesces repeated launches)
+#[cfg(feature = "gui")]
+pub mod single_instance; // GUI single-instance guard (raises the egui window); behind `gui`
 pub mod ui; // text/terminal front-end (interchangeable with `gui`)
 
 /// Copy a SECRET (a password) into the OS clipboard, flagging it so clipboard
@@ -32,6 +34,10 @@ pub mod ui; // text/terminal front-end (interchangeable with `gui`)
 /// selection, not such a log. On other platforms this is a plain set. Shared by the
 /// GUI and TUI so both copy paths get the hint. (A clipboard manager that ignores
 /// the hint, or a native-Wayland-only setup, may still retain history.)
+///
+/// Behind the `clipboard` feature: on Linux arboard dynamically loads X11/Wayland, so a
+/// fully-static (musl) terminal build omits it (the TUI's copy then becomes a no-op).
+#[cfg(feature = "clipboard")]
 pub(crate) fn copy_secret_to_clipboard(text: &str) -> Result<(), arboard::Error> {
     let mut cb = arboard::Clipboard::new()?;
     #[cfg(target_os = "linux")]

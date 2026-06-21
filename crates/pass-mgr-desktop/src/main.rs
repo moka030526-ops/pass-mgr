@@ -57,7 +57,10 @@ use zeroize::{Zeroize, Zeroizing};
 // below unqualified.
 use pass_mgr::launch::{default_vault_path, vault_file};
 use pass_mgr::vault::OpenVault;
-use pass_mgr::{gui, ui, vault};
+use pass_mgr::{ui, vault};
+// The GUI is behind the `gui` feature; a `--no-default-features` build is terminal-only.
+#[cfg(feature = "gui")]
+use pass_mgr::gui;
 
 // `const` is a compile-time constant. `&str` is a borrowed string slice (a view
 // into text); this one points at a string literal baked into the binary. The
@@ -345,13 +348,22 @@ fn main() -> ExitCode {
         // `compact [DIR] <flags>` — reclaim dead volume bytes and/or trim history.
         Some("compact") => cli_compact(&pos, &cflags),
         // Otherwise the (optional) positional argument is the vault directory for
-        // the interactive UI (graphical by default, terminal with --tui).
+        // the interactive UI (graphical by default, terminal with --tui). In a build
+        // without the `gui` feature there is no graphical UI, so always run the TUI.
         _ => {
             let path = vault_dir_arg(0);
-            if tui {
+            #[cfg(feature = "gui")]
+            {
+                if tui {
+                    run_ui(path, writable)
+                } else {
+                    gui::run(path, writable)
+                }
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                let _ = tui; // the flag is accepted but the TUI is the only UI here
                 run_ui(path, writable)
-            } else {
-                gui::run(path, writable)
             }
         }
     };

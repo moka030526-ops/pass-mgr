@@ -442,6 +442,8 @@ struct App {
 }
 
 /// How long a copied password stays on the clipboard before it is auto-cleared.
+/// (Only used when the `clipboard` feature is on — the minimal build does no copying.)
+#[cfg(feature = "clipboard")]
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(15);
 /// How often the event loop wakes (when idle) to check the auto-clear deadline.
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -2524,6 +2526,7 @@ impl App {
         // `text` wipes on drop; the shared helper copies it into the OS clipboard with
         // the Linux history-exclusion hint so clipboard managers don't retain the
         // password (auto-cleared on the 15s timer and on exit either way).
+        #[cfg(feature = "clipboard")]
         match crate::copy_secret_to_clipboard(text.as_str()) {
             Ok(()) => {
                 self.clipboard_dirty = true;
@@ -2531,6 +2534,13 @@ impl App {
                 self.status = "Copied (clipboard auto-clears in 15s, and on exit).".into();
             }
             Err(e) => self.status = format!("Clipboard unavailable: {e}"),
+        }
+        // In a minimal build without OS-clipboard support (e.g. the static terminal
+        // binary), copy is a no-op — say so instead of silently doing nothing.
+        #[cfg(not(feature = "clipboard"))]
+        {
+            let _ = text;
+            self.status = "Clipboard not available in this build.".into();
         }
     }
 
@@ -3000,8 +3010,10 @@ fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
 }
 
 // Best-effort wipe of the OS clipboard (set it to empty). `let _ =` discards the
-// `Result`: if the clipboard is unavailable there is nothing useful to do.
+// `Result`: if the clipboard is unavailable there is nothing useful to do. A no-op in a
+// build without the `clipboard` feature (where nothing is ever copied to begin with).
 fn clear_clipboard() {
+    #[cfg(feature = "clipboard")]
     let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(String::new()));
 }
 
