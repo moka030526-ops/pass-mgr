@@ -549,6 +549,58 @@ re-keying by full rebuild. Because the mirror is **plaintext on disk**, it
 carries the same warning as `decrypt`/`extract`: write it only to encrypted or
 ephemeral storage and delete it promptly (§9.10, §9.17).
 
+### 6.4 Cross-vault merge — "update from another vault"
+
+`update-from` (CLI `pass-mgr update-from OTHER [DIR]`; GUI Config → *Update from another
+vault…*; TUI Config → **Ctrl+U**) pulls changes from a SECOND vault into the current one.
+It is implemented by `pass-mgr-core::merge` (the plan/report types + the pure, `Record`-
+generic diff helpers `collection_changes`/`merge_records`) plus `OpenVault::plan_merge_from`
+(preview, read-only) and `OpenVault::apply_merge_from` (commit, requires `--write`).
+
+**Semantics — one-way and additive.** Keyed by record `id` (128-bit random, so a shared id
+reliably denotes the same logical record — the intended "two copies of one estate vault"
+case). A source record is selected when its id is **absent** from the destination (*new*) or
+present with a **strictly greater** `updated_at` (*updated*). The merge never deletes a
+destination record or document, and never propagates the source's deletions (there is no
+record tombstone, and a deletion is not expressible as a newer `updated_at`). An applied
+record **replaces the destination slot verbatim** — preserving the source's
+`updated_at`/`created_at`/`history` — rather than going through `records::upsert` (which would
+stamp `now` and drop the source's history); this keeps a re-merge a **no-op** (idempotent).
+
+**Documents.** For each applied record, its referenced blob ids (TrustWill.file,
+AssetLiability.statement, TaxFiling.documents, RealEstate.documents, GeneralDocument.file)
+are copied into the destination volume **preserving the id** via `VolumeStore::put`, which
+re-encrypts the plaintext under the **destination** key + vault id with a fresh nonce — a
+cross-vault frame is never byte-copied (the AAD binds each frame to its vault id, §6.2).
+A blob already present in the destination is left as-is (skipped).
+
+**Crash-safety — add-only, no staged rewrite.** Unlike `compact`/rekey (§12.3), the merge
+**adds** blobs and **replaces** records but never removes or rewrites an existing blob, so it
+does **not** need the staged `.rekey/`→READY→roll-forward machinery. `apply_merge_from`
+commits in order: (1) copy every needed blob — each `VolumeStore::put` is individually durable
+(append+fsync volume, then atomic manifest commit); (2) replace/insert the records in memory;
+(3) one atomic `save()` of `vault.pmv`. Because every referenced blob is durable **before** the
+`vault.pmv` that references it, the open-time **referenced⊆stored** invariant always holds; a
+crash at any point leaves the old, consistent vault plus harmless unreferenced blob frames
+(reclaimed by the next `compact --volume`). A fail-closed `referenced⊆stored` check runs
+in-memory just before the save, so a buggy plan refuses to commit rather than brick the vault.
+
+**Untrusted source + R-8 safety.** The source vault is opened with its own two passwords via
+the normal `OpenVault::open_read_only` path (inheriting AEAD verification, the consistency
+check, `RekeyPending` handling, and `O_NOFOLLOW` blob reads). Its `updated_at`, blob ids,
+paths, and sizes are **attacker-controlled** in a crafted vault, so: blob ids are re-validated
+with `is_safe_blob_id` and paths with `is_safe_doc_path` before any use; recency is treated as
+**advisory** — the real authorization is the user's preview + explicit accept. Two further
+guards prevent the R-8 duplicate-frame rollback hazard: `put` is skipped when the destination
+already `contains` the id, and any record that references a doc id the destination has
+**tombstoned** (`deleted_docs`) is *skipped* (reported in the plan's `skipped` list, with the
+reason) rather than resurrected in place — compacting the destination clears the tombstone and
+unblocks it. Opening the source **collapses all errors into one generic message** in the GUI/
+TUI so the screen is not a password-correctness oracle for the other vault (mirrors §9.2's
+unlock collapse). Source passwords use the same `Zeroizing`/pre-reserved-buffer hygiene as the
+unlock screen and are wiped on every exit path; the held decrypted source handle is dropped on
+cancel/apply.
+
 ## 7. User interface (req. 10)
 
 The app ships **two interchangeable front-ends** that drive the **same**

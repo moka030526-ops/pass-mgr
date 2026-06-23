@@ -216,6 +216,33 @@ this computer.
 Backups are still encrypted — each one needs the **two passwords that were in effect
 when it was made** (see the next section about changing passwords).
 
+## Updating from another vault
+
+If you keep a second copy of your estate vault somewhere — a spouse's machine, a USB
+stick, a synced folder — you can pull the newer entries from it into this one without
+re-typing anything. It is **one-way and additive**: it brings in records that are
+**newer** (or entirely new) in the other vault, along with the documents they reference,
+and it **never deletes** anything from your current vault.
+
+1. In **Edit mode**, open **Config** and click **“Update from another vault…”** (in the
+   terminal UI, press **Ctrl+U** on the Config screen).
+2. Enter the **other vault's folder** and its **two passwords**. (The other vault is only
+   ever read — it is opened read-only.)
+3. You'll see a **preview**: exactly which records would change (new vs updated, with their
+   dates) and which documents would be copied. Nothing has changed yet.
+4. Click **Apply** to make those changes, or **Cancel** to back out.
+
+Notes:
+- "Newer" is decided by each record's last-edit time. If a record is newer **here**, it is
+  left alone; the update only ever moves *forward*.
+- Deletions are **not** carried over — if you deleted something here, an update won't bring
+  it back (a record that depends on a document you deleted is simply skipped, and the
+  preview says so).
+- It's wise to **back up first** (the update overwrites the matching records here).
+- From the command line: `pass-mgr update-from OTHER [DIR]` (add `--dry-run` to preview
+  only). It asks for four passwords in order: **this** vault's two, then the **other**
+  vault's two.
+
 ## Changing your master passwords
 
 Use the **🔑 Passwords** button (Edit mode) — or `p` in the terminal UI — to set two

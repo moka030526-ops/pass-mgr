@@ -1251,6 +1251,239 @@ impl OpenVault {
         self.storage.contains(file_id) && !self.is_tombstoned(file_id)
     }
 
+    // --- Cross-vault merge: "update this vault from another vault" ------------
+    //
+    // A one-way, ADDITIVE pull: records that are newer (by `updated_at`) or entirely
+    // new in `source` are copied into `self`, along with the document blobs they
+    // reference. Nothing in `self` is ever deleted. See `crate::merge` for the
+    // semantics and `docs/DESIGN.md` for the security/crash-safety rationale.
+
+    /// Compute the patch that [`apply_merge_from`](Self::apply_merge_from) would apply,
+    /// for previewing. Read-only: touches no files and mutates nothing. `source` must be
+    /// a *separate* already-open vault (opened with its own two passwords).
+    ///
+    /// A record is selected when its id is absent from `self` (New) or its `updated_at`
+    /// is strictly greater than the same-id record in `self` (Updated). A selected record
+    /// whose referenced document cannot be safely resolved — tombstoned in `self`, missing
+    /// from `source`, or carrying an unsafe id/path — is reported in `skipped` and NOT
+    /// applied (so the merge can never brick the vault or resurrect a deleted-then-garbage
+    /// frame). Every displayed path is validated control/bidi-safe.
+    pub fn plan_merge_from(&self, source: &OpenVault) -> Result<crate::merge::MergePlan, VaultError> {
+        use std::collections::BTreeMap;
+        // The source is UNTRUSTED: its `vault.id` is AEAD-authenticated but attacker-chosen,
+        // and it is rendered in the preview AND recorded in this vault's audit log. Apply the
+        // same allowlist `import_tree` uses (short ASCII-alphanumeric) so a crafted source
+        // can't inject control/bidi bytes into the UI or persist them into our audit.
+        let sid = &source.vault.id;
+        if sid.is_empty() || sid.len() > 64 || !sid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe vault id in merge source: {sid:?}"))));
+        }
+        let mut plan = crate::merge::MergePlan { source_vault_id: source.vault.id.clone(), ..Default::default() };
+        // Dedup the blob plan by id (a doc can be referenced by several records).
+        let mut blobs: BTreeMap<String, crate::merge::PlannedBlob> = BTreeMap::new();
+
+        // Resolve every doc id a selected record references. Returns `Err(reason)` if the
+        // record must be blocked, else `Ok(())` having recorded each doc in `blobs`.
+        // `&mut blobs` is threaded in because a closure can't capture it while `self` is
+        // also borrowed by the outer iteration.
+        let resolve = |this: &OpenVault,
+                       docs: &[String],
+                       blobs: &mut BTreeMap<String, crate::merge::PlannedBlob>|
+         -> Result<(), String> {
+            for id in docs {
+                if !is_safe_blob_id(id) {
+                    return Err("references a document with an unsafe id".into());
+                }
+                if this.vault.deleted_docs.iter().any(|t| t == id) {
+                    // Tombstoned here: a lingering deleted frame may still exist, so
+                    // re-adding the same id in place would risk a duplicate frame (R-8).
+                    return Err("references a document deleted in this vault (compact to unblock)".into());
+                }
+                if this.storage.contains(id) {
+                    blobs.entry(id.clone()).or_insert(crate::merge::PlannedBlob {
+                        id: id.clone(),
+                        path: this.storage.entry(id).map(|e| e.path.clone()).unwrap_or_default(),
+                        size: this.storage.entry(id).map(|e| e.size).unwrap_or(0),
+                        already_present: true,
+                    });
+                    continue;
+                }
+                // Must be copied from the source — it has to be there (source opened
+                // consistent) and carry a safe, displayable path.
+                match source_entry_validated(source, id)? {
+                    Some((path, size)) => {
+                        blobs.entry(id.clone()).or_insert(crate::merge::PlannedBlob {
+                            id: id.clone(),
+                            path,
+                            size,
+                            already_present: false,
+                        });
+                    }
+                    None => return Err("references a document missing from the source vault".into()),
+                }
+            }
+            Ok(())
+        };
+
+        // One closure per collection, run via the generic `plan_collection` helper so the
+        // recency diff + blocked-record handling is written once. `docs_of` extracts the
+        // blob ids a record references (empty for Instruction/Account).
+        self.plan_collection(crate::merge::RecordKind::Instruction, &self.vault.instructions, &source.vault.instructions, |_r| Vec::new(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::TrustWill, &self.vault.trust_wills, &source.vault.trust_wills, |r| r.file.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::Asset, &self.vault.assets, &source.vault.assets, |r| r.statement.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::Account, &self.vault.accounts, &source.vault.accounts, |_r| Vec::new(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::RealEstate, &self.vault.real_estate, &source.vault.real_estate, |r| r.documents.clone(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::TaxFiling, &self.vault.tax_filings, &source.vault.tax_filings, |r| r.documents.clone(), &resolve, &mut blobs, &mut plan)?;
+        self.plan_collection(crate::merge::RecordKind::GeneralDocument, &self.vault.general_documents, &source.vault.general_documents, |r| r.file.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
+
+        plan.blobs = blobs.into_values().collect();
+        Ok(plan)
+    }
+
+    /// Generic per-collection planner: run the recency diff, then for each selected source
+    /// record resolve its referenced docs; on success record a [`PlannedRecord`], on a
+    /// block record a [`SkippedRecord`]. Shared by all seven collections.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_collection<R: crate::records::Record>(
+        &self,
+        kind: crate::merge::RecordKind,
+        current: &[R],
+        src: &[R],
+        docs_of: impl Fn(&R) -> Vec<String>,
+        resolve: &impl Fn(&OpenVault, &[String], &mut std::collections::BTreeMap<String, crate::merge::PlannedBlob>) -> Result<(), String>,
+        blobs: &mut std::collections::BTreeMap<String, crate::merge::PlannedBlob>,
+        plan: &mut crate::merge::MergePlan,
+    ) -> Result<(), VaultError> {
+        for sel in crate::merge::collection_changes(current, src) {
+            let s = &src[sel.source_index];
+            let docs = docs_of(s);
+            // Resolve into a SCRATCH blob map first: a blocked record must not leak its
+            // docs into the committed plan's blob list.
+            let mut scratch = blobs.clone();
+            match resolve(self, &docs, &mut scratch) {
+                Ok(()) => {
+                    *blobs = scratch;
+                    plan.records.push(crate::merge::PlannedRecord {
+                        kind,
+                        change: sel.change,
+                        id: s.id().to_string(),
+                        label: s.label(),
+                        current_updated_at: sel.current_updated_at,
+                        source_updated_at: s.updated_at(),
+                    });
+                }
+                Err(reason) => plan.skipped.push(crate::merge::SkippedRecord {
+                    kind,
+                    id: s.id().to_string(),
+                    label: s.label(),
+                    reason,
+                }),
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the merge from `source` into `self`: copy the needed document blobs, replace/
+    /// insert the newer/new records, append a vault-level audit entry, and atomically save.
+    /// Recomputes the plan internally against the live `source` (so the applied set always
+    /// matches a freshly-built [`plan_merge_from`]), then commits **add-only**:
+    ///
+    /// 1. copy each needed blob into this vault's volume (each `storage.put` is individually
+    ///    durable; an interrupted copy only leaves harmless orphan frames),
+    /// 2. replace/insert the records (in memory),
+    /// 3. one atomic `save()` of `vault.pmv` — the single commit point.
+    ///
+    /// Because nothing is ever removed or rewritten, this needs no staged multi-file commit:
+    /// every referenced blob is durable *before* the `vault.pmv` that references it, so the
+    /// open-time `referenced ⊆ stored` invariant always holds (a crash leaves the old vault
+    /// plus harmless garbage). Requires `--write`.
+    pub fn apply_merge_from(&mut self, source: &OpenVault) -> Result<crate::merge::MergeReport, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        // Recompute the plan against the live source — never trust a caller-held plan, and
+        // skip the work entirely when there is nothing to do.
+        let plan = self.plan_merge_from(source)?;
+        let mut report = crate::merge::MergeReport::default();
+        if plan.is_empty() {
+            report.records_skipped = plan.skipped.len();
+            return Ok(report);
+        }
+
+        // (1) Copy every not-already-present blob into THIS vault's volume, re-encrypted
+        // under our key + vault id (a fresh nonce; never a frame byte-copy). Re-validate
+        // each id/path defensively at the moment of use.
+        for b in &plan.blobs {
+            if b.already_present {
+                continue;
+            }
+            if !is_safe_blob_id(&b.id) || !is_safe_doc_path(&b.path) {
+                return Err(VaultError::Storage(StorageError::Corrupt(format!("unsafe document in merge source: {:?}", b.id))));
+            }
+            // Skip if it somehow already arrived (idempotent re-put guard: never append a
+            // second frame for one id — the R-8 hazard).
+            if self.storage.contains(&b.id) {
+                continue;
+            }
+            let entry = source
+                .storage
+                .entry(&b.id)
+                .ok_or_else(|| VaultError::Storage(StorageError::Corrupt(format!("merge source lost document {:?}", b.id))))?;
+            let bytes = source.storage.read(&b.id, &source.key)?; // bounded + id/path-verified
+            self.storage.put(&b.id, &entry.path, &bytes, entry.uploaded_at, &self.key)?;
+            report.blobs_copied += 1;
+            report.bytes_copied = report.bytes_copied.saturating_add(entry.size);
+        }
+
+        // (1b) FAIL-CLOSED, *before* mutating any record: every document the accepted records
+        // reference must now be in the store (just-copied or already present). `plan.blobs`
+        // is exactly that referenced set, so checking it here — rather than over the merged
+        // vault after the mutation — means a storage anomaly aborts with BOTH the on-disk and
+        // the in-memory vault still intact (no half-merged, never-committed state to leak).
+        for b in &plan.blobs {
+            if !self.storage.contains(&b.id) {
+                return Err(VaultError::ArchiveMismatch);
+            }
+        }
+
+        // (2) Group the accepted ids by collection, then replace/insert verbatim.
+        let accepted = |kind: crate::merge::RecordKind| -> std::collections::HashSet<&str> {
+            plan.records.iter().filter(|r| r.kind == kind).map(|r| r.id.as_str()).collect()
+        };
+        let (a1, u1) = crate::merge::merge_records(&mut self.vault.instructions, &source.vault.instructions, &accepted(crate::merge::RecordKind::Instruction));
+        let (a2, u2) = crate::merge::merge_records(&mut self.vault.trust_wills, &source.vault.trust_wills, &accepted(crate::merge::RecordKind::TrustWill));
+        let (a3, u3) = crate::merge::merge_records(&mut self.vault.assets, &source.vault.assets, &accepted(crate::merge::RecordKind::Asset));
+        let (a4, u4) = crate::merge::merge_records(&mut self.vault.accounts, &source.vault.accounts, &accepted(crate::merge::RecordKind::Account));
+        let (a5, u5) = crate::merge::merge_records(&mut self.vault.real_estate, &source.vault.real_estate, &accepted(crate::merge::RecordKind::RealEstate));
+        let (a6, u6) = crate::merge::merge_records(&mut self.vault.tax_filings, &source.vault.tax_filings, &accepted(crate::merge::RecordKind::TaxFiling));
+        let (a7, u7) = crate::merge::merge_records(&mut self.vault.general_documents, &source.vault.general_documents, &accepted(crate::merge::RecordKind::GeneralDocument));
+        report.records_added = a1 + a2 + a3 + a4 + a5 + a6 + a7;
+        report.records_updated = u1 + u2 + u3 + u4 + u5 + u6 + u7;
+        report.records_skipped = plan.skipped.len();
+
+        // Vault-level audit entry — counts only, no record contents or document ids.
+        let short = plan.source_vault_id.get(..8).unwrap_or(plan.source_vault_id.as_str());
+        self.vault.audit.push(records::Change::new(
+            "merged",
+            format!(
+                "from vault {short}: {} new, {} updated, {} document(s) copied",
+                report.records_added, report.records_updated, report.blobs_copied
+            ),
+        ));
+
+        // (3) The single atomic commit. The referenced⊆stored invariant was already verified
+        // in (1b) before any mutation, so we only have to guard the save itself: if it fails
+        // (e.g. ENOSPC), the in-memory vault now holds the merged records + audit entry but
+        // the on-disk vault is still the old one — POISON the handle so a later unrelated
+        // save() can never silently flush this never-committed merge (mirrors `compact`'s
+        // partial-commit poisoning). The caller must reopen.
+        if let Err(e) = self.save() {
+            self.read_only = true;
+            return Err(e);
+        }
+        Ok(report)
+    }
+
     // --- Category lists (stored in the vault) --------------------------------
 
     // Returns a *borrow* (`&TypeLists`) into the vault rather than a copy: the
@@ -1411,6 +1644,22 @@ fn is_safe_blob_id(id: &str) -> bool {
 /// enforced separately by `VolumeStore::put`.
 fn is_safe_doc_path(path: &str) -> bool {
     !path.contains(|c: char| c.is_control() || records::is_spoofy_format_char(c))
+}
+
+/// Look up a blob in the merge SOURCE's store: returns its `(validated path, size)` if
+/// present, `Ok(None)` if the source lacks it, or `Err(reason)` if its stored path is
+/// unsafe to display/store. The id is assumed already `is_safe_blob_id`-checked by the
+/// caller. Used by `plan_merge_from` to build (and gate) the blob-copy plan.
+fn source_entry_validated(source: &OpenVault, id: &str) -> Result<Option<(String, u64)>, String> {
+    match source.storage.entry(id) {
+        None => Ok(None),
+        Some(e) => {
+            if !is_safe_doc_path(&e.path) {
+                return Err("references a document with an unsafe path".into());
+            }
+            Ok(Some((e.path.clone(), e.size)))
+        }
+    }
 }
 
 /// Reject a path that is a symlink, used to guard the INTERMEDIATE directories of an
@@ -5612,5 +5861,210 @@ mod tests {
         assert!(keep_tmp_only.exists(), "an unrelated *.tmp must survive (kills && -> ||)");
         assert!(keep_prefix_only.exists(), "a non-.tmp vault sibling must survive (kills && -> ||)");
         cleanup(&base);
+    }
+
+    // ---- Cross-vault merge ("update from another vault") --------------------
+
+    use crate::merge::ChangeKind;
+
+    /// An account with a chosen id + updated_at, so two vaults can share a record id.
+    fn acct_with(id: &str, user: &str, pw: &str, updated_at: i64) -> Account {
+        let mut a = sample_account(user, pw);
+        a.id = id.to_string();
+        a.title = format!("acct-{id}");
+        a.owner = "owner".into();
+        a.updated_at = updated_at;
+        a.created_at = 1;
+        a
+    }
+
+    #[test]
+    fn merge_pulls_newer_and_new_records_and_copies_blobs() {
+        // SOURCE: a newer version of a shared account, a brand-new account, and a general
+        // document with an attached blob.
+        let s_path = tmp_path("merge-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        s.vault.accounts.push(acct_with("shared", "alice", "NEWpw", 200));
+        s.vault.accounts.push(acct_with("only-in-source", "bob", "bobpw", 50));
+        let doc = write_src("merge-doc", b"top-secret-statement");
+        let blob_id = s.add_document("general-documents/passport", "passport.pdf", &doc).unwrap();
+        let mut gd = records::GeneralDocument::new().unwrap();
+        gd.id = "gd-1".into();
+        gd.title = "Passport".into();
+        gd.file = Some(blob_id.clone());
+        gd.updated_at = 300;
+        s.vault.general_documents.push(gd);
+        s.save().unwrap();
+
+        // CURRENT: an OLDER version of the shared account, plus a current-only record that
+        // the additive merge must leave untouched.
+        let c_path = tmp_path("merge-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        c.vault.accounts.push(acct_with("shared", "alice", "OLDpw", 100));
+        c.vault.accounts.push(acct_with("only-in-current", "carol", "carolpw", 999));
+        c.save().unwrap();
+
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        // PLAN: 1 updated (shared), 2 new (only-in-source account + the general doc); 1 blob.
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert_eq!(plan.updated_count(), 1, "shared account is newer in source");
+        assert_eq!(plan.new_count(), 2, "source-only account + general document");
+        assert_eq!(plan.blobs_to_copy(), 1, "the passport blob must be copied");
+        assert_eq!(plan.bytes_to_copy(), b"top-secret-statement".len() as u64);
+        assert!(plan.skipped.is_empty());
+        // The shared account's preview shows the old->new recency.
+        let shared = plan.records.iter().find(|r| r.id == "shared").unwrap();
+        assert_eq!(shared.change, ChangeKind::Updated);
+        assert_eq!(shared.current_updated_at, Some(100));
+        assert_eq!(shared.source_updated_at, 200);
+
+        // APPLY.
+        let report = c.apply_merge_from(&source).unwrap();
+        assert_eq!((report.records_added, report.records_updated), (2, 1));
+        assert_eq!(report.blobs_copied, 1);
+
+        // Shared account updated verbatim (source password + source updated_at preserved).
+        let shared = c.vault.accounts.iter().find(|a| a.id == "shared").unwrap();
+        assert_eq!(shared.password, "NEWpw");
+        assert_eq!(shared.updated_at, 200, "source updated_at preserved (idempotency)");
+        // New records present; current-only record untouched.
+        assert!(c.vault.accounts.iter().any(|a| a.id == "only-in-source"));
+        assert!(c.vault.accounts.iter().any(|a| a.id == "only-in-current" && a.password == "carolpw"));
+        assert!(c.vault.general_documents.iter().any(|g| g.id == "gd-1" && g.file.as_deref() == Some(blob_id.as_str())));
+        // The copied blob is readable in the destination under the SAME id.
+        assert_eq!(&**c.read_document(&blob_id).unwrap(), b"top-secret-statement");
+        // A vault-level audit entry records the merge (counts only, no secrets).
+        assert!(c.vault.audit.iter().any(|ch| ch.action == "merged"));
+
+        // IDEMPOTENT: a second plan against the same source is empty.
+        let plan2 = c.plan_merge_from(&source).unwrap();
+        assert!(plan2.is_empty(), "re-merge of identical data is a no-op");
+
+        // The destination reopens cleanly (referenced ⊆ stored holds after the merge).
+        drop(c);
+        let c2 = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        assert_eq!(&**c2.read_document(&blob_id).unwrap(), b"top-secret-statement");
+        drop(c2);
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_ignores_older_or_equal_and_current_only_records() {
+        let s_path = tmp_path("merge-old-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        s.vault.accounts.push(acct_with("a", "x", "src-older", 100)); // older than current
+        s.vault.accounts.push(acct_with("b", "x", "src-equal", 500)); // equal to current
+        s.save().unwrap();
+
+        let c_path = tmp_path("merge-old-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        c.vault.accounts.push(acct_with("a", "x", "cur-newer", 300));
+        c.vault.accounts.push(acct_with("b", "x", "cur-equal", 500));
+        c.save().unwrap();
+
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert!(plan.is_empty(), "neither older nor equal source records are pulled");
+        let report = c.apply_merge_from(&source).unwrap();
+        assert_eq!((report.records_added, report.records_updated), (0, 0));
+        // Current values untouched.
+        assert_eq!(c.vault.accounts.iter().find(|a| a.id == "a").unwrap().password, "cur-newer");
+        assert_eq!(c.vault.accounts.iter().find(|a| a.id == "b").unwrap().password, "cur-equal");
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_apply_refused_when_read_only() {
+        let s_path = tmp_path("merge-ro-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        s.vault.accounts.push(acct_with("z", "x", "p", 100));
+        s.save().unwrap();
+        let c_path = tmp_path("merge-ro-cur");
+        OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        let mut c_ro = OpenVault::open_read_only(c_path.clone(), b"c1", b"c2").unwrap();
+        // Planning is allowed read-only (it mutates nothing)...
+        assert_eq!(c_ro.plan_merge_from(&source).unwrap().new_count(), 1);
+        // ...but applying is refused.
+        assert!(matches!(c_ro.apply_merge_from(&source), Err(VaultError::ReadOnly)));
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_skips_record_referencing_locally_tombstoned_doc() {
+        // SOURCE has a general document with an attached blob.
+        let s_path = tmp_path("merge-tomb-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let doc = write_src("tomb-doc", b"deed-bytes");
+        let blob_id = s.add_document("general-documents/deed", "deed.pdf", &doc).unwrap();
+        let mut gd = records::GeneralDocument::new().unwrap();
+        gd.id = "gd-tomb".into();
+        gd.title = "Deed".into();
+        gd.file = Some(blob_id.clone());
+        gd.updated_at = 100;
+        s.vault.general_documents.push(gd);
+        s.save().unwrap();
+
+        // First merge into CURRENT: the doc + blob arrive.
+        let c_path = tmp_path("merge-tomb-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        {
+            let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+            c.apply_merge_from(&source).unwrap();
+        }
+        assert!(c.has_document(&blob_id));
+
+        // In CURRENT: unlink the record and delete (tombstone) the blob.
+        c.vault.general_documents.clear();
+        c.save().unwrap();
+        c.remove_document(&blob_id).unwrap();
+        assert!(c.vault.deleted_docs.contains(&blob_id), "blob is now tombstoned locally");
+
+        // SOURCE bumps the record so recency would re-select it.
+        s.vault.general_documents[0].updated_at = 500;
+        s.save().unwrap();
+
+        // The re-selected record references a locally-tombstoned doc → blocked, not applied.
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert!(plan.records.is_empty(), "record blocked by the tombstoned dependency");
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].reason.contains("deleted"), "reason explains the block: {:?}", plan.skipped[0].reason);
+
+        let report = c.apply_merge_from(&source).unwrap();
+        assert_eq!(report.records_added, 0);
+        assert_eq!(report.records_skipped, 1);
+        // The tombstone is intact (nothing resurrected), and the vault still reopens.
+        assert!(c.vault.deleted_docs.contains(&blob_id));
+        drop(c);
+        OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_rejects_source_with_unsafe_vault_id() {
+        // A crafted source whose (attacker-controlled) vault.id carries a bidi/control char
+        // must be refused before it can reach the preview or this vault's audit log.
+        let s_path = tmp_path("merge-badid-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        s.vault.accounts.push(acct_with("x", "u", "p", 5));
+        s.save().unwrap();
+
+        let c_path = tmp_path("merge-badid-cur");
+        let c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+
+        let mut source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        // Tamper with the in-memory source id (a real crafted vault could carry this).
+        source.vault.id = "ab\u{202e}cd".into();
+        let err = c.plan_merge_from(&source).unwrap_err();
+        assert!(matches!(err, VaultError::Storage(StorageError::Corrupt(_))), "got {err:?}");
+        cleanup(&s_path);
+        cleanup(&c_path);
     }
 }

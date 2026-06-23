@@ -93,6 +93,14 @@ USAGE:
                                     (vault.json + manifest/ + volume/); round-trips with import-tree
     pass-mgr import-tree SRC [DIR]  Build a NEW encrypted vault (new passwords) from a
                                     plaintext mirror SRC produced by export-tree
+    pass-mgr update-from OTHER [DIR]
+                                    Update DIR's vault from ANOTHER vault (OTHER): pull
+                                    records that are newer (or new) in OTHER, plus the
+                                    documents they reference. One-way and ADDITIVE — it
+                                    never deletes anything from DIR. Prompts FOUR passwords
+                                    in order: DIR's two, then OTHER's two. Add --dry-run to
+                                    preview the patch without changing anything (recommended
+                                    first). Tip: back up DIR first (`pass-mgr backup`).
     pass-mgr compact [DIR] <what>   Reclaim space (writable; backs up first by default).
                                     Crash-safe: a power loss leaves the old OR the
                                     compacted vault, never a mix. <what> is one or both:
@@ -181,6 +189,19 @@ impl CompactFlags {
             || self.no_backup
             || self.backup_dest.is_some()
             || self.dry_run
+    }
+
+    /// True when `--dry-run` is the ONLY compact-set flag present. `update-from` reuses
+    /// `--dry-run` for its preview, so the cross-command guard in `main` allows exactly
+    /// this combination (and nothing else from the compact set) for that command.
+    fn is_only_dry_run(&self) -> bool {
+        self.dry_run
+            && !self.volume
+            && !self.json
+            && self.history_before.is_none()
+            && !self.history_all
+            && !self.no_backup
+            && self.backup_dest.is_none()
     }
 }
 
@@ -283,10 +304,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     if cflags.any() && cmd != Some("compact") {
-        eprintln!(
-            "pass-mgr error: --volume/--json/--history-before/--history-all/--backup/--no-backup/--dry-run only apply to 'compact'"
-        );
-        return ExitCode::FAILURE;
+        // `update-from` reuses --dry-run for its preview; allow exactly that (and nothing
+        // else from the compact set) for that command, but reject every other combination.
+        let update_from_dry_run = cmd == Some("update-from") && cflags.is_only_dry_run();
+        if !update_from_dry_run {
+            eprintln!(
+                "pass-mgr error: --volume/--json/--history-before/--history-all/--backup/--no-backup only apply to 'compact'; --dry-run also applies to 'update-from'"
+            );
+            return ExitCode::FAILURE;
+        }
     }
 
     // Hidden test affordance: a scripted vault operation that honors the
@@ -344,6 +370,12 @@ fn main() -> ExitCode {
             2 => cli_import_tree(PathBuf::from(&pos[1]), default_vault_path()),
             3 => cli_import_tree(PathBuf::from(&pos[1]), vault_file(&pos[2])),
             _ => Err(anyhow::anyhow!("usage: pass-mgr import-tree <SOURCE_DIR> [DIR]")),
+        },
+        // `update-from OTHER [DIR]` — pull newer/new records (+ their docs) from OTHER.
+        Some("update-from") => match pos.len() {
+            2 => cli_update_from(PathBuf::from(&pos[1]), default_vault_path(), cflags.dry_run),
+            3 => cli_update_from(PathBuf::from(&pos[1]), vault_file(&pos[2]), cflags.dry_run),
+            _ => Err(anyhow::anyhow!("usage: pass-mgr update-from <OTHER_DIR> [DIR] [--dry-run]")),
         },
         // `compact [DIR] <flags>` — reclaim dead volume bytes and/or trim history.
         Some("compact") => cli_compact(&pos, &cflags),
@@ -754,6 +786,120 @@ fn cli_import_tree(src_dir: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
     vault::OpenVault::import_tree(&src_dir, &dest, pw1.as_bytes(), pw2.as_bytes(), params)?;
     eprintln!("Imported. The new vault directory is {}.", dest.parent().unwrap_or(&dest).display());
     Ok(())
+}
+
+/// `update-from OTHER [DIR]` — update DIR's vault from ANOTHER vault: pull records that are
+/// newer (or new) in OTHER, plus the documents they reference. One-way and ADDITIVE (never
+/// deletes from DIR). With `dry_run`, opens BOTH read-only and only prints the patch.
+///
+/// Prompts FOUR passwords in a fixed, documented order so it is scriptable: DIR's two
+/// (the destination), then OTHER's two (the source). The destination is opened writable
+/// (single-writer lock); the source is always opened read-only.
+fn cli_update_from(other_dir: PathBuf, current_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    let other_path = vault_file(&other_dir.to_string_lossy());
+    // Make BOTH targets unambiguous before any password prompt or write.
+    eprintln!("pass-mgr: update target vault   → {}", current_path.display());
+    eprintln!("pass-mgr: read updates FROM     → {}", other_path.display());
+    if !current_path.exists() {
+        anyhow::bail!("no vault to update at {}", current_path.display());
+    }
+    if !other_path.exists() {
+        anyhow::bail!("no source vault at {}", other_path.display());
+    }
+    // Refuse to merge a vault into itself (a no-op that almost certainly signals a
+    // mistaken DIR). Compare canonicalized paths when possible, else the raw paths.
+    let same = match (std::fs::canonicalize(&current_path), std::fs::canonicalize(&other_path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => current_path == other_path,
+    };
+    if same {
+        anyhow::bail!("the source and target are the same vault — nothing to update");
+    }
+
+    // Four prompts, fixed order (target first, then source) — load-bearing for piped use:
+    //   printf 'dpw1\ndpw2\nopw1\nopw2\n' | pass-mgr update-from OTHER DIR
+    let dpw1 = read_password("Target (this vault) password 1: ")?;
+    let dpw2 = read_password("Target (this vault) password 2: ")?;
+    let opw1 = read_password("Other (source) password 1: ")?;
+    let opw2 = read_password("Other (source) password 2: ")?;
+
+    // The source is ALWAYS read-only (a different fd/path — no lock contention with the
+    // target). For a dry run the target is read-only too (no lock, no writes).
+    let source = OpenVault::open_read_only(other_path.clone(), opw1.as_bytes(), opw2.as_bytes())?;
+
+    if dry_run {
+        let current = OpenVault::open_read_only(current_path.clone(), dpw1.as_bytes(), dpw2.as_bytes())?;
+        let plan = current.plan_merge_from(&source)?;
+        print_merge_plan(&plan, true);
+        return Ok(());
+    }
+
+    // Real run: open the target WRITABLE (single-writer lock + rolls forward any pending
+    // rekey), show the patch, then apply + save atomically.
+    let mut current = OpenVault::open(current_path.clone(), dpw1.as_bytes(), dpw2.as_bytes())?;
+    let plan = current.plan_merge_from(&source)?;
+    print_merge_plan(&plan, false);
+    if plan.is_empty() {
+        return Ok(()); // nothing to apply (skipped-only plans print their reasons above)
+    }
+    let report = current.apply_merge_from(&source)?;
+    eprintln!(
+        "Applied: {} new, {} updated record(s); {} document(s) copied ({} bytes).{}",
+        report.records_added,
+        report.records_updated,
+        report.blobs_copied,
+        report.bytes_copied,
+        if report.records_skipped > 0 { format!(" {} record(s) skipped.", report.records_skipped) } else { String::new() },
+    );
+    Ok(())
+}
+
+/// Print a merge [`MergePlan`](pass_mgr::merge::MergePlan) for the `update-from` preview /
+/// pre-apply summary. `dry` switches the verbs between "would" and the imperative. Shows
+/// the records to change (label + recency), the documents to copy, and any skipped records
+/// with their reason. Record labels never include secret field values.
+fn print_merge_plan(plan: &pass_mgr::merge::MergePlan, dry: bool) {
+    let verb = if dry { "would change" } else { "will change" };
+    if plan.is_empty() && plan.skipped.is_empty() {
+        eprintln!("Already up to date — no records in the source are newer or new.");
+        return;
+    }
+    let short = plan.source_vault_id.get(..8).unwrap_or(plan.source_vault_id.as_str());
+    eprintln!(
+        "Update from vault {short}: {verb} {} record(s) ({} new, {} updated) and copy {} document(s) ({} bytes).",
+        plan.records.len(),
+        plan.new_count(),
+        plan.updated_count(),
+        plan.blobs_to_copy(),
+        plan.bytes_to_copy(),
+    );
+    for r in &plan.records {
+        // `current_updated_at` is None for a brand-new record.
+        let recency = match r.current_updated_at {
+            Some(cur) => format!("{} → {}", fmt_unix(cur), fmt_unix(r.source_updated_at)),
+            None => format!("new @ {}", fmt_unix(r.source_updated_at)),
+        };
+        eprintln!("  [{}] {} — {} ({recency})", r.change.as_str(), r.kind.as_str(), r.label);
+    }
+    if !plan.blobs.is_empty() {
+        eprintln!("  documents:");
+        for b in &plan.blobs {
+            let state = if b.already_present { "present" } else { "copy" };
+            eprintln!("    [{state}] {} ({} bytes)  {}", b.id, b.size, b.path);
+        }
+    }
+    if !plan.skipped.is_empty() {
+        eprintln!("  skipped (not applied):");
+        for s in &plan.skipped {
+            eprintln!("    {} — {} — {}", s.kind.as_str(), s.label, s.reason);
+        }
+    }
+}
+
+/// Format a unix-seconds timestamp as a compact UTC date-time (`YYYYMMDD-HHMMSS`) for CLI
+/// output — the same human-readable UTC stamp the document paths use.
+fn fmt_unix(at: i64) -> String {
+    pass_mgr::records::compact_utc(at)
 }
 
 /// Build a safe RELATIVE path under the output directory from an attacker-

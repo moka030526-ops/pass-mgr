@@ -17,7 +17,7 @@
 
 // Re-export the headless core so existing `pass_mgr::crypto`, `pass_mgr::vault`,
 // `crate::records`, … paths in the binaries and front-ends resolve unchanged.
-pub use pass_mgr_core::{crypto, fault, password, records, storage, types, vault};
+pub use pass_mgr_core::{crypto, fault, merge, password, records, storage, types, vault};
 
 #[cfg(feature = "gui")]
 pub mod gui; // graphical front-end (drives the same vault API as `ui`); behind `gui`

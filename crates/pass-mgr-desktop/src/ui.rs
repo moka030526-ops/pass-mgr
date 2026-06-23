@@ -92,6 +92,9 @@ enum Screen {
     Browse,
     Edit,
     Config,
+    /// "Update from another vault": collect the source dir + its two passwords, preview the
+    /// patch, then apply. Reached from Config with Ctrl+U (writable only).
+    Merge,
 }
 
 // `Clone` allows explicit `.clone()` copies; `Copy` makes the type copy
@@ -412,6 +415,16 @@ struct App {
     // The unlocked vault, present only after a successful unlock/create
     // (`None` while on the Auth screen).
     vault: Option<OpenVault>,
+    // "Update from another vault" (Screen::Merge) state: the source folder + its two
+    // passwords (focus 0/1/2 in the collect phase), then the opened read-only source and
+    // the computed patch held between the preview and the apply.
+    merge_src_dir: String,
+    merge_pw1: String,
+    merge_pw2: String,
+    merge_focus: usize,
+    merge_source: Option<OpenVault>,
+    merge_plan: Option<crate::merge::MergePlan>,
+    merge_error: Option<String>,
     tab: Tab,
     selected: usize,
     edit: Option<EditState>,
@@ -471,6 +484,9 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // it does not outlive the program.
 impl Drop for App {
     fn drop(&mut self) {
+        // Wipe the source-vault passwords (App-owned buffers) on exit.
+        self.merge_pw1.zeroize();
+        self.merge_pw2.zeroize();
         if self.clipboard_dirty {
             clear_clipboard();
         }
@@ -504,6 +520,13 @@ impl App {
             auth_vault_sel,
             auth_scan_warning: scan.warning,
             vault: None,
+            merge_src_dir: String::new(),
+            merge_pw1: String::with_capacity(256),
+            merge_pw2: String::with_capacity(256),
+            merge_focus: 0,
+            merge_source: None,
+            merge_plan: None,
+            merge_error: None,
             tab: Tab::Instructions,
             selected: 0,
             edit: None,
@@ -772,6 +795,7 @@ impl App {
             Screen::Browse => self.handle_browse_key(key),
             Screen::Edit => self.handle_edit_key(key),
             Screen::Config => self.handle_config_key(key),
+            Screen::Merge => self.handle_merge_key(key),
         }
     }
 
@@ -1237,6 +1261,15 @@ impl App {
         const CFG_FIELDS: usize = 8;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
+            // Ctrl+U → "update from another vault" (writable only). Ctrl-combos are excluded
+            // from the text-entry arm below, so this never conflicts with typing 'u'.
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if self.require_writable() {
+                    self.enter_merge();
+                }
+            }
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
             KeyCode::BackTab | KeyCode::Up => self.cfg_focus = (self.cfg_focus + CFG_FIELDS - 1) % CFG_FIELDS,
             // Only allow editing a field whose action is reachable in this mode: in
@@ -2644,6 +2677,170 @@ impl App {
         }
     }
 
+    // --- "Update from another vault" (Screen::Merge) -------------------------
+
+    /// Enter the merge flow with fresh state, pre-filling the source folder with the vault
+    /// root as a convenient starting point.
+    fn enter_merge(&mut self) {
+        self.reset_merge();
+        self.merge_src_dir = self.auth_root.trim().to_string();
+        self.merge_focus = 0;
+        self.screen = Screen::Merge;
+    }
+
+    /// Drop the opened source + computed plan and wipe the source passwords.
+    fn reset_merge(&mut self) {
+        self.merge_source = None;
+        self.merge_plan = None;
+        self.merge_error = None;
+        self.wipe_merge_pw();
+    }
+
+    /// Zeroize + clear the two source-vault password buffers.
+    fn wipe_merge_pw(&mut self) {
+        self.merge_pw1.zeroize();
+        self.merge_pw2.zeroize();
+        self.merge_pw1.clear();
+        self.merge_pw2.clear();
+    }
+
+    /// Open the source vault read-only and compute the patch into `merge_plan`. Collapses
+    /// the source's open errors into ONE generic message so this screen can't be a
+    /// password-correctness oracle for the other vault (mirrors the unlock screen).
+    fn merge_preview(&mut self) {
+        self.merge_error = None;
+        // The just-typed source-vault passwords are secrets: wipe them on EVERY exit path.
+        let dir = self.merge_src_dir.trim();
+        if dir.is_empty() {
+            self.merge_error = Some("Enter the other vault's folder.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        let src_path = crate::launch::vault_file(dir);
+        if !src_path.exists() {
+            self.merge_error = Some("No vault found in that folder.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        if same_vault_path(&src_path, &self.path) {
+            self.merge_error = Some("That is this same vault — choose a different one.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        let source = match OpenVault::open_read_only(src_path, self.merge_pw1.as_bytes(), self.merge_pw2.as_bytes()) {
+            Ok(v) => v,
+            Err(_) => {
+                self.merge_error = Some("Could not open that vault — wrong password(s) or unreadable.".into());
+                self.wipe_merge_pw();
+                return;
+            }
+        };
+        let plan = match self.vault.as_ref() {
+            Some(cur) => match cur.plan_merge_from(&source) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.merge_error = Some(format!("Could not build the update: {e}"));
+                    self.wipe_merge_pw();
+                    return;
+                }
+            },
+            None => {
+                self.merge_error = Some("No vault open.".into());
+                self.wipe_merge_pw();
+                return;
+            }
+        };
+        self.merge_source = Some(source);
+        self.merge_plan = Some(plan);
+        self.wipe_merge_pw();
+    }
+
+    /// Apply the previewed patch (copy blobs, replace/insert records, save), then return to
+    /// Config with a status summary.
+    fn merge_apply(&mut self) {
+        // Disjoint field borrows: `self.vault` (mut) + `self.merge_source` (shared).
+        let result = match (self.vault.as_mut(), self.merge_source.as_ref()) {
+            (Some(cur), Some(src)) => cur.apply_merge_from(src),
+            _ => {
+                self.merge_error = Some("Nothing to apply.".into());
+                return;
+            }
+        };
+        match result {
+            Ok(report) => {
+                self.status = format!(
+                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied.{}",
+                    report.records_added,
+                    report.records_updated,
+                    report.blobs_copied,
+                    if report.records_skipped > 0 { format!(" {} skipped.", report.records_skipped) } else { String::new() },
+                );
+                self.reset_merge();
+                self.screen = Screen::Config;
+            }
+            Err(e) => self.merge_error = Some(format!("Update failed: {e}")),
+        }
+    }
+
+    fn handle_merge_key(&mut self, key: KeyEvent) -> bool {
+        // Esc always abandons the flow back to Config (wiping any held source/passwords).
+        if key.code == KeyCode::Esc {
+            self.reset_merge();
+            self.screen = Screen::Config;
+            return false;
+        }
+        if self.merge_plan.is_some() {
+            // --- Preview phase: Enter/'a' applies (if non-empty), 'c' cancels. ---
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('A') => {
+                    let empty = self.merge_plan.as_ref().map(|p| p.is_empty()).unwrap_or(true);
+                    if empty {
+                        self.reset_merge();
+                        self.screen = Screen::Config;
+                    } else {
+                        self.merge_apply();
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.reset_merge();
+                    self.screen = Screen::Config;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        // --- Collect phase: focus 0 = folder, 1 = password 1, 2 = password 2. ---
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => match self.merge_focus {
+                0 => self.merge_src_dir.push(c),
+                1 => self.merge_pw1.push(c),
+                _ => self.merge_pw2.push(c),
+            },
+            KeyCode::Backspace => match self.merge_focus {
+                0 => {
+                    self.merge_src_dir.pop();
+                }
+                1 => {
+                    self.merge_pw1.pop();
+                }
+                _ => {
+                    self.merge_pw2.pop();
+                }
+            },
+            KeyCode::Tab | KeyCode::Down => self.merge_focus = (self.merge_focus + 1) % 3,
+            KeyCode::BackTab | KeyCode::Up => self.merge_focus = (self.merge_focus + 2) % 3,
+            KeyCode::Enter => {
+                if self.merge_focus < 2 {
+                    self.merge_focus += 1;
+                } else {
+                    self.merge_preview();
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     // --- Drawing -------------------------------------------------------------
 
     // Drawing reads state only, hence `&self`; `frame: &mut Frame` is the
@@ -2655,6 +2852,7 @@ impl App {
             Screen::Browse => self.draw_browse(frame),
             Screen::Edit => self.draw_edit(frame),
             Screen::Config => self.draw_config(frame),
+            Screen::Merge => self.draw_merge(frame),
         }
     }
 
@@ -2741,11 +2939,113 @@ impl App {
                 .wrap(Wrap { trim: true }),
             chunks[0],
         );
-        self.draw_footer(
-            frame,
-            chunks[1],
-            "Tab/↑↓ field · type to edit · Enter = add / backup · Del = delete type (if unused) · Esc back",
+        let footer = if self.writable {
+            "Tab/↑↓ field · type to edit · Enter add/backup · Del delete type · Ctrl+U update from another vault · Esc back"
+        } else {
+            "Tab/↑↓ field · type to edit · Enter = add / backup · Del = delete type (if unused) · Esc back"
+        };
+        self.draw_footer(frame, chunks[1], footer);
+    }
+
+    /// "Update from another vault" screen: collect the source folder + its two passwords,
+    /// then preview the patch and apply. Two phases keyed on whether `merge_plan` is set.
+    fn draw_merge(&self, frame: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(frame.area());
+
+        let mut lines: Vec<Line> = Vec::new();
+        match &self.merge_plan {
+            None => {
+                // --- Collect phase. ---
+                lines.push(Line::from(Span::styled(
+                    "Pull newer/new records (and the documents they reference) from ANOTHER vault.",
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "One-way and additive — nothing here is deleted. The other vault opens read-only.",
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(""));
+                let field = |idx: usize, label: &str, value: String| {
+                    let focused = self.merge_focus == idx;
+                    let marker = if focused { "> " } else { "  " };
+                    let style = if focused {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(vec![Span::styled(format!("{marker}{label:<22}"), style), Span::raw(value)])
+                };
+                lines.push(field(0, "Other vault folder", self.merge_src_dir.clone()));
+                lines.push(field(1, "Other password 1", "*".repeat(self.merge_pw1.chars().count())));
+                lines.push(field(2, "Other password 2", "*".repeat(self.merge_pw2.chars().count())));
+                if let Some(err) = &self.merge_error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+                }
+            }
+            Some(plan) => {
+                // --- Preview phase. ---
+                let short = plan.source_vault_id.get(..8).unwrap_or(plan.source_vault_id.as_str());
+                lines.push(Line::from(Span::styled(format!("From vault {short}"), Style::default().fg(Color::Gray))));
+                if plan.is_empty() && plan.skipped.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from("Already up to date — nothing in the other vault is newer or new."));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} record(s) ({} new, {} updated) · {} document(s) to copy ({} bytes)",
+                            plan.records.len(),
+                            plan.new_count(),
+                            plan.updated_count(),
+                            plan.blobs_to_copy(),
+                            plan.bytes_to_copy(),
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+                    for r in &plan.records {
+                        let recency = match r.current_updated_at {
+                            Some(cur) => format!("{} → {}", format_time(cur), format_time(r.source_updated_at)),
+                            None => format!("new @ {}", format_time(r.source_updated_at)),
+                        };
+                        lines.push(Line::from(format!("  [{}] {} — {} ({recency})", r.change.as_str(), r.kind.as_str(), r.label)));
+                    }
+                    if !plan.blobs.is_empty() {
+                        lines.push(Line::from("  documents:"));
+                        for b in &plan.blobs {
+                            let tag = if b.already_present { "here" } else { "copy" };
+                            lines.push(Line::from(format!("    [{tag}] {} ({} bytes)  {}", b.id, b.size, b.path)));
+                        }
+                    }
+                    if !plan.skipped.is_empty() {
+                        lines.push(Line::from(Span::styled("  skipped (not applied):", Style::default().fg(Color::Yellow))));
+                        for s in &plan.skipped {
+                            lines.push(Line::from(format!("    {} — {} — {}", s.kind.as_str(), s.label, s.reason)));
+                        }
+                    }
+                }
+                if let Some(err) = &self.merge_error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+                }
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" Update from another vault "))
+                .wrap(Wrap { trim: true }),
+            chunks[0],
         );
+        let footer = if self.merge_plan.is_some() {
+            "Enter/a apply · c or Esc cancel"
+        } else {
+            "Tab/↑↓ move · type to edit · Enter next/preview · Esc cancel"
+        };
+        self.draw_footer(frame, chunks[1], footer);
     }
 
     fn draw_auth(&self, frame: &mut Frame) {
@@ -3151,6 +3451,15 @@ pub(crate) fn format_time(ts: i64) -> String {
     let (year, mo, d, h, m, s) = records::civil_from_unix(ts);
     // `{year:04}` etc. are format specs: zero-pad to the given width (4 or 2).
     format!("{year:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+/// True if two `vault.pmv` paths refer to the same vault on disk (canonicalized when both
+/// exist, else compared raw). Used to refuse "update from another vault" pointed at itself.
+fn same_vault_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 // `#[cfg(test)]` is conditional compilation: this whole `mod tests` module is
@@ -4646,6 +4955,99 @@ mod tests {
         render(&app);
         app.screen = Screen::Config;
         render(&app);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn merge_ctrl_u_entry_preview_and_apply() {
+        // SOURCE vault in its own dir: a newer shared account + a doc-bearing record.
+        let s_path = tmp_vault("merge-src");
+        let s_dir = s_path.parent().unwrap().to_path_buf();
+        let blob_id;
+        {
+            let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+            let mut a = crate::records::Account::new().unwrap();
+            a.id = "shared".into();
+            a.title = "Shared".into();
+            a.owner = "o".into();
+            a.account_type = "Checking".into();
+            a.username = "alice".into();
+            a.password = "NEWPW".into();
+            a.updated_at = 2_000;
+            s.vault.accounts.push(a);
+            let f = std::env::temp_dir().join(format!("pmtui-doc-{}.txt", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::write(&f, b"deed-bytes").unwrap();
+            blob_id = s.add_document("general-documents/deed", "deed.pdf", &f).unwrap();
+            let mut gd = crate::records::GeneralDocument::new().unwrap();
+            gd.id = "gd-1".into();
+            gd.title = "Deed".into();
+            gd.file = Some(blob_id.clone());
+            gd.updated_at = 3_000;
+            s.vault.general_documents.push(gd);
+            s.save().unwrap();
+        }
+
+        // CURRENT vault (open, writable) with the OLDER shared account; on Config.
+        let (mut app, c_path) = app_unlocked("merge-cur");
+        {
+            let cur = app.vault.as_mut().unwrap();
+            let mut a = crate::records::Account::new().unwrap();
+            a.id = "shared".into();
+            a.title = "Shared".into();
+            a.owner = "o".into();
+            a.account_type = "Checking".into();
+            a.username = "alice".into();
+            a.password = "OLDPW".into();
+            a.updated_at = 1_000;
+            cur.vault.accounts.push(a);
+            cur.save().unwrap();
+        }
+        app.screen = Screen::Config;
+
+        // Ctrl+U on Config enters the merge screen (writable).
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.screen, Screen::Merge);
+
+        // Clear the pre-filled folder (enter_merge seeds it with the vault root), then type
+        // the source folder into focus 0 via the real key handler.
+        app.merge_src_dir.clear();
+        for c in s_dir.display().to_string().chars() {
+            app.handle_merge_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.merge_src_dir, s_dir.display().to_string());
+        app.merge_pw1 = "s1".into();
+        app.merge_pw2 = "s2".into();
+        app.merge_preview();
+        assert!(app.merge_error.is_none(), "preview error: {:?}", app.merge_error);
+        let plan = app.merge_plan.as_ref().expect("plan built");
+        assert_eq!(plan.updated_count(), 1);
+        assert_eq!(plan.new_count(), 1);
+        assert_eq!(plan.blobs_to_copy(), 1);
+        assert!(app.merge_pw1.is_empty(), "passwords wiped after preview");
+
+        // Enter applies from the preview phase.
+        app.handle_merge_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Config);
+        assert!(app.merge_plan.is_none());
+        let cur = app.vault.as_ref().unwrap();
+        assert_eq!(cur.vault.accounts.iter().find(|a| a.id == "shared").unwrap().password, "NEWPW");
+        assert_eq!(&**cur.read_document(&blob_id).unwrap(), b"deed-bytes");
+
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_ctrl_u_inert_read_only() {
+        // Read-only session: Ctrl+U on Config must NOT enter the merge screen.
+        let path = tmp_vault("merge-ro");
+        let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        drop(ov);
+        let mut app = App::new(path.clone(), false); // read-only
+        app.vault = Some(OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap());
+        app.screen = Screen::Config;
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.screen, Screen::Config, "read-only stays on Config");
         cleanup(&path);
     }
 }

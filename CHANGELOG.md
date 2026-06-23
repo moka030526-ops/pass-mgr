@@ -18,6 +18,20 @@ date and bump the crate versions to match.
 
 ### Added
 
+- **Update from another vault.** A new way to pull changes from a SECOND vault into the
+  current one: records that are **newer** (by `updated_at`) or **new** in the other vault,
+  together with the **documents** they reference, are previewed and then applied. It is
+  **one-way and additive** — it never deletes anything from the current vault. Surfaces:
+  - **CLI:** `pass-mgr update-from OTHER [DIR]` (prompts four passwords: the current vault's
+    two, then the other vault's two). `--dry-run` previews the patch without writing.
+  - **GUI:** Config → "Update from another vault…" (writable only) → enter the other vault's
+    folder + its two passwords → preview the exact records/documents → Apply.
+  - **TUI:** Config → **Ctrl+U** → same collect → preview → apply flow.
+  - Engine in `pass-mgr-core::merge` + `OpenVault::plan_merge_from`/`apply_merge_from`: blobs
+    are re-encrypted under the destination key (never byte-copied), the apply is crash-safe
+    add-only (every referenced blob is durable before the `vault.pmv` that references it), the
+    source vault is opened read-only with its errors collapsed (no password-correctness
+    oracle), and records that depend on a locally-deleted (tombstoned) document are skipped.
 - **Mobile apps.** Native Android and iOS apps (Compose Multiplatform UI over the
   audited core via a UniFFI/Gobley FFI). Read-only viewer surface: open with the two
   passwords, browse the tabs, view a record, read its history. The Android APK builds

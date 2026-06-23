@@ -36,6 +36,7 @@
 // module are private by default unless they too are marked `pub`.
 pub mod crypto; // security-critical: key derivation + authenticated encryption
 pub mod fault; // crash-safety fault-injection hooks (no-op without the feature)
+pub mod merge; // cross-vault "update from another vault" patch/plan types + diff helpers
 pub mod password; // random password generator
 pub mod records; // the secret records stored in the vault
 pub mod storage; // the partitioned, crash-safe on-disk storage engine

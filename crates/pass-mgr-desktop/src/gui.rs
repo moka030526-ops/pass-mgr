@@ -391,12 +391,15 @@ fn save_theme_to(path: &std::path::Path, theme: Theme) {
 // auto-generates trait implementations: `PartialEq`/`Eq` enable `==`/`!=`
 // comparisons; `Clone` enables explicit `.clone()`; `Copy` makes the value
 // trivially duplicated on assignment (so passing it around does not "move" it).
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Screen {
     Auth,
     Main,
     Config,
     Help,
+    /// "Update from another vault": collect the source dir + its two passwords, preview the
+    /// patch, then apply. Reached from Config (writable only).
+    Merge,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -492,6 +495,16 @@ struct GuiApp {
     // then `Some(vault)`; this is how Rust models "may or may not be present"
     // without null pointers.
     vault: Option<OpenVault>,
+    // "Update from another vault" (Screen::Merge) state. The source directory + its two
+    // passwords are collected, then `merge_source` holds the opened (read-only) source and
+    // `merge_plan` the computed patch between the preview and the apply. Passwords are
+    // wiped (and pre-reserved) like the auth buffers.
+    merge_src_dir: String,
+    merge_pw1: String,
+    merge_pw2: String,
+    merge_source: Option<OpenVault>,
+    merge_plan: Option<crate::merge::MergePlan>,
+    merge_error: Option<String>,
     // Tabs + per-tab working edit buffer. Each `edit_*` is the record currently
     // being edited on that tab, or `None` when nothing is selected.
     tab: Tab,
@@ -570,6 +583,8 @@ impl Drop for GuiApp {
         self.confirm1.zeroize();
         self.pw2.zeroize();
         self.confirm2.zeroize();
+        self.merge_pw1.zeroize();
+        self.merge_pw2.zeroize();
         if self.clipboard_dirty {
             clear_clipboard();
         }
@@ -618,6 +633,14 @@ impl GuiApp {
             confirm2: String::with_capacity(256),
             auth_error: None,
             vault: None,
+            merge_src_dir: String::new(),
+            // Pre-reserve so typing the source passwords never reallocates (which would
+            // strand un-zeroized fragments) — same discipline as the auth buffers.
+            merge_pw1: String::with_capacity(256),
+            merge_pw2: String::with_capacity(256),
+            merge_source: None,
+            merge_plan: None,
+            merge_error: None,
             tab: Tab::Instructions,
             edit_instruction: None,
             edit_trustwill: None,
@@ -916,6 +939,25 @@ impl GuiApp {
         self.confirm1.zeroize();
         self.pw2.zeroize();
         self.confirm2.zeroize();
+        self.merge_pw1.zeroize();
+        self.merge_pw2.zeroize();
+    }
+
+    /// Leave the merge flow: drop the opened source vault + computed plan and wipe the
+    /// source passwords. Called on cancel, on apply, and whenever Config/Merge is entered.
+    fn reset_merge(&mut self) {
+        self.merge_source = None;
+        self.merge_plan = None;
+        self.merge_error = None;
+        self.wipe_merge_pw();
+    }
+
+    /// Zeroize + clear the two source-vault password buffers.
+    fn wipe_merge_pw(&mut self) {
+        self.merge_pw1.zeroize();
+        self.merge_pw2.zeroize();
+        self.merge_pw1.clear();
+        self.merge_pw2.clear();
     }
 
     // `&mut egui::Ui` is the drawing surface, borrowed mutably so widgets can be
@@ -1314,6 +1356,7 @@ impl GuiApp {
         let mut set_export = false;
         let mut set_volume = false;
         let mut set_redundancy = false;
+        let mut start_merge = false;
         // Deferred DELETE actions: which category the user clicked × on (handled after
         // the render closures, same borrow-discipline as the add_* flags).
         let mut remove_asset: Option<String> = None;
@@ -1516,6 +1559,22 @@ impl GuiApp {
                         set_redundancy = true;
                     }
                 });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Update from another vault").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Pull records that are newer (or new) in ANOTHER vault — together with the \
+                         documents they reference — into this one. One-way and additive: it never \
+                         deletes anything here. You'll choose the other vault's folder and enter its \
+                         two passwords, then preview the exact changes before applying.",
+                    )
+                    .weak(),
+                );
+                if ui.button("Update from another vault…").clicked() {
+                    start_merge = true;
+                }
             }
         });
 
@@ -1659,10 +1718,227 @@ impl GuiApp {
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
         }
+        if start_merge {
+            // Enter the merge flow with fresh state. Pre-fill the source folder with the
+            // vault root (the folder that holds vaults) as a convenient starting point.
+            self.reset_merge();
+            self.merge_src_dir = self.vault_root.trim().to_string();
+            self.screen = Screen::Merge;
+        }
 
         if !self.status.is_empty() {
             ui.separator();
             ui.label(egui::RichText::new(&self.status).weak());
+        }
+    }
+
+    /// The "Update from another vault" screen: collect the source directory + its two
+    /// passwords, preview the patch (`plan_merge_from`), then apply (`apply_merge_from`).
+    /// Only reachable in `--write` mode (the entry button is gated). The opened source
+    /// handle + computed plan live in `self.merge_*` between the preview and the apply.
+    fn ui_merge(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("⟵ Back to Config").clicked() {
+                self.reset_merge();
+                self.screen = Screen::Config;
+            }
+            ui.heading("Update from another vault");
+        });
+        ui.separator();
+
+        // Deferred actions (set in the render below, run after to avoid borrow clashes).
+        let mut do_preview = false;
+        let mut do_apply = false;
+        let mut do_reset = false;
+        let mut copied: Option<Zeroizing<String>> = None;
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("merge_scroll").show(ui, |ui| {
+            if self.merge_plan.is_none() {
+                // --- Phase 1: collect the source folder + its two passwords. ---
+                ui.label(
+                    egui::RichText::new(
+                        "Choose the OTHER vault's folder and enter ITS two passwords. The other vault \
+                         is opened read-only; this vault is only changed when you click Apply on the \
+                         next screen. Nothing here is deleted — only newer/new records are pulled in.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                egui::Grid::new("merge_form").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Other vault folder");
+                    ui.add(egui::TextEdit::singleline(&mut self.merge_src_dir).hint_text("/path/to/other-vault-folder").desired_width(360.0));
+                    ui.end_row();
+                    ui.label("Other password 1");
+                    password_field(ui, "merge_pw1", &mut self.merge_pw1, &mut copied);
+                    ui.end_row();
+                    ui.label("Other password 2");
+                    password_field(ui, "merge_pw2", &mut self.merge_pw2, &mut copied);
+                    ui.end_row();
+                });
+                ui.add_space(10.0);
+                if ui.button("Preview update").clicked() {
+                    do_preview = true;
+                }
+                if let Some(err) = &self.merge_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), err);
+                }
+            } else if let Some(plan) = self.merge_plan.as_ref() {
+                // --- Phase 2: show the computed plan; Apply or Cancel. ---
+                let short = plan.source_vault_id.get(..8).unwrap_or(plan.source_vault_id.as_str());
+                ui.label(egui::RichText::new(format!("From vault {short}")).weak());
+                if plan.is_empty() && plan.skipped.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label("Already up to date — no records in the other vault are newer or new.");
+                } else {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(format!(
+                        "{} record(s) to change ({} new, {} updated) · {} document(s) to copy ({} bytes)",
+                        plan.records.len(),
+                        plan.new_count(),
+                        plan.updated_count(),
+                        plan.blobs_to_copy(),
+                        plan.bytes_to_copy(),
+                    )).strong());
+                    ui.add_space(6.0);
+                    egui::Grid::new("merge_records").striped(true).num_columns(3).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Change").strong());
+                        ui.label(egui::RichText::new("Type").strong());
+                        ui.label(egui::RichText::new("Record / recency").strong());
+                        ui.end_row();
+                        for r in &plan.records {
+                            ui.label(r.change.as_str());
+                            ui.label(r.kind.as_str());
+                            let recency = match r.current_updated_at {
+                                Some(cur) => format!("{} ({} → {})", r.label, format_time(cur), format_time(r.source_updated_at)),
+                                None => format!("{} (new @ {})", r.label, format_time(r.source_updated_at)),
+                            };
+                            ui.label(recency);
+                            ui.end_row();
+                        }
+                    });
+                    if !plan.blobs.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Documents").strong());
+                        for b in &plan.blobs {
+                            let tag = if b.already_present { "already here" } else { "copy" };
+                            ui.label(format!("  [{tag}] {} ({} bytes)", b.path, b.size));
+                        }
+                    }
+                    if !plan.skipped.is_empty() {
+                        ui.add_space(8.0);
+                        ui.colored_label(egui::Color32::from_rgb(190, 120, 50), "Skipped (not applied):");
+                        for s in &plan.skipped {
+                            ui.label(format!("  {} — {} — {}", s.kind.as_str(), s.label, s.reason));
+                        }
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let can_apply = !plan.is_empty();
+                    if ui.add_enabled(can_apply, egui::Button::new("Apply update")).clicked() {
+                        do_apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_reset = true;
+                    }
+                });
+            }
+        });
+
+        // A copied source-vault password (built-in Ctrl+C) routes through the hardened,
+        // auto-clearing clipboard path, exactly like the unlock screen.
+        if let Some(text) = copied {
+            self.copy_to_clipboard(text);
+        }
+
+        if do_preview {
+            self.merge_preview();
+        }
+        if do_apply {
+            self.merge_apply();
+        }
+        if do_reset {
+            // Cancel the preview but stay on the screen to re-enter credentials.
+            self.reset_merge();
+        }
+    }
+
+    /// Open the source vault read-only and compute the patch into `self.merge_plan`.
+    /// Collapses the source's open errors into ONE generic message so this screen can't be
+    /// used as a password-correctness oracle for the other vault (mirrors the unlock screen).
+    fn merge_preview(&mut self) {
+        self.merge_error = None;
+        // The just-typed source-vault passwords are secrets: wipe them on EVERY exit path
+        // (each validation early-return below, the open failure, the plan error, and success),
+        // never leaving them resident in the heap buffers after this call.
+        let dir = self.merge_src_dir.trim();
+        if dir.is_empty() {
+            self.merge_error = Some("Enter the other vault's folder.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        let src_path = crate::launch::vault_file(dir);
+        if !src_path.exists() {
+            self.merge_error = Some("No vault found in that folder.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        // Guard against merging this vault into itself.
+        if same_vault_path(&src_path, &self.path) {
+            self.merge_error = Some("That is this same vault — choose a different one.".into());
+            self.wipe_merge_pw();
+            return;
+        }
+        let source = match OpenVault::open_read_only(src_path, self.merge_pw1.as_bytes(), self.merge_pw2.as_bytes()) {
+            Ok(v) => v,
+            Err(_) => {
+                // Single generic message for EVERY failure (wrong password, corrupt, etc.)
+                // so the screen never confirms whether the entered passwords were right.
+                self.merge_error = Some("Could not open that vault — wrong password(s) or unreadable.".into());
+                self.wipe_merge_pw();
+                return;
+            }
+        };
+        let plan = match self.vault_ref().plan_merge_from(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                self.merge_error = Some(format!("Could not build the update: {e}"));
+                self.wipe_merge_pw();
+                return;
+            }
+        };
+        // Keep the opened source + plan for the apply step; wipe the entered passwords now.
+        self.merge_source = Some(source);
+        self.merge_plan = Some(plan);
+        self.wipe_merge_pw();
+    }
+
+    /// Apply the previewed patch (copy blobs, replace/insert records, save), then return to
+    /// Config with a status summary. Recomputes against the held source handle internally.
+    fn merge_apply(&mut self) {
+        // Disjoint field borrows: `self.vault` (mut) and `self.merge_source` (shared).
+        let result = match (self.vault.as_mut(), self.merge_source.as_ref()) {
+            (Some(cur), Some(src)) => cur.apply_merge_from(src),
+            _ => {
+                self.merge_error = Some("Nothing to apply.".into());
+                return;
+            }
+        };
+        match result {
+            Ok(report) => {
+                self.status = format!(
+                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied.{}",
+                    report.records_added,
+                    report.records_updated,
+                    report.blobs_copied,
+                    if report.records_skipped > 0 { format!(" {} skipped.", report.records_skipped) } else { String::new() },
+                );
+                self.reset_merge();
+                self.screen = Screen::Config;
+            }
+            Err(e) => self.merge_error = Some(format!("Update failed: {e}")),
         }
     }
 
@@ -3111,6 +3387,10 @@ impl eframe::App for GuiApp {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_config(ui));
             return;
         }
+        if self.screen == Screen::Merge {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.ui_merge(ui));
+            return;
+        }
         if self.screen == Screen::Help {
             egui::CentralPanel::default().show_inside(ui, |ui| self.ui_help(ui));
             return;
@@ -3556,6 +3836,15 @@ fn secret_text_edit(
 
 /// A masked single-line password field; returns true if Enter was pressed. `id_salt`
 /// is unique per field (unlock/create/change-password use four distinct fields).
+/// True if two `vault.pmv` paths refer to the same vault on disk (canonicalized when both
+/// exist, else compared raw). Used to refuse "update from another vault" pointed at itself.
+fn same_vault_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 fn password_field(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -4173,5 +4462,97 @@ mod tests {
         assert!(OpenVault::open(path.clone(), b"a", b"b").is_err());
         assert!(OpenVault::open(path.clone(), b"c", b"d").is_ok());
         cleanup(&path);
+    }
+
+    #[test]
+    fn merge_preview_then_apply_updates_vault_and_copies_blob() {
+        use crate::records;
+        // SOURCE vault in its own dir, with a newer shared account + a doc-bearing record.
+        let s_path = tmp("merge-gui-src");
+        let s_dir = s_path.parent().unwrap().to_path_buf();
+        let blob_id;
+        {
+            let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+            let mut a = records::Account::new().unwrap();
+            a.id = "shared".into();
+            a.title = "Shared".into();
+            a.owner = "o".into();
+            a.account_type = "Checking".into();
+            a.username = "alice".into();
+            a.password = "NEWPW".into();
+            a.updated_at = 2_000;
+            s.vault.accounts.push(a);
+            let f = std::env::temp_dir().join(format!("pmgui-doc-{}.txt", nanos()));
+            std::fs::write(&f, b"deed-bytes").unwrap();
+            blob_id = s.add_document("general-documents/deed", "deed.pdf", &f).unwrap();
+            let mut gd = records::GeneralDocument::new().unwrap();
+            gd.id = "gd-1".into();
+            gd.title = "Deed".into();
+            gd.file = Some(blob_id.clone());
+            gd.updated_at = 3_000;
+            s.vault.general_documents.push(gd);
+            s.save().unwrap();
+        }
+
+        // CURRENT vault (writable, open) with an OLDER version of the shared account.
+        let (mut app, c_path) = app_unlocked("merge-gui-cur");
+        {
+            let cur = app.vault.as_mut().unwrap();
+            let mut a = records::Account::new().unwrap();
+            a.id = "shared".into();
+            a.title = "Shared".into();
+            a.owner = "o".into();
+            a.account_type = "Checking".into();
+            a.username = "alice".into();
+            a.password = "OLDPW".into();
+            a.updated_at = 1_000;
+            cur.vault.accounts.push(a);
+            cur.save().unwrap();
+        }
+
+        // PREVIEW: enter the source folder + its passwords.
+        app.merge_src_dir = s_dir.display().to_string();
+        app.merge_pw1 = "s1".into();
+        app.merge_pw2 = "s2".into();
+        app.merge_preview();
+        assert!(app.merge_error.is_none(), "preview error: {:?}", app.merge_error);
+        let plan = app.merge_plan.as_ref().expect("a plan was built");
+        assert_eq!(plan.updated_count(), 1, "shared account is newer in source");
+        assert_eq!(plan.new_count(), 1, "the general document is new");
+        assert_eq!(plan.blobs_to_copy(), 1);
+        // Passwords were wiped after a successful preview.
+        assert!(app.merge_pw1.is_empty() && app.merge_pw2.is_empty());
+
+        // APPLY.
+        app.merge_apply();
+        assert!(app.merge_plan.is_none(), "merge state cleared after apply");
+        assert_eq!(app.screen, Screen::Config);
+        assert!(app.status.contains("Updated from another vault"), "status: {}", app.status);
+        let cur = app.vault.as_ref().unwrap();
+        assert_eq!(cur.vault.accounts.iter().find(|a| a.id == "shared").unwrap().password, "NEWPW");
+        assert_eq!(&**cur.read_document(&blob_id).unwrap(), b"deed-bytes");
+
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_preview_wrong_password_gives_generic_error() {
+        let s_path = tmp("merge-gui-badpw-src");
+        let s_dir = s_path.parent().unwrap().to_path_buf();
+        {
+            OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        }
+        let (mut app, c_path) = app_unlocked("merge-gui-badpw-cur");
+        app.merge_src_dir = s_dir.display().to_string();
+        app.merge_pw1 = "wrong".into();
+        app.merge_pw2 = "wrong".into();
+        app.merge_preview();
+        assert!(app.merge_plan.is_none());
+        // One generic message — never confirms whether the password was right (oracle-safe).
+        let err = app.merge_error.as_deref().unwrap_or("");
+        assert!(err.contains("wrong password(s) or unreadable"), "got: {err:?}");
+        cleanup(&s_path);
+        cleanup(&c_path);
     }
 }

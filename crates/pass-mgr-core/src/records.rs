@@ -609,6 +609,9 @@ pub trait Record: Clone {
     // view of the id, tied to the lifetime of `self` (no copy).
     fn id(&self) -> &str;
     fn created_at(&self) -> i64;
+    /// Last-modified unix-seconds timestamp — the recency key the cross-vault merge
+    /// compares (a source record is "more recent" iff its `updated_at` is greater).
+    fn updated_at(&self) -> i64;
     // `&mut self` borrows exclusively so the method may mutate the value (a setter).
     fn set_created_at(&mut self, at: i64);
     fn set_updated_at(&mut self, at: i64);
@@ -1010,6 +1013,9 @@ macro_rules! impl_record {
             }
             fn created_at(&self) -> i64 {
                 self.created_at
+            }
+            fn updated_at(&self) -> i64 {
+                self.updated_at
             }
             fn set_created_at(&mut self, at: i64) {
                 self.created_at = at;
