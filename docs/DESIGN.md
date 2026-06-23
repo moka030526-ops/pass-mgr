@@ -252,8 +252,9 @@ enforced in two layers:
   change it (combos/checkboxes are simply disabled); the TUI's `handle_edit_key` drops
   typing / backspace / choice-cycling unless `writable`. The changeable settings in
   read-only mode are the **local, non-secret preferences** kept in `prefs.json` (not the
-  vault) — the **color theme** and the **export directory** — plus the backup-destination
-  field; backup and document export are themselves read-only-safe reads. Storing the
+  vault) — the **color theme**, the **export directory**, and the **vault root** (§ Auth) —
+  plus the backup-destination field; backup and document export are themselves
+  read-only-safe reads. Storing the
   export directory as a preference (rather than in the vault) is what lets a read-only
   session set where to extract documents, so read-only document export keeps working.
 
@@ -570,15 +571,35 @@ Taxes, and General Documents — over four screens. (The read-only mobile viewer
 currently exposes the first five record types.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
-   The start page also exposes an editable **vault-directory** field (GUI text box;
-   TUI focus-0 row), pre-filled with the launch/default directory, so the user can
-   point at a different vault folder without relaunching. Changing it re-derives the
-   vault path (`<dir>/vault.pmv`, via `launch::vault_file`) and re-evaluates the mode:
-   **Unlock** if a `vault.pmv` already exists there, else **Create**. The field is
-   editable in **both** read-only and `--write` mode (an heir can browse to an
-   existing vault to read it), but creating a vault in an empty directory requires
-   `--write` (read-only shows an inline "relaunch with --write" hint and refuses);
-   `OpenVault::create` makes the directory if it doesn't exist. The mode flip rebuilds
+   The start page selects the vault by **root + a collapsed "Vault" control** rather than
+   a free-form path. There are two non-password rows (GUI text boxes; TUI focus-0/1 rows),
+   editable in **both** read-only and `--write` mode:
+   - an editable **Vault root** path — the folder scanned for vaults; and
+   - a **Vault** control: an editable leaf **name** paired with a **dropdown** (GUI
+     `ComboBox`; TUI `←/→`-cycled row) of the vaults found by `launch::discover_vaults`,
+     which scans the root **exactly one level deep** for immediate sub-directories holding
+     a `vault.pmv` (never recursive, never the root itself; names sorted case-insensitively).
+
+   The open target is always `<root>/<name>` (`launch::join_root_name` →
+   `launch::vault_file`), so **picking** a dropdown entry fills the name (→ Unlock) and
+   **typing** a name not yet on disk arms **Create** — that is the create path now that
+   there is no separate directory field. Creating still requires `--write` (read-only shows
+   an inline "relaunch with --write" hint and refuses); `OpenVault::create` makes
+   `<root>/<name>` if absent. An empty name resolves to the root itself. Discovery is
+   **error-reporting, not silent**: an unreadable root yields an empty list with a
+   `VaultScan.warning`, and individual entries that can't be classified (an unreadable
+   directory entry, a metadata/marker read that errors, a non-UTF-8 name) are tallied into
+   an "N skipped (inaccessible)" warning shown under the control rather than aborting the
+   scan. The resolved path + mode are shown in the `Vault:` line.
+
+   The **root is persisted** across sessions as a local, non-secret preference
+   (`vault_root` in `prefs.json`, alongside the theme and export dir — **never** in the
+   vault), written on a successful open/create (`save_vault_root`) and re-seeded at startup
+   by `launch::initial_root_and_name`: an explicitly launched vault (`pass-mgr DIR`) always
+   wins (root = its parent, name = its folder), while a default launch adopts the saved root
+   and pre-selects a name only when the default vault lives directly under it. The chosen
+   root also seeds the Config **backup destination** default (still freely editable there).
+   The mode flip rebuilds
    the password fields (Create asks for each password twice to confirm). After unlock
    it shows the last-opened time and the write `generation` (req. 6; a jump backwards
    in generation hints at a rollback, §9.12). The same screen drives

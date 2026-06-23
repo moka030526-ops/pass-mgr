@@ -389,9 +389,26 @@ struct App {
     writable: bool,
     screen: Screen,
     auth: AuthState,
-    /// The directory whose `vault.pmv` we open/create — editable on the start page (focus 0
-    /// of the auth screen, unless changing the master passwords). Kept in sync with `path`.
+    /// The directory whose `vault.pmv` we open/create. On the collapsed start page this is
+    /// DERIVED as `<auth_root>/<auth_name>` (see `recompute_auth_path`), kept in sync with
+    /// `path`; it is never an editable field of its own.
     auth_dir: String,
+    /// Editable ROOT directory scanned (one level deep) for vaults — focus 0 on the start
+    /// page. Seeded from the saved `vault_root` preference (else the launch dir's parent);
+    /// editing it re-scans `auth_vaults` and is persisted back to prefs.
+    auth_root: String,
+    /// The selected/typed vault folder NAME (leaf under `auth_root`) — the editable "Vault"
+    /// row at focus 1. Typing edits it (a new name arms Create); ←/→ cycle the discovered
+    /// vaults into it. Empty = the root itself. With `auth_root` it derives `auth_dir`/`path`.
+    auth_name: String,
+    /// Names of the subdirectories of `auth_root` that hold a `vault.pmv` — the choices the
+    /// focus-1 Vault row cycles through with ←/→. Empty when none are found.
+    auth_vaults: Vec<String>,
+    /// Index of the highlighted entry in `auth_vaults` (meaningful only when non-empty).
+    auth_vault_sel: usize,
+    /// A warning from the most recent scan (root unreadable, or entries skipped), shown
+    /// under the Vault row. `None` when the scan was clean.
+    auth_scan_warning: Option<String>,
     // The unlocked vault, present only after a successful unlock/create
     // (`None` while on the Auth screen).
     vault: Option<OpenVault>,
@@ -462,19 +479,30 @@ impl Drop for App {
 
 impl App {
     fn new(path: PathBuf, writable: bool) -> Self {
+        // Collapsed start page: the open target is `<root>/<name>`. Seed the root from the
+        // saved preference (so startups share a default root), pre-selecting the launched
+        // vault's folder when appropriate; then derive the directory/path from root+name.
+        let saved_root = crate::load_vault_root();
+        let (auth_root, auth_name) = crate::launch::initial_root_and_name(&path, &saved_root);
+        // Default the backup destination to the root (see the `cfg_backup_dest` field).
+        let cfg_backup_dest = auth_root.clone();
+        let auth_dir = crate::launch::join_root_name(&auth_root, &auth_name);
+        let path = crate::launch::vault_file(&auth_dir);
         let mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
-        // The directory shown (and editable) on the start page — the parent of vault.pmv.
-        let auth_dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let scan = crate::launch::discover_vaults(&auth_root);
+        // Highlight the selected vault in the picker if it was discovered under the root.
+        let auth_vault_sel = scan.vaults.iter().position(|v| *v == auth_name).unwrap_or(0);
         App {
             path,
             writable,
             screen: Screen::Auth,
             auth: AuthState::new(mode),
             auth_dir,
+            auth_root,
+            auth_name,
+            auth_vaults: scan.vaults,
+            auth_vault_sel,
+            auth_scan_warning: scan.warning,
             vault: None,
             tab: Tab::Instructions,
             selected: 0,
@@ -497,7 +525,9 @@ impl App {
             cfg_subtype_type: String::new(),
             cfg_subtype_name: String::new(),
             cfg_volume_size: String::new(),
-            cfg_backup_dest: String::new(),
+            // Default the backup destination to the vault ROOT (editable in Config). It
+            // tracks the root while on the start page; once unlocked it's the user's.
+            cfg_backup_dest,
             cfg_redundancy: String::new(),
             cfg_export_dir: crate::load_export_dir(),
             status: String::new(),
@@ -761,9 +791,13 @@ impl App {
             // editable vault-directory field (on the start page); focuses 1.. are the
             // password fields, so subtract the dir slot to index `auth.fields`.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.on_auth_dir_field() {
-                    self.auth_dir.push(c);
-                    self.apply_auth_dir();
+                if self.on_auth_root_field() {
+                    self.auth_root.push(c);
+                    self.auth_root_edited();
+                } else if self.on_auth_vault_field() {
+                    // Type a vault name: pick an existing one or name a new one (→ Create).
+                    self.auth_name.push(c);
+                    self.recompute_auth_path();
                 } else {
                     let idx = self.auth_field_index();
                     self.auth.fields[idx].value.push(c);
@@ -771,13 +805,27 @@ impl App {
             }
             KeyCode::Backspace => {
                 // `.pop()` removes the last char (returns an `Option`, ignored here).
-                if self.on_auth_dir_field() {
-                    self.auth_dir.pop();
-                    self.apply_auth_dir();
+                if self.on_auth_root_field() {
+                    self.auth_root.pop();
+                    self.auth_root_edited();
+                } else if self.on_auth_vault_field() {
+                    self.auth_name.pop();
+                    self.recompute_auth_path();
                 } else {
                     let idx = self.auth_field_index();
                     self.auth.fields[idx].value.pop();
                 }
+            }
+            // ←/→ on the Vault row (focus 1) cycle the discovered vaults into the name,
+            // adopting each as the open target. Inert elsewhere on the auth screen.
+            KeyCode::Left | KeyCode::Right if self.on_auth_vault_field() && !self.auth_vaults.is_empty() => {
+                let n = self.auth_vaults.len();
+                self.auth_vault_sel = if key.code == KeyCode::Right {
+                    (self.auth_vault_sel + 1) % n
+                } else {
+                    (self.auth_vault_sel + n - 1) % n
+                };
+                self.apply_auth_vault_selection();
             }
             KeyCode::Tab | KeyCode::Down => {
                 let total = self.auth_focus_count();
@@ -799,35 +847,83 @@ impl App {
         false
     }
 
-    /// The start page shows an editable vault-DIRECTORY field at focus 0; the in-vault
-    /// Change-password flow does not (you are already in a vault).
-    fn auth_has_dir_field(&self) -> bool {
+    /// True on the start page (Create/Unlock), false in the in-vault Change-password flow.
+    /// The start page prepends two non-password rows before the password fields:
+    /// focus 0 = Root, focus 1 = the editable "Vault" name (dropdown-filled / ←/→-cycled).
+    fn auth_start_page(&self) -> bool {
         self.auth.mode != AuthMode::ChangePassword
     }
-    /// Total focusable rows: the optional dir field plus the password fields.
+    /// Number of leading non-password rows (Root + Vault), or 0 off the start page.
+    fn auth_lead_rows(&self) -> usize {
+        if self.auth_start_page() {
+            2
+        } else {
+            0
+        }
+    }
+    /// Total focusable rows: the leading non-password rows plus the password fields.
     fn auth_focus_count(&self) -> usize {
-        self.auth.fields.len() + usize::from(self.auth_has_dir_field())
+        self.auth.fields.len() + self.auth_lead_rows()
     }
-    /// True when the current focus is on the dir field (focus 0, when shown).
-    fn on_auth_dir_field(&self) -> bool {
-        self.auth_has_dir_field() && self.auth.focus == 0
+    /// True when focus is on the editable ROOT field (focus 0, start page only).
+    fn on_auth_root_field(&self) -> bool {
+        self.auth_start_page() && self.auth.focus == 0
     }
-    /// Index into `auth.fields` for the current focus (assumes NOT on the dir field).
+    /// True when focus is on the editable "Vault" name row (focus 1, start page only).
+    fn on_auth_vault_field(&self) -> bool {
+        self.auth_start_page() && self.auth.focus == 1
+    }
+    /// Index into `auth.fields` for the current focus (assumes a password row).
     fn auth_field_index(&self) -> usize {
-        self.auth.focus - usize::from(self.auth_has_dir_field())
+        self.auth.focus - self.auth_lead_rows()
     }
 
-    /// Point the start page at the directory in `auth_dir`: re-derive the vault path
-    /// (`<dir>/vault.pmv`) and flip the mode — Unlock if a vault already exists there, else
+    /// Re-derive the open target from `<auth_root>/<auth_name>`: rebuild `auth_dir` and the
+    /// vault path, then flip the mode — Unlock if a `vault.pmv` already exists there, else
     /// Create. A mode change rebuilds the password fields (Create adds confirm fields),
-    /// which also clears any half-typed passwords; focus stays on the dir field.
-    fn apply_auth_dir(&mut self) {
+    /// clearing any half-typed passwords; the current focus row (Root/Vault) is preserved.
+    fn recompute_auth_path(&mut self) {
+        self.auth_dir = crate::launch::join_root_name(&self.auth_root, &self.auth_name);
         self.path = crate::launch::vault_file(self.auth_dir.trim());
         let new_mode = if self.path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         if new_mode != self.auth.mode {
+            let focus = self.auth.focus;
             self.auth = AuthState::new(new_mode);
-            self.auth.focus = 0; // remain on the directory field
+            // Clamp in case the rebuild has fewer rows (Create→Unlock drops 2 fields); the
+            // leading Root/Vault rows always survive, so editing them keeps focus.
+            self.auth.focus = focus.min(self.auth_focus_count().saturating_sub(1));
         }
+    }
+
+    /// Handle an edit to the Root field: re-scan for vaults, re-derive the open target, and
+    /// keep the default backup destination tracking the root until the vault is unlocked (the
+    /// Config backup field is freely editable afterwards). The root is persisted to prefs on
+    /// a successful open (see `submit_auth`), not on every keystroke.
+    fn auth_root_edited(&mut self) {
+        self.refresh_auth_vaults();
+        self.recompute_auth_path();
+        self.cfg_backup_dest = self.auth_root.clone();
+    }
+
+    /// Re-scan `auth_root` for vaults (one level deep) and refresh the picker choices and
+    /// any access warning. Called when the Root field changes.
+    fn refresh_auth_vaults(&mut self) {
+        let scan = crate::launch::discover_vaults(&self.auth_root);
+        self.auth_vaults = scan.vaults;
+        self.auth_scan_warning = scan.warning;
+        if self.auth_vault_sel >= self.auth_vaults.len() {
+            self.auth_vault_sel = self.auth_vaults.len().saturating_sub(1);
+        }
+    }
+
+    /// Adopt the currently highlighted picker entry: copy it into the editable `auth_name`
+    /// and re-derive the path/mode so the user lands ready to unlock it. No-op if empty.
+    fn apply_auth_vault_selection(&mut self) {
+        let Some(name) = self.auth_vaults.get(self.auth_vault_sel).cloned() else {
+            return;
+        };
+        self.auth_name = name;
+        self.recompute_auth_path();
     }
 
     // Returns `Result<(Zeroizing<String>, Zeroizing<String>), String>`:
@@ -931,6 +1027,10 @@ impl App {
         };
         match result {
             Ok(v) => {
+                // Persist the chosen root so the next startup defaults to the same place (a
+                // local prefs.json preference — never written into the vault), at the natural
+                // point the root is "confirmed" by a successful open/create.
+                crate::save_vault_root(self.auth_root.trim());
                 // A recovery from an in-place redundant copy (§12.8) takes priority —
                 // the user needs to know a roll-forward/rollback happened.
                 let recovered = v.recovery_notice().map(|s| s.to_string());
@@ -959,13 +1059,13 @@ impl App {
             // password-INDEPENDENT errors keep their specific messages in the catch-all.
             Err(VaultError::Crypto(_) | VaultError::ArchiveMismatch | VaultError::Json(_) | VaultError::Storage(_)) => {
                 self.auth = AuthState::new(self.auth.mode);
-                self.auth.focus = usize::from(self.auth_has_dir_field()); // land on the first password, past the dir field
+                self.auth.focus = self.auth_lead_rows(); // land on the first password, past the Root/picker/dir rows
                 self.auth.error = Some("Wrong password(s) or corrupted/unreadable vault.".into());
             }
             // Catch-all for any other (password-independent) error variant.
             Err(e) => {
                 self.auth = AuthState::new(self.auth.mode);
-                self.auth.focus = usize::from(self.auth_has_dir_field());
+                self.auth.focus = self.auth_lead_rows();
                 self.auth.error = Some(format!("{e}"));
             }
         }
@@ -2660,31 +2760,51 @@ impl App {
             Line::from(Span::styled(help, Style::default().fg(Color::Gray))),
             Line::from(""),
         ];
-        // Editable vault-DIRECTORY field at focus 0 on the start page (not when changing
-        // passwords). Shown in clear (it is a path, not a secret) and highlighted when focused.
-        let has_dir = self.auth_has_dir_field();
-        if has_dir {
-            let focused = self.auth.focus == 0;
-            let marker = if focused { "> " } else { "  " };
-            let style = if focused {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+        // Start-page rows (not shown when changing passwords): an editable Root path
+        // (focus 0) and a collapsed "Vault" row (focus 1) — an editable leaf name that the
+        // ←/→ picker fills from the vaults scanned under the root, or that you type to name
+        // a new vault. Both shown in clear (they are paths, not secrets), highlighted when
+        // focused. The resolved open target is shown in the "Vault:" line above.
+        let lead_rows = self.auth_lead_rows();
+        if lead_rows > 0 {
+            // Helper to render a focusable, labelled clear-text row.
+            let row = |focus_idx: usize, label: &str, value: String| {
+                let focused = self.auth.focus == focus_idx;
+                let marker = if focused { "> " } else { "  " };
+                let style = if focused {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::from(vec![
+                    Span::styled(format!("{marker}{:<22}", label), style),
+                    Span::raw(value),
+                ])
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{marker}{:<22}", "Vault directory"), style),
-                Span::raw(self.auth_dir.clone()),
-            ]));
+            lines.push(row(0, "Vault root", self.auth_root.clone()));
+            // The Vault row shows the typed/selected name plus a picker hint (count + ←/→).
+            let hint = if self.auth_vaults.is_empty() {
+                "  (none found — type a name to create)".to_string()
+            } else {
+                let sel = self.auth_vault_sel.min(self.auth_vaults.len() - 1);
+                format!("  (←/→ {}/{})", sel + 1, self.auth_vaults.len())
+            };
+            let name_shown = if self.auth_name.trim().is_empty() { "—".to_string() } else { self.auth_name.clone() };
+            lines.push(row(1, "Vault", format!("{name_shown}{hint}")));
+            // Surface a scan problem (root unreadable, or entries skipped) plainly.
+            if let Some(warn) = &self.auth_scan_warning {
+                lines.push(Line::from(Span::styled(format!("  {warn}"), Style::default().fg(Color::Yellow))));
+            }
             // In read-only mode an empty directory can't be created — say so.
             if self.auth.mode == AuthMode::Create && !self.writable {
                 lines.push(Line::from(Span::styled(
-                    "  (no vault in this folder; read-only — relaunch with --write to create one)",
+                    "  (no vault here; read-only — relaunch with --write to create one)",
                     Style::default().fg(Color::Yellow),
                 )));
             }
         }
-        // Password fields follow; their focus index is offset by the dir field (if shown).
-        let offset = usize::from(has_dir);
+        // Password fields follow; their focus index is offset by the leading rows (if any).
+        let offset = lead_rows;
         for (i, field) in self.auth.fields.iter().enumerate() {
             let focused = i + offset == self.auth.focus;
             let marker = if focused { "> " } else { "  " };
@@ -2707,8 +2827,9 @@ impl App {
         }
         lines.push(Line::from(""));
         let esc = if self.auth.mode == AuthMode::ChangePassword { "Esc cancel" } else { "Esc quit" };
+        let pick = if self.auth_start_page() { "←/→ pick vault · " } else { "" };
         lines.push(Line::from(Span::styled(
-            format!("Tab/↑↓ move · Enter next/submit · {esc}"),
+            format!("Tab/↑↓ move · {pick}Enter next/submit · {esc}"),
             Style::default().fg(Color::DarkGray),
         )));
         let block = Block::default().borders(Borders::ALL).title(title);
@@ -3101,29 +3222,39 @@ mod tests {
 
     #[test]
     fn start_page_vault_dir_field_switches_mode_and_creates() {
-        // The start page exposes an editable vault-directory field at focus 0; it pre-fills
-        // the launch dir, flips Unlock<->Create as the directory changes, and (in --write
-        // mode) creates the vault in a brand-new directory.
+        // The collapsed start page exposes a Root field (focus 0) and a "Vault" name row
+        // (focus 1); the open target is <root>/<name>. It pre-fills root=parent, name=folder,
+        // flips Unlock<->Create as the name changes, and (in --write mode) creates the vault.
         let base = std::env::temp_dir()
             .join(format!("passmgr-ui-startdir-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&base).unwrap();
 
         let mut app = App::new(base.join("fresh").join("vault.pmv"), true);
         assert_eq!(app.auth.mode, AuthMode::Create, "no vault yet -> Create");
-        assert!(app.auth_has_dir_field(), "dir field shown on the start page");
-        assert_eq!(app.auth_dir, base.join("fresh").display().to_string(), "dir pre-filled");
-        // Focus 0 is the dir field; typing edits the directory, not a password.
-        assert!(app.on_auth_dir_field());
+        assert!(app.auth_start_page(), "start page shows the Root + Vault rows");
+        assert_eq!(app.auth_dir, base.join("fresh").display().to_string(), "dir = root/name");
+        assert_eq!(app.auth_root, base.display().to_string(), "root = parent");
+        assert_eq!(app.auth_name, "fresh", "name = launch folder");
+        // Focus 0 is the editable Root field; typing there edits the root, not a password.
+        assert!(app.on_auth_root_field());
         app.handle_auth_key(key(KeyCode::Char('X')));
-        assert!(app.auth_dir.ends_with('X'), "typing on focus 0 edits the directory");
+        assert!(app.auth_root.ends_with('X'), "typing on focus 0 edits the root");
+        app.handle_auth_key(key(KeyCode::Backspace));
+        // Focus 1 is the editable Vault name row; typing there edits the name → directory.
+        app.auth.focus = 1;
+        assert!(app.on_auth_vault_field());
+        app.handle_auth_key(key(KeyCode::Char('X')));
+        assert!(app.auth_name.ends_with('X'), "typing on the Vault row edits the name");
+        assert!(app.auth_dir.ends_with('X'), "...which re-derives the directory");
         app.handle_auth_key(key(KeyCode::Backspace));
 
-        // Point at a brand-new directory and create the vault there.
+        // Type a brand-new vault name and create the vault there.
         let fresh = base.join("brandnew");
-        app.auth_dir = fresh.display().to_string();
-        app.apply_auth_dir();
+        app.auth_name = "brandnew".into();
+        app.recompute_auth_path();
+        assert_eq!(app.auth_dir, fresh.display().to_string());
         assert_eq!(app.auth.mode, AuthMode::Create);
-        // Create has 4 password fields (pw1, confirm1, pw2, confirm2); the dir field is
+        // Create has 4 password fields (pw1, confirm1, pw2, confirm2); the lead rows are
         // separate, so fill auth.fields directly.
         app.auth.fields[0].value = "a".into();
         app.auth.fields[1].value = "a".into();
@@ -3137,6 +3268,45 @@ mod tests {
         let app2 = App::new(fresh.join("vault.pmv"), true);
         assert_eq!(app2.auth.mode, AuthMode::Unlock, "existing vault -> Unlock");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn start_page_vault_picker_scans_root_and_selects() {
+        // Two existing vaults plus an empty dir under a common root. The picker should list
+        // exactly the two vaults; cycling it with ←/→ adopts a vault and flips to Unlock.
+        let root = std::env::temp_dir()
+            .join(format!("passmgr-ui-picker-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("alpha").join("vault.pmv"), b"x").unwrap();
+        std::fs::write(root.join("beta").join("vault.pmv"), b"x").unwrap();
+
+        // Launch pointed at the empty (vault-less) subdir → Create, picker not yet scanned here.
+        let mut app = App::new(root.join("empty").join("vault.pmv"), true);
+        assert_eq!(app.auth.mode, AuthMode::Create);
+        // Point the Root field at the shared root and rescan.
+        app.auth_root = root.display().to_string();
+        app.refresh_auth_vaults();
+        assert_eq!(app.auth_vaults, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(app.auth_scan_warning.is_none());
+
+        // Cycle the picker (focus 1) right: select "alpha" → existing vault → Unlock mode,
+        // and auth_dir/path now point inside the root.
+        app.auth.focus = 1;
+        assert!(app.on_auth_vault_field());
+        app.handle_auth_key(key(KeyCode::Right)); // 0 -> 1 (beta)
+        assert_eq!(app.auth_name, "beta");
+        assert_eq!(app.auth_dir, root.join("beta").display().to_string());
+        assert_eq!(app.auth.mode, AuthMode::Unlock, "an existing vault flips to Unlock");
+        app.handle_auth_key(key(KeyCode::Left)); // 1 -> 0 (alpha)
+        assert_eq!(app.auth_name, "alpha");
+        assert_eq!(app.auth_dir, root.join("alpha").display().to_string());
+        assert_eq!(app.path, root.join("alpha").join("vault.pmv"));
+        // Focus survived the AuthState rebuild on the mode change.
+        assert!(app.on_auth_vault_field(), "focus stays on the Vault row after selecting");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -48,6 +48,18 @@ date and bump the crate versions to match.
   - **Trim all fields** — every field of **every record type** (all tabs, secrets
     included) is left/right-trimmed on save, plus a one-off bulk-trim action that
     sweeps the whole vault (history-recorded).
+- **Start-page vault picker** — the unlock/create screen now selects a vault by **root +
+  a collapsed "Vault" control** instead of a free-form directory path. An editable **Vault
+  root** is scanned one level deep (`launch::discover_vaults` lists immediate sub-directories
+  holding a `vault.pmv`; never recursive), and the **Vault** control is an editable leaf name
+  with a **dropdown**: pick an existing vault (→ Unlock) or type a new folder name (→ Create,
+  with `--write`). The open target is always `<root>/<name>`. Discovery reports access problems
+  instead of hiding them: an unreadable root or any skipped (inaccessible) entry surfaces a
+  warning. GUI uses an `egui::ComboBox`; the TUI cycles the Vault row with `←/→`.
+  - The chosen **root is remembered** across sessions as a local, non-secret preference
+    (`vault_root` in `prefs.json`, never inside a vault), and an explicit `pass-mgr DIR` launch
+    still takes precedence over it.
+  - The Config **backup destination** now defaults to that root (still editable).
 - **Config: delete an unused category** — asset types, account types, and account
   subtypes can be deleted from Config, **only when no live record uses them** (history
   mentions never block); an account type with subtypes must have those removed first.

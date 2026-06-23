@@ -465,10 +465,24 @@ struct GuiApp {
     screen: Screen,
     // Auth.
     auth_mode: AuthMode,
-    /// The directory whose `vault.pmv` we open/create — editable on the start page so the
-    /// user can point at a different vault (or, in --write mode, create one in a new dir).
-    /// Kept in sync with `path` (`path == <vault_dir>/vault.pmv`).
+    /// The directory whose `vault.pmv` we open/create. On the collapsed start page this is
+    /// DERIVED as `<vault_root>/<vault_name>` (see `recompute_vault_path`), never edited
+    /// directly. Kept in sync with `path` (`path == <vault_dir>/vault.pmv`).
     vault_dir: String,
+    /// Editable ROOT directory scanned (one level deep) for vaults to populate the
+    /// start-page dropdown. Seeded from the saved `vault_root` preference (else the launch
+    /// dir's parent); editing it re-scans and is persisted back to prefs.
+    vault_root: String,
+    /// The selected/typed vault folder NAME (leaf under `vault_root`) — the editable "Vault"
+    /// box. The dropdown fills it; typing a name not on disk arms Create. Empty = the root
+    /// itself. Together with `vault_root` it derives `vault_dir`/`path`.
+    vault_name: String,
+    /// Names of the subdirectories of `vault_root` that contain a `vault.pmv`, refreshed
+    /// whenever `vault_root` changes — the dropdown's items. Sorted case-insensitively.
+    discovered_vaults: Vec<String>,
+    /// A warning from the most recent scan (root unreadable, or some entries skipped),
+    /// shown beneath the picker. `None` when the scan was clean.
+    vault_scan_warning: Option<String>,
     pw1: String,
     confirm1: String,
     pw2: String,
@@ -568,15 +582,19 @@ impl GuiApp {
     // A constructor by convention; `-> Self` returns a new `GuiApp`. There is no
     // `new` keyword in Rust — this is just a regular function.
     fn new(path: std::path::PathBuf, writable: bool) -> Self {
+        // Collapsed start page: the open target is `<root>/<name>`. Seed the root from the
+        // saved preference (so startups share a default root), pre-selecting the launched
+        // vault's folder when appropriate; then derive the directory/path from root+name.
+        let saved_root = crate::load_vault_root();
+        let (vault_root, vault_name) = crate::launch::initial_root_and_name(&path, &saved_root);
+        // Default the backup destination to the root (see the `backup_dest` field).
+        let backup_dest = vault_root.clone();
+        let vault_dir = crate::launch::join_root_name(&vault_root, &vault_name);
+        let path = crate::launch::vault_file(&vault_dir);
         // `if ... { } else { }` is an expression here: its value initializes
         // `auth_mode` (unlock an existing vault file, else offer to create one).
         let auth_mode = if path.exists() { AuthMode::Unlock } else { AuthMode::Create };
-        // The directory shown (and editable) on the start page — the parent of vault.pmv.
-        let vault_dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let scan = crate::launch::discover_vaults(&vault_root);
         // Load the saved theme; `applied_theme` starts equal to it so the first
         // frame doesn't needlessly re-apply/re-save (the same value `run` already set).
         let theme = load_theme();
@@ -586,6 +604,10 @@ impl GuiApp {
             screen: Screen::Auth,
             auth_mode,
             vault_dir,
+            vault_root,
+            vault_name,
+            discovered_vaults: scan.vaults,
+            vault_scan_warning: scan.warning,
             // Pre-reserve generous capacity so typing a password never grows (and so
             // reallocates) these buffers, which would strand un-zeroized fragments of
             // the master password in freed heap. `wipe_passwords`/`Drop` wipe the live
@@ -618,7 +640,9 @@ impl GuiApp {
             new_account_type: String::new(),
             new_subtype_for: String::new(),
             new_subtype_name: String::new(),
-            backup_dest: String::new(),
+            // Default the backup destination to the vault ROOT (editable in Config). It
+            // tracks the root while still on the start page; once unlocked it's the user's.
+            backup_dest,
             cfg_volume_size: String::new(),
             cfg_redundancy: 0,
             doc_subfolder: String::new(),
@@ -808,6 +832,10 @@ impl GuiApp {
 
         match result {
             Ok(v) => {
+                // Persist the chosen root so the next startup defaults to the same place (a
+                // local prefs.json preference — never written into the vault). Done on a
+                // successful open/create, the natural point at which the root is "confirmed".
+                crate::save_vault_root(self.vault_root.trim());
                 // If the live vault.pmv was unreadable and we recovered from an
                 // in-place redundant copy (§12.8), that notice takes priority — the
                 // user needs to know a roll-forward/rollback happened.
@@ -857,13 +885,30 @@ impl GuiApp {
         }
     }
 
-    /// Point the start page at the directory in `self.vault_dir`: re-derive the vault path
-    /// (`<dir>/vault.pmv`) and flip the mode — Unlock if a vault already exists there, else
-    /// Create (which, in --write mode, will create the directory + vault on submit).
-    fn apply_vault_dir(&mut self) {
-        self.path = crate::launch::vault_file(self.vault_dir.trim());
+    /// Re-derive the open target from `<vault_root>/<vault_name>`: rebuild `vault_dir` and
+    /// `path`, then flip the mode — Unlock if a `vault.pmv` already exists there, else Create
+    /// (which, in --write mode, creates the directory + vault on submit). Called whenever the
+    /// root, the vault name, or the dropdown selection changes.
+    fn recompute_vault_path(&mut self) {
+        self.vault_dir = crate::launch::join_root_name(&self.vault_root, &self.vault_name);
+        self.path = crate::launch::vault_file(&self.vault_dir);
         self.auth_mode = if self.path.exists() { AuthMode::Unlock } else { AuthMode::Create };
         self.auth_error = None;
+    }
+
+    /// Re-scan `vault_root` for vaults (one level deep) and refresh the dropdown items
+    /// plus any access warning. Called when the root field changes.
+    fn refresh_discovered_vaults(&mut self) {
+        let scan = crate::launch::discover_vaults(&self.vault_root);
+        self.discovered_vaults = scan.vaults;
+        self.vault_scan_warning = scan.warning;
+    }
+
+    /// Pick a vault `name` from the dropdown: set the vault name and re-derive the
+    /// path/mode so the user lands ready to unlock it.
+    fn select_vault(&mut self, name: &str) {
+        self.vault_name = name.to_string();
+        self.recompute_vault_path();
     }
 
     fn wipe_passwords(&mut self) {
@@ -879,23 +924,77 @@ impl GuiApp {
         // `match` used as an expression: it yields a `(heading, help)` pair which
         // we immediately destructure into two named bindings.
         ui.add_space(28.0);
-        // On the start page (not the in-vault Change-password flow) let the user pick the
-        // vault DIRECTORY. The field is editable in BOTH read-only and --write mode and is
-        // pre-filled with the default/launch directory. Changing it re-derives the vault path
-        // and flips between Unlock (a vault.pmv already exists there) and Create (it doesn't).
-        // Rendered FIRST so the heading/confirm-fields below reflect the just-updated mode.
+        // On the start page (not the in-vault Change-password flow) the user picks the vault
+        // by ROOT + a collapsed "Vault" box: an editable ROOT path scanned (one level deep)
+        // for vaults, and a Vault box that the dropdown fills — pick an existing vault, or
+        // TYPE a new folder name to create one. Both editable in read-only AND --write mode.
+        // The open target is always `<root>/<name>`. Rendered FIRST so the heading/confirm
+        // fields below reflect the just-updated mode.
         if self.auth_mode != AuthMode::ChangePassword {
+            // Deferred edits/picks gathered during the (borrow-locked) closure, applied after
+            // it returns so the handlers can take `&mut self` freely.
+            let mut root_changed = false;
+            let mut name_changed = false;
+            let mut picked: Option<String> = None;
+            // The dropdown's button text: the current name, or a placeholder.
+            let current = self.vault_name.trim().to_string();
+            let selected_text = if !current.is_empty() {
+                current.clone()
+            } else if self.discovered_vaults.is_empty() {
+                "(no vaults found)".to_string()
+            } else {
+                "— choose —".to_string()
+            };
             ui.vertical_centered(|ui| {
-                ui.label("Vault directory");
+                // Editable ROOT path: the folder scanned (one level deep) for vaults.
+                ui.label("Vault root");
                 let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.vault_dir)
-                        .hint_text("/path/to/vault-folder")
+                    egui::TextEdit::singleline(&mut self.vault_root)
+                        .hint_text("/path/that/holds/vault-folders")
                         .desired_width(360.0),
                 );
-                if resp.changed() {
-                    self.apply_vault_dir();
+                root_changed = resp.changed();
+                ui.add_space(4.0);
+                // The "Vault" control: an editable leaf-name box plus a dropdown of the
+                // vaults discovered under the root. Pick one to fill the box (→ Unlock), or
+                // type a new name (→ Create, in --write mode). Empty = the root itself.
+                ui.label("Vault");
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_name)
+                            .hint_text("vault folder name")
+                            .desired_width(244.0),
+                    );
+                    name_changed = resp.changed();
+                    egui::ComboBox::from_id_salt("vault_picker")
+                        .selected_text(selected_text)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for name in &self.discovered_vaults {
+                                if ui.selectable_label(current == *name, name).clicked() {
+                                    picked = Some(name.clone());
+                                }
+                            }
+                        });
+                });
+                // Surface a scan problem (root unreadable, or entries skipped) plainly.
+                if let Some(warn) = &self.vault_scan_warning {
+                    ui.colored_label(egui::Color32::from_rgb(190, 120, 50), warn);
                 }
             });
+            if root_changed {
+                self.refresh_discovered_vaults();
+                self.recompute_vault_path();
+                // Keep the default backup destination tracking the root until the vault is
+                // unlocked (the Config backup field is freely editable afterwards).
+                self.backup_dest = self.vault_root.clone();
+            }
+            if name_changed {
+                self.recompute_vault_path();
+            }
+            if let Some(name) = picked {
+                self.select_vault(&name);
+            }
             ui.add_space(8.0);
         }
 
@@ -3544,11 +3643,16 @@ mod tests {
         assert_eq!(app.auth_mode, AuthMode::Create, "no vault yet -> Create");
         assert_eq!(app.vault_dir, base.join("fresh").display().to_string(), "dir pre-filled");
 
-        // Point at a brand-new directory and create the vault there.
+        // Collapsed model: root pre-filled with the launch dir's parent, name = its folder.
+        assert_eq!(app.vault_root, base.display().to_string(), "root = parent of launch dir");
+        assert_eq!(app.vault_name, "fresh", "name = launch dir's folder");
+
+        // Type a brand-new vault name to create it under the root.
+        app.vault_name = "brandnew".into();
+        app.recompute_vault_path();
         let fresh = base.join("brandnew");
-        app.vault_dir = fresh.display().to_string();
-        app.apply_vault_dir();
-        assert_eq!(app.auth_mode, AuthMode::Create, "empty dir stays Create");
+        assert_eq!(app.vault_dir, fresh.display().to_string(), "dir = root/name");
+        assert_eq!(app.auth_mode, AuthMode::Create, "no vault there -> Create");
         app.pw1 = "a".into();
         app.confirm1 = "a".into();
         app.pw2 = "b".into();

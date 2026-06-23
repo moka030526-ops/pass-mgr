@@ -7,7 +7,7 @@
 //! instead of duplicated in each binary — guarantees `pass-mgr DIR` and
 //! `pass-mgr-gui DIR` open the same vault.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
@@ -20,9 +20,134 @@ pub fn default_vault_path() -> PathBuf {
     }
 }
 
+/// The name of the encrypted vault file inside a vault directory. A directory is
+/// treated as a vault iff it directly contains a file with this name.
+const VAULT_FILE: &str = "vault.pmv";
+
 /// The vault file inside a user-supplied vault directory.
 pub fn vault_file(dir: &str) -> PathBuf {
-    PathBuf::from(dir).join("vault.pmv")
+    PathBuf::from(dir).join(VAULT_FILE)
+}
+
+/// The outcome of scanning a root directory for vaults: the discovered vault names
+/// plus an optional human-readable `warning` to surface in the UI. The warning is
+/// `Some` when the root itself can't be read (the list is then empty) or when some
+/// entries beneath it had to be skipped because they were inaccessible.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VaultScan {
+    pub vaults: Vec<String>,
+    pub warning: Option<String>,
+}
+
+/// The vault directory for a `root` plus a selected/typed leaf `name`. An empty name
+/// resolves to the root itself (so a vault sitting directly at the root still opens);
+/// otherwise it is `<root>/<name>`. Both sides are trimmed. This is the collapsed start
+/// page's single source of truth: the open target is always `root` + `name`.
+pub fn join_root_name(root: &str, name: &str) -> String {
+    let root = root.trim();
+    let name = name.trim();
+    if name.is_empty() {
+        root.to_string()
+    } else {
+        Path::new(root).join(name).display().to_string()
+    }
+}
+
+/// Compute the start page's initial `(root, vault_name)` for a launched vault `path`,
+/// given the persisted root preference `saved_root` ("" if unset).
+///
+/// An **explicitly launched** vault (a `path` differing from the per-user default) always
+/// wins: its parent becomes the root and its folder the selected name, so `pass-mgr DIR`
+/// opens exactly `DIR`. For a **default** launch, the saved root preference (if any) seeds
+/// the root instead — that is what makes "remember my root across startups" work — and the
+/// name is pre-selected only when the default vault actually lives directly under that root
+/// (otherwise it is empty and the user picks from the dropdown).
+pub fn initial_root_and_name(path: &Path, saved_root: &str) -> (String, String) {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir_parent = dir.and_then(|d| d.parent()).filter(|p| !p.as_os_str().is_empty());
+    let parent_str = dir_parent.map(|p| p.display().to_string());
+    let leaf = dir.and_then(|d| d.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+
+    let launched_default = path == default_vault_path();
+    let saved = saved_root.trim();
+    if !launched_default || saved.is_empty() {
+        // Honor the launched vault: root = its parent, name = its folder.
+        (parent_str.unwrap_or_else(|| ".".into()), leaf.unwrap_or_default())
+    } else {
+        // Default launch + a saved root: browse that root. Pre-select the default vault's
+        // folder only when it lives directly under the saved root.
+        let name = match (&parent_str, &leaf) {
+            (Some(p), Some(l)) if p == saved => l.clone(),
+            _ => String::new(),
+        };
+        (saved.to_string(), name)
+    }
+}
+
+/// Discover the vaults directly beneath `root`: every IMMEDIATE subdirectory that
+/// contains a `vault.pmv`. Returns the subdirectory NAMES (not full paths), sorted
+/// case-insensitively. The scan is one level deep only (never recursive) and never
+/// includes `root` itself. This powers the start-page vault dropdown in both front-ends.
+///
+/// Errors are reported, not hidden. An unreadable root (missing, not a directory, or
+/// permission-denied) yields an empty list with an explanatory `warning`. Individual
+/// entries that can't be inspected — an unreadable directory entry, a subdirectory
+/// whose metadata or vault-marker can't be read — are skipped and tallied into a
+/// "N skipped (inaccessible)" warning rather than aborting the whole scan.
+pub fn discover_vaults(root: &str) -> VaultScan {
+    let root = std::path::Path::new(root.trim());
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return VaultScan {
+                vaults: Vec::new(),
+                warning: Some(format!("Cannot read vault root '{}': {e}", root.display())),
+            };
+        }
+    };
+    let mut vaults: Vec<String> = Vec::new();
+    let mut skipped: usize = 0;
+    for entry in entries {
+        // An entry that errors mid-iteration (e.g. a racing unlink, an unreadable
+        // name) is skipped, not fatal.
+        let Ok(entry) = entry else {
+            skipped += 1;
+            continue;
+        };
+        let path = entry.path();
+        // `metadata` follows symlinks, so a subdir symlinked to a vault still counts;
+        // a permission error reading the metadata means we can't classify it → skip.
+        let is_dir = match std::fs::metadata(&path) {
+            Ok(m) => m.is_dir(),
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if !is_dir {
+            continue; // a plain file under the root is simply not a vault.
+        }
+        // `try_exists` distinguishes "no marker" (Ok(false)) from "couldn't check"
+        // (Err, e.g. a permission-denied subtree) — the latter is surfaced as skipped
+        // rather than silently treated as "not a vault".
+        match path.join(VAULT_FILE).try_exists() {
+            Ok(true) => {
+                if let Some(name) = entry.file_name().to_str() {
+                    vaults.push(name.to_owned());
+                } else {
+                    skipped += 1; // a non-UTF-8 directory name we can't display/select.
+                }
+            }
+            Ok(false) => {}
+            Err(_) => skipped += 1,
+        }
+    }
+    // Case-insensitive so the list reads naturally regardless of the OS's raw
+    // directory-entry order.
+    vaults.sort_by_key(|s| s.to_lowercase());
+    let warning = (skipped > 0)
+        .then(|| format!("{skipped} item(s) under the root were skipped (inaccessible)."));
+    VaultScan { vaults, warning }
 }
 
 /// Resolve an interactive launch from the process arguments (everything *after*
@@ -86,5 +211,65 @@ mod tests {
         let (p, w) = resolve_interactive(&["-weird-dir".into()]);
         assert_eq!(p, PathBuf::from("-weird-dir/vault.pmv"));
         assert!(!w);
+    }
+
+    #[test]
+    fn join_root_name_combines_or_falls_back_to_root() {
+        assert_eq!(join_root_name("/a/b", "vault1"), PathBuf::from("/a/b/vault1").display().to_string());
+        assert_eq!(join_root_name("  /a/b ", " vault1 "), PathBuf::from("/a/b/vault1").display().to_string());
+        // Empty name → the root itself (a vault sitting directly at the root).
+        assert_eq!(join_root_name("/a/b", ""), "/a/b");
+        assert_eq!(join_root_name("/a/b", "   "), "/a/b");
+    }
+
+    #[test]
+    fn initial_root_and_name_honors_explicit_launch_and_saved_root() {
+        // An explicit launch (path != default) always wins: parent is the root, folder the name.
+        let p = PathBuf::from("/vaults/work/vault.pmv");
+        assert_eq!(initial_root_and_name(&p, ""), ("/vaults".to_string(), "work".to_string()));
+        // ...even when a (different) saved root exists — the explicit arg is not overridden.
+        assert_eq!(initial_root_and_name(&p, "/elsewhere"), ("/vaults".to_string(), "work".to_string()));
+
+        // A DEFAULT launch with a saved root browses that root; the name is empty unless the
+        // default vault lives directly under it.
+        let def = default_vault_path();
+        let (root, name) = initial_root_and_name(&def, "/my/vaults");
+        assert_eq!(root, "/my/vaults");
+        assert!(name.is_empty(), "default vault isn't under the saved root → no pre-selection");
+
+        // A default launch with NO saved root falls back to the default's own parent/leaf.
+        let (root2, name2) = initial_root_and_name(&def, "");
+        let def_parent = def.parent().unwrap().parent().unwrap().display().to_string();
+        let def_leaf = def.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(root2, def_parent);
+        assert_eq!(name2, def_leaf);
+    }
+
+    #[test]
+    fn discover_vaults_unreadable_root_is_empty_with_warning() {
+        // A root that does not exist can't be read → empty list, explanatory warning.
+        let scan = discover_vaults("/nonexistent-pass-mgr-root-zzz-9173");
+        assert!(scan.vaults.is_empty());
+        assert!(scan.warning.is_some(), "missing root should warn");
+    }
+
+    #[test]
+    fn discover_vaults_finds_only_subdirs_with_a_vault_file() {
+        // Build a throwaway root: two vault subdirs, one empty subdir, one loose file.
+        let root = std::env::temp_dir().join(format!("pmv-scan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Bravo")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("not-a-vault")).unwrap();
+        std::fs::write(root.join("Bravo").join(VAULT_FILE), b"x").unwrap();
+        std::fs::write(root.join("alpha").join(VAULT_FILE), b"x").unwrap();
+        std::fs::write(root.join("loose.txt"), b"x").unwrap();
+
+        let scan = discover_vaults(root.to_str().unwrap());
+        // Only the two dirs holding a vault.pmv, sorted case-insensitively.
+        assert_eq!(scan.vaults, vec!["alpha".to_string(), "Bravo".to_string()]);
+        assert!(scan.warning.is_none(), "no inaccessible entries expected: {:?}", scan.warning);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

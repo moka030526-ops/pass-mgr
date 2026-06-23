@@ -117,6 +117,34 @@ pub(crate) fn save_export_dir_to(path: &Path, dir: &str) {
     write_prefs_obj(path, &obj);
 }
 
+/// The saved **vault root** — the folder the start page scans for vaults ("" if unset).
+/// Like the export dir, this is a local-machine UI preference (NOT vault content), so it
+/// persists across sessions and is settable even in a read-only session.
+pub(crate) fn load_vault_root() -> String {
+    prefs_path().map(|p| load_vault_root_from(&p)).unwrap_or_default()
+}
+pub(crate) fn load_vault_root_from(path: &Path) -> String {
+    read_prefs_obj(path).get("vault_root").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+/// Persist the vault root, preserving any other prefs keys (theme, export dir).
+pub(crate) fn save_vault_root(dir: &str) {
+    // This is reached from the unlock/create flow, which the front-end unit tests drive
+    // directly; skip the real-prefs write under `cfg(test)` so the suite never clobbers the
+    // developer's `~/.config/pass-mgr/prefs.json`. The write logic itself stays covered via
+    // the path-parametrized `save_vault_root_to` (see the `vault_root_round_trips` test).
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = prefs_path() {
+        save_vault_root_to(&path, dir);
+    }
+}
+pub(crate) fn save_vault_root_to(path: &Path, dir: &str) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("vault_root".into(), serde_json::Value::String(dir.to_string()));
+    write_prefs_obj(path, &obj);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +189,22 @@ mod tests {
         let obj = read_prefs_obj(&p);
         assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("solarized"), "theme key preserved");
         assert_eq!(obj.get("export_dir").and_then(|v| v.as_str()), Some("/exports"), "export_dir written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vault_root_round_trips_and_coexists_with_other_keys() {
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        // Absent -> empty (unset), so the front-end falls back to its launch default.
+        assert_eq!(load_vault_root_from(&p), "");
+        // Round-trips, and the read-modify-write preserves a co-resident export dir.
+        save_export_dir_to(&p, "/exports");
+        save_vault_root_to(&p, "/vaults");
+        assert_eq!(load_vault_root_from(&p), "/vaults");
+        assert_eq!(load_export_dir_from(&p), "/exports", "export_dir preserved");
+        save_vault_root_to(&p, "/other-vaults");
+        assert_eq!(load_vault_root_from(&p), "/other-vaults");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

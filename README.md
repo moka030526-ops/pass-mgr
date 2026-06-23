@@ -88,10 +88,16 @@ Choose passwords that are long and memorable to you but hard for others to guess
 
 1. Start the program (Edit shortcut if you want to change things; plain program to
    just look).
-2. The start page shows a **Vault directory** box, pre-filled with the default
-   location. Leave it as-is, or point it at a different vault folder (handy if you
-   keep your vault on a USB stick or in a synced folder). The window title updates to
-   show whether that folder already has a vault (**Unlock**) or not (**Create**).
+2. The start page shows a **Vault root** box and a **Vault** box with a dropdown.
+   Point the **root** at the folder that holds your vaults (handy if you keep them on a
+   USB stick or in a synced folder): the app scans the root **one level deep** and the
+   dropdown lists every sub-folder that contains a vault. **Pick one** from the dropdown
+   (it fills the Vault box and arms it for unlocking), or **type a new folder name** in
+   the Vault box to make a brand-new vault there. The chosen **root is remembered** for
+   next time (saved in a small local settings file, never inside a vault). If the root
+   can't be read, or some sub-folders are inaccessible, a short notice says so. The line
+   below shows the exact vault that will open, and whether it already exists (**Unlock**)
+   or will be created (**Create**).
 3. Type your **first password**, then your **second password**, in the same order
    as when you created the vault.
 4. Click **Unlock**. You'll briefly see when the vault was last opened.
@@ -99,11 +105,12 @@ Choose passwords that are long and memorable to you but hard for others to guess
 If a password is wrong it simply says so — try again, checking the order.
 
 **Starting a brand-new vault in a folder of your choice:** open the program in
-**Edit** mode, type (or paste) the folder path into the **Vault directory** box, and
-— if no vault exists there yet — the button changes to **Create vault**. Choose your
-two passwords and create it; the folder is made for you if it doesn't exist. (In the
-plain read-only program you can *point at* any existing vault to view it, but you
-can't create one — relaunch in Edit mode for that.)
+**Edit** mode, set the **Vault root** to where you keep vaults, and **type a new folder
+name** in the **Vault** box (one that isn't already in the dropdown). Since no vault
+exists there yet, the button changes to **Create vault**; choose your two passwords and
+create it — the folder is made for you under the root. (In the plain read-only program
+you can *pick* any existing vault to view it, but you can't create one — relaunch in
+Edit mode for that.)
 
 ## The six sections (tabs)
 
@@ -200,8 +207,9 @@ this computer.
 ## Making a backup (please do this regularly)
 
 1. In **Edit mode**, open the **Config** screen.
-2. Find **Backup**, enter a folder to save into (for example a USB drive), and
-   click **Backup now**.
+2. Find **Backup** — its destination is pre-filled with your **vault root** (the folder
+   that holds your vaults); change it to wherever you want (for example a USB drive),
+   then click **Backup now**.
 3. The program saves a dated, still-encrypted copy of your vault and its
    documents. Keep at least one backup on a **separate** drive or location.
 
@@ -502,10 +510,11 @@ pass-mgr compact ./myvault --volume --dry-run             # just report what it 
 
 ### Terminal (`--tui`) key bindings
 
-**Unlock / Create:** `Tab`/`↑/↓` move between the **Vault directory** field and the two
-passwords · type to edit · `Enter` next/submit · `Esc` quit. Editing the directory
-switches between **Unlock** (a vault exists there) and **Create** (it doesn't; needs
-`--write`).
+**Unlock / Create:** `Tab`/`↑/↓` move between the **Vault root** field, the **Vault**
+row, and the two passwords · type to edit the root, or to type/extend the vault name ·
+on the Vault row, `←/→` cycle through the vaults found one level under the root · `Enter`
+next/submit · `Esc` quit. The open target is `<root>/<vault>`; an existing one is
+**Unlock**, a new name is **Create** (needs `--write`).
 
 **Browse:** `←/→` or `1`–`5` switch tab · `↑/↓` select · `Enter` edit · `n` new ·
 `d` delete · `t`/`s`/`o`/`v` Account filters (type/subtype/owner/review) ·
