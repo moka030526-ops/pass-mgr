@@ -313,6 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn positional_first_occurrence_wins_among_duplicate_source_ids() {
+        // When a crafted source lists the same id twice with DIFFERENT updated_at, the
+        // merge keeps the FIRST positional occurrence — NOT the newest. This behaviour is
+        // load-bearing (the `seen`/`done` HashSet guards in collection_changes/merge_records
+        // walk source in index order) yet was previously unasserted: a refactor to
+        // max-updated-at or last-occurrence would silently change which value the user gets.
+        let apply: HashSet<&str> = ["a"].into_iter().collect();
+        let mut dest1: Vec<Instruction> = vec![];
+        merge_records(&mut dest1, &[instr("a", 100), instr("a", 300)], &apply);
+        assert_eq!(dest1.len(), 1);
+        assert_eq!(dest1[0].updated_at, 100, "first occurrence wins, not the newest");
+        // Reversing the slice changes the winner — proving it is positional, not by recency.
+        let mut dest2: Vec<Instruction> = vec![];
+        merge_records(&mut dest2, &[instr("a", 300), instr("a", 100)], &apply);
+        assert_eq!(dest2.len(), 1);
+        assert_eq!(dest2[0].updated_at, 300, "reversing the slice changes the winner");
+    }
+
+    #[test]
     fn merge_records_ignores_ids_not_in_apply_set() {
         let mut current = vec![instr("a", 100)];
         let source = vec![instr("a", 999), instr("z", 999)];

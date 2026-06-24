@@ -497,6 +497,120 @@ fn summary<R: Record>(r: &R) -> RecordSummary {
 mod tests {
     use super::*;
 
+    /// v1 FFI SURFACE LOCK (compile-time). The mobile bindings are generated against this
+    /// crate's `#[uniffi::export]` surface and `App.kt` hardcodes these names, so an
+    /// accidental rename, removal, field change, or enum-variant change must break the
+    /// build. This test pins the surface by EXHAUSTIVELY matching every enum variant and
+    /// constructing every DTO with ALL its fields — any change is a COMPILE error here.
+    /// (cargo-public-api was deliberately not used: on a UniFFI crate its output is ~90%
+    /// `FfiConverter`/`Lift`/`Lower` boilerplate that churns on every uniffi bump, and it
+    /// cannot see a dropped `#[uniffi::export]`; the android APK job is the cross-language
+    /// backstop that compiles `App.kt` against the generated bindings.)
+    #[test]
+    fn v1_ffi_surface_is_locked() {
+        // Every RecordKind variant — a new/removed/renamed variant breaks this match.
+        fn kind_name(k: RecordKind) -> &'static str {
+            match k {
+                RecordKind::Instruction => "Instruction",
+                RecordKind::TrustWill => "TrustWill",
+                RecordKind::AssetLiability => "AssetLiability",
+                RecordKind::Account => "Account",
+                RecordKind::RealEstate => "RealEstate",
+            }
+        }
+        for k in [
+            RecordKind::Instruction,
+            RecordKind::TrustWill,
+            RecordKind::AssetLiability,
+            RecordKind::Account,
+            RecordKind::RealEstate,
+        ] {
+            assert!(!kind_name(k).is_empty());
+        }
+
+        // Every VaultError variant — the exhaustive match pins the no-leak error surface.
+        fn err_is_known(e: &VaultError) -> bool {
+            match e {
+                VaultError::WrongPasswordOrCorrupt
+                | VaultError::NotFound
+                | VaultError::RekeyPending
+                | VaultError::Locked
+                | VaultError::RecordNotFound
+                | VaultError::Io
+                | VaultError::Internal => true,
+            }
+        }
+        assert!(err_is_known(&VaultError::WrongPasswordOrCorrupt));
+
+        // Every DTO with ALL its fields — a renamed/removed/added field breaks these literals.
+        let _ = RecordSummary { id: String::new(), label: String::new() };
+        let _ = Change { at: 0, action: String::new(), detail: String::new() };
+        let _ = Instruction {
+            id: String::new(),
+            title: String::new(),
+            description: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let _ = TrustWill {
+            id: String::new(),
+            document: String::new(),
+            usage: String::new(),
+            file: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let _ = AssetLiability {
+            id: String::new(),
+            kind: String::new(),
+            description: String::new(),
+            owner: String::new(),
+            title: String::new(),
+            approx_value: String::new(),
+            as_of_date: String::new(),
+            institution: String::new(),
+            asset_type: String::new(),
+            url: String::new(),
+            beneficiary: String::new(),
+            review: false,
+            statement: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let _ = Account {
+            id: String::new(),
+            title: String::new(),
+            account_type: String::new(),
+            account_subtype: String::new(),
+            owner: String::new(),
+            username: String::new(),
+            password: String::new(),
+            description: String::new(),
+            url: String::new(),
+            closed_as_of: String::new(),
+            review: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let _ = RealEstate {
+            id: String::new(),
+            address: String::new(),
+            ownership: String::new(),
+            taxes: String::new(),
+            hoa: String::new(),
+            income_account: String::new(),
+            financing_account: String::new(),
+            payment_account: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // The exported entry point keeps its exact signature (referenced, not called).
+        // The explicit fn-pointer type IS the lock here, so the complexity is intentional.
+        #[allow(clippy::type_complexity)]
+        let _open: fn(String, Vec<u8>, Vec<u8>) -> Result<std::sync::Arc<Vault>, VaultError> = open_vault;
+    }
+
     // -----------------------------------------------------------------------
     // Extended FFI coverage: build a vault with one of EACH of the five record
     // types via the core, then drive every read-only FFI method. Tax filings and

@@ -560,6 +560,11 @@ struct GuiApp {
     // not vault content — so read-only document export (the heir use case) keeps working.
     export_dir: String,
     status: String,
+    /// When `Some`, a hard operation failure (a failed save/export/backup/upload, …) to
+    /// surface in a CONSPICUOUS top banner — not just the easily-missed weak status line.
+    /// Cleared on dismissal or when any later status message replaces the failure text
+    /// (see [`error_banner_is_stale`]).
+    error: Option<String>,
     clipboard_dirty: bool,
     // When set, the clipboard should be wiped at/after this instant.
     // `Option<Instant>`: `None` = no pending wipe, `Some(t)` = wipe at time `t`.
@@ -676,6 +681,7 @@ impl GuiApp {
             doc_source: String::new(),
             export_dir: crate::load_export_dir(),
             status: String::new(),
+            error: None,
             clipboard_dirty: false,
             clipboard_clear_at: None,
             theme,
@@ -691,18 +697,20 @@ impl GuiApp {
         // deadline has been scheduled. `&egui::Context` is a shared borrow.
         if let Some(deadline) = self.clipboard_clear_at {
             let now = Instant::now();
-            if now >= deadline {
-                clear_clipboard();
-                self.clipboard_dirty = false;
-                self.clipboard_clear_at = None;
-                // Only replace a blank or the prior "Copied …" notice — never clobber a
-                // meaningful message the user may not have seen yet (e.g. "Save failed: …"),
-                // which the idle auto-clear repaint could otherwise silently overwrite.
-                if self.status.is_empty() || self.status.starts_with("Copied") {
-                    self.status = "Clipboard cleared.".into();
+            // The deadline/status-preservation rules live in a pure, unit-tested helper
+            // shared with the TUI; `Some` means "wipe now", `None` means "not yet".
+            match crate::clipboard_tick_decision(Some(deadline), now, &self.status) {
+                Some(status_change) => {
+                    clear_clipboard();
+                    self.clipboard_dirty = false;
+                    self.clipboard_clear_at = None;
+                    if let Some(s) = status_change {
+                        self.status = s;
+                    }
                 }
-            } else {
-                ctx.request_repaint_after(deadline - now);
+                None => {
+                    ctx.request_repaint_after(deadline - now);
+                }
             }
         }
     }
@@ -723,20 +731,31 @@ impl GuiApp {
     /// references the doc, so dropping its blob would leave a dangling reference
     /// (`ArchiveMismatch` — an unopenable vault) on the next open.
     fn persist(&mut self) -> bool {
-        // A "let-chain": both conditions must hold to enter the block. First
-        // `.as_mut()` borrows the vault mutably if present (binding `ov`); then
-        // `ov.save()` runs and we match its `Err(e)` case. `&&` short-circuits,
-        // so save is only attempted when the vault exists.
-        match self.vault.as_mut() {
+        // Borrow the vault mutably if present, attempt the save, and return early on the
+        // success/absent paths. We can't call `self.fail()` (a `&mut self` method) while
+        // `self.vault` is borrowed for the save, so we capture the message and report it
+        // AFTER the borrow ends — surfacing a failed save in the conspicuous banner.
+        let err = match self.vault.as_mut() {
             Some(ov) => match ov.save() {
-                Ok(()) => true,
-                Err(e) => {
-                    self.status = format!("Save failed: {e}");
-                    false
-                }
+                Ok(()) => return true,
+                Err(e) => format!("Save failed: {e}"),
             },
-            None => false,
-        }
+            None => return false,
+        };
+        self.fail(err);
+        false
+    }
+
+    /// Record a hard operation FAILURE: show `msg` in the CONSPICUOUS top error banner
+    /// (rendered by [`GuiApp::ui`]) as well as the status line. A failed save (e.g. a full
+    /// disk) must be impossible to miss — hidden in the weak status text alone, the user
+    /// would believe the edit was saved when it was not. The banner clears when the user
+    /// dismisses it or any later status message replaces this text (see
+    /// [`error_banner_is_stale`]).
+    fn fail(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.error = Some(msg.clone());
+        self.status = msg;
     }
 
     fn clear_doc_inputs(&mut self) {
@@ -758,7 +777,7 @@ impl GuiApp {
         if let Some(ov) = self.vault.as_ref() {
             match ov.export_document_into(id, Path::new(&dir)) {
                 Ok(p) => self.status = format!("Exported to {}", p.display()),
-                Err(e) => self.status = format!("Export failed: {e}"),
+                Err(e) => self.fail(format!("Export failed: {e}")),
             }
         }
     }
@@ -1610,7 +1629,7 @@ impl GuiApp {
                     self.new_asset_type.clear();
                 }
                 Ok(false) => self.status = "Type is empty or already exists.".into(),
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.fail(format!("Save failed: {e}")),
             }
         }
         if add_account {
@@ -1621,7 +1640,7 @@ impl GuiApp {
                     self.new_account_type.clear();
                 }
                 Ok(false) => self.status = "Type is empty or already exists.".into(),
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.fail(format!("Save failed: {e}")),
             }
         }
         if add_subtype {
@@ -1641,7 +1660,7 @@ impl GuiApp {
                         self.new_subtype_name.clear();
                     }
                     Ok(false) => self.status = "Subtype is empty or already exists.".into(),
-                    Err(e) => self.status = format!("Save failed: {e}"),
+                    Err(e) => self.fail(format!("Save failed: {e}")),
                 }
             }
         }
@@ -1699,7 +1718,7 @@ impl GuiApp {
                 // to re-acquire the per-fd flock this session already holds → Locked.
                 match ov.backup(Path::new(&dest)) {
                     Ok(p) => self.status = format!("Backed up to {}", p.display()),
-                    Err(e) => self.status = format!("Backup failed: {e}"),
+                    Err(e) => self.fail(format!("Backup failed: {e}")),
                 }
             }
         }
@@ -1717,7 +1736,7 @@ impl GuiApp {
                             self.status = format!("Volume size set to {mib} MiB (applies to future documents).");
                             self.cfg_volume_size.clear();
                         }
-                        Err(e) => self.status = format!("Save failed: {e}"),
+                        Err(e) => self.fail(format!("Save failed: {e}")),
                     }
                 }
                 // `_` is the catch-all arm: any other case (parse error, or 0).
@@ -1734,7 +1753,7 @@ impl GuiApp {
                         format!("Vault file redundancy set to {choice} (mirror + {choice} prior generation(s)).")
                     };
                 }
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.fail(format!("Save failed: {e}")),
             }
         }
         if start_merge {
@@ -1748,7 +1767,7 @@ impl GuiApp {
             match self.vault.as_mut().expect("vault open on config").sync_types_from_records() {
                 Ok(0) => self.status = "Types already in sync — nothing to add.".into(),
                 Ok(n) => self.status = format!("Added {n} type(s) from records to the lists."),
-                Err(e) => self.status = format!("Sync failed: {e}"),
+                Err(e) => self.fail(format!("Sync failed: {e}")),
             }
         }
 
@@ -2965,7 +2984,7 @@ impl GuiApp {
                     Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status = format!("Upload failed: {e}");
+                            self.fail(format!("Upload failed: {e}"));
                             return;
                         }
                     },
@@ -3008,7 +3027,7 @@ impl GuiApp {
                     && let Some(ov) = self.vault.as_mut()
                     && let Err(e) = ov.remove_document(&id)
                 {
-                    self.status = format!("Unlinked, but blob cleanup failed: {e}");
+                    self.fail(format!("Unlinked, but blob cleanup failed: {e}"));
                     return;
                 }
                 self.status = "Removed document from the vault.".into();
@@ -3103,7 +3122,7 @@ impl GuiApp {
                     Some(ov) => match ov.add_document(&loc, &fname, Path::new(&src)) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status = format!("Upload failed: {e}");
+                            self.fail(format!("Upload failed: {e}"));
                             return;
                         }
                     },
@@ -3201,7 +3220,7 @@ impl GuiApp {
                     && let Some(ov) = self.vault.as_mut()
                     && let Err(e) = ov.remove_document(&id)
                 {
-                    self.status = format!("Unlinked, but blob cleanup failed: {e}");
+                    self.fail(format!("Unlinked, but blob cleanup failed: {e}"));
                     return;
                 }
                 self.status = "Removed document from the vault.".into();
@@ -3247,7 +3266,7 @@ impl GuiApp {
                     Some(ov) => match ov.add_document(&loc, &name, Path::new(&src)) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status = format!("Upload failed: {e}");
+                            self.fail(format!("Upload failed: {e}"));
                             return;
                         }
                     },
@@ -3295,7 +3314,7 @@ impl GuiApp {
                     && let Some(ov) = self.vault.as_mut()
                     && let Err(e) = ov.remove_document(&id)
                 {
-                    self.status = format!("Unlinked, but blob cleanup failed: {e}");
+                    self.fail(format!("Unlinked, but blob cleanup failed: {e}"));
                     return;
                 }
                 self.status = "Removed document from the vault.".into();
@@ -3393,7 +3412,7 @@ impl GuiApp {
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
                 self.status = "Copied (clipboard auto-clears in 15s, and on exit).".into();
             }
-            Err(e) => self.status = format!("Clipboard unavailable: {e}"),
+            Err(e) => self.fail(format!("Clipboard unavailable: {e}")),
         }
     }
 }
@@ -3418,6 +3437,17 @@ impl eframe::App for GuiApp {
             save_theme(self.theme);
             self.applied_theme = self.theme;
         }
+        // Clear the error banner once any later status message has replaced the failure
+        // text it was showing (a success/info line means the problem is no longer current).
+        if error_banner_is_stale(self.error.as_deref(), &self.status) {
+            self.error = None;
+        }
+        // A hard failure (a failed save/export/backup/upload, …) gets a bright, dismissable
+        // banner across the TOP of EVERY screen — far more visible than the weak status
+        // line, so a failure can never be missed (e.g. a save that failed on a full disk,
+        // where the status line alone would leave the user believing the edit was saved).
+        // Rendered before the per-screen panels so it sits above all of them.
+        show_error_banner(&mut self.error, ui);
         if self.screen == Screen::Auth {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 egui::ScrollArea::both().auto_shrink([false, false]).id_salt("auth_scroll").show(ui, |ui| {
@@ -3471,6 +3501,45 @@ impl eframe::App for GuiApp {
 }
 
 // --- Free helper widgets -----------------------------------------------------
+
+/// Pure lifetime rule for the conspicuous error banner, unit-testable without egui (mirrors
+/// the `clipboard_tick_decision` pattern). The banner shows the last hard failure and must
+/// disappear as soon as any later status line replaces that text — a success/info message
+/// means the failure is no longer current — while staying put as long as the status still
+/// equals it. Returns `true` when the stored `error` is stale and should be cleared.
+fn error_banner_is_stale(error: Option<&str>, status: &str) -> bool {
+    error.is_some_and(|e| e != status)
+}
+
+/// Render the CONSPICUOUS error banner for a hard failure: a bright red full-width strip at
+/// the top of the window with a ⚠ and the failure message, plus a Dismiss button that clears
+/// it (`*error = None`). Does nothing when `error` is `None`. Kept a free function (taking
+/// just `&mut Option<String>` and `ui`) so a headless `egui_kittest` harness can drive it
+/// without constructing an `eframe::Frame`. Far more visible than the weak status line, so a
+/// failed save/upload can't be silently overlooked.
+fn show_error_banner(error: &mut Option<String>, ui: &mut egui::Ui) {
+    let Some(msg) = error.clone() else { return };
+    egui::Panel::top("error_banner")
+        .frame(
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(176, 0, 32))
+                .inner_margin(egui::Margin::same(10)),
+        )
+        .show_inside(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚠  {msg}"))
+                        .color(egui::Color32::WHITE)
+                        .strong()
+                        .size(15.0),
+                );
+            });
+            ui.add_space(2.0);
+            if ui.button("Dismiss ✕").clicked() {
+                *error = None;
+            }
+        });
+}
 
 // `current` is borrowed mutably so the click can change it. `*current` is a
 // *dereference*: it reads/writes the value behind the `&mut` reference (compare
@@ -3974,6 +4043,19 @@ mod tests {
 
     fn fast() -> KdfParams {
         KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
+    }
+
+    #[test]
+    fn error_banner_clears_when_a_later_status_replaces_the_failure() {
+        // Nothing showing → never stale (the banner is hidden anyway).
+        assert!(!error_banner_is_stale(None, ""));
+        assert!(!error_banner_is_stale(None, "Saved."));
+        // The failure is still current (the status line still holds it) → keep the banner.
+        assert!(!error_banner_is_stale(Some("Save failed: disk full"), "Save failed: disk full"));
+        // A later success/info line replaced the failure text → the banner is stale and the
+        // core rule fires: a fixed problem must not leave a scary banner stuck on screen.
+        assert!(error_banner_is_stale(Some("Save failed: disk full"), "Saved."));
+        assert!(error_banner_is_stale(Some("Upload failed: bad path"), ""));
     }
 
     fn nanos() -> u128 {
@@ -4677,6 +4759,34 @@ mod kittest_tests {
         for leaf in &node.leaves {
             let _ = ui.selectable_label(false, &leaf.title);
         }
+    }
+
+    #[test]
+    fn error_banner_renders_and_dismiss_clears_it_in_real_egui() {
+        use super::show_error_banner;
+        use std::cell::RefCell;
+
+        // A live failure message: the conspicuous banner must render with a Dismiss control.
+        let error = RefCell::new(Some("Save failed: disk full".to_string()));
+        let mut h = Harness::new_ui(|ui| {
+            let mut e = error.borrow_mut();
+            show_error_banner(&mut e, ui);
+        });
+        h.run();
+        // The banner is on-screen (its Dismiss button is the deterministic, queryable marker).
+        assert!(
+            h.query_by_label("Dismiss ✕").is_some(),
+            "the conspicuous error banner renders while an error is set"
+        );
+
+        // Clicking Dismiss clears the error and removes the banner entirely.
+        h.get_by_label("Dismiss ✕").click();
+        h.run();
+        assert!(error.borrow().is_none(), "Dismiss clears the stored error");
+        assert!(
+            h.query_by_label("Dismiss ✕").is_none(),
+            "the banner is gone after dismissal (nothing rendered when error is None)"
+        );
     }
 
     #[test]

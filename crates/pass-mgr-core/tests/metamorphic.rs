@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pass_mgr_core::crypto::KdfParams;
-use pass_mgr_core::records::{self, account_tree, asset_tree, AcctNode, Account, AssetLiability};
+use pass_mgr_core::records::{self, account_tree, asset_tree, AcctNode, Account, AssetLiability, Record};
 use pass_mgr_core::vault::OpenVault;
 
 // --- tiny deterministic PRNG -------------------------------------------------
@@ -429,6 +429,187 @@ fn export_import_tree_round_trips_records_and_docs() {
             assert_eq!(&**v2.read_document(id).unwrap(), &body[..], "seed {seed}: doc {id} changed across round-trip");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// --- Property 7: merging two SOURCES is order-independent (confluence) --------
+//
+// The additive recency merge must converge regardless of which source is pulled first
+// (its core CRDT-like guarantee). Every other test applies only ONE source per merge,
+// so a bug where the second merge fails to overwrite a record already pulled from the
+// first (now tying on updated_at) would slip through. Both orders must equal the per-id
+// MAX recency across base + both sources.
+
+#[test]
+fn merge_two_account_sources_is_order_independent() {
+    for seed in 0..50u64 {
+        let mut rng = Rng::new(8_000_000 + seed);
+        let pool: Vec<String> = (0..6).map(|i| format!("q{i}")).collect();
+        let build = |rng: &mut Rng| -> Vec<Account> {
+            let mut v: Vec<Account> = Vec::new();
+            for _ in 0..rng.below(6) {
+                let id = pool[rng.below(pool.len())].clone();
+                if !v.iter().any(|a| a.id == id) {
+                    let mut a = Account::new().unwrap();
+                    a.id = id;
+                    a.updated_at = rng.i64();
+                    v.push(a);
+                }
+            }
+            v
+        };
+        let c = build(&mut rng);
+        let a = build(&mut rng);
+        let b = build(&mut rng);
+
+        // Reference: additive recency over two sources converges to the per-id MAX.
+        let mut want: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for set in [&c, &a, &b] {
+            for r in set {
+                let e = want.entry(r.id.clone()).or_insert(i64::MIN);
+                if r.updated_at > *e {
+                    *e = r.updated_at;
+                }
+            }
+        }
+
+        let dir = tmp_dir("conf");
+        let make = |name: &str, accts: &[Account]| -> PathBuf {
+            let p = dir.join(name).join("vault.pmv");
+            let mut v = OpenVault::create(p.clone(), b"a", b"b", fast()).unwrap();
+            v.vault.accounts = accts.to_vec();
+            v.save().unwrap();
+            p
+        };
+        let cpath1 = make("c1", &c);
+        let cpath2 = make("c2", &c);
+        let apath = make("a", &a);
+        let bpath = make("b", &b);
+
+        let final_map = |path: PathBuf, first: &PathBuf, second: &PathBuf| {
+            let mut cur = OpenVault::open(path, b"a", b"b").unwrap();
+            let s1 = OpenVault::open_read_only(first.clone(), b"a", b"b").unwrap();
+            let s2 = OpenVault::open_read_only(second.clone(), b"a", b"b").unwrap();
+            cur.apply_merge_from(&s1).unwrap();
+            cur.apply_merge_from(&s2).unwrap();
+            cur.vault
+                .accounts
+                .iter()
+                .map(|x| (x.id.clone(), x.updated_at))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let map_ab = final_map(cpath1, &apath, &bpath); // C ← A ← B
+        let map_ba = final_map(cpath2, &bpath, &apath); // C ← B ← A
+
+        assert_eq!(map_ab, map_ba, "seed {seed}: two-source merge is not order-independent");
+        assert_eq!(map_ab, want, "seed {seed}: two-source merge did not converge to per-id max recency");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// --- Property 8: merge is correct across ALL SEVEN collections (differential) -
+//
+// Property 3 only populates `accounts`; apply_merge_from fans out over seven collections
+// with per-kind `docs_of` closures. A collection dropped from the fan-out, or a
+// cross-collection id collision, is invisible to an accounts-only model. Here every
+// collection is populated with ids drawn from ONE shared pool (so the same id appears
+// across DIFFERENT collections), and each collection is checked independently against a
+// reference winner-map.
+
+#[test]
+fn merge_differential_across_all_seven_collections() {
+    use std::collections::HashMap;
+    fn winners<R: Record>(cur: &[R], src: &[R]) -> HashMap<String, i64> {
+        let mut m = HashMap::new();
+        for c in cur {
+            m.insert(c.id().to_string(), c.updated_at());
+        }
+        for s in src {
+            let e = m.entry(s.id().to_string()).or_insert(i64::MIN);
+            if s.updated_at() > *e {
+                *e = s.updated_at();
+            }
+        }
+        m
+    }
+    fn actual<R: Record>(v: &[R]) -> HashMap<String, i64> {
+        v.iter().map(|r| (r.id().to_string(), r.updated_at())).collect()
+    }
+
+    for seed in 0..50u64 {
+        let mut rng = Rng::new(7_000_000 + seed);
+        let pool: Vec<String> = (0..5).map(|i| format!("x{i}")).collect();
+        macro_rules! fill {
+            ($ctor:expr) => {{
+                let mut v = Vec::new();
+                let mut used = std::collections::HashSet::new();
+                for _ in 0..rng.below(5) {
+                    let id = pool[rng.below(pool.len())].clone();
+                    // Dedup ids WITHIN one collection (a well-formed vault never repeats an
+                    // id in a collection) while still allowing the SAME id across different
+                    // collections — exactly the cross-collection-collision case under test.
+                    if used.insert(id.clone()) {
+                        let mut r = $ctor;
+                        r.id = id;
+                        r.updated_at = rng.i64();
+                        v.push(r);
+                    }
+                }
+                v
+            }};
+        }
+
+        let cdir = tmp_dir("d7c");
+        let sdir = tmp_dir("d7s");
+        let cpath = cdir.join("vault.pmv");
+        let spath = sdir.join("vault.pmv");
+
+        let mut cur = OpenVault::create(cpath.clone(), b"a", b"b", fast()).unwrap();
+        cur.vault.instructions = fill!(records::Instruction::new().unwrap());
+        cur.vault.trust_wills = fill!(records::TrustWill::new().unwrap());
+        cur.vault.assets = fill!(records::AssetLiability::new().unwrap());
+        cur.vault.accounts = fill!(records::Account::new().unwrap());
+        cur.vault.real_estate = fill!(records::RealEstate::new().unwrap());
+        cur.vault.tax_filings = fill!(records::TaxFiling::new().unwrap());
+        cur.vault.general_documents = fill!(records::GeneralDocument::new().unwrap());
+        cur.save().unwrap();
+
+        let mut src = OpenVault::create(spath.clone(), b"a", b"b", fast()).unwrap();
+        src.vault.instructions = fill!(records::Instruction::new().unwrap());
+        src.vault.trust_wills = fill!(records::TrustWill::new().unwrap());
+        src.vault.assets = fill!(records::AssetLiability::new().unwrap());
+        src.vault.accounts = fill!(records::Account::new().unwrap());
+        src.vault.real_estate = fill!(records::RealEstate::new().unwrap());
+        src.vault.tax_filings = fill!(records::TaxFiling::new().unwrap());
+        src.vault.general_documents = fill!(records::GeneralDocument::new().unwrap());
+        src.save().unwrap();
+
+        // Reference winners per collection, computed BEFORE the merge mutates `cur`.
+        let want_ins = winners(&cur.vault.instructions, &src.vault.instructions);
+        let want_tw = winners(&cur.vault.trust_wills, &src.vault.trust_wills);
+        let want_al = winners(&cur.vault.assets, &src.vault.assets);
+        let want_acc = winners(&cur.vault.accounts, &src.vault.accounts);
+        let want_re = winners(&cur.vault.real_estate, &src.vault.real_estate);
+        let want_tax = winners(&cur.vault.tax_filings, &src.vault.tax_filings);
+        let want_gd = winners(&cur.vault.general_documents, &src.vault.general_documents);
+
+        drop(src); // release the source's write lock, then reopen read-only for the merge
+        let src = OpenVault::open_read_only(spath, b"a", b"b").unwrap();
+        cur.apply_merge_from(&src).unwrap();
+
+        assert_eq!(actual(&cur.vault.instructions), want_ins, "seed {seed}: instructions");
+        assert_eq!(actual(&cur.vault.trust_wills), want_tw, "seed {seed}: trust_wills");
+        assert_eq!(actual(&cur.vault.assets), want_al, "seed {seed}: assets");
+        assert_eq!(actual(&cur.vault.accounts), want_acc, "seed {seed}: accounts");
+        assert_eq!(actual(&cur.vault.real_estate), want_re, "seed {seed}: real_estate");
+        assert_eq!(actual(&cur.vault.tax_filings), want_tax, "seed {seed}: tax_filings");
+        assert_eq!(actual(&cur.vault.general_documents), want_gd, "seed {seed}: general_documents");
+
+        drop(cur);
+        drop(src);
+        OpenVault::open(cpath, b"a", b"b").unwrap();
+        std::fs::remove_dir_all(&cdir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
     }
 }
 

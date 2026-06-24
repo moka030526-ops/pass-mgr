@@ -2797,8 +2797,112 @@ mod tests {
         assert!(t.documents.is_empty());
     }
 
+    /// Comprehensive guard: EVERY record type derives both `Default` and `Zeroize`,
+    /// and `zeroize()` resets each field to its default — so a fully-populated record
+    /// must serialize identically to `T::default()` afterwards. Comparing the whole
+    /// serialized value (rather than hand-listing fields) makes this AUTO-COVER any
+    /// field added later: a new secret field that is not wiped — or that a future
+    /// contributor marks `#[zeroize(skip)]` to silence a trait-bound error (e.g. on
+    /// `Account.password`) — leaves a non-default value and fails here, instead of
+    /// silently stranding a plaintext secret in freed heap.
+    #[test]
+    fn every_record_type_is_fully_wiped_by_zeroize() {
+        fn assert_wiped<T: serde::Serialize + Zeroize + Default>(mut full: T, name: &str) {
+            full.zeroize();
+            assert_eq!(
+                serde_json::to_value(&full).unwrap(),
+                serde_json::to_value(T::default()).unwrap(),
+                "{name}: a field survived zeroize() — a secret may be stranded in freed memory"
+            );
+        }
+        let s = || "SENTINEL".to_string();
+        let hist = || vec![Change::new("updated", "password: \"old\" -> \"new\"".into())];
+
+        let mut ins = Instruction::default();
+        ins.id = s(); ins.title = s(); ins.description = s();
+        ins.created_at = 7; ins.updated_at = 9; ins.history = hist();
+        assert_wiped(ins, "Instruction");
+
+        let mut tw = TrustWill::default();
+        tw.id = s(); tw.document = s(); tw.usage = s(); tw.file = Some(s());
+        tw.created_at = 7; tw.updated_at = 9; tw.history = hist();
+        assert_wiped(tw, "TrustWill");
+
+        let mut al = AssetLiability::default();
+        al.id = s(); al.kind = s(); al.description = s(); al.owner = s(); al.title = s();
+        al.approx_value = s(); al.as_of_date = s(); al.institution = s(); al.asset_type = s();
+        al.url = s(); al.beneficiary = s(); al.review = true; al.statement = Some(s());
+        al.created_at = 7; al.updated_at = 9; al.history = hist();
+        assert_wiped(al, "AssetLiability");
+
+        let mut acc = Account::default();
+        acc.id = s(); acc.title = s(); acc.account_type = s(); acc.account_subtype = s();
+        acc.owner = s(); acc.username = s(); acc.password = s(); acc.description = s();
+        acc.url = s(); acc.closed_as_of = s(); acc.review = true;
+        acc.created_at = 7; acc.updated_at = 9; acc.history = hist();
+        assert_wiped(acc, "Account");
+
+        let mut re = RealEstate::default();
+        re.id = s(); re.address = s(); re.ownership = s(); re.taxes = s(); re.hoa = s();
+        re.income_account = s(); re.financing_account = s(); re.payment_account = s();
+        re.financing_balance = s();
+        re.property_mgmt_url = s(); re.property_mgmt_username = s();
+        re.property_mgmt_password = s(); re.property_mgmt_comment = s();
+        re.insurance_url = s(); re.insurance_username = s();
+        re.insurance_password = s(); re.insurance_comment = s();
+        re.hoa_url = s(); re.hoa_username = s(); re.hoa_password = s(); re.hoa_comment = s();
+        re.tax_portal_url = s(); re.tax_portal_username = s();
+        re.tax_portal_password = s(); re.tax_portal_comment = s();
+        re.comments = s(); re.documents = vec![s(), s()];
+        re.created_at = 7; re.updated_at = 9; re.history = hist();
+        assert_wiped(re, "RealEstate");
+
+        let mut tax = TaxFiling::default();
+        tax.id = s(); tax.year = s(); tax.notes = s(); tax.documents = vec![s()];
+        tax.created_at = 7; tax.updated_at = 9; tax.history = hist();
+        assert_wiped(tax, "TaxFiling");
+
+        let mut gd = GeneralDocument::default();
+        gd.id = s(); gd.title = s(); gd.description = s(); gd.file = Some(s());
+        gd.created_at = 7; gd.updated_at = 9; gd.history = hist();
+        assert_wiped(gd, "GeneralDocument");
+    }
+
     use proptest::prelude::*;
     proptest! {
+        /// `upsert` is append-only on a record's history: editing the SAME id over and
+        /// over keeps the "created" entry first, never shrinks the history, keeps
+        /// `created_at` constant, and never moves `updated_at` backwards. The metamorphic
+        /// suite never re-edits one id, so a regression clobbering prior history (or the
+        /// creation time) would slip past it — this pins the audit-trail integrity.
+        #[test]
+        fn prop_upsert_history_is_append_only(
+            edits in proptest::collection::vec(("[a-z ]{0,8}", "[a-z0-9]{0,8}"), 0..12)
+        ) {
+            let mut list: Vec<Account> = Vec::new();
+            let mut a = Account::new().unwrap();
+            a.id = "fixed-id".into();
+            upsert(&mut list, a);
+            let created_at = list[0].created_at;
+            prop_assert_eq!(list.len(), 1);
+            prop_assert_eq!(list[0].history[0].action.as_str(), "created");
+            let mut prev_hist = list[0].history.len();
+            let mut prev_updated = list[0].updated_at;
+            for (user, pass) in edits {
+                let mut e = list[0].clone();
+                e.username = user;
+                e.password = pass;
+                upsert(&mut list, e);
+                prop_assert_eq!(list.len(), 1, "upsert of the same id never adds a row");
+                prop_assert_eq!(list[0].created_at, created_at, "created_at is immutable");
+                prop_assert_eq!(list[0].history[0].action.as_str(), "created", "created entry stays first");
+                prop_assert!(list[0].history.len() >= prev_hist, "history never shrinks");
+                prop_assert!(list[0].updated_at >= prev_updated, "updated_at is monotonic");
+                prev_hist = list[0].history.len();
+                prev_updated = list[0].updated_at;
+            }
+        }
+
         /// `civil_from_unix` and `unix_from_civil` are exact inverses across the whole
         /// post-epoch range the app uses — a single off-by-one in the calendar math
         /// would break this.

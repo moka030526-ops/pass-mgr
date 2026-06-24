@@ -4053,6 +4053,33 @@ mod tests {
     }
 
     #[test]
+    fn body_version_disagreeing_with_header_is_rejected() {
+        // decode_vault_with_key re-checks the AEAD-authenticated body's `version` against
+        // the header as defense-in-depth. A single-byte flip can't reach this branch (it
+        // fails the Poly1305 tag first), so the exhaustive byte-flip test never covers it
+        // and a mutant deleting the check survives. Craft a body whose version disagrees
+        // UNDER A VALID TAG and assert it is rejected with BadVersion.
+        let params = KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+        let salt = [0x11u8; SALT_LEN];
+        let nonce = [0x22u8; NONCE_LEN];
+        let key = crypto::derive_key(b"k", &salt, &params).unwrap();
+        let header = Header { params, salt, nonce };
+        let aad = header.to_bytes();
+        let mut body = Vault::default();
+        body.version = FORMAT_VERSION - 1; // authenticated, but the WRONG version
+        let json = serde_json::to_vec(&body).unwrap();
+        let ct = crypto::encrypt_with_nonce(&key, &nonce, &json, &aad).unwrap();
+        let mut raw = aad.to_vec();
+        raw.extend_from_slice(&ct);
+        // The tag verifies (we are past AEAD), but body.version != FORMAT_VERSION.
+        let err = decode_vault_with_key(&raw, &key).unwrap_err();
+        assert!(
+            matches!(err, VaultError::BadVersion(v) if v == FORMAT_VERSION - 1),
+            "expected BadVersion, got {err:?}"
+        );
+    }
+
+    #[test]
     fn every_single_byte_flip_of_a_valid_vault_is_rejected_without_panic() {
         // Exhaustive tamper matrix over the WHOLE open path (parse → KDF → AEAD → JSON →
         // referenced⊆stored), complementing the byte-level parser fuzzers: flip one bit

@@ -209,6 +209,26 @@ impl VolumeStore {
             store.manifests.push(manifest); // append to the vec
             part += 1;
         }
+
+        // Fail closed on a NON-CONTIGUOUS partition set. The loop above stops at the
+        // first absent partition, so a lost MIDDLE partition (vol.1/manifest.1 gone via a
+        // partial restore, selective backup, or filesystem corruption) while a higher
+        // partition survives would otherwise be SILENTLY dropped — the vault would open
+        // "successfully" minus every document in the orphaned higher partitions. Silent
+        // data loss is the worst possible outcome for a vault, so detect a surviving
+        // higher partition and refuse (corruption fails closed, like everywhere else here).
+        let highest = highest_partition_index(&store.manifest_dir, "manifest.")
+            .max(highest_partition_index(&store.volume_dir, "vol."));
+        if let Some(hi) = highest
+            && hi as usize >= store.manifests.len()
+        {
+            return Err(StorageError::Corrupt(format!(
+                "non-contiguous partitions: loaded {} but partition {hi} still exists on disk \
+                 (a middle partition is missing)",
+                store.manifests.len()
+            )));
+        }
+
         store.reindex();
         Ok(store) // wrap the finished store as the success value
     }
@@ -753,6 +773,27 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     Ok(())
 }
 
+/// Highest partition index `N` for which a file named exactly `<prefix>N` (e.g.
+/// `manifest.3`, `vol.3`) exists in `dir`; `None` if the dir is absent or holds no
+/// such file. The strict `<prefix><decimal>` match ignores the hidden in-flight temp
+/// files (`.manifest.N.<suffix>.tmp`) the atomic writer leaves, so a mid-write open is
+/// not mistaken for a real partition. Used by `open` to detect a missing middle partition.
+fn highest_partition_index(dir: &Path, prefix: &str) -> Option<u32> {
+    let mut hi: Option<u32> = None;
+    let Ok(rd) = fs::read_dir(dir) else { return None };
+    for entry in rd.flatten() {
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(rest) = name.strip_prefix(prefix)
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = rest.parse::<u32>()
+        {
+            hi = Some(hi.map_or(n, |h| h.max(n)));
+        }
+    }
+    hi
+}
+
 /// Atomic write: unique hidden temp in the same dir → fsync → rename → fsync dir.
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     // `.filter(closure)` keeps the parent only if the closure is true (here: non-empty),
@@ -915,6 +956,64 @@ mod tests {
         let d = std::env::temp_dir().join(format!("pmstore-{tag}-{}", nanos()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn missing_middle_partition_is_detected_not_silently_dropped() {
+        // A lost middle partition must FAIL CLOSED on open, never silently drop the
+        // documents in the surviving higher partition(s). Without the contiguity guard
+        // in `open`, the partition-scan loop stops at the first gap and "successfully"
+        // returns a store missing partition 2's document — silent data loss.
+        let dir = tmp_dir("gap");
+        let key = fast_key();
+        // Small cap so each (large) doc rolls into its own partition: 0, 1, 2.
+        let mut s = VolumeStore::open(&dir, &key, "v", 1024).unwrap();
+        let big = vec![b'x'; 1000];
+        s.put("a", "/a", &big, 1, &key).unwrap();
+        s.put("b", "/b", &big, 2, &key).unwrap();
+        s.put("c", "/c", &big, 3, &key).unwrap();
+        assert_eq!(s.partition_count(), 3, "each large doc should roll to its own partition");
+        drop(s);
+        // Lose ONLY the middle partition (1); 0 and 2 survive.
+        std::fs::remove_file(dir.join("volume").join("vol.1")).unwrap();
+        std::fs::remove_file(dir.join("manifest").join("manifest.1")).unwrap();
+        match VolumeStore::open(&dir, &key, "v", 1024) {
+            Err(StorageError::Corrupt(_)) => {} // fail-closed: correct
+            Ok(s2) => panic!(
+                "a missing middle partition was silently accepted: contains(c)={}, partitions={}",
+                s2.contains("c"),
+                s2.partition_count()
+            ),
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_bit_corruption_in_a_committed_frame_fails_closed_on_read() {
+        // Bit rot inside a committed frame's bytes (manifest intact) is the most common
+        // real-world corruption on the normal read path. AEAD must turn it into a clean
+        // error — never silently return altered plaintext under the right document id.
+        let dir = tmp_dir("bitrot");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("doc", "/d", b"the quick brown fox", 1, &key).unwrap();
+        let e = s.entry("doc").unwrap();
+        let target = (e.offset + e.length - 1) as usize; // last byte = inside the Poly1305 tag
+        drop(s);
+        let vpath = dir.join("volume").join("vol.0");
+        let mut bytes = std::fs::read(&vpath).unwrap();
+        bytes[target] ^= 0x01;
+        std::fs::write(&vpath, &bytes).unwrap();
+        // open() is lazy (reads no frames), so the intact manifest still opens fine...
+        let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        // ...but read() must fail closed.
+        match s2.read("doc", &key) {
+            Err(StorageError::Crypto(_) | StorageError::Corrupt(_)) => {}
+            Ok(b) => panic!("bit rot served wrong plaintext instead of failing: {:?}", &*b),
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

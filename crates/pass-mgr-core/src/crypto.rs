@@ -541,4 +541,141 @@ mod tests {
             "m_cost == MIN - 1 must be rejected"
         );
     }
+
+    // --- known-answer tests (KAT) -----------------------------------------
+    // Every OTHER crypto test here compares the code against ITSELF (round-trip,
+    // determinism), so a silent dependency/configuration change that still
+    // self-round-trips would pass them all while making EVERY previously-written
+    // vault permanently undecryptable. These KATs pin the primitives to fixed,
+    // externally-anchored outputs so that failure class fails CI instead.
+
+    fn to_hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+    fn from_hex(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex string must have even length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    #[test]
+    fn kat_argon2id_pins_algorithm_version_and_output() {
+        // Pins that derive_key is Argon2id / Version V0x13 / 32-byte output AND the
+        // exact derived bytes. An argon2 default flip (Argon2id->Argon2i, V0x13->V0x10),
+        // an output-length change, or a dropped parameter would still self-round-trip
+        // and pass `derivation_is_deterministic`, but would diverge here.
+        let params = KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+        let pw = b"pass-mgr-kat-password";
+        let salt = b"pass-mgr-kat!slt"; // 16 bytes, like a real per-vault salt
+
+        // (1) Independent, explicitly-configured reference derivation.
+        let argon = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN)).unwrap(),
+        );
+        let mut reference = [0u8; KEY_LEN];
+        argon.hash_password_into(pw, salt, &mut reference).unwrap();
+        let derived = derive_key(pw, salt, &params).unwrap();
+        assert_eq!(
+            derived.as_bytes(),
+            &reference[..],
+            "derive_key must be Argon2id / V0x13 / {KEY_LEN}-byte output"
+        );
+
+        // (2) Frozen vector. This literal is a CONTRACT: if it ever changes, the
+        // on-disk KDF changed and existing vaults will not open — it must be paired
+        // with a FORMAT_VERSION bump + migration, never silently edited to pass.
+        assert_eq!(
+            to_hex(derived.as_bytes()),
+            "8b02325a933c6bb4a13ba99a8b455c4ccab09c7073d08f5b8643101df03cf30d",
+        );
+    }
+
+    #[test]
+    fn kat_xchacha20poly1305_matches_the_published_vector() {
+        // (1) Published external vector: draft-irtf-cfrg-xchacha-03 §A.3.1
+        // (AEAD_XCHACHA20_POLY1305). encrypt_with_nonce must produce the exact
+        // ciphertext+tag the spec specifies, and decrypt must invert it. This anchors
+        // the AEAD to the standard independently of the chacha20poly1305 crate's own
+        // tests, so a crate behaviour change (HChaCha subkey derivation, tag layout)
+        // that still self-round-trips is caught here.
+        let key = {
+            let mut k = [0u8; KEY_LEN];
+            k.copy_from_slice(&from_hex(
+                "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+            ));
+            Key::new(k)
+        };
+        let nonce: [u8; NONCE_LEN] = from_hex("404142434445464748494a4b4c4d4e4f5051525354555657")
+            .try_into()
+            .unwrap();
+        let aad = from_hex("50515253c0c1c2c3c4c5c6c7");
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected = "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52ec0875924c1c7987947deafd8780acf49";
+
+        let ct = encrypt_with_nonce(&key, &nonce, plaintext, &aad).unwrap();
+        assert_eq!(
+            to_hex(&ct),
+            expected,
+            "ciphertext+tag must match the published XChaCha20-Poly1305 vector"
+        );
+        assert_eq!(
+            decrypt(&key, &nonce, &ct, &aad).unwrap(),
+            plaintext.to_vec(),
+            "decrypt inverts the published vector"
+        );
+
+        // (2) encrypt_with_nonce must equal a hand-built XChaCha20Poly1305 call: pins
+        // that the wrapper uses this exact AEAD and binds nonce + aad the obvious way.
+        let direct = XChaCha20Poly1305::new(ChaChaKey::from_slice(key.as_bytes()))
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plaintext[..], aad: &aad })
+            .unwrap();
+        assert_eq!(ct, direct);
+
+        // (3) Frozen vector under our own fixed inputs (drift detector / contract).
+        let fk = Key::new([0x42u8; KEY_LEN]);
+        let fct = encrypt_with_nonce(&fk, &[0x07u8; NONCE_LEN], b"pass-mgr KAT plaintext", b"pass-mgr KAT aad")
+            .unwrap();
+        assert_eq!(
+            to_hex(&fct),
+            "876df61b4e2cf9d169efbc1f65bd6c4df1b50b431219787e2f3f9b2b6bab0281e821c4a8e4a3",
+        );
+    }
+
+    #[test]
+    fn kdf_params_feed_the_derivation() {
+        // The header binds m/t/p_cost as AAD (tampering fails the tag), but that alone
+        // does not prove the params actually CHANGE the key. If the derivation ever
+        // ignored a parameter, an attacker could rewrite the header to the minimum cost
+        // (m_cost=8) and still derive the same key, silently defeating the memory-hard
+        // work factor. Varying only one parameter at a time must change the key.
+        let pw = b"pw";
+        let salt = b"sixteen-byte-slt";
+        let base = KdfParams { m_cost: 256, t_cost: 2, p_cost: 1 };
+        let k = |p: &KdfParams| derive_key(pw, salt, p).unwrap().as_bytes().to_vec();
+        let kb = k(&base);
+        assert_ne!(kb, k(&KdfParams { m_cost: 512, ..base }), "m_cost must affect the key");
+        assert_ne!(kb, k(&KdfParams { t_cost: 3, ..base }), "t_cost must affect the key");
+        assert_ne!(kb, k(&KdfParams { p_cost: 2, ..base }), "p_cost must affect the key");
+    }
+
+    #[test]
+    fn chained_derivation_uses_k1_as_the_second_salt() {
+        // Pin the documented construction key = Argon2id(pw2, salt = Argon2id(pw1, salt1)).
+        // The existing chained tests prove order-sensitivity and both-required, but a
+        // mutant that ignored the chaining (salted pass 2 with salt1, say) could still
+        // pass those; this pins the exact algebraic relationship.
+        let salt1 = b"sixteen-byte-slt";
+        let params = fast();
+        let k1 = derive_key(b"pw1", salt1, &params).unwrap();
+        let expected = derive_key(b"pw2", k1.as_bytes(), &params).unwrap();
+        let chained = derive_key_chained(b"pw1", b"pw2", salt1, &params).unwrap();
+        assert_eq!(chained.as_bytes(), expected.as_bytes());
+        // Must NOT equal the wrong-but-plausible "salt pass 2 with salt1" construction.
+        let wrong = derive_key(b"pw2", salt1, &params).unwrap();
+        assert_ne!(chained.as_bytes(), wrong.as_bytes(), "pass 2 must be salted by k1, not salt1");
+    }
 }
