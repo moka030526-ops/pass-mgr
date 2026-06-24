@@ -330,6 +330,20 @@ fn main() -> ExitCode {
         };
     }
 
+    // Hidden test affordance: open the vault read-WRITE (taking the single-writer lock)
+    // and hold it until stdin closes, so the cross-process lock test can hold the lock
+    // from a REAL second process. Compiled ONLY with `--features fault-injection`.
+    #[cfg(feature = "fault-injection")]
+    if cmd == Some("__holdlock") {
+        return match holdlock(&pos) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("holdlock error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Dispatch on the subcommand. Matching on `Option<&str>` lets each arm test a
     // specific command name (with `|` allowing aliases like decrypt/export). The
     // chosen arm calls the matching handler, and the resulting `Result` is stored.
@@ -1086,6 +1100,27 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     // Propagate a cancellation / read error now (after raw mode is restored), then hand back.
     outcome?;
     Ok(input)
+}
+
+/// Test-only affordance behind the `__holdlock` subcommand (compiled only with
+/// `--features fault-injection`). Opens `DIR`'s vault read-WRITE — acquiring the OS
+/// advisory single-writer lock for this process's lifetime — prints `LOCKED`, then
+/// blocks until stdin reaches EOF before dropping the handle (releasing the lock). Lets
+/// `tests/lock_cross_process.rs` hold the lock from a genuine second OS process. `pos`
+/// is `["__holdlock", <DIR>]`; the test's fixed `a`/`b` passwords are used.
+#[cfg(feature = "fault-injection")]
+fn holdlock(pos: &[String]) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    let dir = pos.get(1).cloned().ok_or_else(|| anyhow::anyhow!("holdlock: missing DIR"))?;
+    // Open writable: this acquires the single-writer lock and holds it via `_held`.
+    let _held = OpenVault::open(vault_file(&dir), b"a", b"b")?;
+    let mut out = std::io::stdout();
+    writeln!(out, "LOCKED")?;
+    out.flush()?;
+    // Block until the parent closes our stdin (EOF); then `_held` drops and unlocks.
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    Ok(())
 }
 
 /// Test-only scripted vault operation behind the `__crashop` subcommand (compiled

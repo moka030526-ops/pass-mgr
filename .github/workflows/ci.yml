@@ -92,6 +92,33 @@ jobs:
           for t in parse_header parse_frame parse_manifest scan_volume doc_paths; do
             cargo +nightly fuzz run "$t" -- -max_total_time=30 -print_final_stats=1
           done
+          # merge_from drives the REAL plan/apply_merge_from end-to-end against hostile
+          # source vaults (writes real volumes/manifests + crypto, then reopens) — the
+          # highest-value durability fuzzer. It does disk I/O, so give it its own shorter
+          # budget rather than the 30s parser slice.
+          cargo +nightly fuzz run merge_from -- -max_total_time=20 -print_final_stats=1
+
+  coverage:
+    name: coverage (cargo-llvm-cov, informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # eframe/arboard link X11/xcb/xkb even though the tests never open a window.
+      - name: Install GUI link deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-llvm-cov --locked
+      # Informational ONLY (no --fail-under gate): a flaky line-count threshold on rarely
+      # hit error-handling arms would block PRs for little signal. The summary surfaces
+      # untested branches (e.g. the decrypt BadNonce arm, the mlock-off Key::new path) in
+      # the job log so they can be closed deliberately.
+      - run: cargo llvm-cov --workspace --all-features --summary-only
 
   android:
     name: android apk build
