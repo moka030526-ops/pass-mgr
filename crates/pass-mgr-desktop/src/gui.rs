@@ -2256,7 +2256,7 @@ impl GuiApp {
                     });
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("asset_tree").show(lp, |ui| {
                         let mut path: Vec<String> = Vec::new();
-                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels) {
+                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels, "asset") {
                             select = Some(s);
                         }
                     });
@@ -2577,7 +2577,7 @@ impl GuiApp {
                     });
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("acct_tree").show(lp, |ui| {
                         let mut path: Vec<String> = Vec::new();
-                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels) {
+                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels, "acct") {
                             select = Some(s);
                         }
                     });
@@ -3492,19 +3492,25 @@ fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
 /// labels; it is hashed AS A SLICE for each header's `id_salt`, which is collision-free
 /// (unlike a `/`-joined string, where owner "a/b" would collide with owner "a" + type "b" and
 /// share expand state). Shared by the grouped Accounts and Assets views.
+// `kind` ("acct" / "asset") prefixes the header id_salt so the Accounts and Assets trees get
+// DISTINCT persistent collapse state for a same-named group (e.g. owner "Bob" in both). egui's
+// ScrollArea id_salt namespaces only the scroll offset, not child widget ids, so without this
+// the two trees would share expand/collapse state (the TUI keeps separate expand-sets for the
+// same reason).
 fn render_acct_node(
     ui: &mut egui::Ui,
     node: &records::AcctNode,
     path: &mut Vec<String>,
     cur: Option<&str>,
     labels: &[(String, String)],
+    kind: &str,
 ) -> Option<usize> {
     let mut select = None;
     for child in &node.children {
         path.push(child.label.clone());
         let resp = egui::CollapsingHeader::new(&child.label)
-            .id_salt(("group_node", path.as_slice()))
-            .show(ui, |ui| render_acct_node(ui, child, path, cur, labels));
+            .id_salt((kind, "group_node", path.as_slice()))
+            .show(ui, |ui| render_acct_node(ui, child, path, cur, labels, kind));
         if let Some(s) = resp.body_returned.flatten() {
             select = Some(s);
         }

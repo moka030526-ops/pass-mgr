@@ -1138,9 +1138,12 @@ impl_record!(
         // Prefer the (new) title for the list label; fall back to the description, then a
         // placeholder. `.as_str()` borrows the String as a `&str` so every arm has the same
         // type (the literal is already a `&str`); no allocation happens here.
-        let d = if !l.title.is_empty() {
+        // Gate on the TRIMMED value (matching `asset_tree`'s leaf label), so a
+        // whitespace-only title doesn't show as a blank label in the flat list while the
+        // grouped tree falls back to the description.
+        let d = if !l.title.trim().is_empty() {
             l.title.as_str()
-        } else if !l.description.is_empty() {
+        } else if !l.description.trim().is_empty() {
             l.description.as_str()
         } else {
             "(no description)"
