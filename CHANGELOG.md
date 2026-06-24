@@ -70,6 +70,10 @@ date and bump the crate versions to match.
   - **Trim all fields** — every field of **every record type** (all tabs, secrets
     included) is left/right-trimmed on save, plus a one-off bulk-trim action that
     sweeps the whole vault (history-recorded).
+- **Assets/Liabilities: grouped tree view** — toggle the Assets list into a grouped tree
+  **owner → Asset/Liability → type** (empty levels skipped), mirroring the Accounts grouping:
+  a "grouped" checkbox in the GUI, `g` in the TUI (`records::asset_tree`). Honors the
+  review-only filter.
 - **Assets/Liabilities: Title field** — a short title, shown under **Owner** in the editor
   (GUI + TUI) and used as the list label when set (falling back to the description). Additive
   and `#[serde(default)]`, so older vaults load unchanged; also surfaced over the mobile FFI.

@@ -188,6 +188,38 @@ pub fn account_tree<'a>(accounts: impl IntoIterator<Item = &'a Account>) -> Acct
     root
 }
 
+/// Build the **grouped tree** of `assets` for the "grouped" Assets view: each asset is
+/// placed along the path of its NON-EMPTY grouping values in the order **owner → kind
+/// (Asset/Liability) → type**, then added as a leaf at the end of that path. Empty grouping
+/// values are skipped (no "(none)" nodes), every level is sorted case-insensitively, and the
+/// leaf shows the entry's title (or description, then a placeholder) — the `[kind]` prefix is
+/// omitted since the kind is already a grouping level. Reuses [`AcctNode`]/[`AccountLeaf`]
+/// (the leaf `title` field carries the display label). Takes any iterator of asset references
+/// so a caller can pass the FILTERED assets without cloning.
+pub fn asset_tree<'a>(assets: impl IntoIterator<Item = &'a AssetLiability>) -> AcctNode {
+    let mut root = AcctNode::default();
+    for a in assets {
+        let mut node = &mut root;
+        for level in [&a.owner, &a.kind, &a.asset_type] {
+            let level = level.trim();
+            if !level.is_empty() {
+                node = node.child_mut(level);
+            }
+        }
+        // Display label without the `[kind]` prefix (kind is a grouping level here).
+        let label = if !a.title.trim().is_empty() {
+            a.title.clone()
+        } else if !a.description.trim().is_empty() {
+            a.description.clone()
+        } else {
+            "(no description)".to_string()
+        };
+        node.leaves.push(AccountLeaf { id: a.id.clone(), title: label });
+    }
+    root.sort_recursive();
+    root
+}
+
 /// A random 128-bit hex id, used for records and volume blobs.
 // Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
@@ -1722,6 +1754,37 @@ mod tests {
         assert_eq!(acc.title, "", "missing title defaults to empty");
         assert_eq!(acc.closed_as_of, "", "missing closed_as_of defaults to empty");
         assert_eq!(acc.username, "jane", "old fields preserved");
+    }
+
+    #[test]
+    fn asset_tree_groups_by_owner_kind_type_and_skips_empty() {
+        let mk = |id: &str, owner: &str, kind: &str, atype: &str, title: &str| {
+            let mut a = AssetLiability::new().unwrap();
+            a.id = id.into();
+            a.owner = owner.into();
+            a.kind = kind.into();
+            a.asset_type = atype.into();
+            a.title = title.into();
+            a
+        };
+        let assets = vec![
+            mk("1", "Bob", "Asset", "Bank", "Savings"),
+            mk("2", "Bob", "Asset", "Bank", "Checking"),
+            mk("3", "Bob", "Liability", "Loan", "Car"),
+            mk("4", "", "Asset", "", "Cash"), // no owner/type → kind-group at the root, then a leaf
+        ];
+        let root = asset_tree(&assets);
+        // Top level: the owner-less entry's kind group "Asset" + "Bob", sorted.
+        let tops: Vec<&str> = root.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(tops, vec!["Asset", "Bob"]);
+        // The owner-less "Cash" sits as a leaf under the top-level "Asset" group.
+        let asset_grp = root.children.iter().find(|c| c.label == "Asset").unwrap();
+        assert_eq!(asset_grp.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(), vec!["Cash"]);
+        // Bob → [Asset, Liability]; Bob/Asset/Bank → [Checking, Savings] (sorted, no [kind] prefix).
+        let bob = root.children.iter().find(|c| c.label == "Bob").unwrap();
+        assert_eq!(bob.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), vec!["Asset", "Liability"]);
+        let bank = bob.children.iter().find(|c| c.label == "Asset").unwrap().children.iter().find(|c| c.label == "Bank").unwrap();
+        assert_eq!(bank.leaves.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(), vec!["Checking", "Savings"]);
     }
 
     #[test]

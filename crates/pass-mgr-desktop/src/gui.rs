@@ -532,6 +532,8 @@ struct GuiApp {
     // Accounts view: false = flat filtered list, true = grouped tree
     // (type → subtype → owner → title).
     acct_grouped: bool,
+    // Assets view: false = flat filtered list, true = grouped tree (owner → Asset/Liability → type).
+    asset_grouped: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
     // Config screen inputs.
@@ -658,6 +660,7 @@ impl GuiApp {
             acct_filter_review: false,
             acct_search_user: String::new(),
             acct_grouped: false,
+            asset_grouped: false,
             asset_filter_review: false,
             new_asset_type: String::new(),
             new_account_type: String::new(),
@@ -2208,8 +2211,17 @@ impl GuiApp {
     fn tab_assets(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.asset_filter_review, "Show only items flagged for review");
+            // Grouped tree: owner → Asset/Liability → type (empty levels skipped).
+            ui.checkbox(&mut self.asset_grouped, "grouped");
         });
         let fr = self.asset_filter_review;
+        // In grouped mode, the same review-filtered assets as an owner→kind→type tree
+        // (built here so the render closure doesn't re-borrow `self`).
+        let tree = if self.asset_grouped {
+            Some(records::asset_tree(self.vault_ref().vault.assets.iter().filter(|a| !fr || a.review)))
+        } else {
+            None
+        };
         // Iterator pipeline: walk assets by reference, keep only those passing the
         // filter closure (`!fr` = filter off, or the item is flagged), turn each
         // into an `(id, label)` tuple, and collect into a `Vec`.
@@ -2231,7 +2243,28 @@ impl GuiApp {
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable);
+            match &tree {
+                // Grouped tree: owner → Asset/Liability → type → entry (leaf), empty levels
+                // skipped. egui's CollapsingHeader gives the +/- expand control.
+                Some(root) => {
+                    let lp = &mut c[0];
+                    lp.horizontal(|ui| {
+                        ui.heading("Assets and Liabilities");
+                        if self.writable && ui.button("➕ New").clicked() {
+                            new = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("asset_tree").show(lp, |ui| {
+                        let mut path: Vec<String> = Vec::new();
+                        if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels) {
+                            select = Some(s);
+                        }
+                    });
+                }
+                None => {
+                    (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable);
+                }
+            }
             let ui = &mut c[1];
             if let Some(r) = self.edit_asset.as_mut() {
                 let w = self.writable;
@@ -2529,42 +2562,6 @@ impl GuiApp {
                 s
             })
             .unwrap_or_default();
-
-        // Recursive render of one grouped-tree node: child groups (each an
-        // expandable CollapsingHeader) followed by this node's leaf accounts (shown
-        // by title only). Returns the index into `labels` of a clicked leaf, if any.
-        // `path` is the stack of ancestor labels; it is hashed AS A SLICE for each
-        // header's id_salt, which is collision-free (unlike a `/`-joined string, where
-        // owner "a/b" would collide with owner "a" + type "b" and share expand state).
-        fn render_acct_node(
-            ui: &mut egui::Ui,
-            node: &records::AcctNode,
-            path: &mut Vec<String>,
-            cur: Option<&str>,
-            labels: &[(String, String)],
-        ) -> Option<usize> {
-            let mut select = None;
-            for child in &node.children {
-                path.push(child.label.clone());
-                let resp = egui::CollapsingHeader::new(&child.label)
-                    .id_salt(("acct_node", path.as_slice()))
-                    .show(ui, |ui| render_acct_node(ui, child, path, cur, labels));
-                if let Some(s) = resp.body_returned.flatten() {
-                    select = Some(s);
-                }
-                path.pop();
-            }
-            for leaf in &node.leaves {
-                let sel = cur == Some(leaf.id.as_str());
-                let title = if leaf.title.is_empty() { "(no title)".to_string() } else { leaf.title.clone() };
-                if ui.selectable_label(sel, title).clicked() {
-                    // `select` is an index into `labels` (the same filtered set as the
-                    // tree), matching the flat-list model used by the form below.
-                    select = labels.iter().position(|(id, _)| *id == leaf.id);
-                }
-            }
-            select
-        }
 
         ui.columns(2, |c| {
             match &tree {
@@ -3489,6 +3486,42 @@ fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
 // contiguous run of `(id, label)` tuples (no ownership taken). `Option<&str>`
 // is a maybe-present borrowed string. Returning a tuple lets one call report two
 // outcomes at once.
+/// Recursive render of one grouped-tree node ([`records::AcctNode`]): child groups (each an
+/// expandable `CollapsingHeader`) followed by this node's leaves (shown by label only).
+/// Returns the index into `labels` of a clicked leaf, if any. `path` is the stack of ancestor
+/// labels; it is hashed AS A SLICE for each header's `id_salt`, which is collision-free
+/// (unlike a `/`-joined string, where owner "a/b" would collide with owner "a" + type "b" and
+/// share expand state). Shared by the grouped Accounts and Assets views.
+fn render_acct_node(
+    ui: &mut egui::Ui,
+    node: &records::AcctNode,
+    path: &mut Vec<String>,
+    cur: Option<&str>,
+    labels: &[(String, String)],
+) -> Option<usize> {
+    let mut select = None;
+    for child in &node.children {
+        path.push(child.label.clone());
+        let resp = egui::CollapsingHeader::new(&child.label)
+            .id_salt(("group_node", path.as_slice()))
+            .show(ui, |ui| render_acct_node(ui, child, path, cur, labels));
+        if let Some(s) = resp.body_returned.flatten() {
+            select = Some(s);
+        }
+        path.pop();
+    }
+    for leaf in &node.leaves {
+        let sel = cur == Some(leaf.id.as_str());
+        let title = if leaf.title.is_empty() { "(no title)".to_string() } else { leaf.title.clone() };
+        if ui.selectable_label(sel, title).clicked() {
+            // An index into `labels` (the same filtered set as the tree), matching the
+            // flat-list model used by the form.
+            select = labels.iter().position(|(id, _)| *id == leaf.id);
+        }
+    }
+    select
+}
+
 fn list_panel(
     ui: &mut egui::Ui,
     title: &str,
