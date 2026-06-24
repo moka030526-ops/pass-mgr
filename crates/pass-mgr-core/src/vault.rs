@@ -1588,6 +1588,46 @@ impl OpenVault {
         self.mutate_categories(|c| c.add_account_subtype(type_name, subtype))
     }
 
+    /// Scan every record and add any asset/account **type** + account **subtype** it uses that
+    /// is missing from the editable category lists (§4.2), so types brought in by a merge,
+    /// `import-tree`, or older data show up in Config and the dropdowns. Returns the number of
+    /// category entries added; a no-op returns `Ok(0)` without writing. Requires `--write`.
+    pub fn sync_types_from_records(&mut self) -> Result<usize, VaultError> {
+        if self.read_only {
+            return Err(VaultError::ReadOnly);
+        }
+        let mut added = 0usize;
+        // Snapshot the type strings first so the immutable record borrow is released before the
+        // category lists are mutated (the `add_*` are case-insensitive dedup).
+        let asset_types: Vec<String> = self.vault.assets.iter().map(|a| a.asset_type.clone()).collect();
+        for t in &asset_types {
+            let t = t.trim();
+            if !t.is_empty() && self.vault.categories.add_asset_type(t) {
+                added += 1;
+            }
+        }
+        let accts: Vec<(String, String)> =
+            self.vault.accounts.iter().map(|a| (a.account_type.clone(), a.account_subtype.clone())).collect();
+        for (t, st) in &accts {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if self.vault.categories.add_account_type(t) {
+                added += 1;
+            }
+            let st = st.trim();
+            if !st.is_empty() && self.vault.categories.add_account_subtype(t, st) {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.vault.audit.push(records::Change::new("types_synced", format!("{added} category type(s) added from records")));
+            self.save()?;
+        }
+        Ok(added)
+    }
+
     /// Delete an Asset/Liability type — only if **no live asset/liability record**
     /// still has that `asset_type`. (History never blocks: a `Change.detail` string
     /// is not the `asset_type` field, so it is not scanned here.) See [`CategoryRemoval`].
@@ -6194,6 +6234,39 @@ mod tests {
         assert!(c.plan_merge_from(&source).unwrap().new_categories.is_empty());
         cleanup(&s_path);
         cleanup(&c_path);
+    }
+
+    #[test]
+    fn sync_types_from_records_backfills_missing_category_types() {
+        let path = tmp_path("sync-types");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // Records carrying types NOT in the editable lists (as if from an older import/merge).
+        let mut acct = sample_account("u", "p");
+        acct.account_type = "Brokerage".into();
+        acct.account_subtype = "Margin".into();
+        v.vault.accounts.push(acct);
+        let mut asset = records::AssetLiability::new().unwrap();
+        asset.asset_type = "Crypto".into();
+        v.vault.assets.push(asset);
+        // A blank type contributes nothing.
+        let mut blank = records::AssetLiability::new().unwrap();
+        blank.asset_type = "   ".into();
+        v.vault.assets.push(blank);
+        v.save().unwrap();
+
+        let added = v.sync_types_from_records().unwrap();
+        assert_eq!(added, 3, "account type + subtype + asset type");
+        assert!(v.categories().account_type_names().iter().any(|t| t == "Brokerage"));
+        assert!(v.categories().subtypes_for("Brokerage").iter().any(|s| s == "Margin"));
+        assert!(v.categories().asset.iter().any(|t| t == "Crypto"));
+        // Idempotent: a second sync adds nothing and writes nothing new.
+        assert_eq!(v.sync_types_from_records().unwrap(), 0);
+
+        // Read-only handles refuse.
+        drop(v);
+        let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        assert!(matches!(ro.sync_types_from_records(), Err(VaultError::ReadOnly)));
+        cleanup(&path);
     }
 
     /// Build a (source, current) pair where the source has a NEWER general-document record

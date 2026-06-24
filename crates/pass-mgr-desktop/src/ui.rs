@@ -1270,6 +1270,20 @@ impl App {
                     self.enter_merge();
                 }
             }
+            // Ctrl+T → sync category types from records (writable only). Like Ctrl+U, the
+            // Ctrl modifier keeps it out of the text-entry arm below.
+            KeyCode::Char('t') | KeyCode::Char('T')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if self.require_writable() {
+                    match self.vault.as_mut().map(|ov| ov.sync_types_from_records()) {
+                        Some(Ok(0)) => self.status = "Types already in sync — nothing to add.".into(),
+                        Some(Ok(n)) => self.status = format!("Added {n} type(s) from records to the lists."),
+                        Some(Err(e)) => self.status = format!("Sync failed: {e}"),
+                        None => {}
+                    }
+                }
+            }
             KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
             KeyCode::BackTab | KeyCode::Up => self.cfg_focus = (self.cfg_focus + CFG_FIELDS - 1) % CFG_FIELDS,
             // Only allow editing a field whose action is reachable in this mode: in
@@ -2953,7 +2967,7 @@ impl App {
             chunks[0],
         );
         let footer = if self.writable {
-            "Tab/↑↓ field · type to edit · Enter add/backup · Del delete type · Ctrl+U update from another vault · Esc back"
+            "Tab/↑↓ field · type edit · Enter add/backup · Del delete type · Ctrl+U update from another vault · Ctrl+T sync types · Esc back"
         } else {
             "Tab/↑↓ field · type to edit · Enter = add / backup · Del = delete type (if unused) · Esc back"
         };
@@ -5067,6 +5081,24 @@ mod tests {
         app.screen = Screen::Config;
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.screen, Screen::Config, "read-only stays on Config");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ctrl_t_syncs_category_types_from_records() {
+        let (mut app, path) = app_unlocked("sync-types");
+        {
+            let cur = app.vault.as_mut().unwrap();
+            let mut a = crate::records::Account::new().unwrap();
+            a.account_type = "Brokerage".into();
+            cur.vault.accounts.push(a);
+            cur.save().unwrap();
+            assert!(!cur.categories().account_type_names().iter().any(|t| t == "Brokerage"));
+        }
+        app.screen = Screen::Config;
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.vault.as_ref().unwrap().categories().account_type_names().iter().any(|t| t == "Brokerage"));
+        assert!(app.status.contains("Added 1 type"), "status: {}", app.status);
         cleanup(&path);
     }
 

@@ -1357,6 +1357,7 @@ impl GuiApp {
         let mut set_volume = false;
         let mut set_redundancy = false;
         let mut start_merge = false;
+        let mut sync_types = false;
         // Deferred DELETE actions: which category the user clicked × on (handled after
         // the render closures, same borrow-discipline as the add_* flags).
         let mut remove_asset: Option<String> = None;
@@ -1575,6 +1576,21 @@ impl GuiApp {
                 if ui.button("Update from another vault…").clicked() {
                     start_merge = true;
                 }
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Sync types from records").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Scan every record and add any asset/account type or subtype it uses that \
+                         is missing from the lists above — useful after pulling in records (from a \
+                         merge or import) whose types aren't yet listed here.",
+                    )
+                    .weak(),
+                );
+                if ui.button("Sync types from records").clicked() {
+                    sync_types = true;
+                }
             }
         });
 
@@ -1724,6 +1740,13 @@ impl GuiApp {
             self.reset_merge();
             self.merge_src_dir = self.vault_root.trim().to_string();
             self.screen = Screen::Merge;
+        }
+        if sync_types {
+            match self.vault.as_mut().expect("vault open on config").sync_types_from_records() {
+                Ok(0) => self.status = "Types already in sync — nothing to add.".into(),
+                Ok(n) => self.status = format!("Added {n} type(s) from records to the lists."),
+                Err(e) => self.status = format!("Sync failed: {e}"),
+            }
         }
 
         if !self.status.is_empty() {
