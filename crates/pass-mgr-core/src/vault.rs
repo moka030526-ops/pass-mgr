@@ -6067,4 +6067,81 @@ mod tests {
         cleanup(&s_path);
         cleanup(&c_path);
     }
+
+    /// Build a (source, current) pair where the source has a NEWER general-document record
+    /// (same id "gd") referencing a fresh blob, and the current has an OLDER `gd` with no
+    /// document. Returns the two vault.pmv paths. Used by the ENOSPC merge tests.
+    #[cfg(feature = "fault-injection")]
+    fn merge_pair(tag: &str) -> (PathBuf, PathBuf) {
+        let s_path = tmp_path(&format!("{tag}-src"));
+        {
+            let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+            let f = write_src(tag, b"document-bytes");
+            let blob = s.add_document("general-documents/x", "x.pdf", &f).unwrap();
+            let mut gd = records::GeneralDocument::new().unwrap();
+            gd.id = "gd".into();
+            gd.updated_at = 2000;
+            gd.file = Some(blob);
+            s.vault.general_documents.push(gd);
+            s.save().unwrap();
+            fs::remove_file(&f).ok();
+        }
+        let c_path = tmp_path(&format!("{tag}-cur"));
+        {
+            let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+            let mut gd = records::GeneralDocument::new().unwrap();
+            gd.id = "gd".into();
+            gd.updated_at = 1000;
+            gd.file = None;
+            c.vault.general_documents.push(gd);
+            c.save().unwrap();
+        }
+        (s_path, c_path)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_during_merge_blob_copy_leaves_current_unchanged_and_unpoisoned() {
+        let (s_path, c_path) = merge_pair("enospc-merge-blob");
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        let mut c = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        // The merge must copy the source's blob — make that copy hit a full disk.
+        crate::fault::fail_at("volume.write", 1);
+        let err = c.apply_merge_from(&source).unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, VaultError::Storage(_)), "blob copy fails cleanly: {err:?}");
+        // Phase 1 failed before any record mutation: in-memory record is still the old one,
+        // and the handle is NOT poisoned (nothing was committed) — a normal save still works.
+        assert_eq!(c.vault.general_documents.iter().find(|g| g.id == "gd").unwrap().updated_at, 1000);
+        c.save().expect("handle still writable (not poisoned)");
+        drop(c);
+        // On disk the older record stands and the vault reopens.
+        let re = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        assert_eq!(re.vault.general_documents.iter().find(|g| g.id == "gd").unwrap().updated_at, 1000);
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn enospc_during_merge_save_poisons_handle_and_does_not_persist() {
+        let (s_path, c_path) = merge_pair("enospc-merge-save");
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        let mut c = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        // The blob copy succeeds; the FINAL vault.pmv save hits a full disk.
+        crate::fault::fail_at("vault.write", 1);
+        let err = c.apply_merge_from(&source).unwrap_err();
+        crate::fault::clear();
+        assert!(matches!(err, VaultError::Io(_)), "the final save fails: {err:?}");
+        // The handle is POISONED so the diverged in-memory (merged) state can never be
+        // re-flushed by a later unrelated save (the #0/#3 fix).
+        assert!(matches!(c.save(), Err(VaultError::ReadOnly)), "handle poisoned after a failed merge save");
+        drop(c);
+        // The merge did NOT take on disk (the save failed): the older record stands, and the
+        // vault reopens cleanly (the copied blob is a harmless unreferenced orphan).
+        let re = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
+        assert_eq!(re.vault.general_documents.iter().find(|g| g.id == "gd").unwrap().updated_at, 1000, "merge not persisted");
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
 }

@@ -324,3 +324,79 @@ fn force_kill_during_redundant_primary_save_keeps_old() {
     assert_eq!(referenced_doc(&v), doc_one(), "the pre-save committed doc is intact");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- Cross-vault merge ("update from another vault") force-kill recovery ------
+//
+// `setup_merge` builds a current vault (older "shared" → doc-one) + a source vault
+// (newer "shared" → doc-two). `merge` applies the patch; a force-kill at each of its
+// on-disk commit steps must leave the current vault CONSISTENT — either fully merged
+// (record updated_at 2000 ⇒ doc-two) or untouched (1000 ⇒ doc-one), never half, and
+// always openable (`verify_merge` re-checks referenced⊆stored + record/doc agreement).
+
+/// A clean merge (no crash) is the control: it must actually apply.
+#[test]
+fn merge_clean_applies() {
+    let dir = tmp_dir("merge-clean");
+    assert!(run_crashop(&dir, "setup_merge", None), "setup_merge");
+    assert!(run_crashop(&dir, "merge", None), "clean merge applies");
+    // After a successful merge the record is the newer one (updated_at 2000 ⇒ doc-two).
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").unwrap();
+    let tw = v.vault.trust_wills.iter().find(|t| t.id == "shared").unwrap();
+    assert_eq!(tw.updated_at, 2000, "merge pulled the newer record");
+    assert_eq!(referenced_doc(&v), doc_two(), "the copied document is intact + referenced");
+    drop(v);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Force-kill right after the copied blob's volume frame is durable but before its
+/// manifest commit: the frame is recovered as an unreferenced orphan; the current
+/// vault still references doc-one. The merge effectively didn't happen — consistent.
+#[test]
+fn merge_force_kill_after_blob_append_recovers() {
+    let dir = tmp_dir("merge-append");
+    assert!(run_crashop(&dir, "setup_merge", None), "setup_merge");
+    assert!(!run_crashop(&dir, "merge", Some("put.after_append")), "child aborts mid blob-copy");
+    assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently");
+    // The vault is healthy enough that a fresh merge now succeeds.
+    assert!(run_crashop(&dir, "merge", None), "a retried merge applies cleanly");
+    let v = OpenVault::open(vault_pmv(&dir), b"a", b"b").unwrap();
+    assert_eq!(referenced_doc(&v), doc_two(), "retry pulled the newer doc");
+    drop(v);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Force-kill after the copied blob's manifest committed but before the vault save:
+/// doc-two is a durable orphan; the vault.pmv still has the old record → consistent.
+#[test]
+fn merge_force_kill_after_blob_commit_recovers() {
+    let dir = tmp_dir("merge-commit");
+    assert!(run_crashop(&dir, "setup_merge", None), "setup_merge");
+    assert!(!run_crashop(&dir, "merge", Some("put.after_commit")), "child aborts after blob commit");
+    assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Force-kill while the new vault.pmv is being written (temp not yet renamed): the
+/// atomic write means the OLD vault.pmv stands; the merge is lost but doc-two lingers
+/// as a harmless orphan. Consistent and openable.
+#[test]
+fn merge_force_kill_during_vault_write_recovers() {
+    let dir = tmp_dir("merge-vwrite");
+    assert!(run_crashop(&dir, "setup_merge", None), "setup_merge");
+    assert!(!run_crashop(&dir, "merge", Some("vault.write")), "child aborts during vault write");
+    assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Force-kill at the vault.pmv rename (the single commit point): recovery lands on
+/// EITHER the old vault (merge lost) OR the new vault (merge applied) — and because
+/// every copied blob was made durable BEFORE this rename, the new vault's referenced
+/// doc is present either way. `verify_merge` accepts both and rejects a half state.
+#[test]
+fn merge_force_kill_at_vault_rename_recovers() {
+    let dir = tmp_dir("merge-vrename");
+    assert!(run_crashop(&dir, "setup_merge", None), "setup_merge");
+    assert!(!run_crashop(&dir, "merge", Some("vault.rename")), "child aborts at the vault rename");
+    assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently (old OR new, never half)");
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -1190,6 +1190,69 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             }
             eprintln!("verify: OK — vault opened and the committed document is intact");
         }
+        // --- Cross-vault merge crash-safety ---------------------------------
+        // Build a CURRENT vault (a/b) holding an OLDER record "shared" referencing
+        // doc-one (0xA1), and a SOURCE vault (s/t) under <DIR>/__merge_src holding a
+        // NEWER "shared" (same id) referencing a fresh doc-two (0xB2). A merge then
+        // pulls the newer record + copies doc-two. The tiny volume cap forces the
+        // copied blob into its own partition (exercises new-volume creation on copy).
+        "setup_merge" => {
+            let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+            // CURRENT: older shared record, references doc-one.
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", params)?;
+            v.set_volume_max_size(1024)?;
+            std::fs::write(&src, body(0xA1))?;
+            let id1 = v.add_document("/w", "d1.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.id = "shared".into();
+            tw.updated_at = 1000; // OLDER — pushed directly so upsert can't restamp it to now
+            tw.file = Some(id1);
+            v.vault.trust_wills.push(tw);
+            v.save()?;
+            // SOURCE: newer shared record (same id), references doc-two.
+            let src_dir = PathBuf::from(&dir).join("__merge_src");
+            std::fs::create_dir_all(&src_dir)?;
+            let mut s = OpenVault::create(src_dir.join("vault.pmv"), b"s", b"t", params)?;
+            s.set_volume_max_size(1024)?;
+            std::fs::write(&src, body(0xB2))?;
+            let id2 = s.add_document("/w", "d2.txt", &src)?;
+            let mut tw2 = records::TrustWill::new()?;
+            tw2.id = "shared".into();
+            tw2.updated_at = 2000; // NEWER
+            tw2.file = Some(id2);
+            s.vault.trust_wills.push(tw2);
+            s.save()?;
+        }
+        // Open CURRENT writable + SOURCE read-only and apply the merge. The blob-copy
+        // (put.*) and final save (vault.*) crash points fire mid-apply.
+        "merge" => {
+            let src_dir = PathBuf::from(&dir).join("__merge_src");
+            let mut v = OpenVault::open(path, b"a", b"b")?;
+            let source = OpenVault::open_read_only(src_dir.join("vault.pmv"), b"s", b"t")?;
+            v.apply_merge_from(&source)?;
+        }
+        // Recovery check for the merge: CURRENT must open under a/b, and the "shared"
+        // record's referenced document must be CONSISTENT with the record — either the
+        // merge fully took (updated_at 2000 ⇒ doc-two) or it did not (updated_at 1000 ⇒
+        // doc-one), never a half state. OpenVault::open already enforces referenced⊆stored.
+        "verify_merge" => {
+            let v = OpenVault::open(path, b"a", b"b")
+                .map_err(|e| anyhow::anyhow!("verify_merge: current vault did not open: {e}"))?;
+            let tw = v
+                .vault
+                .trust_wills
+                .iter()
+                .find(|t| t.id == "shared")
+                .ok_or_else(|| anyhow::anyhow!("verify_merge: 'shared' record missing"))?;
+            let id = tw.file.clone().ok_or_else(|| anyhow::anyhow!("verify_merge: 'shared' has no doc"))?;
+            let got = v.read_document(&id)?;
+            let merged = tw.updated_at == 2000;
+            let expect = if merged { body(0xB2) } else { body(0xA1) };
+            if got[..] != expect[..] {
+                anyhow::bail!("verify_merge: doc mismatch for the recovered state (merged={merged})");
+            }
+            eprintln!("verify_merge: OK — consistent (merged={merged})");
+        }
         other => anyhow::bail!("crashop: unknown scenario {other:?}"),
     }
     Ok(())
