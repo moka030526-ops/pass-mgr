@@ -2771,16 +2771,27 @@ impl App {
         match result {
             Ok(report) => {
                 self.status = format!(
-                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied.{}",
+                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied; {} type(s) added.{}",
                     report.records_added,
                     report.records_updated,
                     report.blobs_copied,
+                    report.categories_added,
                     if report.records_skipped > 0 { format!(" {} skipped.", report.records_skipped) } else { String::new() },
                 );
                 self.reset_merge();
                 self.screen = Screen::Config;
             }
-            Err(e) => self.merge_error = Some(format!("Update failed: {e}")),
+            Err(e) => {
+                // A failed apply may have poisoned the handle (the in-memory merge can no
+                // longer be saved). Drop it and return to unlock so reopening loads the clean
+                // on-disk vault — mirrors the change-password recovery path. Nothing committed
+                // is lost (the merge did not persist; prior edits were already saved).
+                self.vault = None;
+                self.reset_merge();
+                self.auth = AuthState::new(AuthMode::Unlock);
+                self.auth.error = Some(format!("Update interrupted: {e}. Unlock again to recover."));
+                self.screen = Screen::Auth;
+            }
         }
     }
 
@@ -3020,6 +3031,12 @@ impl App {
                         for b in &plan.blobs {
                             let tag = if b.already_present { "here" } else { "copy" };
                             lines.push(Line::from(format!("    [{tag}] {} ({} bytes)  {}", b.id, b.size, b.path)));
+                        }
+                    }
+                    if !plan.new_categories.is_empty() {
+                        lines.push(Line::from("  category types to add (so the merged types show in Config):"));
+                        for c in &plan.new_categories {
+                            lines.push(Line::from(format!("    + {c}")));
                         }
                     }
                     if !plan.skipped.is_empty() {
@@ -5051,5 +5068,55 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.screen, Screen::Config, "read-only stays on Config");
         cleanup(&path);
+    }
+
+    /// A full disk during the merge's final save poisons the handle; the front-end must
+    /// drop the vault and return to the unlock screen so reopening loads the clean on-disk
+    /// vault (the merge did not persist).
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn merge_apply_save_failure_drops_handle_to_unlock() {
+        let s_path = tmp_vault("merge-poison-src");
+        let s_dir = s_path.parent().unwrap().to_path_buf();
+        {
+            let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+            let f = std::env::temp_dir().join(format!("pmtui-poison-{}.txt", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::write(&f, b"doc-bytes").unwrap();
+            let blob = s.add_document("general-documents/x", "x.pdf", &f).unwrap();
+            let mut gd = crate::records::GeneralDocument::new().unwrap();
+            gd.id = "gd".into();
+            gd.updated_at = 2000;
+            gd.file = Some(blob);
+            s.vault.general_documents.push(gd);
+            s.save().unwrap();
+        }
+        let (mut app, c_path) = app_unlocked("merge-poison-cur");
+        {
+            let cur = app.vault.as_mut().unwrap();
+            let mut gd = crate::records::GeneralDocument::new().unwrap();
+            gd.id = "gd".into();
+            gd.updated_at = 1000;
+            gd.file = None;
+            cur.vault.general_documents.push(gd);
+            cur.save().unwrap();
+        }
+        app.screen = Screen::Config;
+        app.merge_src_dir = s_dir.display().to_string();
+        app.merge_pw1 = "s1".into();
+        app.merge_pw2 = "s2".into();
+        app.merge_preview();
+        assert!(app.merge_plan.is_some(), "preview built");
+        // The blob copy succeeds; the FINAL vault.pmv save hits a full disk → poison.
+        crate::fault::fail_at("vault.write", 1);
+        app.merge_apply();
+        crate::fault::clear();
+        assert!(app.vault.is_none(), "poisoned handle dropped");
+        assert_eq!(app.screen, Screen::Auth, "returned to the unlock screen");
+        assert!(app.auth.error.as_deref().unwrap_or("").contains("interrupted"), "recovery message shown");
+        // The on-disk vault is the clean old one: it reopens and the merge did NOT persist.
+        let re = OpenVault::open(c_path.clone(), b"a", b"b").unwrap();
+        assert_eq!(re.vault.general_documents.iter().find(|g| g.id == "gd").unwrap().updated_at, 1000, "merge not persisted");
+        cleanup(&s_path);
+        cleanup(&c_path);
     }
 }

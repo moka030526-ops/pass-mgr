@@ -1826,6 +1826,13 @@ impl GuiApp {
                             ui.label(format!("  [{tag}] {} ({} bytes)", b.path, b.size));
                         }
                     }
+                    if !plan.new_categories.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Category types to add (so the merged types show in Config)").strong());
+                        for c in &plan.new_categories {
+                            ui.label(format!("  + {c}"));
+                        }
+                    }
                     if !plan.skipped.is_empty() {
                         ui.add_space(8.0);
                         ui.colored_label(egui::Color32::from_rgb(190, 120, 50), "Skipped (not applied):");
@@ -1929,16 +1936,29 @@ impl GuiApp {
         match result {
             Ok(report) => {
                 self.status = format!(
-                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied.{}",
+                    "Updated from another vault: {} new, {} updated record(s); {} document(s) copied; {} type(s) added.{}",
                     report.records_added,
                     report.records_updated,
                     report.blobs_copied,
+                    report.categories_added,
                     if report.records_skipped > 0 { format!(" {} skipped.", report.records_skipped) } else { String::new() },
                 );
                 self.reset_merge();
                 self.screen = Screen::Config;
             }
-            Err(e) => self.merge_error = Some(format!("Update failed: {e}")),
+            Err(e) => {
+                // A failed apply may have poisoned the handle (the in-memory merge can no
+                // longer be saved — see apply_merge_from's save-failure poisoning). Drop it
+                // and return to the unlock screen so reopening loads the clean on-disk vault,
+                // mirroring the change-password recovery path. Nothing committed is lost: the
+                // merge did not persist, and any prior edits were already saved.
+                self.vault = None;
+                self.reset_merge();
+                self.auth_mode = AuthMode::Unlock;
+                self.screen = Screen::Auth;
+                self.wipe_passwords();
+                self.auth_error = Some(format!("Update interrupted: {e}. Unlock again to recover."));
+            }
         }
     }
 

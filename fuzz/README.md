@@ -12,6 +12,13 @@ only ever produce `Ok`/`Err` — never a panic, hang, or unbounded allocation.**
 | `parse_frame` | `storage::fuzz::frame` → `parse_plaintext` | the length-prefixed decrypted volume frame `[id_len][id][path_len][path][bytes]` (highest OOB/over-alloc risk) |
 | `parse_manifest` | `storage::fuzz::manifest` → `serde_json::from_slice::<Manifest>` | the decrypted manifest JSON |
 | `scan_volume` | `storage::fuzz::scan_volume` → `scan_volume` | the volume rebuild path (frame length prefix + bounds + seek/advance) over arbitrary bytes |
+| `doc_paths` | `records::{doc_slug,doc_filename,doc_upload_dir}` | virtual-path sanitization invariants over arbitrary subfolder/filename strings |
+| `merge_from` | `OpenVault::plan_merge_from` + `apply_merge_from` | the cross-vault merge over an attacker-shaped SOURCE vault (arbitrary record ids / `updated_at` / duplicates + a document). Invariant: the destination always reopens (never corrupted) and nothing panics |
+
+> **Note on `merge_from`:** unlike the pure-parser targets (millions of execs/min), this one
+> builds two real encrypted vaults and runs a full merge per iteration, so it does real crypto
+> + disk I/O and runs at roughly **1–10 exec/s**. Budget more wall-clock (or fewer execs)
+> accordingly; it complements — does not replace — the `parse_*` parser coverage.
 
 ## Run
 

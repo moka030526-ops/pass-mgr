@@ -50,5 +50,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "merge_from"
+path = "fuzz_targets/merge_from.rs"
+test = false
+doc = false
+bench = false
+
 # Keep the fuzz crate out of the parent workspace; it is its own package.
 [workspace]

@@ -32,6 +32,14 @@ date and bump the crate versions to match.
     add-only (every referenced blob is durable before the `vault.pmv` that references it), the
     source vault is opened read-only with its errors collapsed (no password-correctness
     oracle), and records that depend on a locally-deleted (tombstoned) document are skipped.
+  - **Category reconciliation:** a merged record's `asset_type`/`account_type`/`subtype` that
+    the destination's lists lack is added to them (previewed + counted), so the merged types
+    show up in **Config** and the dropdowns instead of being invisible.
+  - **Hardening:** the apply checks `referenced ⊆ stored` *before* mutating and poisons the
+    handle on a save failure (so a never-committed merge can't be re-flushed); the GUI/TUI drop
+    a poisoned handle back to the unlock screen. Verified by fault-injection crash-recovery
+    tests (force-kill at each commit step, incl. redundancy), in-process ENOSPC tests, a
+    `merge_from` fuzz target, and `cargo-mutants` (0 missed on `merge.rs`).
 - **Mobile apps.** Native Android and iOS apps (Compose Multiplatform UI over the
   audited core via a UniFFI/Gobley FFI). Read-only viewer surface: open with the two
   passwords, browse the tabs, view a record, read its history. The Android APK builds

@@ -295,6 +295,16 @@ impl WriteLock {
     }
 }
 
+// With the lock feature ON, `WriteLock` owns an `fs::File` whose own `Drop` releases the
+// OS lock, so the struct already has drop glue and explicit `drop(lock)` is meaningful. With
+// the feature OFF the struct is empty and has none, which makes `drop(lock)` a `clippy::
+// drop_non_drop` lint (and reads as a no-op). Give the disabled build a trivial `Drop` so
+// every explicit `drop(lock)` / lock-release site compiles and reads the same on both configs.
+#[cfg(not(feature = "single-writer-lock"))]
+impl Drop for WriteLock {
+    fn drop(&mut self) {}
+}
+
 // The main API surface of the vault: all the public operations live as methods here.
 impl OpenVault {
     /// Create a brand-new vault in the directory containing `path`
@@ -1337,6 +1347,50 @@ impl OpenVault {
         self.plan_collection(crate::merge::RecordKind::GeneralDocument, &self.vault.general_documents, &source.vault.general_documents, |r| r.file.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
 
         plan.blobs = blobs.into_values().collect();
+
+        // Reconcile category TYPES: collect the asset/account types + subtypes the to-apply
+        // records use that this vault's editable lists lack. Without this, a merged record's
+        // type wouldn't appear in Config or the dropdowns. Read-only here; `apply` adds them.
+        let cats = &self.vault.categories;
+        let mut seen_cat: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let accepted_ids = |kind: crate::merge::RecordKind| -> std::collections::HashSet<&str> {
+            plan.records.iter().filter(|r| r.kind == kind).map(|r| r.id.as_str()).collect()
+        };
+        let asset_ids = accepted_ids(crate::merge::RecordKind::Asset);
+        for a in &source.vault.assets {
+            if !asset_ids.contains(a.id.as_str()) {
+                continue;
+            }
+            let t = a.asset_type.trim();
+            if !t.is_empty()
+                && !cats.asset.iter().any(|x| x.eq_ignore_ascii_case(t))
+                && seen_cat.insert(format!("a\u{1f}{}", t.to_lowercase()))
+            {
+                plan.new_categories.push(format!("asset type \u{201c}{t}\u{201d}"));
+            }
+        }
+        let acct_ids = accepted_ids(crate::merge::RecordKind::Account);
+        for a in &source.vault.accounts {
+            if !acct_ids.contains(a.id.as_str()) {
+                continue;
+            }
+            let t = a.account_type.trim();
+            if !t.is_empty() {
+                if !cats.account.iter().any(|x| x.name.eq_ignore_ascii_case(t))
+                    && seen_cat.insert(format!("c\u{1f}{}", t.to_lowercase()))
+                {
+                    plan.new_categories.push(format!("account type \u{201c}{t}\u{201d}"));
+                }
+                let st = a.account_subtype.trim();
+                if !st.is_empty()
+                    && !cats.subtypes_for(t).iter().any(|x| x.eq_ignore_ascii_case(st))
+                    && seen_cat.insert(format!("s\u{1f}{}\u{1f}{}", t.to_lowercase(), st.to_lowercase()))
+                {
+                    plan.new_categories.push(format!("subtype \u{201c}{st}\u{201d} under \u{201c}{t}\u{201d}"));
+                }
+            }
+        }
+
         Ok(plan)
     }
 
@@ -1461,13 +1515,43 @@ impl OpenVault {
         report.records_updated = u1 + u2 + u3 + u4 + u5 + u6 + u7;
         report.records_skipped = plan.skipped.len();
 
+        // (2b) Reconcile category TYPES so the merged records' asset/account types + subtypes
+        // appear in Config and the dropdowns (the lists' add_* are case-insensitive dedup, and
+        // the subtype add finds the type just added above). Persisted by the single save below.
+        let asset_ids = accepted(crate::merge::RecordKind::Asset);
+        for a in &source.vault.assets {
+            if !asset_ids.contains(a.id.as_str()) {
+                continue;
+            }
+            let t = a.asset_type.trim();
+            if !t.is_empty() && self.vault.categories.add_asset_type(t) {
+                report.categories_added += 1;
+            }
+        }
+        let acct_ids = accepted(crate::merge::RecordKind::Account);
+        for a in &source.vault.accounts {
+            if !acct_ids.contains(a.id.as_str()) {
+                continue;
+            }
+            let t = a.account_type.trim();
+            if !t.is_empty() {
+                if self.vault.categories.add_account_type(t) {
+                    report.categories_added += 1;
+                }
+                let st = a.account_subtype.trim();
+                if !st.is_empty() && self.vault.categories.add_account_subtype(t, st) {
+                    report.categories_added += 1;
+                }
+            }
+        }
+
         // Vault-level audit entry — counts only, no record contents or document ids.
         let short = plan.source_vault_id.get(..8).unwrap_or(plan.source_vault_id.as_str());
         self.vault.audit.push(records::Change::new(
             "merged",
             format!(
-                "from vault {short}: {} new, {} updated, {} document(s) copied",
-                report.records_added, report.records_updated, report.blobs_copied
+                "from vault {short}: {} new, {} updated, {} document(s) copied, {} type(s) added",
+                report.records_added, report.records_updated, report.blobs_copied, report.categories_added
             ),
         ));
 
@@ -6064,6 +6148,50 @@ mod tests {
         source.vault.id = "ab\u{202e}cd".into();
         let err = c.plan_merge_from(&source).unwrap_err();
         assert!(matches!(err, VaultError::Storage(StorageError::Corrupt(_))), "got {err:?}");
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_reconciles_category_types_into_config_lists() {
+        // SOURCE: an account with a NOVEL type+subtype and an asset with a NOVEL type — none
+        // present in the destination's editable category lists.
+        let s_path = tmp_path("merge-cats-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a = sample_account("alice", "pw");
+        a.id = "acct-x".into();
+        a.title = "X".into();
+        a.owner = "o".into();
+        a.account_type = "Brokerage".into();
+        a.account_subtype = "Margin".into();
+        a.updated_at = 9;
+        s.vault.accounts.push(a);
+        let mut asset = records::AssetLiability::new().unwrap();
+        asset.id = "asset-x".into();
+        asset.asset_type = "Crypto".into();
+        asset.updated_at = 9;
+        s.vault.assets.push(asset);
+        s.save().unwrap();
+
+        let c_path = tmp_path("merge-cats-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        // Sanity: the destination's lists do NOT have these types yet.
+        assert!(!c.categories().account_type_names().iter().any(|t| t == "Brokerage"));
+        assert!(!c.categories().asset.iter().any(|t| t == "Crypto"));
+
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+        // The plan previews the new types that will be added.
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert_eq!(plan.new_categories.len(), 3, "account type + subtype + asset type: {:?}", plan.new_categories);
+
+        let report = c.apply_merge_from(&source).unwrap();
+        assert_eq!(report.categories_added, 3);
+        // The types now appear in the editable Config lists + the subtype is under its type.
+        assert!(c.categories().account_type_names().iter().any(|t| t == "Brokerage"));
+        assert!(c.categories().subtypes_for("Brokerage").iter().any(|s| s == "Margin"));
+        assert!(c.categories().asset.iter().any(|t| t == "Crypto"));
+        // Idempotent: a re-merge adds nothing more.
+        assert!(c.plan_merge_from(&source).unwrap().new_categories.is_empty());
         cleanup(&s_path);
         cleanup(&c_path);
     }

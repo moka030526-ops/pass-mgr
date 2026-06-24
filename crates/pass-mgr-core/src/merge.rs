@@ -126,6 +126,10 @@ pub struct MergePlan {
     pub blobs: Vec<PlannedBlob>,
     /// Records selected by recency but blocked (e.g. depend on a locally-deleted document).
     pub skipped: Vec<SkippedRecord>,
+    /// Editable **category types** (asset types, account types, account subtypes) that the
+    /// applied records use but that this vault's lists lack — they will be added so the
+    /// merged records' types show up in Config and the dropdowns. Human-readable descriptions.
+    pub new_categories: Vec<String>,
     /// The source vault's id (non-secret) — shown in the preview and recorded in the audit log.
     pub source_vault_id: String,
 }
@@ -163,6 +167,9 @@ pub struct MergeReport {
     pub records_skipped: usize,
     pub blobs_copied: usize,
     pub bytes_copied: u64,
+    /// Editable category types (asset/account types + subtypes) added so the merged
+    /// records' types appear in Config and the dropdowns.
+    pub categories_added: usize,
 }
 
 /// A source record selected by the recency diff: its index in the source collection,
@@ -317,22 +324,52 @@ mod tests {
 
     #[test]
     fn plan_counters() {
+        let rec = |change| PlannedRecord {
+            kind: RecordKind::Account,
+            change,
+            id: "x".into(),
+            label: "x".into(),
+            current_updated_at: None,
+            source_updated_at: 9,
+        };
+        // Deliberately use counts that are NOT 1, so a "always return 1" mutation of any
+        // counter is caught (and not just "always 0").
         let plan = MergePlan {
-            records: vec![
-                PlannedRecord { kind: RecordKind::Account, change: ChangeKind::New, id: "1".into(), label: "x".into(), current_updated_at: None, source_updated_at: 5 },
-                PlannedRecord { kind: RecordKind::Account, change: ChangeKind::Updated, id: "2".into(), label: "y".into(), current_updated_at: Some(1), source_updated_at: 9 },
-            ],
+            records: vec![rec(ChangeKind::New), rec(ChangeKind::New), rec(ChangeKind::Updated), rec(ChangeKind::Updated)],
             blobs: vec![
                 PlannedBlob { id: "b1".into(), path: "/a".into(), size: 10, already_present: false },
-                PlannedBlob { id: "b2".into(), path: "/b".into(), size: 7, already_present: true },
+                PlannedBlob { id: "b2".into(), path: "/b".into(), size: 4, already_present: false },
+                PlannedBlob { id: "b3".into(), path: "/c".into(), size: 7, already_present: true },
             ],
             skipped: vec![],
+            new_categories: vec![],
             source_vault_id: "vid".into(),
         };
         assert!(!plan.is_empty());
-        assert_eq!(plan.new_count(), 1);
-        assert_eq!(plan.updated_count(), 1);
-        assert_eq!(plan.blobs_to_copy(), 1);
-        assert_eq!(plan.bytes_to_copy(), 10);
+        assert_eq!(plan.new_count(), 2);
+        assert_eq!(plan.updated_count(), 2);
+        assert_eq!(plan.blobs_to_copy(), 2, "only the two not-already-present blobs");
+        assert_eq!(plan.bytes_to_copy(), 14, "10 + 4, excluding the already-present blob");
+        // An empty plan reports empty + zero counts (kills "always 1"/"always non-empty").
+        let empty = MergePlan::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.new_count(), 0);
+        assert_eq!(empty.updated_count(), 0);
+        assert_eq!(empty.blobs_to_copy(), 0);
+        assert_eq!(empty.bytes_to_copy(), 0);
+    }
+
+    #[test]
+    fn kind_and_change_display_strings() {
+        // Pin the human-readable labels so a mutated `as_str` (empty / garbage) is caught.
+        assert_eq!(RecordKind::Instruction.as_str(), "Instruction");
+        assert_eq!(RecordKind::TrustWill.as_str(), "Trust & Will");
+        assert_eq!(RecordKind::Asset.as_str(), "Asset/Liability");
+        assert_eq!(RecordKind::Account.as_str(), "Account");
+        assert_eq!(RecordKind::RealEstate.as_str(), "Real Estate");
+        assert_eq!(RecordKind::TaxFiling.as_str(), "Tax filing");
+        assert_eq!(RecordKind::GeneralDocument.as_str(), "General document");
+        assert_eq!(ChangeKind::New.as_str(), "new");
+        assert_eq!(ChangeKind::Updated.as_str(), "updated");
     }
 }

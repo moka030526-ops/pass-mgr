@@ -400,3 +400,15 @@ fn merge_force_kill_at_vault_rename_recovers() {
     assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently (old OR new, never half)");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// With redundancy enabled on the destination, force-kill the merge while it rotates the
+/// generation ring (which runs AFTER the authoritative primary commit). The merged primary
+/// is durable, so recovery lands on the merged vault with an intact (if not-yet-ringed) state.
+#[test]
+fn merge_redundant_force_kill_at_ring_rotate_recovers() {
+    let dir = tmp_dir("merge-redun");
+    assert!(run_crashop(&dir, "setup_merge_redundant", None), "setup_merge_redundant");
+    assert!(!run_crashop(&dir, "merge", Some("redundancy.rotate")), "child aborts at the ring rotate");
+    assert!(run_crashop(&dir, "verify_merge", None), "current recovers consistently");
+    std::fs::remove_dir_all(&dir).ok();
+}

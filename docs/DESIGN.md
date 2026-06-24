@@ -574,6 +574,14 @@ re-encrypts the plaintext under the **destination** key + vault id with a fresh 
 cross-vault frame is never byte-copied (the AAD binds each frame to its vault id, §6.2).
 A blob already present in the destination is left as-is (skipped).
 
+**Category reconciliation.** A merged record may carry an `asset_type`/`account_type`/
+`account_subtype` that the destination's editable category lists (§4.2) lack — without
+reconciliation that type would be invisible in Config and unselectable in the dropdowns.
+So `apply_merge_from` also adds, into the destination `TypeLists`, any such type/subtype used
+by an applied record (case-insensitive dedup via `add_asset_type`/`add_account_type`/
+`add_account_subtype`); the preview lists them up front (`MergePlan.new_categories`) and the
+report counts them. This is the only place the merge mutates anything beyond records + blobs.
+
 **Crash-safety — add-only, no staged rewrite.** Unlike `compact`/rekey (§12.3), the merge
 **adds** blobs and **replaces** records but never removes or rewrites an existing blob, so it
 does **not** need the staged `.rekey/`→READY→roll-forward machinery. `apply_merge_from`

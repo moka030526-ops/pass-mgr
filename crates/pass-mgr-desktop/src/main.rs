@@ -844,11 +844,12 @@ fn cli_update_from(other_dir: PathBuf, current_path: PathBuf, dry_run: bool) -> 
     }
     let report = current.apply_merge_from(&source)?;
     eprintln!(
-        "Applied: {} new, {} updated record(s); {} document(s) copied ({} bytes).{}",
+        "Applied: {} new, {} updated record(s); {} document(s) copied ({} bytes); {} type(s) added.{}",
         report.records_added,
         report.records_updated,
         report.blobs_copied,
         report.bytes_copied,
+        report.categories_added,
         if report.records_skipped > 0 { format!(" {} record(s) skipped.", report.records_skipped) } else { String::new() },
     );
     Ok(())
@@ -886,6 +887,12 @@ fn print_merge_plan(plan: &pass_mgr::merge::MergePlan, dry: bool) {
         for b in &plan.blobs {
             let state = if b.already_present { "present" } else { "copy" };
             eprintln!("    [{state}] {} ({} bytes)  {}", b.id, b.size, b.path);
+        }
+    }
+    if !plan.new_categories.is_empty() {
+        eprintln!("  category types to add (so the merged records' types show in Config):");
+        for c in &plan.new_categories {
+            eprintln!("    + {c}");
         }
     }
     if !plan.skipped.is_empty() {
@@ -1223,8 +1230,37 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             s.vault.trust_wills.push(tw2);
             s.save()?;
         }
+        // Like `setup_merge`, but the CURRENT vault has in-place redundancy (depth 2), so the
+        // merge's final save runs the §12.8 mirror + generation-ring writes — exercising the
+        // redundancy.* crash points (which fire AFTER the authoritative primary commit).
+        "setup_merge_redundant" => {
+            let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", params)?;
+            v.set_volume_max_size(1024)?;
+            v.set_redundancy(2)?;
+            std::fs::write(&src, body(0xA1))?;
+            let id1 = v.add_document("/w", "d1.txt", &src)?;
+            let mut tw = records::TrustWill::new()?;
+            tw.id = "shared".into();
+            tw.updated_at = 1000;
+            tw.file = Some(id1);
+            v.vault.trust_wills.push(tw);
+            v.save()?;
+            let src_dir = PathBuf::from(&dir).join("__merge_src");
+            std::fs::create_dir_all(&src_dir)?;
+            let mut s = OpenVault::create(src_dir.join("vault.pmv"), b"s", b"t", params)?;
+            s.set_volume_max_size(1024)?;
+            std::fs::write(&src, body(0xB2))?;
+            let id2 = s.add_document("/w", "d2.txt", &src)?;
+            let mut tw2 = records::TrustWill::new()?;
+            tw2.id = "shared".into();
+            tw2.updated_at = 2000;
+            tw2.file = Some(id2);
+            s.vault.trust_wills.push(tw2);
+            s.save()?;
+        }
         // Open CURRENT writable + SOURCE read-only and apply the merge. The blob-copy
-        // (put.*) and final save (vault.*) crash points fire mid-apply.
+        // (put.*) and final save (vault.*/redundancy.*) crash points fire mid-apply.
         "merge" => {
             let src_dir = PathBuf::from(&dir).join("__merge_src");
             let mut v = OpenVault::open(path, b"a", b"b")?;
