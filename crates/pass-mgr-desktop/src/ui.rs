@@ -4706,6 +4706,88 @@ mod tests {
     }
 
     #[test]
+    fn grouped_and_flat_views_show_the_same_record_set() {
+        // Differential property: for any records + filters, the grouped tree (fully expanded)
+        // and the flat list must contain EXACTLY the same record ids — the two code paths
+        // must never disagree about which records are shown.
+        use std::collections::HashSet;
+        let (mut app, path) = app_unlocked("uidiff");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let owners = ["", "Alice", "Bob"];
+            let types = ["", "Bank", "Crypto"];
+            let subs = ["", "Checking"];
+            let kinds = ["Asset", "Liability"];
+            for i in 0..24usize {
+                let mut a = Account::new().unwrap();
+                a.owner = owners[i % owners.len()].into();
+                a.account_type = types[(i / 3) % types.len()].into();
+                a.account_subtype = subs[i % subs.len()].into();
+                a.title = format!("t{i}");
+                a.review = i % 4 == 0;
+                records::upsert(&mut v.accounts, a);
+                let mut as_ = AssetLiability::new().unwrap();
+                as_.owner = owners[i % owners.len()].into();
+                as_.kind = kinds[i % kinds.len()].into();
+                as_.asset_type = types[i % types.len()].into();
+                as_.review = i % 3 == 0;
+                records::upsert(&mut v.assets, as_);
+            }
+        }
+
+        // Helper: fully expand the current tab's tree, then return the leaf-id set.
+        fn expanded_leaf_ids(app: &mut App) -> HashSet<String> {
+            loop {
+                let collapsed: Vec<Vec<String>> = app
+                    .grouped_rows()
+                    .iter()
+                    .filter_map(|r| match &r.kind {
+                        AcctRowKind::Group { path, expanded: false } => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if collapsed.is_empty() {
+                    break;
+                }
+                for p in collapsed {
+                    app.toggle_group_expanded(p);
+                }
+            }
+            app.grouped_rows()
+                .iter()
+                .filter_map(|r| match &r.kind {
+                    AcctRowKind::Leaf { id } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Accounts: across several filter combinations, grouped == flat.
+        app.tab = Tab::Accounts;
+        app.acct_grouped = true;
+        for (ft, rev) in [(None, false), (Some("Bank".to_string()), false), (None, true)] {
+            app.acct_filter_type = ft.clone();
+            app.acct_filter_review = rev;
+            app.acct_expanded.clear();
+            let grouped = expanded_leaf_ids(&mut app);
+            let flat: HashSet<String> = app.current_labels().into_iter().map(|(id, _)| id).collect();
+            assert_eq!(grouped, flat, "accounts grouped vs flat diverged (type={ft:?}, review={rev})");
+        }
+
+        // Assets: with and without the review filter, grouped == flat.
+        app.tab = Tab::Assets;
+        app.asset_grouped = true;
+        for rev in [false, true] {
+            app.asset_filter_review = rev;
+            app.asset_expanded.clear();
+            let grouped = expanded_leaf_ids(&mut app);
+            let flat: HashSet<String> = app.current_labels().into_iter().map(|(id, _)| id).collect();
+            assert_eq!(grouped, flat, "assets grouped vs flat diverged (review={rev})");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn tui_assets_grouped_tree_expands_then_edits_leaf() {
         let (mut app, path) = app_unlocked("uiassettree");
         let want_id = {
