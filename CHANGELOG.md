@@ -62,6 +62,9 @@ date and bump the crate versions to match.
   - **Trim all fields** — every field of **every record type** (all tabs, secrets
     included) is left/right-trimmed on save, plus a one-off bulk-trim action that
     sweeps the whole vault (history-recorded).
+- **Assets/Liabilities: Title field** — a short title, shown under **Owner** in the editor
+  (GUI + TUI) and used as the list label when set (falling back to the description). Additive
+  and `#[serde(default)]`, so older vaults load unchanged; also surfaced over the mobile FFI.
 - **Start-page vault picker** — the unlock/create screen now selects a vault by **root +
   a collapsed "Vault" control** instead of a free-form directory path. An editable **Vault
   root** is scanned one level deep (`launch::discover_vaults` lists immediate sub-directories

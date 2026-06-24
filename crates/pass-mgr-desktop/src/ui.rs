@@ -1585,6 +1585,7 @@ impl App {
                         Field::choice("Asset/Liability", r.kind.clone(), vec!["Asset".into(), "Liability".into()]),
                         Field::multiline("Description", r.description.clone()),
                         Field::text("Owner", r.owner.clone()),
+                        Field::text("Title", r.title.clone()),
                         Field::text("Beneficiary", r.beneficiary.clone()),
                         Field::text("Approx. value", r.approx_value.clone()),
                         Field::text("As-of date", r.as_of_date.clone()),
@@ -2421,14 +2422,15 @@ impl App {
                 r.kind = f(0);
                 r.description = f(1);
                 r.owner = f(2);
-                r.beneficiary = f(3);
-                r.approx_value = f(4);
-                r.as_of_date = f(5);
-                r.institution = f(6);
-                r.asset_type = f(7);
-                r.url = f(8);
+                r.title = f(3);
+                r.beneficiary = f(4);
+                r.approx_value = f(5);
+                r.as_of_date = f(6);
+                r.institution = f(7);
+                r.asset_type = f(8);
+                r.url = f(9);
                 // The "Review" Choice stores "Yes"/"No"; compare to get a bool.
-                r.review = f(9) == "Yes";
+                r.review = f(10) == "Yes";
                 r.statement = es.attached_file_id.clone();
                 r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.assets, r);

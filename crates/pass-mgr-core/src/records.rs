@@ -742,6 +742,11 @@ pub struct AssetLiability {
     pub kind: String,
     pub description: String,
     pub owner: String,
+    /// Short title/name for the entry (shown under Owner in the editor and used as the
+    /// list label when set). Added after `owner`; `#[serde(default)]` keeps older vaults
+    /// (which lack it) loadable — the field defaults to "".
+    #[serde(default)]
+    pub title: String,
     pub approx_value: String,
     pub as_of_date: String,
     pub institution: String,
@@ -1085,6 +1090,7 @@ impl_record!(
         track(out, at, "kind", &s.kind, &n.kind);
         track(out, at, "description", &s.description, &n.description);
         track(out, at, "owner", &s.owner, &n.owner);
+        track(out, at, "title", &s.title, &n.title);
         track(out, at, "approx_value", &s.approx_value, &n.approx_value);
         track(out, at, "as_of_date", &s.as_of_date, &n.as_of_date);
         track(out, at, "institution", &s.institution, &n.institution);
@@ -1097,9 +1103,16 @@ impl_record!(
         }
     },
     |l: &AssetLiability| {
-        // `.as_str()` borrows the String as a `&str` so both arms have the same
+        // Prefer the (new) title for the list label; fall back to the description, then a
+        // placeholder. `.as_str()` borrows the String as a `&str` so every arm has the same
         // type (the literal is already a `&str`); no allocation happens here.
-        let d = if l.description.is_empty() { "(no description)" } else { l.description.as_str() };
+        let d = if !l.title.is_empty() {
+            l.title.as_str()
+        } else if !l.description.is_empty() {
+            l.description.as_str()
+        } else {
+            "(no description)"
+        };
         format!("[{}] {d}", l.kind)
     },
     |r: &mut AssetLiability| {
@@ -1107,6 +1120,7 @@ impl_record!(
             &mut r.kind,
             &mut r.description,
             &mut r.owner,
+            &mut r.title,
             &mut r.approx_value,
             &mut r.as_of_date,
             &mut r.institution,
@@ -1488,11 +1502,33 @@ mod tests {
         al.kind = "Liability".into();
         al.description = "Mortgage".into();
         assert_eq!(al.label(), "[Liability] Mortgage");
+        // A title (the new field) takes precedence over the description in the label.
+        al.title = "Beach house loan".into();
+        assert_eq!(al.label(), "[Liability] Beach house loan");
 
         let re = RealEstate::new().unwrap();
         assert_eq!(re.label(), "(no address)");
         let tw = TrustWill::new().unwrap();
         assert_eq!(tw.label(), "(untitled)");
+    }
+
+    #[test]
+    fn asset_title_diffs_trims_and_round_trips() {
+        // An edit that sets the title records a "title" history entry (and nothing leaks
+        // a secret — there are none here).
+        let mut old = AssetLiability::new().unwrap();
+        old.owner = "Bob".into();
+        let mut new = old.clone();
+        new.title = "  Vanguard IRA  ".into();
+        let changes = old.diff(&new, 1);
+        assert!(changes.iter().any(|c| c.detail.starts_with("title:")), "title change tracked: {changes:?}");
+        // trim_fields trims the title in place.
+        new.trim_fields();
+        assert_eq!(new.title, "Vanguard IRA");
+        // upsert round-trips the title through a record list.
+        let mut list: Vec<AssetLiability> = Vec::new();
+        upsert(&mut list, new.clone());
+        assert_eq!(list[0].title, "Vanguard IRA");
     }
 
     #[test]

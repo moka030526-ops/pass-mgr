@@ -2199,6 +2199,9 @@ impl GuiApp {
                     ui.label("Owner");
                     field_singleline(ui, &mut r.owner, w, 420.0);
                     ui.end_row();
+                    ui.label("Title");
+                    field_singleline(ui, &mut r.title, w, 420.0);
+                    ui.end_row();
                     ui.label("Beneficiary");
                     field_singleline(ui, &mut r.beneficiary, w, 420.0);
                     ui.end_row();
