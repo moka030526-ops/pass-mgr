@@ -63,3 +63,6 @@ clipboard = ["dep:arboard"]
 # points. OFF by default. Enable with:
 #   cargo test -p pass-mgr -p pass-mgr-core --features pass-mgr/fault-injection
 fault-injection = ["pass-mgr-core/fault-injection"]
+
+[dev-dependencies]
+egui_kittest = "0.34"

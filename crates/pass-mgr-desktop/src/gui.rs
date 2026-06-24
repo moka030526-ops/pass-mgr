@@ -4641,3 +4641,92 @@ mod tests {
         cleanup(&c_path);
     }
 }
+
+// Headless egui-driven verification (egui_kittest): runs the REAL `render_acct_node`
+// through a real egui Context + accesskit, simulates a real click, and observes widget
+// visibility — i.e. drives the actual GUI surface without a window.
+#[cfg(test)]
+mod kittest_tests {
+    use super::render_acct_node;
+    use crate::records::{AccountLeaf, AcctNode};
+    use eframe::egui;
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    fn one_group_tree(group: &str, leaf_id: &str, leaf_title: &str) -> AcctNode {
+        AcctNode {
+            label: String::new(),
+            children: vec![AcctNode {
+                label: group.into(),
+                children: vec![],
+                leaves: vec![AccountLeaf { id: leaf_id.into(), title: leaf_title.into() }],
+            }],
+            leaves: vec![],
+        }
+    }
+
+    // The PRE-FIX render: id_salt WITHOUT the per-tree `kind` discriminant (used as a negative
+    // control to prove the test actually detects the shared-state bug).
+    fn render_buggy(ui: &mut egui::Ui, node: &AcctNode, path: &mut Vec<String>) {
+        for child in &node.children {
+            path.push(child.label.clone());
+            egui::CollapsingHeader::new(&child.label)
+                .id_salt(("group_node", path.as_slice()))
+                .show(ui, |ui| render_buggy(ui, child, path));
+            path.pop();
+        }
+        for leaf in &node.leaves {
+            let _ = ui.selectable_label(false, &leaf.title);
+        }
+    }
+
+    #[test]
+    fn grouped_account_and_asset_trees_expand_independently_in_real_egui() {
+        // Both trees share the group label "Bob" but have uniquely-labelled leaves, so a leaf
+        // being visible tells us exactly which tree's "Bob" is expanded.
+        use std::cell::Cell;
+        let acct = one_group_tree("Bob", "a1", "acct-leaf");
+        let asset = one_group_tree("Bob", "s1", "asset-leaf");
+        let labels: Vec<(String, String)> = vec![];
+
+        // Faithfully model the real bug, which is CROSS-TAB: only one tab renders per frame, but
+        // both share the same egui Context (hence the persistent collapse state). `tab` selects
+        // which tree the harness renders this frame (0 = Accounts, 1 = Assets); `fixed` picks the
+        // real render_acct_node (per-tree id) vs the pre-fix shared-id render. Returns whether the
+        // Assets "Bob" leaked OPEN after we expanded the Accounts "Bob" and switched tabs.
+        let asset_leaks_after_expanding_accounts = |fixed: bool| -> bool {
+            let tab = Cell::new(0u8);
+            let mut h = Harness::new_ui(|ui| {
+                let mut p = Vec::new();
+                let (tree, kind) = if tab.get() == 0 { (&acct, "acct") } else { (&asset, "asset") };
+                if fixed {
+                    render_acct_node(ui, tree, &mut p, None, &labels, kind);
+                } else {
+                    render_buggy(ui, tree, &mut p);
+                }
+            });
+            // Accounts tab: expand "Bob".
+            tab.set(0);
+            h.run();
+            assert!(h.query_by_label("acct-leaf").is_none(), "accounts/Bob collapsed before the click");
+            h.get_by_label("Bob").click();
+            h.run();
+            assert!(h.query_by_label("acct-leaf").is_some(), "accounts/Bob expanded after the click");
+            // Switch to the Assets tab (same Context → shared persistent state) and observe.
+            tab.set(1);
+            h.run();
+            h.query_by_label("asset-leaf").is_some()
+        };
+
+        // FIX: expanding Accounts/Bob then switching to Assets leaves Assets/Bob COLLAPSED.
+        assert!(
+            !asset_leaks_after_expanding_accounts(true),
+            "FIX: Assets/Bob must stay collapsed after expanding Accounts/Bob (independent state)"
+        );
+        // NEGATIVE CONTROL: the pre-fix shared id DOES leak the expand across tabs — proving the
+        // test detects the real bug, and that the discriminant is what prevents it.
+        assert!(
+            asset_leaks_after_expanding_accounts(false),
+            "control: the pre-fix shared id leaks the expand to the Assets tab (reproduces the bug)"
+        );
+    }
+}
