@@ -569,18 +569,17 @@ impl App {
     /// Wipe the clipboard once the auto-clear deadline has passed. Called from the
     /// event loop, so a copied password is cleared even with no further input.
     fn tick_clipboard(&mut self) {
-        // Let-chain: only act when a deadline is set (`Some(deadline)`) AND the
-        // current time has reached it.
-        if let Some(deadline) = self.clipboard_clear_at
-            && Instant::now() >= deadline
+        // The deadline/status decision (and the rule that a "Save failed: …" the user may
+        // not have seen is never clobbered) lives in a pure, unit-tested helper shared with
+        // the GUI; here we just apply the clipboard side effect it asks for.
+        if let Some(status_change) =
+            crate::clipboard_tick_decision(self.clipboard_clear_at, Instant::now(), &self.status)
         {
             clear_clipboard();
             self.clipboard_dirty = false;
             self.clipboard_clear_at = None;
-            // Don't clobber a meaningful status (e.g. "Save failed: …") the user may not
-            // have seen yet; only replace a blank or the prior "Copied …" notice.
-            if self.status.is_empty() || self.status.starts_with("Copied") {
-                self.status = "Clipboard cleared.".into();
+            if let Some(s) = status_change {
+                self.status = s;
             }
         }
     }

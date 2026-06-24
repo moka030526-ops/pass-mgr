@@ -51,6 +51,34 @@ pub(crate) fn copy_secret_to_clipboard(text: &str) -> Result<(), arboard::Error>
     }
 }
 
+/// Pure decision for the clipboard auto-clear "tick", shared by the TUI (`ui.rs`) and
+/// GUI (`gui.rs`) so both obey the SAME security-relevant contract. Given the pending
+/// wipe `deadline` (if any), the current time `now`, and the current `status` line:
+///   * `None` — nothing scheduled, or the deadline has not been reached: do nothing.
+///   * `Some(None)` — wipe the clipboard now, but LEAVE the status untouched (it shows a
+///     message the user may not have seen yet, e.g. `"Save failed: …"`).
+///   * `Some(Some(s))` — wipe the clipboard now and set the status to `s`.
+///
+/// Kept side-effect-free (no clipboard or egui access) so the two rules a password
+/// manager must not get wrong — fire only at/after the deadline, and never clobber an
+/// unseen status, only a blank or a prior `"Copied …"` notice — are unit-testable.
+pub(crate) fn clipboard_tick_decision(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    status: &str,
+) -> Option<Option<String>> {
+    match deadline {
+        Some(t) if now >= t => {
+            if status.is_empty() || status.starts_with("Copied") {
+                Some(Some("Clipboard cleared.".to_string()))
+            } else {
+                Some(None) // keep the existing (possibly unseen) status
+            }
+        }
+        _ => None,
+    }
+}
+
 // --- Local, non-secret preferences (shared by the GUI and TUI) ---------------
 //
 // A tiny `prefs.json` in the OS config dir holds UI preferences that are NOT vault
@@ -225,5 +253,27 @@ mod tests {
             assert!(read_prefs_obj(&link).is_empty(), "symlinked prefs refused");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_tick_decision_obeys_deadline_and_preserves_unseen_status() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let future = now + Duration::from_secs(60);
+        // Nothing scheduled, or deadline not reached → no action.
+        assert_eq!(clipboard_tick_decision(None, now, ""), None);
+        assert_eq!(clipboard_tick_decision(Some(future), now, "anything"), None);
+        // Deadline reached + a blank or "Copied …" status → wipe and show the cleared notice.
+        assert_eq!(
+            clipboard_tick_decision(Some(now), now, ""),
+            Some(Some("Clipboard cleared.".to_string()))
+        );
+        assert_eq!(
+            clipboard_tick_decision(Some(now), now, "Copied password to clipboard."),
+            Some(Some("Clipboard cleared.".to_string()))
+        );
+        // Deadline reached but an important status is showing → wipe, but DON'T clobber it
+        // (the core rule: a "Save failed: …" the user hasn't seen must survive the auto-clear).
+        assert_eq!(clipboard_tick_decision(Some(now), now, "Save failed: disk full"), Some(None));
     }
 }

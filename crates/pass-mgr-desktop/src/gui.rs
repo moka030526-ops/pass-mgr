@@ -691,18 +691,20 @@ impl GuiApp {
         // deadline has been scheduled. `&egui::Context` is a shared borrow.
         if let Some(deadline) = self.clipboard_clear_at {
             let now = Instant::now();
-            if now >= deadline {
-                clear_clipboard();
-                self.clipboard_dirty = false;
-                self.clipboard_clear_at = None;
-                // Only replace a blank or the prior "Copied …" notice — never clobber a
-                // meaningful message the user may not have seen yet (e.g. "Save failed: …"),
-                // which the idle auto-clear repaint could otherwise silently overwrite.
-                if self.status.is_empty() || self.status.starts_with("Copied") {
-                    self.status = "Clipboard cleared.".into();
+            // The deadline/status-preservation rules live in a pure, unit-tested helper
+            // shared with the TUI; `Some` means "wipe now", `None` means "not yet".
+            match crate::clipboard_tick_decision(Some(deadline), now, &self.status) {
+                Some(status_change) => {
+                    clear_clipboard();
+                    self.clipboard_dirty = false;
+                    self.clipboard_clear_at = None;
+                    if let Some(s) = status_change {
+                        self.status = s;
+                    }
                 }
-            } else {
-                ctx.request_repaint_after(deadline - now);
+                None => {
+                    ctx.request_repaint_after(deadline - now);
+                }
             }
         }
     }
