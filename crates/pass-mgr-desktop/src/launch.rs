@@ -45,8 +45,12 @@ pub struct VaultScan {
 /// page's single source of truth: the open target is always `root` + `name`.
 pub fn join_root_name(root: &str, name: &str) -> String {
     let root = root.trim();
-    let name = name.trim();
-    if name.is_empty() {
+    // Trim only to DECIDE empty-vs-present; when present, join the name VERBATIM so this is
+    // the exact inverse of `discover_vaults`, which returns raw directory names. Trimming the
+    // joined name would make a vault folder whose name has leading/trailing whitespace
+    // un-openable from the dropdown — the derived path wouldn't match the real folder, so the
+    // start page would silently flip to "Create" instead of opening the selected vault.
+    if name.trim().is_empty() {
         root.to_string()
     } else {
         Path::new(root).join(name).display().to_string()
@@ -216,10 +220,33 @@ mod tests {
     #[test]
     fn join_root_name_combines_or_falls_back_to_root() {
         assert_eq!(join_root_name("/a/b", "vault1"), PathBuf::from("/a/b/vault1").display().to_string());
-        assert_eq!(join_root_name("  /a/b ", " vault1 "), PathBuf::from("/a/b/vault1").display().to_string());
-        // Empty name → the root itself (a vault sitting directly at the root).
+        // The ROOT is trimmed, but the NAME is joined VERBATIM, so a folder name round-trips
+        // through discovery → join (trimming it would make a whitespace-named folder unopenable).
+        assert_eq!(join_root_name("  /a/b ", "vault1"), PathBuf::from("/a/b/vault1").display().to_string());
+        assert_eq!(join_root_name("/a/b", " vault1 "), PathBuf::from("/a/b/ vault1 ").display().to_string());
+        // Empty / all-whitespace name → the root itself (a vault sitting directly at the root).
         assert_eq!(join_root_name("/a/b", ""), "/a/b");
         assert_eq!(join_root_name("/a/b", "   "), "/a/b");
+    }
+
+    #[test]
+    fn discovered_whitespace_named_vault_round_trips_through_join() {
+        // Regression: a vault folder whose name has surrounding whitespace must be OPENABLE
+        // from the dropdown — discover_vaults returns the raw name, and join_root_name must
+        // produce the path that actually holds its vault.pmv (not a trimmed, non-existent path,
+        // which would silently flip the start page to "Create").
+        let root = std::env::temp_dir().join(format!("pmv-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let weird = " spaced "; // leading + trailing space in the folder name
+        std::fs::create_dir_all(root.join(weird)).unwrap();
+        std::fs::write(root.join(weird).join(VAULT_FILE), b"x").unwrap();
+
+        let scan = discover_vaults(root.to_str().unwrap());
+        assert!(scan.vaults.contains(&weird.to_string()), "whitespace-named vault is discovered: {:?}", scan.vaults);
+        let joined = join_root_name(root.to_str().unwrap(), weird);
+        assert!(vault_file(&joined).exists(), "join must resolve to the discovered vault's vault.pmv: {joined}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

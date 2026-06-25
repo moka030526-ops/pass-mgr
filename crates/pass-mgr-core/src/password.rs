@@ -19,6 +19,7 @@
 // (an error type) from this crate's `crypto` module. `crate::` means "rooted at
 // this project", not an external dependency.
 use crate::crypto::{random_bytes, CryptoError};
+use zeroize::Zeroizing;
 
 // `const` is a compile-time constant. `&[u8]` is a "byte slice": a read-only
 // view (shared borrow, the `&`) into a sequence of bytes (`u8` = unsigned 8-bit).
@@ -176,10 +177,14 @@ pub fn generate(opts: &GenOptions) -> Result<String, GenError> {
         return Err(GenError::NoClasses);
     }
 
-    // Mutable byte buffer we'll build the password into. `Vec::with_capacity`
-    // pre-allocates room for `opts.length` bytes (an optimization; it can still
-    // grow). Type annotation `Vec<u8>` makes the element type explicit.
-    let mut out: Vec<u8> = Vec::with_capacity(opts.length);
+    // Mutable byte buffer we'll build the cleartext password into, wrapped in
+    // `Zeroizing` so it is WIPED on drop. This matters on the error paths below: any
+    // `?` that returns an RNG failure mid-build drops `out` while it already holds a
+    // PARTIAL plaintext password — without `Zeroizing` those bytes would be freed to
+    // the allocator un-wiped (stranding a secret in freed heap, which the rest of the
+    // codebase forbids). Pre-sized to `opts.length` so the pushes never reallocate
+    // (a realloc would orphan an un-wiped copy of the partial password).
+    let mut out = Zeroizing::new(Vec::<u8>::with_capacity(opts.length));
 
     // Guarantee one char from each class when there's room.
     if opts.length >= classes.len() {
@@ -218,7 +223,10 @@ pub fn generate(opts: &GenOptions) -> Result<String, GenError> {
     // unwraps the Ok value and would panic with this message if the bytes were
     // somehow not valid UTF-8. It is safe here because every byte came from the
     // ASCII-only constant tables, so the failure branch is unreachable in practice.
-    Ok(String::from_utf8(out).expect("charset is ASCII"))
+    // Move the bytes OUT of the zeroizing buffer into the returned String (the success
+    // path's intended secret, which the caller stores in a ZeroizeOnDrop record field).
+    // `mem::take` leaves `out` holding an empty Vec, so its drop wipes nothing extra.
+    Ok(String::from_utf8(std::mem::take(&mut *out)).expect("charset is ASCII"))
 }
 
 // `#[cfg(test)]` is conditional compilation: this `mod tests` module is only
