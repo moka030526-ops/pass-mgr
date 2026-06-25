@@ -1667,34 +1667,33 @@ impl GuiApp {
         // Deferred DELETE handlers. A refusal (in use / has subtypes) is a normal
         // status message, not a failure; only a real save error reads as "failed".
         if let Some(name) = remove_asset {
-            let outcome = self.vault.as_mut().expect("vault open on config").remove_asset_type(&name);
-            self.status = match outcome {
-                Ok(CategoryRemoval::Removed) => format!("Deleted asset/liability type “{name}”."),
-                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} record(s)."),
-                Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
+            // A save failure must surface in the conspicuous banner (via `fail`), not just the
+            // weak status line — a refusal (in use / not found) is an ordinary status message.
+            match self.vault.as_mut().expect("vault open on config").remove_asset_type(&name) {
+                Ok(CategoryRemoval::Removed) => self.status = format!("Deleted asset/liability type “{name}”."),
+                Ok(CategoryRemoval::InUse(n)) => self.status = format!("Can’t delete “{name}”: still used by {n} record(s)."),
+                Ok(CategoryRemoval::NotFound) => self.status = format!("“{name}” was not found."),
                 Ok(CategoryRemoval::HasSubtypes) => unreachable!("asset types have no subtypes"),
-                Err(e) => format!("Delete failed: {e}"),
-            };
+                Err(e) => self.fail(format!("Delete failed: {e}")),
+            }
         }
         if let Some(name) = remove_account {
-            let outcome = self.vault.as_mut().expect("vault open on config").remove_account_type(&name);
-            self.status = match outcome {
-                Ok(CategoryRemoval::Removed) => format!("Deleted account type “{name}”."),
-                Ok(CategoryRemoval::HasSubtypes) => format!("Can’t delete “{name}”: delete its subtypes first."),
-                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{name}”: still used by {n} account(s)."),
-                Ok(CategoryRemoval::NotFound) => format!("“{name}” was not found."),
-                Err(e) => format!("Delete failed: {e}"),
-            };
+            match self.vault.as_mut().expect("vault open on config").remove_account_type(&name) {
+                Ok(CategoryRemoval::Removed) => self.status = format!("Deleted account type “{name}”."),
+                Ok(CategoryRemoval::HasSubtypes) => self.status = format!("Can’t delete “{name}”: delete its subtypes first."),
+                Ok(CategoryRemoval::InUse(n)) => self.status = format!("Can’t delete “{name}”: still used by {n} account(s)."),
+                Ok(CategoryRemoval::NotFound) => self.status = format!("“{name}” was not found."),
+                Err(e) => self.fail(format!("Delete failed: {e}")),
+            }
         }
         if let Some((ty, sub)) = remove_subtype {
-            let outcome = self.vault.as_mut().expect("vault open on config").remove_account_subtype(&ty, &sub);
-            self.status = match outcome {
-                Ok(CategoryRemoval::Removed) => format!("Deleted subtype “{sub}” under “{ty}”."),
-                Ok(CategoryRemoval::InUse(n)) => format!("Can’t delete “{sub}”: still used by {n} account(s)."),
-                Ok(CategoryRemoval::NotFound) => format!("“{sub}” was not found under “{ty}”."),
+            match self.vault.as_mut().expect("vault open on config").remove_account_subtype(&ty, &sub) {
+                Ok(CategoryRemoval::Removed) => self.status = format!("Deleted subtype “{sub}” under “{ty}”."),
+                Ok(CategoryRemoval::InUse(n)) => self.status = format!("Can’t delete “{sub}”: still used by {n} account(s)."),
+                Ok(CategoryRemoval::NotFound) => self.status = format!("“{sub}” was not found under “{ty}”."),
                 Ok(CategoryRemoval::HasSubtypes) => unreachable!("a subtype has no subtypes"),
-                Err(e) => format!("Delete failed: {e}"),
-            };
+                Err(e) => self.fail(format!("Delete failed: {e}")),
+            }
         }
         if set_export {
             // Persist the export directory to the local prefs file (non-secret; no vault
