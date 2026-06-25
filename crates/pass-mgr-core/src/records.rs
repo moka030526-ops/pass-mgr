@@ -337,7 +337,9 @@ pub(crate) fn is_spoofy_format_char(c: char) -> bool {
 /// merge preview the user authorizes, or a real on-disk filename. Unlike [`doc_filename`] it
 /// does NOT touch separators/whitespace or cap length; it only neutralizes the invisible/bidi
 /// spoof set, so it is safe to apply to an arbitrary display label without otherwise mangling it.
-pub(crate) fn display_safe(s: &str) -> String {
+/// `pub` (not `pub(crate)`) so the desktop CLI `extract` (main.rs) can apply the same
+/// neutralization to a filename derived from an untrusted manifest path.
+pub fn display_safe(s: &str) -> String {
     s.chars().map(|c| if c.is_control() || is_spoofy_format_char(c) { '_' } else { c }).collect()
 }
 

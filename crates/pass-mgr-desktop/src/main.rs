@@ -964,8 +964,13 @@ fn safe_relative_path(location: &str, filename: &str, id: &str) -> PathBuf {
         if RESERVED.contains(&upper.as_str()) || is_com_lpt {
             return None;
         }
-        // `.to_string()` makes an owned `String` copy to hand back to the caller.
-        Some(trimmed.to_string())
+        // Neutralize control + bidi/zero-width spoof chars (e.g. U+202E RLO) in the final
+        // name, matching `export_document_into`: a crafted manifest path must not write a
+        // SPOOFED on-disk filename (report<RLO>txt.exe) or inject terminal escapes into the
+        // extract list this CLI prints. The checks above already rejected empty/separator/
+        // reserved on the un-mapped form, and `display_safe` only turns control/spoof chars
+        // into '_', so it cannot reintroduce any of those.
+        Some(pass_mgr::records::display_safe(trimmed))
     }
     let mut path = PathBuf::new();
     // Split the directory portion on either separator and append each safe piece.
@@ -1395,6 +1400,22 @@ mod tests {
             let p = safe_relative_path(loc, name, "fallbackid");
             assert!(contained(&p), "must stay contained: {loc:?} {name:?} -> {p:?}");
         }
+    }
+
+    #[test]
+    fn safe_path_strips_bidi_and_control_chars() {
+        // A crafted manifest path must not write a SPOOFED on-disk filename or inject escapes
+        // into the printed extract list: U+202E (RLO) and control chars become '_', matching
+        // export_document_into.
+        let p = safe_relative_path("docs", "invoice\u{202e}fdp.exe", "id");
+        let s = p.to_string_lossy();
+        assert!(!s.contains('\u{202e}'), "bidi override stripped from extract filename: {s}");
+        assert!(s.contains('_'), "spoof char replaced with '_': {s}");
+        assert!(contained(&p));
+        // ...also in a location (directory) component.
+        let p2 = safe_relative_path("a\u{202e}b", "f.txt", "id");
+        assert!(!p2.to_string_lossy().contains('\u{202e}'));
+        assert!(contained(&p2));
     }
 
     #[test]
