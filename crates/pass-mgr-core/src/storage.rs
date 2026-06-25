@@ -493,11 +493,21 @@ impl VolumeStore {
 
     fn load_manifest(&self, part: u32, key: &Key) -> Result<Manifest, StorageError> {
         let path = self.manifest_path(part);
-        let meta = fs::metadata(&path)?;
+        // Reject a symlinked manifest and CAP THE READ ITSELF — not just a pre-stat. A plain
+        // `fs::metadata` cap + `fs::read` both FOLLOW a symlink and leave a stat-then-read
+        // gap: a `manifest.N` swapped for a symlink to `/dev/zero` (whose stat size is 0, so
+        // the cap passes) would otherwise be read UNBOUNDEDLY → OOM on every vault open.
+        // `symlink_metadata` does not follow the link (cheap early reject + over-size reject
+        // without a big read); the bounded O_NOFOLLOW read closes the residual open-time
+        // TOCTOU, matching `vault::read_bounded` and `append_frame`.
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(StorageError::Corrupt(format!("manifest.{part} is a symlink")));
+        }
         if meta.len() > MAX_MANIFEST_SIZE {
             return Err(StorageError::TooLarge);
         }
-        let raw = fs::read(&path)?; // read whole file into a Vec<u8>
+        let raw = read_file_bounded_nofollow(&path, MAX_MANIFEST_SIZE)?;
         if raw.len() < NONCE_LEN {
             return Err(StorageError::Corrupt(format!("manifest.{part} truncated")));
         }
@@ -773,6 +783,30 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     Ok(())
 }
 
+/// Read at most `max + 1` bytes from `path` WITHOUT following a final-component symlink,
+/// erroring `TooLarge` if the file holds more than `max`. Unlike `fs::read` (which both
+/// follows symlinks and allocates without bound), this caps the allocation on the READ and
+/// refuses a symlinked file at the open, so a file swapped for a symlink to `/dev/zero`
+/// (stat size 0) can neither be followed nor drive an OOM. Mirrors `vault::read_bounded`
+/// and `append_frame`'s O_NOFOLLOW discipline. (On non-unix the caller's `symlink_metadata`
+/// pre-check remains the guard.)
+fn read_file_bounded_nofollow(path: &Path, max: u64) -> Result<Vec<u8>, StorageError> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?
+    };
+    #[cfg(not(unix))]
+    let f = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(StorageError::TooLarge);
+    }
+    Ok(buf)
+}
+
 /// Highest partition index `N` for which a file named exactly `<prefix>N` (e.g.
 /// `manifest.3`, `vol.3`) exists in `dir`; `None` if the dir is absent or holds no
 /// such file. The strict `<prefix><decimal>` match ignores the hidden in-flight temp
@@ -986,6 +1020,36 @@ mod tests {
             ),
             Err(e) => panic!("unexpected error variant: {e:?}"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_manifest_refuses_a_symlinked_manifest() {
+        // A `manifest.N` swapped for a SYMLINK must be REFUSED, never followed: a metadata()
+        // cap + fs::read would follow a symlink to e.g. /dev/zero (stat size 0, so the size
+        // cap passes) and read unboundedly → OOM. We assert the manifest reader directly: the
+        // decoy target is a real readable file, so following it WOULD "succeed" — proving the
+        // refusal is about the symlink itself. (`open()` itself recovers by rebuilding from the
+        // volume, which never reads the manifest, so the symlink can't OOM or brick the vault.)
+        let dir = tmp_dir("mansym");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", 1 << 20).unwrap();
+        s.put("a", "/a", b"hello", 1, &key).unwrap();
+        let manifest = dir.join("manifest").join("manifest.0");
+        let decoy = dir.join("decoy");
+        std::fs::write(&decoy, b"not a manifest").unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        std::os::unix::fs::symlink(&decoy, &manifest).unwrap();
+        match s.load_manifest(0, &key) {
+            Err(StorageError::Corrupt(_)) => {} // refused the symlink: correct
+            Err(e) => panic!("a symlinked manifest must be refused as Corrupt, got {e:?}"),
+            Ok(_) => panic!("a symlinked manifest must be refused, not followed"),
+        }
+        // And open() still recovers (rebuilds from the volume) rather than bricking.
+        drop(s);
+        let s2 = VolumeStore::open(&dir, &key, "v", 1 << 20).unwrap();
+        assert!(s2.contains("a"), "open recovers the document by rebuilding from the volume");
         std::fs::remove_dir_all(&dir).ok();
     }
 
