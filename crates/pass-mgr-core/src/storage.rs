@@ -1054,6 +1054,22 @@ mod tests {
     }
 
     #[test]
+    fn read_file_bounded_nofollow_enforces_the_exact_cap() {
+        // Pins the `buf.len() > max` boundary (the TOCTOU / lying-size guard): a file of
+        // EXACTLY `max` bytes is accepted, one byte over is TooLarge. (Mutation kill-test:
+        // `>` -> `==`/`>=` would wrongly reject the exactly-max case.)
+        let dir = tmp_dir("rfbn");
+        let path = dir.join("blob");
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        assert_eq!(read_file_bounded_nofollow(&path, 100).unwrap().len(), 100, "exactly max is accepted");
+        assert!(
+            matches!(read_file_bounded_nofollow(&path, 99), Err(StorageError::TooLarge)),
+            "max + 1 is rejected"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn single_bit_corruption_in_a_committed_frame_fails_closed_on_read() {
         // Bit rot inside a committed frame's bytes (manifest intact) is the most common
         // real-world corruption on the normal read path. AEAD must turn it into a clean

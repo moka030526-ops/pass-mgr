@@ -6232,6 +6232,45 @@ mod tests {
     }
 
     #[test]
+    fn merge_duplicate_source_asset_id_does_not_add_a_phantom_type() {
+        // Same first-occurrence-wins dedup as the account test, but exercises the ASSET loop
+        // in plan/apply_merge_from (mutation kill-test: `||`->`&&` in the asset dedup guard
+        // would process the un-applied duplicate and seed an orphan "Phantom" asset type).
+        let s_path = tmp_path("merge-dupa-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a1 = records::AssetLiability::new().unwrap();
+        a1.id = "dup".into();
+        a1.asset_type = "Bank".into();
+        a1.updated_at = 100;
+        let mut a2 = records::AssetLiability::new().unwrap();
+        a2.id = "dup".into();
+        a2.asset_type = "Phantom".into();
+        a2.updated_at = 100;
+        s.vault.assets.push(a1);
+        s.vault.assets.push(a2);
+        s.save().unwrap();
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        let c_path = tmp_path("merge-dupa-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert!(plan.new_categories.iter().any(|s| s.contains("Bank")), "first asset type previewed");
+        assert!(
+            !plan.new_categories.iter().any(|s| s.contains("Phantom")),
+            "duplicate asset id's second type must not be a phantom: {:?}",
+            plan.new_categories
+        );
+        c.apply_merge_from(&source).unwrap();
+        assert!(c.vault.categories.asset.iter().any(|x| x.as_str() == "Bank"));
+        assert!(
+            !c.vault.categories.asset.iter().any(|x| x.as_str() == "Phantom"),
+            "no orphan asset type from the un-applied duplicate"
+        );
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
     fn merge_preview_sanitizes_untrusted_source_record_labels() {
         // A crafted SOURCE vault must not inject bidi/zero-width characters into the merge
         // preview label the user authorizes (terminal/TUI/GUI spoofing). The label is cleaned
