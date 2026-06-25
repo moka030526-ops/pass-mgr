@@ -220,6 +220,134 @@ pub fn asset_tree<'a>(assets: impl IntoIterator<Item = &'a AssetLiability>) -> A
     root
 }
 
+// --- Value summary (owner × asset/liability buckets) -------------------------
+//
+// The "Summary" tab aggregates every Asset/Liability's `approx_value` into a small matrix:
+// one ROW per owner, columns split by kind (Asset vs Liability) and a coarse tax bucket.
+// Assets get three buckets — Real Estate, Before Tax (retirement + HSA), After Tax
+// (everything else); Liabilities get two (Before Tax, After Tax). The bucket is inferred by
+// keyword from the entry's Type + Institution — the only fields that carry that meaning.
+
+/// Which summary column an Asset/Liability falls into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValueBucket {
+    RealEstate,
+    BeforeTax,
+    AfterTax,
+}
+
+/// Keyword-classify an entry by its `asset_type` + `institution`. `is_liability` suppresses
+/// the Real-Estate bucket (liabilities only split Before/After tax).
+///
+/// BEFORE TAX = retirement accounts (401k/403b/457/IRA/Roth/pension/annuity/TSP) AND pre-tax
+/// HEALTH accounts (HSA / "Health Equity"). REAL ESTATE = property / real estate. Everything
+/// else is AFTER TAX. The keyword lists are intentionally simple — extend them here if a
+/// holding isn't bucketed the way you expect.
+pub fn value_bucket(asset_type: &str, institution: &str, is_liability: bool) -> ValueBucket {
+    let hay = format!("{asset_type} {institution}").to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| hay.contains(n));
+    const BEFORE_TAX: &[&str] = &[
+        "retire", "401", "403", "457", "ira", "roth", "pension", "annuity", "tsp", "hsa",
+        "health equity", "healthequity", "health savings",
+    ];
+    const REAL_ESTATE: &[&str] = &["real estate", "real-estate", "realestate", "property", "rental"];
+    if !is_liability && has(REAL_ESTATE) {
+        ValueBucket::RealEstate
+    } else if has(BEFORE_TAX) {
+        ValueBucket::BeforeTax
+    } else {
+        ValueBucket::AfterTax
+    }
+}
+
+/// Parse a free-text `approx_value` into a number for aggregation and validation. Accepts an
+/// optional leading currency symbol, thousands separators (commas/spaces/underscores), a
+/// decimal point, a leading sign, surrounding whitespace, and an optional magnitude suffix
+/// k/m/b/t (case-insensitive: `1.2m` = 1_200_000). Returns `None` if the remainder is not a
+/// finite number.
+pub fn parse_approx_value(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    // A trailing ASCII k/m/b/t is a magnitude suffix; the slice boundary is safe because the
+    // matched byte is ASCII (1 byte), so `len - 1` lands on a char boundary.
+    let (digits, mult): (&str, f64) = match lower.as_bytes().last() {
+        Some(b'k') => (&lower[..lower.len() - 1], 1e3),
+        Some(b'm') => (&lower[..lower.len() - 1], 1e6),
+        Some(b'b') => (&lower[..lower.len() - 1], 1e9),
+        Some(b't') => (&lower[..lower.len() - 1], 1e12),
+        _ => (lower.as_str(), 1.0),
+    };
+    let cleaned: String =
+        digits.chars().filter(|c| !matches!(c, '$' | '€' | '£' | '¥' | ',' | ' ' | '_')).collect();
+    let v: f64 = cleaned.parse().ok()?;
+    v.is_finite().then_some(v * mult)
+}
+
+/// One owner's row in the value summary. Each field sums the parseable `approx_value`s for
+/// that owner in the given kind + bucket.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OwnerValueRow {
+    pub owner: String,
+    pub asset_real_estate: f64,
+    pub asset_before_tax: f64,
+    pub asset_after_tax: f64,
+    pub liab_before_tax: f64,
+    pub liab_after_tax: f64,
+}
+
+impl OwnerValueRow {
+    pub fn asset_total(&self) -> f64 {
+        self.asset_real_estate + self.asset_before_tax + self.asset_after_tax
+    }
+    pub fn liability_total(&self) -> f64 {
+        self.liab_before_tax + self.liab_after_tax
+    }
+    pub fn net(&self) -> f64 {
+        self.asset_total() - self.liability_total()
+    }
+}
+
+/// Build the owner × (Asset buckets / Liability buckets) summary from an asset/liability
+/// iterator. Rows are sorted by owner (case-insensitive); a blank owner groups under
+/// "(no owner)". An unparseable `approx_value` contributes 0 (the save-time validation keeps
+/// real entries numeric). Used by the GUI + TUI Summary tabs.
+pub fn owner_value_summary<'a>(items: impl IntoIterator<Item = &'a AssetLiability>) -> Vec<OwnerValueRow> {
+    let mut map: std::collections::BTreeMap<String, OwnerValueRow> = std::collections::BTreeMap::new();
+    for a in items {
+        let owner = a.owner.trim();
+        let disp = if owner.is_empty() { "(no owner)" } else { owner };
+        let val = parse_approx_value(&a.approx_value).unwrap_or(0.0);
+        let is_liab = a.kind.trim().eq_ignore_ascii_case("Liability");
+        let row = map
+            .entry(disp.to_lowercase())
+            .or_insert_with(|| OwnerValueRow { owner: disp.to_string(), ..Default::default() });
+        match (is_liab, value_bucket(&a.asset_type, &a.institution, is_liab)) {
+            (false, ValueBucket::RealEstate) => row.asset_real_estate += val,
+            (false, ValueBucket::BeforeTax) => row.asset_before_tax += val,
+            (false, ValueBucket::AfterTax) => row.asset_after_tax += val,
+            (true, ValueBucket::BeforeTax) => row.liab_before_tax += val,
+            (true, _) => row.liab_after_tax += val, // liabilities have no Real-Estate column
+        }
+    }
+    map.into_values().collect()
+}
+
+/// Validate an Asset/Liability for the summary: it must have an owner and a NUMERIC
+/// approximate value, so every entry lands in a row and contributes a real number. Returns
+/// `Some(message)` describing the first problem, or `None` if valid.
+pub fn asset_validation_error(a: &AssetLiability) -> Option<String> {
+    if a.owner.trim().is_empty() {
+        return Some("Owner is required.".to_string());
+    }
+    if parse_approx_value(&a.approx_value).is_none() {
+        return Some("Approximate value must be a number (e.g. 1500, 12,000.50, or 250k).".to_string());
+    }
+    None
+}
+
 /// A random 128-bit hex id, used for records and volume blobs.
 // Returns `Ok(String)` on success or an `Err(CryptoError)` if the RNG fails.
 pub fn random_id() -> Result<String, CryptoError> {
@@ -2610,6 +2738,82 @@ mod tests {
         assert_eq!(display_safe("tab\tnl\n"), "tab_nl_"); // ASCII control
         assert_eq!(display_safe("José café 北京"), "José café 北京"); // ordinary unicode preserved
         assert_eq!(display_safe("plain.txt"), "plain.txt");
+    }
+
+    #[test]
+    fn parse_approx_value_handles_currency_commas_and_suffixes() {
+        assert_eq!(parse_approx_value("1500"), Some(1500.0));
+        assert_eq!(parse_approx_value(" $12,000.50 "), Some(12_000.50));
+        assert_eq!(parse_approx_value("250k"), Some(250_000.0));
+        assert_eq!(parse_approx_value("1.2M"), Some(1_200_000.0));
+        assert_eq!(parse_approx_value("-2500"), Some(-2500.0));
+        assert_eq!(parse_approx_value("€1 234"), Some(1234.0));
+        // Not numeric → None.
+        assert_eq!(parse_approx_value(""), None);
+        assert_eq!(parse_approx_value("about 5"), None);
+        assert_eq!(parse_approx_value("$"), None);
+        assert_eq!(parse_approx_value("tbd"), None);
+    }
+
+    #[test]
+    fn value_bucket_classifies_real_estate_retirement_hsa_and_other() {
+        use ValueBucket::*;
+        assert_eq!(value_bucket("Real Estate", "", false), RealEstate);
+        assert_eq!(value_bucket("Rental Property", "", false), RealEstate);
+        assert_eq!(value_bucket("401k", "Fidelity", false), BeforeTax);
+        assert_eq!(value_bucket("Roth IRA", "Vanguard", false), BeforeTax);
+        assert_eq!(value_bucket("HSA", "Health Equity", false), BeforeTax);
+        assert_eq!(value_bucket("Brokerage", "Health Equity", false), BeforeTax); // institution alone
+        assert_eq!(value_bucket("Brokerage", "Schwab", false), AfterTax); // everything else
+        // Liabilities never use the Real-Estate bucket.
+        assert_eq!(value_bucket("Real Estate", "", true), AfterTax);
+        assert_eq!(value_bucket("Loan", "401k", true), BeforeTax);
+    }
+
+    #[test]
+    fn owner_value_summary_aggregates_by_owner_kind_and_bucket() {
+        let mk = |owner: &str, kind: &str, ty: &str, inst: &str, val: &str| {
+            let mut a = AssetLiability::new().unwrap();
+            a.owner = owner.into();
+            a.kind = kind.into();
+            a.asset_type = ty.into();
+            a.institution = inst.into();
+            a.approx_value = val.into();
+            a
+        };
+        let items = [
+            mk("Alice", "Asset", "Real Estate", "", "500000"),
+            mk("Alice", "Asset", "401k", "Fidelity", "200000"),
+            mk("Alice", "Asset", "HSA", "Health Equity", "10000"),
+            mk("Alice", "Asset", "Brokerage", "Schwab", "50000"),
+            mk("Alice", "Liability", "Mortgage", "", "300000"),
+            mk("Bob", "Asset", "Brokerage", "", "not-a-number"), // unparseable → 0
+            mk("", "Asset", "Cash", "", "1000"),                  // blank owner → "(no owner)"
+        ];
+        let rows = owner_value_summary(items.iter());
+        let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
+        assert_eq!(alice.asset_real_estate, 500_000.0);
+        assert_eq!(alice.asset_before_tax, 210_000.0, "401k + HSA");
+        assert_eq!(alice.asset_after_tax, 50_000.0);
+        assert_eq!(alice.liab_after_tax, 300_000.0, "mortgage is not retirement");
+        assert_eq!(alice.asset_total(), 760_000.0);
+        assert_eq!(alice.net(), 460_000.0);
+        let bob = rows.iter().find(|r| r.owner == "Bob").unwrap();
+        assert_eq!(bob.asset_after_tax, 0.0, "unparseable value contributes 0");
+        assert!(rows.iter().any(|r| r.owner == "(no owner)"));
+    }
+
+    #[test]
+    fn asset_validation_requires_owner_and_numeric_value() {
+        let mut a = AssetLiability::new().unwrap();
+        a.owner = String::new();
+        a.approx_value = "1000".into();
+        assert!(asset_validation_error(&a).unwrap().contains("Owner"));
+        a.owner = "Alice".into();
+        a.approx_value = "lots".into();
+        assert!(asset_validation_error(&a).unwrap().contains("number"));
+        a.approx_value = "1000".into();
+        assert!(asset_validation_error(&a).is_none());
     }
 
     #[test]

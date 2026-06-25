@@ -28,7 +28,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap};
 // Secret-wiping helpers. `Zeroize` = a trait (interface) providing `.zeroize()`
 // to overwrite memory with zeros; `ZeroizeOnDrop` makes a type wipe itself
 // automatically when it goes out of scope; `Zeroizing<T>` wraps a value so it is
@@ -109,13 +109,14 @@ enum Tab {
     RealEstate,
     Taxes,
     GeneralDocuments,
+    Summary,
 }
 
 // `impl Tab { ... }` attaches methods/constants to the `Tab` type.
 impl Tab {
     // `[Tab; 6]` is a fixed-size array of 6 `Tab` values. `const` = a
     // compile-time constant.
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Instructions,
         Tab::TrustWill,
         Tab::Assets,
@@ -123,6 +124,7 @@ impl Tab {
         Tab::RealEstate,
         Tab::Taxes,
         Tab::GeneralDocuments,
+        Tab::Summary,
     ];
 
     // Methods take `self`; because `Tab` is `Copy`, taking `self` by value here is
@@ -134,6 +136,7 @@ impl Tab {
             Tab::Instructions => "Instructions",
             Tab::TrustWill => "Trust and Will",
             Tab::Assets => "Assets & Liabilities",
+            Tab::Summary => "Summary",
             Tab::Accounts => "Accounts",
             Tab::RealEstate => "Real Estate",
             Tab::Taxes => "Taxes",
@@ -639,6 +642,8 @@ impl App {
             Tab::RealEstate => label_list(&v.real_estate),
             Tab::Taxes => label_list(&v.tax_filings),
             Tab::GeneralDocuments => label_list(&v.general_documents),
+            // The Summary tab is a read-only aggregate table, not a record list.
+            Tab::Summary => Vec::new(),
         }
     }
 
@@ -1549,6 +1554,10 @@ impl App {
     /// (`existing = true`) or a fresh one.
     fn start_edit(&mut self, existing: bool) {
         let tab = self.tab;
+        // The Summary tab has no records to create or edit.
+        if tab == Tab::Summary {
+            return;
+        }
         // Resolve the selected record by id: the browse list may be filtered
         // (Accounts), so a positional index must not be applied to the unfiltered
         // vector. `sel` finds a record by that id in any record vector.
@@ -1791,6 +1800,8 @@ impl App {
                     r.history.clone(),
                 )
             }
+            // Guarded at the top of `start_edit`; the Summary tab has no edit form.
+            Tab::Summary => return,
         };
 
         // Remember how many fields belong to the record itself, before appending
@@ -2555,6 +2566,8 @@ impl App {
                 r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.general_documents, r);
             }
+            // The Summary tab has no record to commit.
+            Tab::Summary => {}
         }
     }
 
@@ -2577,6 +2590,19 @@ impl App {
         }
         if es.tab == Tab::Accounts && es.fields[3].value.trim().is_empty() {
             self.status = "Owner is required — every account must have an owner.".into();
+            self.edit = Some(es);
+            return;
+        }
+        // Assets/Liabilities: every entry must have an owner (field 2) and a NUMERIC
+        // approximate value (field 5) so the Summary tab can aggregate it. Keep the form
+        // open on a problem so the user can fix it rather than silently saving a bad entry.
+        if es.tab == Tab::Assets && es.fields[2].value.trim().is_empty() {
+            self.status = "Owner is required — every asset/liability must have an owner.".into();
+            self.edit = Some(es);
+            return;
+        }
+        if es.tab == Tab::Assets && records::parse_approx_value(&es.fields[5].value).is_none() {
+            self.status = "Approximate value must be a number (e.g. 1500, 12,000.50, or 250k).".into();
             self.edit = Some(es);
             return;
         }
@@ -2687,6 +2713,8 @@ impl App {
                     }
                     records::remove(&mut v.general_documents, &id, &mut v.audit, "General document");
                 }
+                // The Summary tab has no record to delete.
+                Tab::Summary => {}
             }
         }
         // Persist the record removal before reclaiming blobs, and only reclaim if
@@ -3216,9 +3244,16 @@ impl App {
         // type). Here it gathers every tab's title into a list for the tab bar.
         let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
             .select(self.tab.index())
-            .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-7) "))
+            .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-8) "))
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD));
         frame.render_widget(tabs, chunks[0]);
+
+        // The Summary tab renders a read-only aggregate TABLE instead of the record list.
+        if self.tab == Tab::Summary {
+            self.draw_summary(frame, chunks[1]);
+            self.draw_footer(frame, chunks[2], "←/→ or 1-8 switch tab · Summary is a read-only overview");
+            return;
+        }
 
         let labels = self.current_labels();
         let grouped = self.grouped_mode();
@@ -3314,6 +3349,61 @@ impl App {
             }
         };
         self.draw_footer(frame, chunks[2], hints);
+    }
+
+    /// Render the read-only Summary table: one row per owner, asset buckets (Real Estate /
+    /// Before Tax / After Tax) then liability buckets (Before/After Tax), per-owner Asset and
+    /// Liability totals + Net, and a bold grand-total row. Before Tax = retirement + HSA.
+    fn draw_summary(&self, frame: &mut Frame, area: Rect) {
+        let data = records::owner_value_summary(self.vault_ref().vault.assets.iter());
+        let block = Block::default().borders(Borders::ALL).title(
+            " Summary of Assets & Liabilities — Before Tax = retirement + HSA · After Tax = everything else ",
+        );
+        if data.is_empty() {
+            let p = Paragraph::new("No assets or liabilities yet — add some on the Assets & Liabilities tab.").block(block);
+            frame.render_widget(p, area);
+            return;
+        }
+        let mut total = records::OwnerValueRow { owner: "TOTAL".to_string(), ..Default::default() };
+        for r in &data {
+            total.asset_real_estate += r.asset_real_estate;
+            total.asset_before_tax += r.asset_before_tax;
+            total.asset_after_tax += r.asset_after_tax;
+            total.liab_before_tax += r.liab_before_tax;
+            total.liab_after_tax += r.liab_after_tax;
+        }
+        let row_of = |r: &records::OwnerValueRow| {
+            vec![
+                r.owner.clone(),
+                crate::fmt_money(r.asset_real_estate),
+                crate::fmt_money(r.asset_before_tax),
+                crate::fmt_money(r.asset_after_tax),
+                crate::fmt_money(r.asset_total()),
+                crate::fmt_money(r.liab_before_tax),
+                crate::fmt_money(r.liab_after_tax),
+                crate::fmt_money(r.liability_total()),
+                crate::fmt_money(r.net()),
+            ]
+        };
+        let mut rows: Vec<Row> = data.iter().map(|r| Row::new(row_of(r))).collect();
+        rows.push(Row::new(row_of(&total)).style(Style::default().add_modifier(Modifier::BOLD)));
+        let header = Row::new(vec![
+            "Owner", "Asset RE", "Asset Bef-Tax", "Asset Aft-Tax", "Asset Σ", "Liab Bef-Tax", "Liab Aft-Tax", "Liab Σ", "Net",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+        let widths = [
+            Constraint::Min(8),
+            Constraint::Length(11),
+            Constraint::Length(13),
+            Constraint::Length(13),
+            Constraint::Length(12),
+            Constraint::Length(13),
+            Constraint::Length(13),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ];
+        let table = Table::new(rows, widths).header(header).column_spacing(1).block(block);
+        frame.render_widget(table, area);
     }
 
     fn draw_edit(&self, frame: &mut Frame) {
@@ -4019,6 +4109,7 @@ mod tests {
                 "Real Estate",
                 "Taxes",
                 "General Documents",
+                "Summary",
             ]
         );
         for t in Tab::ALL {
@@ -4055,6 +4146,36 @@ mod tests {
         // draw_edit / portal-rendering no-op mutants).
         assert!(screen.contains("Financing balance"), "RE edit form renders its fields");
         assert!(screen.contains("Property Mgmt"), "RE edit form renders the portal sections");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn summary_tab_renders_aggregated_owner_table() {
+        let (mut app, path) = app_unlocked("uisummary");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut mk = |owner: &str, kind: &str, ty: &str, inst: &str, val: &str| {
+                let mut a = AssetLiability::new().unwrap();
+                a.owner = owner.into();
+                a.kind = kind.into();
+                a.asset_type = ty.into();
+                a.institution = inst.into();
+                a.approx_value = val.into();
+                records::upsert(&mut v.assets, a);
+            };
+            mk("Alice", "Asset", "Real Estate", "", "500000");
+            mk("Alice", "Asset", "401k", "Fidelity", "200000"); // before-tax (retirement)
+            mk("Alice", "Liability", "Mortgage", "", "300000"); // after-tax liability
+        }
+        app.tab = Tab::Summary;
+        let screen = render_to_string(&app);
+        assert!(screen.contains("Summary of Assets"), "the Summary title is drawn");
+        assert!(screen.contains("Asset Bef-Tax"), "the bucket column headers are drawn");
+        assert!(screen.contains("Alice"), "the owner row is drawn");
+        assert!(screen.contains("$500,000"), "the real-estate aggregate is shown");
+        assert!(screen.contains("$200,000"), "the before-tax (401k) aggregate is shown");
+        assert!(screen.contains("$300,000"), "the liability aggregate is shown");
+        assert!(screen.contains("TOTAL"), "the grand-total row is drawn");
         cleanup(&path);
     }
 

@@ -418,6 +418,7 @@ enum Tab {
     RealEstate,
     Taxes,
     GeneralDocuments,
+    Summary,
 }
 
 /// Deferred form action gathered during rendering, applied afterwards.
@@ -1163,6 +1164,7 @@ impl GuiApp {
                 tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
                 tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
                 tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
+                tab_button(ui, &mut self.tab, Tab::Summary, "Summary");
                 ui.separator();
                 // Change-password is a write; only offer it when writable.
                 // `&&` short-circuits: the button is only drawn/evaluated when
@@ -2357,19 +2359,109 @@ impl GuiApp {
                 if let Some(r) = self.edit_asset.as_mut() {
                     r.trim_fields();
                 }
-                if let Some(r) = self.edit_asset.clone()
-                    && let Some(ov) = self.vault.as_mut()
-                {
-                    records::upsert(&mut ov.vault.assets, r);
+                // Validate before saving: every Asset/Liability must have an owner and a
+                // NUMERIC approximate value, so the Summary tab can aggregate it. On failure,
+                // surface the reason in the conspicuous banner and do NOT save the bad record.
+                let invalid = self.edit_asset.as_ref().and_then(records::asset_validation_error);
+                if let Some(msg) = invalid {
+                    self.fail(msg);
+                } else {
+                    if let Some(r) = self.edit_asset.clone()
+                        && let Some(ov) = self.vault.as_mut()
+                    {
+                        records::upsert(&mut ov.vault.assets, r);
+                    }
+                    if self.persist() {
+                        self.status = "Saved.".into();
+                    }
+                    // On failure persist() has already set the "Save failed: …" status.
                 }
-                if self.persist() {
-                    self.status = "Saved.".into();
-                }
-                // On failure persist() has already set the "Save failed: …" status.
             }
             FormAction::Delete => self.delete_current(Tab::Assets),
             _ => {}
         }
+    }
+
+    // --- Tab: Summary --------------------------------------------------------
+
+    /// The "Summary" tab: a flat table aggregating every Asset/Liability's approximate value
+    /// by owner, split into asset buckets (Real Estate / Before Tax / After Tax) and liability
+    /// buckets (Before Tax / After Tax), with per-owner totals + net worth and a grand-total
+    /// row. Before Tax = retirement + HSA; After Tax = everything else (records::value_bucket).
+    fn tab_summary(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading("Summary of Assets & Liabilities");
+        ui.label(
+            egui::RichText::new(
+                "Aggregated approximate values by owner. Before Tax = retirement + HSA; After Tax = everything else.",
+            )
+            .weak(),
+        );
+        ui.add_space(8.0);
+        let rows = records::owner_value_summary(self.vault_ref().vault.assets.iter());
+        if rows.is_empty() {
+            ui.label("No assets or liabilities yet — add some on the Assets and Liabilities tab.");
+            return;
+        }
+        // Grand total across all owners.
+        let mut total = records::OwnerValueRow { owner: "All owners".to_string(), ..Default::default() };
+        for r in &rows {
+            total.asset_real_estate += r.asset_real_estate;
+            total.asset_before_tax += r.asset_before_tax;
+            total.asset_after_tax += r.asset_after_tax;
+            total.liab_before_tax += r.liab_before_tax;
+            total.liab_after_tax += r.liab_after_tax;
+        }
+        egui::ScrollArea::both().auto_shrink([false, false]).id_salt("summary_scroll").show(ui, |ui| {
+            egui::Grid::new("summary_grid").striped(true).num_columns(9).spacing([18.0, 6.0]).show(ui, |ui| {
+                // Group header: ASSETS over its 4 value columns, LIABILITIES over its 3.
+                ui.label("");
+                ui.label(egui::RichText::new("ASSETS").strong().color(egui::Color32::from_rgb(40, 120, 60)));
+                ui.label("");
+                ui.label("");
+                ui.label("");
+                ui.label(egui::RichText::new("LIABILITIES").strong().color(egui::Color32::from_rgb(170, 70, 70)));
+                ui.label("");
+                ui.label("");
+                ui.label("");
+                ui.end_row();
+                // Column headers.
+                for h in
+                    ["Owner", "Real Estate", "Before Tax", "After Tax", "Assets Σ", "Before Tax", "After Tax", "Liab. Σ", "Net"]
+                {
+                    ui.label(egui::RichText::new(h).strong());
+                }
+                ui.end_row();
+                // One row per owner (monospace amounts so the digits line up).
+                for r in &rows {
+                    ui.label(r.owner.as_str());
+                    ui.monospace(crate::fmt_money(r.asset_real_estate));
+                    ui.monospace(crate::fmt_money(r.asset_before_tax));
+                    ui.monospace(crate::fmt_money(r.asset_after_tax));
+                    ui.monospace(crate::fmt_money(r.asset_total()));
+                    ui.monospace(crate::fmt_money(r.liab_before_tax));
+                    ui.monospace(crate::fmt_money(r.liab_after_tax));
+                    ui.monospace(crate::fmt_money(r.liability_total()));
+                    ui.monospace(crate::fmt_money(r.net()));
+                    ui.end_row();
+                }
+                // Grand-total row (bold).
+                ui.label(egui::RichText::new(total.owner.as_str()).strong());
+                for v in [
+                    total.asset_real_estate,
+                    total.asset_before_tax,
+                    total.asset_after_tax,
+                    total.asset_total(),
+                    total.liab_before_tax,
+                    total.liab_after_tax,
+                    total.liability_total(),
+                    total.net(),
+                ] {
+                    ui.label(egui::RichText::new(crate::fmt_money(v)).strong().monospace());
+                }
+                ui.end_row();
+            });
+        });
     }
 
     // --- Tab: Accounts -------------------------------------------------------
@@ -3384,6 +3476,8 @@ impl GuiApp {
                         records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document");
                     }
                 }
+                // The Summary tab is read-only (no records of its own), so it never deletes.
+                Tab::Summary => {}
             }
         }
         // Persist the record removal BEFORE reclaiming its blobs, AND only reclaim
@@ -3489,6 +3583,7 @@ impl eframe::App for GuiApp {
                     Tab::Instructions => self.tab_instructions(ui),
                     Tab::TrustWill => self.tab_trustwill(ui),
                     Tab::Assets => self.tab_assets(ui),
+                    Tab::Summary => self.tab_summary(ui),
                     Tab::Accounts => self.tab_accounts(ui),
                     Tab::RealEstate => self.tab_realestate(ui),
                     Tab::Taxes => self.tab_taxes(ui),

@@ -79,6 +79,27 @@ pub(crate) fn clipboard_tick_decision(
     }
 }
 
+/// Format a Summary-tab amount as a grouped, whole-unit currency string, shared by the GUI
+/// and TUI so both render identically: `1_234_567.8 -> "$1,234,568"`, `-2500.0 -> "-$2,500"`,
+/// `0.0 -> "$0"`. The summary is an approximation, so cents are rounded away for legibility.
+pub(crate) fn fmt_money(v: f64) -> String {
+    let neg = v < 0.0;
+    let digits = (v.abs().round() as u64).to_string();
+    let bytes = digits.as_bytes();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 2);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(*b as char);
+    }
+    if neg {
+        format!("-${grouped}")
+    } else {
+        format!("${grouped}")
+    }
+}
+
 // --- Local, non-secret preferences (shared by the GUI and TUI) ---------------
 //
 // A tiny `prefs.json` in the OS config dir holds UI preferences that are NOT vault
@@ -253,6 +274,15 @@ mod tests {
             assert!(read_prefs_obj(&link).is_empty(), "symlinked prefs refused");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fmt_money_groups_thousands_and_signs() {
+        assert_eq!(fmt_money(0.0), "$0");
+        assert_eq!(fmt_money(1500.0), "$1,500");
+        assert_eq!(fmt_money(1_234_567.8), "$1,234,568"); // rounds, groups
+        assert_eq!(fmt_money(-2500.0), "-$2,500");
+        assert_eq!(fmt_money(999.0), "$999");
     }
 
     #[test]
