@@ -684,6 +684,19 @@ impl OpenVault {
             }
             p += 1;
         }
+        // FAIL CLOSED on a NON-CONTIGUOUS mirror, exactly like `VolumeStore::open`: the loop
+        // above stops at the first absent `manifest.<N>.json`, so a lost MIDDLE partition (a
+        // partial copy or selective restore of the mirror) while a HIGHER one survives would
+        // otherwise be silently dropped — importing a vault missing every document in the
+        // orphaned higher partitions. Detect a surviving higher manifest and refuse.
+        if let Some(hi) = highest_mirror_manifest(&man_dir)
+            && hi >= p
+        {
+            return Err(VaultError::Storage(StorageError::Corrupt(format!(
+                "non-contiguous partitions in mirror: imported {p} but manifest.{hi}.json still exists \
+                 (a middle partition is missing)"
+            ))));
+        }
         drop(store);
 
         // Write the encrypted vault (the final commit point), then open it through
@@ -1796,6 +1809,26 @@ fn is_safe_blob_id(id: &str) -> bool {
 /// enforced separately by `VolumeStore::put`.
 fn is_safe_doc_path(path: &str) -> bool {
     !path.contains(|c: char| c.is_control() || records::is_spoofy_format_char(c))
+}
+
+/// Highest `N` for which a file named exactly `manifest.<N>.json` exists in `dir` (strict
+/// `<decimal>` between the fixed prefix/suffix), or `None`. Used by `import_tree` to detect a
+/// non-contiguous mirror (a missing middle partition), mirroring `VolumeStore::open`'s guard.
+fn highest_mirror_manifest(dir: &Path) -> Option<u32> {
+    let mut hi: Option<u32> = None;
+    let rd = fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(rest) = name.strip_prefix("manifest.")
+            && let Some(num) = rest.strip_suffix(".json")
+            && !num.is_empty()
+            && num.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = num.parse::<u32>()
+        {
+            hi = Some(hi.map_or(n, |h| h.max(n)));
+        }
+    }
+    hi
 }
 
 /// Look up a blob in the merge SOURCE's store: returns its `(validated path, size)` if
@@ -4455,6 +4488,30 @@ mod tests {
 
         std::fs::remove_dir_all(&mirror).ok();
         std::fs::remove_dir_all(&dest_dir).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_tree_rejects_a_non_contiguous_mirror() {
+        // A mirror with a missing MIDDLE manifest must FAIL CLOSED, never silently drop the
+        // documents in the surviving higher partitions — symmetric with VolumeStore::open's
+        // non-contiguous-partition guard. (seed_multi_partition spans partitions 0,1,2.)
+        let (path, _docs) = seed_multi_partition("impgap", b"o1", b"o2");
+        let mirror = std::env::temp_dir().join(format!("pmgap-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        assert!(mirror.join("manifest/manifest.2.json").exists(), "seed should span >= 3 partitions");
+        // Lose the MIDDLE manifest (1); 0 and 2 survive → a gap the loop would silently truncate.
+        std::fs::remove_file(mirror.join("manifest/manifest.1.json")).unwrap();
+        let dest = std::env::temp_dir().join(format!("pmgapd-{}", nanos())).join(VAULT_FILE);
+        assert!(
+            matches!(
+                OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()),
+                Err(VaultError::Storage(StorageError::Corrupt(_)))
+            ),
+            "a non-contiguous mirror (missing middle manifest) must be rejected"
+        );
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(parent_dir(&dest)).ok();
         cleanup(&path);
     }
 
