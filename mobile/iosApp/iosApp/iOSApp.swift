@@ -1,4 +1,6 @@
 import SwiftUI
+// The shared Kotlin framework (baseName "ComposeApp"), for the AppLifecycle auto-lock signal.
+import ComposeApp
 
 @main
 struct iOSApp: App {
@@ -16,6 +18,15 @@ struct iOSApp: App {
                 .overlay {
                     if scenePhase != .active {
                         Color(.systemBackground).ignoresSafeArea()
+                    }
+                }
+                // Auto-lock when the scene leaves the foreground: signal the shared Compose
+                // app (AppLifecycle) so it drops the unlocked Vault, mirroring Android's
+                // onStop. The opaque overlay above only hides the snapshot; this re-locks.
+                // (Kotlin `object` -> Swift `.shared`.) Verify on a Mac.
+                .onChange(of: scenePhase) { newPhase in
+                    if newPhase != .active {
+                        AppLifecycle.shared.onEnterBackground()
                     }
                 }
         }
