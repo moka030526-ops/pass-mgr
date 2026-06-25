@@ -1371,11 +1371,17 @@ impl OpenVault {
                 continue;
             }
             let t = a.asset_type.trim();
+            // `to_ascii_lowercase` (not `to_lowercase`) so the preview's dedup key matches the
+            // case-fold the apply-time list uses (`eq_ignore_ascii_case`) — else a non-ASCII
+            // case-distinct type makes the preview count drift from what apply adds.
             if !t.is_empty()
                 && !cats.asset.iter().any(|x| x.eq_ignore_ascii_case(t))
-                && seen_cat.insert(format!("a\u{1f}{}", t.to_lowercase()))
+                && seen_cat.insert(format!("a\u{1f}{}", t.to_ascii_lowercase()))
             {
-                plan.new_categories.push(format!("asset type \u{201c}{t}\u{201d}"));
+                // Sanitize the UNTRUSTED source type string for the approval screen, exactly
+                // like the record labels above: a crafted source vault must not inject terminal
+                // escapes / bidi chars into the new-category list the user authorizes.
+                plan.new_categories.push(format!("asset type \u{201c}{}\u{201d}", records::display_safe(t)));
             }
         }
         let acct_ids = accepted_ids(crate::merge::RecordKind::Account);
@@ -1387,16 +1393,20 @@ impl OpenVault {
             let t = a.account_type.trim();
             if !t.is_empty() {
                 if !cats.account.iter().any(|x| x.name.eq_ignore_ascii_case(t))
-                    && seen_cat.insert(format!("c\u{1f}{}", t.to_lowercase()))
+                    && seen_cat.insert(format!("c\u{1f}{}", t.to_ascii_lowercase()))
                 {
-                    plan.new_categories.push(format!("account type \u{201c}{t}\u{201d}"));
+                    plan.new_categories.push(format!("account type \u{201c}{}\u{201d}", records::display_safe(t)));
                 }
                 let st = a.account_subtype.trim();
                 if !st.is_empty()
                     && !cats.subtypes_for(t).iter().any(|x| x.eq_ignore_ascii_case(st))
-                    && seen_cat.insert(format!("s\u{1f}{}\u{1f}{}", t.to_lowercase(), st.to_lowercase()))
+                    && seen_cat.insert(format!("s\u{1f}{}\u{1f}{}", t.to_ascii_lowercase(), st.to_ascii_lowercase()))
                 {
-                    plan.new_categories.push(format!("subtype \u{201c}{st}\u{201d} under \u{201c}{t}\u{201d}"));
+                    plan.new_categories.push(format!(
+                        "subtype \u{201c}{}\u{201d} under \u{201c}{}\u{201d}",
+                        records::display_safe(st),
+                        records::display_safe(t)
+                    ));
                 }
             }
         }
@@ -6173,6 +6183,7 @@ mod tests {
         let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
         let mut a = acct_with("spoof", "alice", "pw", 100);
         a.title = "invoice\u{202e}fdp.exe".into(); // U+202E RIGHT-TO-LEFT OVERRIDE
+        a.account_type = "Bank\u{202e}x".into(); // untrusted category type, also spoofed
         s.vault.accounts.push(a);
         s.save().unwrap();
         let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
@@ -6187,6 +6198,18 @@ mod tests {
             r.label
         );
         assert!(r.label.contains('_'), "the spoof char is replaced with '_', got {:?}", r.label);
+        // The new-category preview strings (sibling text on the same approval screen, derived
+        // from the same untrusted source) must be sanitized too.
+        assert!(
+            !plan.new_categories.iter().any(|c| c.contains('\u{202e}')),
+            "preview category strings must be sanitized: {:?}",
+            plan.new_categories
+        );
+        assert!(
+            plan.new_categories.iter().any(|c| c.contains("Bank_x")),
+            "the spoofed account type appears sanitized in the preview: {:?}",
+            plan.new_categories
+        );
         cleanup(&s_path);
         cleanup(&c_path);
     }
