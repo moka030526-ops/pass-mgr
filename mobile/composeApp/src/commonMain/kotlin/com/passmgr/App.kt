@@ -64,6 +64,23 @@ private enum class Section(val title: String, val kind: RecordKind) {
 }
 
 /**
+ * App-wide "left the foreground" signal. Each platform entry point calls [onEnterBackground]
+ * when the app is backgrounded — Android `Activity.onStop`, iOS scene phase != `.active` — and
+ * [App] observes [backgroundEpoch] to LOCK the vault. Without this a backgrounded password
+ * manager resumes still-unlocked, leaving secrets in memory and on screen for whoever next
+ * picks up the device. (The app-switcher SNAPSHOT is separately covered by Android FLAG_SECURE
+ * and the iOS overlay; this adds the missing auto-lock.)
+ */
+object AppLifecycle {
+    // Only `onEnterBackground` bumps this; `App` reads it as a snapshot state to trigger a lock.
+    var backgroundEpoch by mutableStateOf(0)
+
+    fun onEnterBackground() {
+        backgroundEpoch++
+    }
+}
+
+/**
  * Root composable. Shared verbatim by Android and iOS. Holds the locked/unlocked
  * state; the opaque [Vault] handle is destroyed when locking so the Rust side
  * zeroizes the key.
@@ -105,6 +122,21 @@ fun App(vaultDir: String, copySecret: ((String) -> Unit)? = null) {
             clipboardToken++
         }
 
+        // Auto-lock on background: the platform entry points bump AppLifecycle when the app
+        // leaves the foreground; we drop the Vault handle (Rust zeroizes the key) so the app
+        // never resumes still-unlocked. backgroundEpoch starts at 0, so this is a no-op until
+        // the first real background event.
+        LaunchedEffect(AppLifecycle.backgroundEpoch) {
+            if (AppLifecycle.backgroundEpoch > 0 && vault != null) {
+                vault?.destroy()
+                vault = null
+                if (clipboardToken != 0) {
+                    clipboard.setText(AnnotatedString(""))
+                    clipboardToken = 0
+                }
+            }
+        }
+
         val current = vault
         if (current == null) {
             UnlockScreen(vaultDir) { vault = it }
@@ -112,8 +144,12 @@ fun App(vaultDir: String, copySecret: ((String) -> Unit)? = null) {
             VaultScreen(current, copyToClipboard) {
                 current.destroy()
                 vault = null
-                clipboard.setText(AnnotatedString("")) // wipe any copied secret on lock
-                clipboardToken = 0 // we just wiped — cancel any pending auto-clear
+                // Only wipe the clipboard if WE put a secret there (token != 0); otherwise an
+                // unrelated clip the user copied meanwhile must be left untouched on lock.
+                if (clipboardToken != 0) {
+                    clipboard.setText(AnnotatedString("")) // wipe the copied secret on lock
+                    clipboardToken = 0 // we just wiped — cancel any pending auto-clear
+                }
             }
         }
     }

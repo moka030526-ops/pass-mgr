@@ -29,6 +29,17 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Lock the vault whenever the app leaves the foreground. `onStop` fires once the activity
+     * is fully hidden (backgrounded, screen off, or another app on top); the shared [App]
+     * observes [AppLifecycle] and drops the Vault handle, so the app never resumes still
+     * unlocked. (FLAG_SECURE above separately keeps the recents thumbnail blank.)
+     */
+    override fun onStop() {
+        super.onStop()
+        AppLifecycle.onEnterBackground()
+    }
+
+    /**
      * Copy a password to the clipboard marked SENSITIVE. On Android 13+ the system
      * paste-preview overlay then redacts it instead of rendering the plaintext, and
      * history-aware keyboards (Gboard) are asked not to retain it. (The app's own

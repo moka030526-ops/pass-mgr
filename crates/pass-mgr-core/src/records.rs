@@ -331,6 +331,16 @@ pub(crate) fn is_spoofy_format_char(c: char) -> bool {
     )
 }
 
+/// Replace control characters and Unicode bidi/format/zero-width characters (everything
+/// [`is_spoofy_format_char`] flags, plus [`char::is_control`]) with `_`, for rendering an
+/// UNTRUSTED string into a context where those characters would spoof — a terminal line, a
+/// merge preview the user authorizes, or a real on-disk filename. Unlike [`doc_filename`] it
+/// does NOT touch separators/whitespace or cap length; it only neutralizes the invisible/bidi
+/// spoof set, so it is safe to apply to an arbitrary display label without otherwise mangling it.
+pub(crate) fn display_safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || is_spoofy_format_char(c) { '_' } else { c }).collect()
+}
+
 /// True if `name`'s stem (the part before the first '.') is a Windows reserved DEVICE name
 /// (case-insensitive): CON, PRN, AUX, NUL, COM1–9, LPT1–9. On Windows such a name maps to a
 /// device, not a file, regardless of extension (`con.pdf` opens the console), so it must be
@@ -2586,6 +2596,18 @@ mod tests {
         let long = doc_filename(&format!("con.{}", "a".repeat(200)));
         assert!(long.len() <= 120, "reserved+long stays capped: {} bytes", long.len());
         assert!(long.starts_with("_con") && !long.ends_with('.') && !long.is_empty());
+    }
+
+    #[test]
+    fn display_safe_neutralizes_control_and_bidi_chars() {
+        // Replaces the RLO override, zero-width/BOM, and control chars with '_' while keeping
+        // ordinary text (including non-ASCII letters) intact. Used by export_document_into for
+        // a real on-disk name and by the merge preview for an untrusted source label.
+        assert_eq!(display_safe("invoice\u{202e}fdp.exe"), "invoice_fdp.exe"); // RIGHT-TO-LEFT OVERRIDE
+        assert_eq!(display_safe("a\u{200b}b\u{feff}c"), "a_b_c"); // zero-width space + BOM
+        assert_eq!(display_safe("tab\tnl\n"), "tab_nl_"); // ASCII control
+        assert_eq!(display_safe("José café 北京"), "José café 北京"); // ordinary unicode preserved
+        assert_eq!(display_safe("plain.txt"), "plain.txt");
     }
 
     #[test]
