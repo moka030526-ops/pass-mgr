@@ -1221,13 +1221,18 @@ impl OpenVault {
             // on Windows instead of opening a device or colliding. New docs are already
             // sanitized at store time by `records::doc_filename`; this covers legacy paths.
             // Trailing dots/spaces are likewise stripped (silently dropped by the Win32 layer).
-            let p = p.trim_end_matches(['.', ' ']);
-            if records::is_windows_reserved_name(p) {
-                dest.push(format!("_{p}"));
-            } else if p.is_empty() {
+            // Neutralize control + bidi/zero-width spoof chars (e.g. U+202E RLO) exactly as
+            // the store-time sanitizer `records::doc_filename` does, so a legacy or merge-
+            // imported manifest path can't write a SPOOFED real filename on disk (e.g.
+            // `invoice\u{202e}fdp.exe` rendering as `invoiceexe.pdf` in the heir's file
+            // manager). New docs are sanitized at store time; this is the legacy backstop.
+            let p = records::display_safe(p.trim_end_matches(['.', ' ']));
+            if p.is_empty() {
                 continue;
+            } else if records::is_windows_reserved_name(&p) {
+                dest.push(format!("_{p}"));
             } else {
-                dest.push(p);
+                dest.push(&p);
             }
         }
         if dest == root {
@@ -1357,8 +1362,12 @@ impl OpenVault {
             plan.records.iter().filter(|r| r.kind == kind).map(|r| r.id.as_str()).collect()
         };
         let asset_ids = accepted_ids(crate::merge::RecordKind::Asset);
+        // Only the FIRST source occurrence of an accepted id is actually applied
+        // (merge_records is first-occurrence-wins), so a later DUPLICATE id carrying a
+        // different type must not seed a phantom category that no applied record uses.
+        let mut done_assets: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for a in &source.vault.assets {
-            if !asset_ids.contains(a.id.as_str()) {
+            if !asset_ids.contains(a.id.as_str()) || !done_assets.insert(a.id.as_str()) {
                 continue;
             }
             let t = a.asset_type.trim();
@@ -1370,9 +1379,10 @@ impl OpenVault {
             }
         }
         let acct_ids = accepted_ids(crate::merge::RecordKind::Account);
+        let mut done_accounts: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for a in &source.vault.accounts {
-            if !acct_ids.contains(a.id.as_str()) {
-                continue;
+            if !acct_ids.contains(a.id.as_str()) || !done_accounts.insert(a.id.as_str()) {
+                continue; // first-occurrence-wins, like the asset loop above
             }
             let t = a.account_type.trim();
             if !t.is_empty() {
@@ -1421,7 +1431,11 @@ impl OpenVault {
                         kind,
                         change: sel.change,
                         id: s.id().to_string(),
-                        label: s.label(),
+                        // Sanitize the UNTRUSTED source label for display: this string is
+                        // rendered into the CLI/TUI merge preview the user authorizes, so a
+                        // crafted source vault must not inject terminal escapes or bidi/zero-
+                        // width characters that spoof which records are being merged in.
+                        label: records::display_safe(&s.label()),
                         current_updated_at: sel.current_updated_at,
                         source_updated_at: s.updated_at(),
                     });
@@ -1429,7 +1443,7 @@ impl OpenVault {
                 Err(reason) => plan.skipped.push(crate::merge::SkippedRecord {
                     kind,
                     id: s.id().to_string(),
-                    label: s.label(),
+                    label: records::display_safe(&s.label()), // untrusted source label — see above
                     reason,
                 }),
             }
@@ -1519,8 +1533,11 @@ impl OpenVault {
         // appear in Config and the dropdowns (the lists' add_* are case-insensitive dedup, and
         // the subtype add finds the type just added above). Persisted by the single save below.
         let asset_ids = accepted(crate::merge::RecordKind::Asset);
+        // Dedup by id (first-occurrence-wins) so a duplicate source id with a different
+        // type can't add an orphan category type whose only "user" was the un-applied dup.
+        let mut done_assets: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for a in &source.vault.assets {
-            if !asset_ids.contains(a.id.as_str()) {
+            if !asset_ids.contains(a.id.as_str()) || !done_assets.insert(a.id.as_str()) {
                 continue;
             }
             let t = a.asset_type.trim();
@@ -1529,9 +1546,10 @@ impl OpenVault {
             }
         }
         let acct_ids = accepted(crate::merge::RecordKind::Account);
+        let mut done_accounts: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for a in &source.vault.accounts {
-            if !acct_ids.contains(a.id.as_str()) {
-                continue;
+            if !acct_ids.contains(a.id.as_str()) || !done_accounts.insert(a.id.as_str()) {
+                continue; // first-occurrence-wins, like the asset loop above
             }
             let t = a.account_type.trim();
             if !t.is_empty() {
@@ -1780,6 +1798,12 @@ fn source_entry_validated(source: &OpenVault, id: &str) -> Result<Option<(String
         Some(e) => {
             if !is_safe_doc_path(&e.path) {
                 return Err("references a document with an unsafe path".into());
+            }
+            // Enforce the SAME length bound `VolumeStore::put` enforces at apply time, so an
+            // over-long source path surfaces as a skipped record in the PREVIEW instead of
+            // aborting the merge with a hard error after the user already approved the plan.
+            if e.path.len() > crate::storage::MAX_PATH_LEN {
+                return Err("references a document whose path is too long".into());
             }
             Ok(Some((e.path.clone(), e.size)))
         }
@@ -6097,6 +6121,72 @@ mod tests {
         let c2 = OpenVault::open(c_path.clone(), b"c1", b"c2").unwrap();
         assert_eq!(&**c2.read_document(&blob_id).unwrap(), b"top-secret-statement");
         drop(c2);
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_duplicate_source_id_does_not_add_a_phantom_category_type() {
+        // Two SOURCE accounts share id "dup" but carry DIFFERENT account types. merge_records
+        // is first-occurrence-wins, so only the first ("Checking") is actually applied — the
+        // second ("Phantom") must NOT seed an orphan category type that no applied record uses.
+        let s_path = tmp_path("merge-dup-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a1 = acct_with("dup", "alice", "pw", 100);
+        a1.account_type = "Checking".into();
+        let mut a2 = acct_with("dup", "alice", "pw", 100);
+        a2.account_type = "Phantom".into();
+        s.vault.accounts.push(a1);
+        s.vault.accounts.push(a2);
+        s.save().unwrap();
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        let c_path = tmp_path("merge-dup-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+
+        // PLAN: only the first occurrence's type appears in the preview's new categories.
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert!(plan.new_categories.iter().any(|s| s.contains("Checking")), "first type previewed");
+        assert!(
+            !plan.new_categories.iter().any(|s| s.contains("Phantom")),
+            "the duplicate id's second type must not be a phantom category: {:?}",
+            plan.new_categories
+        );
+
+        // APPLY: the category list gains "Checking" but never the orphan "Phantom".
+        c.apply_merge_from(&source).unwrap();
+        assert!(c.vault.categories.account.iter().any(|x| x.name == "Checking"));
+        assert!(
+            !c.vault.categories.account.iter().any(|x| x.name == "Phantom"),
+            "no orphan category type from the un-applied duplicate"
+        );
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_preview_sanitizes_untrusted_source_record_labels() {
+        // A crafted SOURCE vault must not inject bidi/zero-width characters into the merge
+        // preview label the user authorizes (terminal/TUI/GUI spoofing). The label is cleaned
+        // at the source in plan_collection, so neither the CLI nor the TUI renderer is spoofable.
+        let s_path = tmp_path("merge-spoof-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a = acct_with("spoof", "alice", "pw", 100);
+        a.title = "invoice\u{202e}fdp.exe".into(); // U+202E RIGHT-TO-LEFT OVERRIDE
+        s.vault.accounts.push(a);
+        s.save().unwrap();
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        let c_path = tmp_path("merge-spoof-cur");
+        let c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        let plan = c.plan_merge_from(&source).unwrap();
+        let r = plan.records.iter().find(|r| r.id == "spoof").expect("the source account is previewed");
+        assert!(
+            !r.label.contains('\u{202e}'),
+            "the bidi-override char must be stripped from the preview label, got {:?}",
+            r.label
+        );
+        assert!(r.label.contains('_'), "the spoof char is replaced with '_', got {:?}", r.label);
         cleanup(&s_path);
         cleanup(&c_path);
     }
