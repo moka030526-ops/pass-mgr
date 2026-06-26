@@ -194,6 +194,95 @@ pub(crate) fn save_vault_root_to(path: &Path, dir: &str) {
     write_prefs_obj(path, &obj);
 }
 
+// --- View defaults: three local UI preferences (NOT vault content) -----------
+//
+// Each is a bool persisted in the shared `prefs.json` and read at startup by BOTH
+// front-ends to seed per-tab view state (so a freshly opened vault honours the
+// user's saved defaults). Like every other UI preference here they are settable
+// even in a read-only session and follow the export-dir read-modify-write template
+// (`as_bool()` / `Value::Bool`, defaulting to `false` = today's behaviour when
+// unset). The public `load_*`/`save_*` wrappers short-circuit under `cfg(test)`:
+// the loaders are invoked from `App::new`/`GuiApp::new` (which the unit tests
+// construct), so a stable `false` keeps those tests hermetic and independent of the
+// developer's real `~/.config/pass-mgr/prefs.json`; the path-parametrized
+// `_from`/`_to` helpers stay fully exercised by the round-trip tests.
+
+/// "Reveal all passwords by default" — when set, every tab that has passwords opens
+/// with its reveal-all toggle ON instead of masked.
+pub(crate) fn load_reveal_all_default() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    prefs_path().map(|p| load_reveal_all_default_from(&p)).unwrap_or(false)
+}
+pub(crate) fn load_reveal_all_default_from(path: &Path) -> bool {
+    read_prefs_obj(path).get("reveal_all_default").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+/// Persist the "reveal all by default" flag, preserving any other prefs keys.
+pub(crate) fn save_reveal_all_default(on: bool) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = prefs_path() {
+        save_reveal_all_default_to(&path, on);
+    }
+}
+pub(crate) fn save_reveal_all_default_to(path: &Path, on: bool) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("reveal_all_default".into(), serde_json::Value::Bool(on));
+    write_prefs_obj(path, &obj);
+}
+
+/// "Group assets by default" — when set, the Assets & Liabilities view opens grouped.
+pub(crate) fn load_group_assets_default() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    prefs_path().map(|p| load_group_assets_default_from(&p)).unwrap_or(false)
+}
+pub(crate) fn load_group_assets_default_from(path: &Path) -> bool {
+    read_prefs_obj(path).get("group_assets_default").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+/// Persist the "group assets by default" flag, preserving any other prefs keys.
+pub(crate) fn save_group_assets_default(on: bool) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = prefs_path() {
+        save_group_assets_default_to(&path, on);
+    }
+}
+pub(crate) fn save_group_assets_default_to(path: &Path, on: bool) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("group_assets_default".into(), serde_json::Value::Bool(on));
+    write_prefs_obj(path, &obj);
+}
+
+/// "Group accounts by default" — when set, the Accounts view opens grouped.
+pub(crate) fn load_group_accounts_default() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    prefs_path().map(|p| load_group_accounts_default_from(&p)).unwrap_or(false)
+}
+pub(crate) fn load_group_accounts_default_from(path: &Path) -> bool {
+    read_prefs_obj(path).get("group_accounts_default").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+/// Persist the "group accounts by default" flag, preserving any other prefs keys.
+pub(crate) fn save_group_accounts_default(on: bool) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = prefs_path() {
+        save_group_accounts_default_to(&path, on);
+    }
+}
+pub(crate) fn save_group_accounts_default_to(path: &Path, on: bool) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("group_accounts_default".into(), serde_json::Value::Bool(on));
+    write_prefs_obj(path, &obj);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +327,56 @@ mod tests {
         let obj = read_prefs_obj(&p);
         assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("solarized"), "theme key preserved");
         assert_eq!(obj.get("export_dir").and_then(|v| v.as_str()), Some("/exports"), "export_dir written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_default_bool_prefs_round_trip_and_default_false() {
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        // Absent file -> false (today's behaviour) for each flag.
+        assert!(!load_reveal_all_default_from(&p));
+        assert!(!load_group_assets_default_from(&p));
+        assert!(!load_group_accounts_default_from(&p));
+        // Save true, then load round-trips for each.
+        save_reveal_all_default_to(&p, true);
+        save_group_assets_default_to(&p, true);
+        save_group_accounts_default_to(&p, true);
+        assert!(load_reveal_all_default_from(&p));
+        assert!(load_group_assets_default_from(&p));
+        assert!(load_group_accounts_default_from(&p));
+        // Toggling back to false is preserved as false.
+        save_reveal_all_default_to(&p, false);
+        save_group_assets_default_to(&p, false);
+        save_group_accounts_default_to(&p, false);
+        assert!(!load_reveal_all_default_from(&p));
+        assert!(!load_group_assets_default_from(&p));
+        assert!(!load_group_accounts_default_from(&p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_default_bool_prefs_coexist_with_other_keys() {
+        // Each flag's read-modify-write must not clobber co-resident keys (theme,
+        // export dir, vault root, or the sibling bool flags).
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        std::fs::write(&p, br#"{"theme":"solarized"}"#).unwrap();
+        save_export_dir_to(&p, "/exports");
+        save_vault_root_to(&p, "/vaults");
+        save_reveal_all_default_to(&p, true);
+        save_group_assets_default_to(&p, true);
+        save_group_accounts_default_to(&p, true);
+        let obj = read_prefs_obj(&p);
+        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("solarized"), "theme preserved");
+        assert_eq!(obj.get("export_dir").and_then(|v| v.as_str()), Some("/exports"), "export_dir preserved");
+        assert_eq!(obj.get("vault_root").and_then(|v| v.as_str()), Some("/vaults"), "vault_root preserved");
+        assert_eq!(obj.get("reveal_all_default").and_then(|v| v.as_bool()), Some(true), "reveal_all_default written");
+        assert_eq!(obj.get("group_assets_default").and_then(|v| v.as_bool()), Some(true), "group_assets_default written");
+        assert_eq!(obj.get("group_accounts_default").and_then(|v| v.as_bool()), Some(true), "group_accounts_default written");
+        // A non-bool value for a flag key falls back to false rather than panicking.
+        std::fs::write(&p, br#"{"reveal_all_default":"yes"}"#).unwrap();
+        assert!(!load_reveal_all_default_from(&p), "non-bool value falls back to false");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
