@@ -522,6 +522,15 @@ struct GuiApp {
     // The same single global toggle for the Real Estate screen's four portal passwords.
     // Kept separate from `reveal_all` so the two screens don't reveal each other.
     re_reveal_all: bool,
+    // Saved "view defaults" preferences (the three Config checkboxes, persisted in
+    // prefs.json). They are kept SEPARATE from the live view state above so the Config
+    // checkboxes always reflect the saved default, never a transient per-tab toggle.
+    // `reveal_default` seeds `reveal_all`/`re_reveal_all` at open AND is re-applied by the
+    // tab-switch reset (instead of forcing reveal back to masked); the two grouping
+    // defaults seed `acct_grouped`/`asset_grouped` at open.
+    reveal_default: bool,
+    group_assets_default: bool,
+    group_accounts_default: bool,
     // Accounts-tab display filters ("" = no filter).
     acct_filter_type: String,
     acct_filter_subtype: String,
@@ -621,6 +630,13 @@ impl GuiApp {
         // Load the saved theme; `applied_theme` starts equal to it so the first
         // frame doesn't needlessly re-apply/re-save (the same value `run` already set).
         let theme = load_theme();
+        // Saved "view defaults" (Config checkboxes, prefs.json): seed the reveal-all
+        // toggles and the grouped/flat view state so a freshly opened vault honours the
+        // user's preferences. The pref values are also retained on the struct so the Config
+        // checkboxes show the saved default and the tab-switch reset can re-apply reveal.
+        let reveal_default = crate::load_reveal_all_default();
+        let group_assets_default = crate::load_group_assets_default();
+        let group_accounts_default = crate::load_group_accounts_default();
         GuiApp {
             path,
             writable,
@@ -657,16 +673,19 @@ impl GuiApp {
             edit_realestate: None,
             edit_taxfiling: None,
             edit_general: None,
-            reveal_all: false,
-            re_reveal_all: false,
+            reveal_all: reveal_default,
+            re_reveal_all: reveal_default,
+            reveal_default,
+            group_assets_default,
+            group_accounts_default,
             acct_filter_type: String::new(),
             acct_filter_subtype: String::new(),
             acct_filter_owner: String::new(),
             acct_filter_title: String::new(),
             acct_filter_review: false,
             acct_search_user: String::new(),
-            acct_grouped: false,
-            asset_grouped: false,
+            acct_grouped: group_accounts_default,
+            asset_grouped: group_assets_default,
             asset_filter_review: false,
             new_asset_type: String::new(),
             new_account_type: String::new(),
@@ -902,6 +921,22 @@ impl GuiApp {
                     )
                 };
                 self.vault = Some(v);
+                // Bring the Config type lists into line with what records actually use, so a
+                // freshly opened (writable) vault's Config matches its data — types brought in
+                // by an older import/merge appear without a manual "sync". This is ADD-ONLY:
+                // `sync_types_from_records` only inserts missing types/subtypes, it never
+                // deletes a configured entry. Read-only sessions skip it; with no drift it adds
+                // nothing and writes nothing. Appended to the open message so a recovery/unlock
+                // notice is never clobbered.
+                if self.writable {
+                    match self.vault.as_mut().map(|ov| ov.sync_types_from_records()) {
+                        Some(Ok(n)) if n > 0 => {
+                            self.status = format!("{} · Synced {n} type(s) from records.", self.status)
+                        }
+                        Some(Err(e)) => self.status = format!("{} · Type sync failed: {e}", self.status),
+                        _ => {}
+                    }
+                }
                 self.auth_error = None;
                 self.wipe_passwords();
                 self.screen = Screen::Main;
@@ -1205,13 +1240,16 @@ impl GuiApp {
                 }
             });
         });
-        // Re-mask passwords when the user switches tabs (see prev_tab above): reveal is
-        // momentary, so a stale "reveal all" must not persist into a later tab visit. Also
-        // clear the shared document-input buffers so a half-typed "Upload from" path / name /
-        // subfolder from one tab does not linger in the next tab's attach form.
+        // Reset the global reveal toggles when the user switches tabs (see prev_tab above):
+        // reveal is momentary, so a stale "reveal all" must not persist into a later tab
+        // visit. The reset target is the saved "reveal all by default" preference, not a
+        // hardcoded `false`: when that pref is OFF this re-masks exactly as before, and when
+        // it is ON every tab re-opens revealed (the user's chosen default). Also clear the
+        // shared document-input buffers so a half-typed "Upload from" path / name / subfolder
+        // from one tab does not linger in the next tab's attach form.
         if self.tab != prev_tab {
-            self.reveal_all = false;
-            self.re_reveal_all = false;
+            self.reveal_all = self.reveal_default;
+            self.re_reveal_all = self.reveal_default;
             self.clear_doc_inputs();
         }
     }
@@ -1282,7 +1320,9 @@ impl GuiApp {
                 "Passwords: reveal, generate, copy",
                 &[
                     "Reveal is a single global toggle per screen ('reveal all') on Accounts and Real \
-                     Estate — there is no per-record reveal, and it clears when you switch tabs.",
+                     Estate — there is no per-record reveal. Switching tabs resets reveal to your \
+                     'Reveal all passwords by default' setting in Config: OFF (the default) re-masks \
+                     every tab; ON re-reveals every tab.",
                     "🎲 generates a strong random password (and turns reveal on so you can see it). \
                      📋 copies a password through a history-excluded clipboard path; the clipboard \
                      auto-clears after 15 seconds and is wiped on exit.",
@@ -1368,7 +1408,8 @@ impl GuiApp {
         if !self.writable {
             ui.label(
                 egui::RichText::new(
-                    "Read-only: no field can be edited. Only the color theme can be changed; \
+                    "Read-only: no vault field can be edited. The color theme and the view \
+                     defaults below can still be changed (they are local preferences); \
                      backup and document export are still available.",
                 )
                 .color(egui::Color32::from_rgb(170, 90, 0)),
@@ -1420,12 +1461,47 @@ impl GuiApp {
             });
             ui.add_space(14.0);
 
+            // View defaults: local UI preferences (prefs.json), not vault content — so they
+            // work in read-only mode too and persist to the next launch. Each checkbox binds
+            // to the saved-default field, saves the preference on change, and applies it to
+            // the live view state so the effect is immediate; the saved value re-seeds these
+            // on the next vault open (see `GuiApp::new` and the tab-switch reset).
+            ui.label(egui::RichText::new("View defaults").strong());
+            if ui
+                .checkbox(&mut self.reveal_default, "Reveal all passwords by default")
+                .changed()
+            {
+                crate::save_reveal_all_default(self.reveal_default);
+                self.reveal_all = self.reveal_default;
+                self.re_reveal_all = self.reveal_default;
+            }
+            if ui
+                .checkbox(&mut self.group_assets_default, "Group assets by default")
+                .changed()
+            {
+                crate::save_group_assets_default(self.group_assets_default);
+                self.asset_grouped = self.group_assets_default;
+            }
+            if ui
+                .checkbox(&mut self.group_accounts_default, "Group accounts by default")
+                .changed()
+            {
+                crate::save_group_accounts_default(self.group_accounts_default);
+                self.acct_grouped = self.group_accounts_default;
+            }
+            ui.add_space(14.0);
+
             ui.label(egui::RichText::new("Asset / Liability types").strong());
             // One chip per type with a delete (×) button. The × only deletes when the
             // type is unused by a live record (else a status message explains why).
             ui.horizontal_wrapped(|ui| {
                 for name in &asset_names {
                     ui.label(egui::RichText::new(name).weak());
+                    // The category list is stored independently of records; tag entries no
+                    // live record uses so the user can see what's safe to delete.
+                    if self.vault_ref().asset_type_usage(name) == 0 {
+                        ui.label(egui::RichText::new("· unused").weak().italics());
+                    }
                     if self.writable
                         && ui.small_button("×").on_hover_text(format!("Delete “{name}” (only if unused)")).clicked()
                     {
@@ -1451,6 +1527,9 @@ impl GuiApp {
             for (name, subs) in &account_list {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new(name).strong());
+                    if self.vault_ref().account_type_usage(name) == 0 {
+                        ui.label(egui::RichText::new("· unused").weak().italics());
+                    }
                     if self.writable
                         && ui
                             .small_button("×")
@@ -1465,6 +1544,9 @@ impl GuiApp {
                     }
                     for sub in subs {
                         ui.label(egui::RichText::new(sub).weak());
+                        if self.vault_ref().account_subtype_usage(name, sub) == 0 {
+                            ui.label(egui::RichText::new("· unused").weak().italics());
+                        }
                         if self.writable
                             && ui.small_button("×").on_hover_text(format!("Delete subtype “{sub}” (only if unused)")).clicked()
                         {
@@ -2033,7 +2115,7 @@ impl GuiApp {
             // Destructuring assignment into the outer `new`/`select` vars.
             // `cur.as_deref()` turns `Option<String>` into `Option<&str>` (a
             // borrowed view) without consuming `cur`.
-            (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable);
+            (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable, None);
             // Shadow `ui` with a mutable borrow of the right column. "Shadowing"
             // reuses the name `ui` for a new binding within this block.
             let ui = &mut c[1];
@@ -2107,7 +2189,7 @@ impl GuiApp {
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable);
+            (new, select) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -2177,7 +2259,7 @@ impl GuiApp {
 
         ui.columns(2, |c| {
             (new, select) =
-                list_panel(&mut c[0], "General Documents", "➕ New", &labels, cur.as_deref(), self.writable);
+                list_panel(&mut c[0], "General Documents", "➕ New", &labels, cur.as_deref(), self.writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_general.as_mut() {
                 egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -2260,6 +2342,8 @@ impl GuiApp {
             .map(|a| (a.id.clone(), a.label()))
             .collect();
         let cur = self.edit_asset.as_ref().map(|r| r.id.clone());
+        // Flat-list arrow navigation: when not grouped, ↑/↓ move to the prev/next item.
+        let nav_target = list_nav_target(ui, !self.asset_grouped, &labels, cur.as_deref());
         let attached: Vec<String> =
             self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone())).into_iter().collect();
         let asset_types = self.vault_ref().categories().asset.clone();
@@ -2288,7 +2372,8 @@ impl GuiApp {
                     });
                 }
                 None => {
-                    (new, select) = list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable);
+                    (new, select) =
+                        list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
             let ui = &mut c[1];
@@ -2349,6 +2434,8 @@ impl GuiApp {
             self.edit_asset = AssetLiability::new().ok();
             self.clear_doc_inputs();
         }
+        // A click wins over keyboard nav (they can't both happen in one frame, but be safe).
+        select = select.or(nav_target);
         if let Some(i) = select
             && let Some((id, _)) = labels.get(i)
         {
@@ -2654,6 +2741,8 @@ impl GuiApp {
             None
         };
         let cur = self.edit_account.as_ref().map(|r| r.id.clone());
+        // Flat-list arrow navigation: when not grouped, ↑/↓ move to the prev/next item.
+        let nav_target = list_nav_target(ui, !self.acct_grouped, &labels, cur.as_deref());
         let mut new = false;
         let mut select = None;
         let mut action = FormAction::None;
@@ -2661,22 +2750,15 @@ impl GuiApp {
         // Deferred password-copy: `None` unless the user clicks copy, in which
         // case it holds the secret in a self-wiping `Zeroizing<String>`.
         let mut copy_pw: Option<Zeroizing<String>> = None;
-        // Subtypes for the record under edit, looked up from the vault's category
-        // lists before the mutable borrow of `edit_account` below. The record's
-        // current subtype is kept selectable even if it is a free-text value not
-        // in the configured list (e.g. legacy/imported data).
-        // `.map(|r| { ... last expr is the value })` builds the list when a record
-        // is being edited; `.unwrap_or_default()` yields an empty `Vec` otherwise.
+        // Subtypes for the record under edit, looked up from the vault's category lists
+        // before the mutable borrow of `edit_account` below. The record's current subtype is
+        // kept selectable even when off-list — `combo` prepends the current value, so no
+        // manual prepend is needed here. `.unwrap_or_default()` yields an empty `Vec` when no
+        // record is being edited.
         let subtypes: Vec<String> = self
             .edit_account
             .as_ref()
-            .map(|r| {
-                let mut s = self.vault_ref().categories().subtypes_for(&r.account_type);
-                if !r.account_subtype.is_empty() && !s.contains(&r.account_subtype) {
-                    s.insert(0, r.account_subtype.clone());
-                }
-                s
-            })
+            .map(|r| self.vault_ref().categories().subtypes_for(&r.account_type))
             .unwrap_or_default();
 
         ui.columns(2, |c| {
@@ -2699,7 +2781,8 @@ impl GuiApp {
                     });
                 }
                 None => {
-                    (new, select) = list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable);
+                    (new, select) =
+                        list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
             let ui = &mut c[1];
@@ -2764,6 +2847,8 @@ impl GuiApp {
         if new {
             self.edit_account = self.new_account_from_filters();
         }
+        // A click wins over keyboard nav (they can't both happen in one frame, but be safe).
+        select = select.or(nav_target);
         if let Some(i) = select {
             // `labels` is the FILTERED list, so resolve the clicked row to its id
             // and look the account up by id (a positional index into the
@@ -2858,7 +2943,7 @@ impl GuiApp {
         let mut docreq = ReDocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable);
+            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_realestate.as_mut() {
                 // No inner ScrollArea here: the whole tab is already wrapped in the
@@ -2979,7 +3064,7 @@ impl GuiApp {
         let mut docreq = TaxDocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable);
+            (new, select) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_taxfiling.as_mut() {
                 egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -3697,6 +3782,59 @@ fn render_acct_node(
     select
 }
 
+/// Keyboard-navigation target for a FLAT (non-grouped) record list. Returns `Some(index)`
+/// when the user pressed ↑/↓ this frame and `enabled` is set and neither a widget holds
+/// keyboard focus NOR a popup is open. Those guards mean typing in an edit-pane field moves
+/// the text cursor, and an open Type/Subtype dropdown navigates its own options, rather than
+/// moving the list selection (nav runs at the top of the tab, before the dropdowns render,
+/// so without the popup guard it would drain the arrow key the open combo needs). `enabled`
+/// is false in grouped mode (the tree has its own layout).
+///
+/// The arrow key is consumed so a focused widget that also reads arrows (e.g. a slider)
+/// won't act on the same press too. Note this does NOT suppress egui's cardinal focus
+/// navigation (`focus_direction` is captured from RawInput before any UI runs); egui only
+/// moves focus directionally when a widget already holds it, so the `focused()` guard is
+/// what keeps arrows driving the list here.
+fn list_nav_target(
+    ui: &egui::Ui,
+    enabled: bool,
+    labels: &[(String, String)],
+    current_id: Option<&str>,
+) -> Option<usize> {
+    if !enabled
+        || labels.is_empty()
+        || ui.memory(|m| m.focused().is_some())
+        || egui::Popup::is_any_open(ui.ctx())
+    {
+        return None;
+    }
+    let delta = ui.input_mut(|i| {
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            1isize
+        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            -1
+        } else {
+            0
+        }
+    });
+    if delta == 0 {
+        return None;
+    }
+    let here = current_id.and_then(|id| labels.iter().position(|(lid, _)| lid == id));
+    Some(stepped_list_index(here, delta, labels.len()))
+}
+
+/// Step a flat-list cursor by `delta` (±1), clamped to `[0, len-1]` (the ends don't wrap).
+/// With nothing currently selected, ↓ (`delta > 0`) starts at the top and ↑ at the bottom.
+/// `len` must be > 0 (callers guard on a non-empty list).
+fn stepped_list_index(current: Option<usize>, delta: isize, len: usize) -> usize {
+    match current {
+        Some(i) => (i as isize + delta).clamp(0, len as isize - 1) as usize,
+        None if delta > 0 => 0,
+        None => len - 1,
+    }
+}
+
 fn list_panel(
     ui: &mut egui::Ui,
     title: &str,
@@ -3704,6 +3842,9 @@ fn list_panel(
     labels: &[(String, String)],
     current_id: Option<&str>,
     writable: bool,
+    // When `Some(i)`, scroll so row `i` is visible (set only on the frame the user navigates
+    // with the arrow keys, so it never fights manual scrolling).
+    scroll_to: Option<usize>,
 ) -> (bool, Option<usize>) {
     let mut new = false;
     let mut select = None;
@@ -3723,8 +3864,12 @@ fn list_panel(
             // `id.as_str()` borrows the `String` as `&str` to compare with the
             // currently-selected id.
             let selected = current_id == Some(id.as_str());
-            if ui.selectable_label(selected, label).clicked() {
+            let resp = ui.selectable_label(selected, label);
+            if resp.clicked() {
                 select = Some(i);
+            }
+            if scroll_to == Some(i) {
+                resp.scroll_to_me(Some(egui::Align::Center));
             }
         }
     });
@@ -3885,11 +4030,20 @@ fn filter_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[Stri
     });
 }
 
-/// A dropdown restricted to `options`. Non-interactive (display-only) in read-only mode.
+/// A dropdown over `options`. Non-interactive (display-only) in read-only mode. The
+/// record's CURRENT value is always offered as a choice — even when it is off-list (legacy
+/// data, or a type later removed from Config) — so opening the dropdown can never drop it.
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String], writable: bool) {
     let current = if value.is_empty() { "(choose)".to_string() } else { value.clone() };
     ui.add_enabled_ui(writable, |ui| {
         egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
+            // Keep an off-list current value selectable, listed first. Compare trimmed +
+            // case-insensitively (matching the core's category dedup) so a value differing
+            // from a configured entry only by case/whitespace isn't shown as a near-duplicate.
+            if !value.is_empty() && !options.iter().any(|o| o.trim().eq_ignore_ascii_case(value.trim())) {
+                let cur = value.clone();
+                ui.selectable_value(value, cur.clone(), cur);
+            }
             for opt in options {
                 ui.selectable_value(value, opt.clone(), opt);
             }
@@ -4143,6 +4297,21 @@ mod tests {
 
     fn fast() -> KdfParams {
         KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 }
+    }
+
+    #[test]
+    fn stepped_list_index_clamps_and_seeds_from_empty_selection() {
+        // From a known position, ±1 with clamped ends (no wrap).
+        assert_eq!(stepped_list_index(Some(2), 1, 5), 3);
+        assert_eq!(stepped_list_index(Some(2), -1, 5), 1);
+        assert_eq!(stepped_list_index(Some(4), 1, 5), 4, "down at the bottom stays put");
+        assert_eq!(stepped_list_index(Some(0), -1, 5), 0, "up at the top stays put");
+        // With nothing selected, down seeds the top and up seeds the bottom.
+        assert_eq!(stepped_list_index(None, 1, 5), 0);
+        assert_eq!(stepped_list_index(None, -1, 5), 4);
+        // Single-item list: both directions stay on the only row.
+        assert_eq!(stepped_list_index(Some(0), 1, 1), 0);
+        assert_eq!(stepped_list_index(None, -1, 1), 0);
     }
 
     #[test]

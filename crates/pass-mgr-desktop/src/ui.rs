@@ -274,6 +274,18 @@ impl Field {
         Field { label: label.into(), value, kind: FieldKind::Choice(options) }
     }
 
+    /// Like [`choice`](Field::choice), but guarantees the record's CURRENT `value` is in the
+    /// option list: a non-empty value absent from `options` is prepended. This keeps an
+    /// off-list value (legacy data, or a type later removed from the configured list)
+    /// visible AND selectable, and stops arrow-cycling from silently snapping it to the
+    /// first option (`cycle` falls back to index 0 when the value isn't found).
+    fn choice_keep_current(label: &str, value: String, mut options: Vec<String>) -> Field {
+        if !value.is_empty() && !options.iter().any(|o| o == &value) {
+            options.insert(0, value.clone());
+        }
+        Field::choice(label, value, options)
+    }
+
     /// Cycle a Choice field's value by `delta` (no-op for other kinds).
     fn cycle(&mut self, delta: isize) {
         // `if let PATTERN = EXPR` runs the body only when the pattern matches.
@@ -447,6 +459,15 @@ struct App {
     // The same for the Real Estate tab's four portal passwords (toggled with `r` on
     // the RE tab). Scoped per-tab so revealing one screen never reveals the other.
     re_reveal_all: bool,
+    // Saved "view defaults" preferences (the three Config checkboxes, persisted in
+    // prefs.json and shared with the GUI). Kept SEPARATE from the live view state above so
+    // the Config checkboxes always show the saved default, never a transient toggle.
+    // `reveal_default` seeds `reveal_all`/`re_reveal_all` at open AND is re-applied by
+    // `switch_tab` (instead of forcing reveal back to masked); the grouping defaults seed
+    // `acct_grouped`/`asset_grouped` at open.
+    reveal_default: bool,
+    group_assets_default: bool,
+    group_accounts_default: bool,
     // Accounts view: false = flat filtered list, true = grouped tree
     // (type → subtype → owner → title), toggled with `g`.
     acct_grouped: bool,
@@ -516,6 +537,13 @@ impl App {
         let scan = crate::launch::discover_vaults(&auth_root);
         // Highlight the selected vault in the picker if it was discovered under the root.
         let auth_vault_sel = scan.vaults.iter().position(|v| *v == auth_name).unwrap_or(0);
+        // Saved "view defaults" (Config checkboxes, prefs.json): seed the reveal-all toggles
+        // and the grouped/flat view state so a freshly opened vault honours the user's
+        // preferences; the pref values are retained on the struct so the Config checkboxes
+        // show the saved default and `switch_tab` can re-apply reveal.
+        let reveal_default = crate::load_reveal_all_default();
+        let group_assets_default = crate::load_group_assets_default();
+        let group_accounts_default = crate::load_group_accounts_default();
         App {
             path,
             writable,
@@ -545,11 +573,14 @@ impl App {
             acct_filter_review: false,
             acct_search: String::new(),
             search_active: false,
-            reveal_all: false,
-            re_reveal_all: false,
-            acct_grouped: false,
+            reveal_all: reveal_default,
+            re_reveal_all: reveal_default,
+            reveal_default,
+            group_assets_default,
+            group_accounts_default,
+            acct_grouped: group_accounts_default,
             acct_expanded: std::collections::HashSet::new(),
-            asset_grouped: false,
+            asset_grouped: group_assets_default,
             asset_expanded: std::collections::HashSet::new(),
             asset_filter_review: false,
             cfg_focus: 0,
@@ -804,15 +835,17 @@ impl App {
         }
     }
 
-    /// Switch to tab `t`, reset the selection, and clear the "reveal all" toggles.
-    /// Reveal is a momentary, in-context action (and the ONLY reveal control — there is
-    /// no per-record reveal), so a stale `reveal_all`/`re_reveal_all` must not silently
-    /// persist into a later visit and expose every password.
+    /// Switch to tab `t`, reset the selection, and reset the "reveal all" toggles to the
+    /// saved "reveal all by default" preference. Reveal is a momentary, in-context action
+    /// (and the ONLY reveal control — there is no per-record reveal), so a stale
+    /// `reveal_all`/`re_reveal_all` must not silently persist into a later visit; resetting
+    /// to `reveal_default` re-masks exactly as before when the pref is OFF, and re-opens
+    /// every tab revealed when the user has chosen that as their default.
     fn switch_tab(&mut self, t: Tab) {
         self.tab = t;
         self.selected = 0;
-        self.reveal_all = false;
-        self.re_reveal_all = false;
+        self.reveal_all = self.reveal_default;
+        self.re_reveal_all = self.reveal_default;
     }
 
     /// Gate a mutating action: returns true if writable, else sets a status hint.
@@ -1113,6 +1146,22 @@ impl App {
                     )
                 };
                 self.vault = Some(v);
+                // Bring the Config type lists into line with what records actually use, so a
+                // freshly opened (writable) vault's Config matches its data — types brought in
+                // by an older import/merge show up without a manual Ctrl+T. This is ADD-ONLY:
+                // `sync_types_from_records` only inserts missing types/subtypes, it never
+                // deletes a configured entry. Read-only sessions skip it (they can't write);
+                // with no drift it adds nothing and writes nothing. Appended to the open
+                // message so a recovery/unlock notice is never clobbered.
+                if self.writable {
+                    match self.vault.as_mut().map(|ov| ov.sync_types_from_records()) {
+                        Some(Ok(n)) if n > 0 => {
+                            self.status = format!("{} · Synced {n} type(s) from records.", self.status)
+                        }
+                        Some(Err(e)) => self.status = format!("{} · Type sync failed: {e}", self.status),
+                        _ => {}
+                    }
+                }
                 self.wipe_auth();
                 self.screen = Screen::Browse;
             }
@@ -1297,9 +1346,51 @@ impl App {
         false
     }
 
+    // Config-screen focus layout: indices 0..CFG_TEXT_FIELDS are the editable text inputs
+    // (handled by `cfg_field_mut`/`submit_config`/`delete_config`); the next CFG_CHECKBOXES
+    // indices are the view-default checkboxes (toggled with Space/Enter). CFG_FOCUS_COUNT is
+    // the wrap-around modulus for Tab/arrow navigation.
+    const CFG_TEXT_FIELDS: usize = 8;
+    const CFG_CHECKBOXES: usize = 3;
+    const CFG_FOCUS_COUNT: usize = Self::CFG_TEXT_FIELDS + Self::CFG_CHECKBOXES;
+
+    /// Toggle the view-default checkbox at the current focus (a Config index in
+    /// `CFG_TEXT_FIELDS..CFG_FOCUS_COUNT`): flip the saved-default flag, persist it to
+    /// prefs, and apply it to the live view state so the change takes effect immediately.
+    /// These are local UI preferences (not vault content), so no `--write` is required.
+    fn toggle_cfg_checkbox(&mut self) {
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        match self.cfg_focus {
+            n if n == Self::CFG_TEXT_FIELDS => {
+                self.reveal_default = !self.reveal_default;
+                crate::save_reveal_all_default(self.reveal_default);
+                // Apply now so the current tab honours it immediately; `switch_tab` also
+                // re-applies `reveal_default` on every later tab change.
+                self.reveal_all = self.reveal_default;
+                self.re_reveal_all = self.reveal_default;
+                self.status = format!("Reveal all passwords by default: {}", on_off(self.reveal_default));
+            }
+            n if n == Self::CFG_TEXT_FIELDS + 1 => {
+                self.group_assets_default = !self.group_assets_default;
+                crate::save_group_assets_default(self.group_assets_default);
+                self.asset_grouped = self.group_assets_default;
+                // Flat list and grouped tree have different row counts/orderings, so reset
+                // the cursor — exactly as the live `g` toggle does.
+                self.selected = 0;
+                self.status = format!("Group assets by default: {}", on_off(self.group_assets_default));
+            }
+            n if n == Self::CFG_TEXT_FIELDS + 2 => {
+                self.group_accounts_default = !self.group_accounts_default;
+                crate::save_group_accounts_default(self.group_accounts_default);
+                self.acct_grouped = self.group_accounts_default;
+                self.selected = 0;
+                self.status = format!("Group accounts by default: {}", on_off(self.group_accounts_default));
+            }
+            _ => {}
+        }
+    }
+
     fn handle_config_key(&mut self, key: KeyEvent) -> bool {
-        // A local `const` (compile-time constant) for the field count.
-        const CFG_FIELDS: usize = 8;
         match key.code {
             KeyCode::Esc => self.screen = Screen::Browse,
             // Ctrl+U → "update from another vault" (writable only). Ctrl-combos are excluded
@@ -1325,25 +1416,41 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % CFG_FIELDS,
-            KeyCode::BackTab | KeyCode::Up => self.cfg_focus = (self.cfg_focus + CFG_FIELDS - 1) % CFG_FIELDS,
+            KeyCode::Tab | KeyCode::Down => self.cfg_focus = (self.cfg_focus + 1) % Self::CFG_FOCUS_COUNT,
+            KeyCode::BackTab | KeyCode::Up => {
+                self.cfg_focus = (self.cfg_focus + Self::CFG_FOCUS_COUNT - 1) % Self::CFG_FOCUS_COUNT
+            }
+            // View-default checkboxes (focus >= CFG_TEXT_FIELDS): Space or Enter toggles the
+            // flag. Placed BEFORE the text-entry and plain-Enter arms so it wins for those
+            // rows; for text fields Space falls through to the typing arm below. Local prefs,
+            // so allowed even in read-only mode (no require_writable gate).
+            KeyCode::Char(' ') | KeyCode::Enter if self.cfg_focus >= Self::CFG_TEXT_FIELDS => {
+                self.toggle_cfg_checkbox();
+            }
             // Only allow editing a field whose action is reachable in this mode: in
             // read-only that's just backup-dest (5) and export-dir (7), matching the
             // `submit_config` allow-list. The write-only fields stay inert (the GUI hides
             // them outright), so a read-only user can't type into a control that can never
-            // apply. (These buffers are App state, never vault content.)
+            // apply. The `cfg_focus < CFG_TEXT_FIELDS` bound keeps a typed char from being
+            // mis-routed by `cfg_field_mut` when a checkbox row is focused. (These buffers
+            // are App state, never vault content.)
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.cfg_focus < Self::CFG_TEXT_FIELDS
                     && (self.writable || matches!(self.cfg_focus, 5 | 7)) =>
             {
                 self.cfg_field_mut().push(c);
             }
-            KeyCode::Backspace if self.writable || matches!(self.cfg_focus, 5 | 7) => {
+            KeyCode::Backspace
+                if self.cfg_focus < Self::CFG_TEXT_FIELDS
+                    && (self.writable || matches!(self.cfg_focus, 5 | 7)) =>
+            {
                 self.cfg_field_mut().pop();
             }
             KeyCode::Enter => self.submit_config(),
-            // Delete the type/subtype named in the focused field (only if unused).
-            KeyCode::Delete => self.delete_config(),
+            // Delete the type/subtype named in the focused field (only if unused). The bound
+            // skips the checkbox rows (no delete action there).
+            KeyCode::Delete if self.cfg_focus < Self::CFG_TEXT_FIELDS => self.delete_config(),
             _ => {}
         }
         false
@@ -1368,6 +1475,12 @@ impl App {
     /// Perform the focused config action: add a type/subtype, set the volume
     /// size, or run a backup.
     fn submit_config(&mut self) {
+        // Defensive: the view-default checkbox rows have no text-submit action (Enter on
+        // them is handled by `toggle_cfg_checkbox`); never let one fall through to a
+        // String-field branch below.
+        if self.cfg_focus >= Self::CFG_TEXT_FIELDS {
+            return;
+        }
         // Backup (focus 5) is a read/copy and the export directory (focus 7) is a
         // local non-vault preference — both are always allowed, even read-only. The
         // type/subtype adds and the volume-size/redundancy changes (focus 0..4, 6)
@@ -1649,7 +1762,9 @@ impl App {
                         Field::text("Approx. value", r.approx_value.clone()),
                         Field::text("As-of date", r.as_of_date.clone()),
                         Field::text("Institution", r.institution.clone()),
-                        Field::choice(
+                        // The current value is kept selectable even if it is not in the
+                        // configured list (legacy data, or a type later removed from Config).
+                        Field::choice_keep_current(
                             "Type",
                             r.asset_type.clone(),
                             self.vault_ref().categories().asset.clone(),
@@ -1693,27 +1808,20 @@ impl App {
                     r.created_at,
                     vec![
                         Field::text("Title", r.title.clone()),
-                        Field::choice(
+                        // The current value is kept selectable even if it is not in the
+                        // configured list (legacy data, or a type later removed from Config).
+                        Field::choice_keep_current(
                             "Account type",
                             r.account_type.clone(),
                             self.vault_ref().categories().account_type_names(),
                         ),
-                        // Subtype is a dependent dropdown of the chosen type's
-                        // subtypes; the current value is kept selectable even if
-                        // it is not in the configured list (e.g. legacy data).
-                        // The third argument is a block expression `{ ... }` that
-                        // computes the options list. `.any(|x| x == &...)` returns
-                        // true if any option equals the current value; if not, the
-                        // current value is prepended so legacy data stays selectable.
-                        Field::choice("Subtype", r.account_subtype.clone(), {
-                            let mut s = self.vault_ref().categories().subtypes_for(&r.account_type);
-                            if !r.account_subtype.is_empty()
-                                && !s.iter().any(|x| x == &r.account_subtype)
-                            {
-                                s.insert(0, r.account_subtype.clone());
-                            }
-                            s
-                        }),
+                        // Subtype is a dependent dropdown of the chosen type's subtypes; the
+                        // current value is likewise kept selectable when off-list.
+                        Field::choice_keep_current(
+                            "Subtype",
+                            r.account_subtype.clone(),
+                            self.vault_ref().categories().subtypes_for(&r.account_type),
+                        ),
                         Field::text("Owner", r.owner.clone()),
                         Field::text("Username", r.username.clone()),
                         Field::password("Password", r.password.clone()),
@@ -1971,24 +2079,32 @@ impl App {
             // Read-only: cycling a choice would edit the record, so it is inert.
             KeyCode::Left | KeyCode::Right if writable => {
                 let delta = if matches!(key.code, KeyCode::Left) { -1 } else { 1 };
+                // Capture the account-type value BEFORE cycling so the dependent subtype is
+                // reconstrained only on a REAL type change — a single-option cycle is a no-op
+                // and must not wipe an off-list/case-variant subtype.
+                let prev_type = (self.tab == Tab::Accounts && es.fields[es.focus].label.as_str() == "Account type")
+                    .then(|| es.fields[es.focus].value.clone());
                 es.fields[es.focus].cycle(delta);
-                // On the Accounts tab, cycling the account-type field reconstrains
-                // the dependent subtype field: rebuild its options for the new type
-                // and drop a value that no longer belongs to it.
-                // `.as_str()` borrows the `String` label as a `&str` for comparison.
-                if self.tab == Tab::Accounts && es.fields[es.focus].label.as_str() == "Account type" {
+                // On the Accounts tab, a changed account-type reconstrains the dependent
+                // subtype field: rebuild its options for the new type and drop a subtype that
+                // no longer belongs to it.
+                if let Some(prev_type) = prev_type {
                     let new_type = es.fields[es.focus].value.clone();
                     // `.position(...)` finds the subtype field's index, if present.
-                    if let Some(si) = es.fields.iter().position(|f| f.label.as_str() == "Subtype") {
+                    if new_type != prev_type
+                        && let Some(si) = es.fields.iter().position(|f| f.label.as_str() == "Subtype")
+                    {
                         let opts = self
                             .vault
                             .as_ref()
                             .map(|ov| ov.categories().subtypes_for(&new_type))
                             .unwrap_or_default();
                         let cur = es.fields[si].value.clone();
-                        // Keep the current subtype only if it's still a valid option.
-                        let value = if opts.iter().any(|o| o == &cur) { cur } else { String::new() };
-                        es.fields[si] = Field::choice("Subtype", value, opts);
+                        // Keep the current subtype if the new type still has it (case-insensitive);
+                        // `choice_keep_current` keeps a retained off-list value selectable so a
+                        // later cycle can't silently drop it.
+                        let value = if opts.iter().any(|o| o.eq_ignore_ascii_case(&cur)) { cur } else { String::new() };
+                        es.fields[si] = Field::choice_keep_current("Subtype", value, opts);
                     }
                 }
             }
@@ -2969,6 +3085,17 @@ impl App {
             ("Export directory", &self.cfg_export_dir),
         ];
         let cats = self.vault_ref().categories();
+        // The category lists are stored independently of records, so an entry can linger with
+        // no record using it. Tag those "(unused)" so the user can see what's safe to delete.
+        let asset_line = if cats.asset.is_empty() {
+            "—".to_string()
+        } else {
+            cats.asset
+                .iter()
+                .map(|t| if self.vault_ref().asset_type_usage(t) == 0 { format!("{t} (unused)") } else { t.clone() })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
         let mut lines = vec![
             // Where this vault lives on disk (the vault.pmv path).
             Line::from(vec![
@@ -2977,13 +3104,32 @@ impl App {
             ]),
             Line::from(""),
             Line::from(Span::styled("Asset/Liability types:", Style::default().add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled(cats.asset.join(" · "), Style::default().fg(Color::Gray))),
+            Line::from(Span::styled(asset_line, Style::default().fg(Color::Gray))),
             Line::from(""),
             Line::from(Span::styled("Account types (with subtypes):", Style::default().add_modifier(Modifier::BOLD))),
         ];
         for t in &cats.account {
-            let subs = if t.subtypes.is_empty() { "—".to_string() } else { t.subtypes.join(", ") };
-            lines.push(Line::from(Span::styled(format!("  {}: {subs}", t.name), Style::default().fg(Color::Gray))));
+            let subs = if t.subtypes.is_empty() {
+                "—".to_string()
+            } else {
+                t.subtypes
+                    .iter()
+                    .map(|s| {
+                        if self.vault_ref().account_subtype_usage(&t.name, s) == 0 {
+                            format!("{s} (unused)")
+                        } else {
+                            s.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let name = if self.vault_ref().account_type_usage(&t.name) == 0 {
+                format!("{} (unused)", t.name)
+            } else {
+                t.name.clone()
+            };
+            lines.push(Line::from(Span::styled(format!("  {name}: {subs}"), Style::default().fg(Color::Gray))));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -3024,6 +3170,29 @@ impl App {
             ]));
         }
 
+        // View-default checkboxes (focus CFG_TEXT_FIELDS..CFG_FOCUS_COUNT): rendered after
+        // the text inputs, reusing the same focus marker/highlight, drawn as [x]/[ ]. Toggle
+        // with Space/Enter (see `toggle_cfg_checkbox`). These are local UI preferences saved
+        // to prefs.json and shared with the GUI's Config "View defaults" checkboxes.
+        let checkboxes = [
+            ("Reveal all passwords by default", self.reveal_default),
+            ("Group assets by default", self.group_assets_default),
+            ("Group accounts by default", self.group_accounts_default),
+        ];
+        debug_assert_eq!(checkboxes.len(), Self::CFG_CHECKBOXES, "checkbox render count must match focus count");
+        lines.push(Line::from(""));
+        for (j, (label, on)) in checkboxes.iter().enumerate() {
+            let focused = Self::CFG_TEXT_FIELDS + j == self.cfg_focus;
+            let marker = if focused { "> " } else { "  " };
+            let style = if focused {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let check = if *on { "[x] " } else { "[ ] " };
+            lines.push(Line::from(Span::styled(format!("{marker}{check}{label}"), style)));
+        }
+
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL).title(" Configuration "))
@@ -3031,9 +3200,9 @@ impl App {
             chunks[0],
         );
         let footer = if self.writable {
-            "Tab/↑↓ field · type edit · Enter add/backup · Del delete type · Ctrl+U update from another vault · Ctrl+T sync types · Esc back"
+            "Tab/↑↓ field · type edit · Space toggle default · Enter add/backup · Del delete type · Ctrl+U update from another vault · Ctrl+T sync types · Esc back"
         } else {
-            "Tab/↑↓ field · type to edit · Enter = add / backup · Del = delete type (if unused) · Esc back"
+            "Tab/↑↓ field · type to edit · Space toggle default · Enter = add / backup · Del = delete type (if unused) · Esc back"
         };
         self.draw_footer(frame, chunks[1], footer);
     }
@@ -4056,6 +4225,88 @@ mod tests {
         app.re_reveal_all = true;
         app.handle_key(key(KeyCode::Right));
         assert!(!app.re_reveal_all, "arrow tab-switch also clears reveal");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn choice_keep_current_keeps_off_list_value_selectable() {
+        // An off-list value (legacy data / type removed from Config) is prepended so it stays
+        // selectable AND arrow-cycling never silently snaps it to a different option.
+        let f = Field::choice_keep_current("Type", "Legacy".into(), vec!["A".into(), "B".into()]);
+        match &f.kind {
+            FieldKind::Choice(opts) => {
+                assert_eq!(opts[0], "Legacy", "off-list current value is prepended");
+                assert_eq!(opts.len(), 3);
+            }
+            _ => panic!("expected a Choice field"),
+        }
+        // Cycle forward then back returns to the original off-list value (not lost).
+        let mut g = Field::choice_keep_current("Type", "Legacy".into(), vec!["A".into(), "B".into()]);
+        g.cycle(1);
+        assert_eq!(g.value, "A");
+        g.cycle(-1);
+        assert_eq!(g.value, "Legacy", "off-list value preserved through a cycle round-trip");
+        // A value already in the list is not duplicated; an empty (new-record) value is not added.
+        let h = Field::choice_keep_current("Type", "A".into(), vec!["A".into(), "B".into()]);
+        match &h.kind {
+            FieldKind::Choice(opts) => assert_eq!(opts.len(), 2, "in-list value not duplicated"),
+            _ => unreachable!(),
+        }
+        let e = Field::choice_keep_current("Type", String::new(), vec!["A".into()]);
+        match &e.kind {
+            FieldKind::Choice(opts) => assert_eq!(opts.len(), 1, "empty value not prepended"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn reveal_default_pref_persists_reveal_across_tab_switches() {
+        // With the "reveal all by default" preference on, switching tabs RE-APPLIES reveal
+        // (to the pref) instead of clearing it, so every password tab re-opens revealed.
+        let (mut app, path) = app_unlocked("revealdefault");
+        app.reveal_default = true;
+        app.reveal_all = true;
+        app.re_reveal_all = true;
+        app.tab = Tab::Accounts;
+        app.handle_key(key(KeyCode::Char('5'))); // jump to Real Estate
+        assert_eq!(app.tab, Tab::RealEstate);
+        assert!(app.reveal_all, "reveal_all re-applied from pref on tab switch");
+        assert!(app.re_reveal_all, "re_reveal_all re-applied from pref on tab switch");
+        app.handle_key(key(KeyCode::Char('4'))); // back to Accounts
+        assert!(app.reveal_all && app.re_reveal_all, "still revealed after another switch");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn config_view_default_checkboxes_toggle_and_apply() {
+        // Space/Enter on a view-default checkbox flips the saved-default flag AND applies it
+        // to the live view state immediately. (The prefs WRITE is a no-op under cfg(test);
+        // the in-memory flag + applied state are what the UI reads.)
+        let (mut app, path) = app_unlocked("cfgcheckbox");
+        app.handle_key(key(KeyCode::Char('c'))); // open Config (focus resets to 0)
+        assert_eq!(app.screen, Screen::Config);
+        // Step focus from the first text field onto the first checkbox row.
+        for _ in 0..App::CFG_TEXT_FIELDS {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.cfg_focus, App::CFG_TEXT_FIELDS);
+        assert!(!app.reveal_default, "reveal default starts off");
+        app.handle_key(key(KeyCode::Char(' '))); // toggle reveal-all-default ON
+        assert!(app.reveal_default, "reveal default toggled on");
+        assert!(app.reveal_all && app.re_reveal_all, "applied to live reveal state");
+        app.handle_key(key(KeyCode::Down)); // group-assets checkbox
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.group_assets_default && app.asset_grouped, "group-assets default toggled + applied");
+        app.handle_key(key(KeyCode::Down)); // group-accounts checkbox (Enter also toggles)
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.group_accounts_default && app.acct_grouped, "group-accounts default toggled + applied");
+        // A char typed on a checkbox row must NOT be routed into a text field.
+        let export_before = app.cfg_export_dir.clone();
+        app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(app.cfg_export_dir, export_before, "typing on a checkbox row leaves text fields untouched");
+        // Navigation wraps over all focus rows back to the first text field.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.cfg_focus, 0, "focus wraps after the last checkbox");
         cleanup(&path);
     }
 

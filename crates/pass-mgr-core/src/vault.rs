@@ -1617,6 +1617,38 @@ impl OpenVault {
         &self.vault.categories
     }
 
+    /// How many live asset/liability records use `name` as their `asset_type`
+    /// (trimmed, case-insensitive). `0` means the configured type is unused — safe to remove,
+    /// and flagged as such in the Config screen. This is the single source of truth for the
+    /// "in use?" question (`remove_asset_type` uses it too). Matching is trimmed on BOTH sides
+    /// so it keys off the same normalized value `add_*`/`sync_types_from_records` store — a
+    /// whitespace-padded record value (legacy/imported data) still counts as in use.
+    pub fn asset_type_usage(&self, name: &str) -> usize {
+        let name = name.trim();
+        self.vault.assets.iter().filter(|a| a.asset_type.trim().eq_ignore_ascii_case(name)).count()
+    }
+
+    /// How many live accounts use `name` as their `account_type` (trimmed, case-insensitive).
+    /// `0` means the configured type is unused. Shared with `remove_account_type`.
+    pub fn account_type_usage(&self, name: &str) -> usize {
+        let name = name.trim();
+        self.vault.accounts.iter().filter(|a| a.account_type.trim().eq_ignore_ascii_case(name)).count()
+    }
+
+    /// How many live accounts use the (`type_name`, `subtype`) pair (trimmed, case-insensitive).
+    /// `0` means the configured subtype is unused. Shared with `remove_account_subtype`.
+    pub fn account_subtype_usage(&self, type_name: &str, subtype: &str) -> usize {
+        let (type_name, subtype) = (type_name.trim(), subtype.trim());
+        self.vault
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.account_type.trim().eq_ignore_ascii_case(type_name)
+                    && a.account_subtype.trim().eq_ignore_ascii_case(subtype)
+            })
+            .count()
+    }
+
     pub fn add_asset_type(&mut self, name: &str) -> Result<bool, VaultError> {
         self.mutate_categories(|c| c.add_asset_type(name))
     }
@@ -1633,10 +1665,20 @@ impl OpenVault {
     /// is missing from the editable category lists (§4.2), so types brought in by a merge,
     /// `import-tree`, or older data show up in Config and the dropdowns. Returns the number of
     /// category entries added; a no-op returns `Ok(0)` without writing. Requires `--write`.
+    ///
+    /// **Purely additive**: this only inserts missing entries — it NEVER deletes a configured
+    /// type or subtype, including ones no record currently uses. (Removal is a deliberate,
+    /// per-entry action via `remove_*`.) This is what makes it safe to run automatically at
+    /// vault open.
     pub fn sync_types_from_records(&mut self) -> Result<usize, VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
+        // Snapshot the category list + audit length so a save failure rolls the in-memory
+        // state back to match disk. Sync now runs automatically at open, so it must be
+        // all-or-nothing: never leave memory holding types the persisted vault doesn't.
+        let cats_before = self.vault.categories.clone();
+        let audit_len = self.vault.audit.len();
         let mut added = 0usize;
         // Snapshot the type strings first so the immutable record borrow is released before the
         // category lists are mutated (the `add_*` are case-insensitive dedup).
@@ -1664,7 +1706,13 @@ impl OpenVault {
         }
         if added > 0 {
             self.vault.audit.push(records::Change::new("types_synced", format!("{added} category type(s) added from records")));
-            self.save()?;
+            if let Err(e) = self.save() {
+                // Roll the in-memory additions (and the audit entry) back so memory matches
+                // the unchanged on-disk vault.
+                self.vault.categories = cats_before;
+                self.vault.audit.truncate(audit_len);
+                return Err(e);
+            }
         }
         Ok(added)
     }
@@ -1676,7 +1724,7 @@ impl OpenVault {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let used = self.vault.assets.iter().filter(|a| a.asset_type.eq_ignore_ascii_case(name)).count();
+        let used = self.asset_type_usage(name);
         if used > 0 {
             return Ok(CategoryRemoval::InUse(used));
         }
@@ -1695,7 +1743,7 @@ impl OpenVault {
         if !self.vault.categories.subtypes_for(name).is_empty() {
             return Ok(CategoryRemoval::HasSubtypes);
         }
-        let used = self.vault.accounts.iter().filter(|a| a.account_type.eq_ignore_ascii_case(name)).count();
+        let used = self.account_type_usage(name);
         if used > 0 {
             return Ok(CategoryRemoval::InUse(used));
         }
@@ -1709,12 +1757,7 @@ impl OpenVault {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let used = self
-            .vault
-            .accounts
-            .iter()
-            .filter(|a| a.account_type.eq_ignore_ascii_case(type_name) && a.account_subtype.eq_ignore_ascii_case(subtype))
-            .count();
+        let used = self.account_subtype_usage(type_name, subtype);
         if used > 0 {
             return Ok(CategoryRemoval::InUse(used));
         }
@@ -6502,6 +6545,85 @@ mod tests {
         drop(v);
         let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
         assert!(matches!(ro.sync_types_from_records(), Err(VaultError::ReadOnly)));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn type_usage_helpers_count_live_records_and_sync_never_deletes() {
+        let path = tmp_path("type-usage");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        // Configured entries that NO record uses (as if added then their records deleted).
+        v.add_account_type("Unused Bank").unwrap();
+        v.add_account_subtype("Unused Bank", "GhostSub").unwrap();
+        v.add_asset_type("Unused Asset").unwrap();
+        // Records using OTHER types not yet in the lists.
+        for u in ["u1", "u2"] {
+            let mut a = sample_account(u, "p");
+            a.account_type = "Used Bank".into();
+            a.account_subtype = "Checking".into();
+            v.vault.accounts.push(a);
+        }
+        let mut asset = records::AssetLiability::new().unwrap();
+        asset.asset_type = "Used Asset".into();
+        v.vault.assets.push(asset);
+        v.save().unwrap();
+
+        // Usage counts reflect live records (case-insensitive); unused entries report 0.
+        assert_eq!(v.account_type_usage("Used Bank"), 2);
+        assert_eq!(v.account_type_usage("used bank"), 2, "case-insensitive");
+        assert_eq!(v.account_subtype_usage("Used Bank", "Checking"), 2);
+        assert_eq!(v.asset_type_usage("Used Asset"), 1);
+        assert_eq!(v.account_type_usage("Unused Bank"), 0);
+        assert_eq!(v.account_subtype_usage("Unused Bank", "GhostSub"), 0);
+        assert_eq!(v.asset_type_usage("Unused Asset"), 0);
+
+        // Auto-sync is ADDITIVE: it adds the record-derived types and keeps the unused ones.
+        let before_accounts = v.categories().account_type_names();
+        let before_assets = v.categories().asset.clone();
+        let added = v.sync_types_from_records().unwrap();
+        assert_eq!(added, 3, "Used Bank + Checking + Used Asset");
+        let after_accounts = v.categories().account_type_names();
+        let after_assets = v.categories().asset.clone();
+        for t in &before_accounts {
+            assert!(after_accounts.contains(t), "sync kept pre-existing account type {t}");
+        }
+        for t in &before_assets {
+            assert!(after_assets.contains(t), "sync kept pre-existing asset type {t}");
+        }
+        assert!(after_accounts.iter().any(|t| t == "Unused Bank"), "unused type survives sync");
+        assert!(after_assets.iter().any(|t| t == "Unused Asset"), "unused asset type survives sync");
+        assert!(
+            v.categories().subtypes_for("Unused Bank").iter().any(|s| s == "GhostSub"),
+            "unused subtype survives sync"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn type_usage_matches_whitespace_padded_record_values() {
+        // A record carrying a whitespace-padded type (legacy/imported data) must still count
+        // as "in use" of the TRIMMED configured type — otherwise a just-synced type would be
+        // mislabeled "unused" and wrongly deletable. usage/sync/remove must agree on the key.
+        let path = tmp_path("type-usage-trim");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut acct = sample_account("u", "p");
+        acct.account_type = " Brokerage ".into();
+        acct.account_subtype = " Margin ".into();
+        v.vault.accounts.push(acct);
+        let mut asset = records::AssetLiability::new().unwrap();
+        asset.asset_type = " Crypto ".into();
+        v.vault.assets.push(asset);
+        v.save().unwrap();
+
+        // Sync inserts the TRIMMED entries.
+        assert_eq!(v.sync_types_from_records().unwrap(), 3);
+        // The trimmed entries are reported IN USE (not "unused"), despite the padded records.
+        assert_eq!(v.asset_type_usage("Crypto"), 1);
+        assert_eq!(v.account_type_usage("Brokerage"), 1);
+        assert_eq!(v.account_subtype_usage("Brokerage", "Margin"), 1);
+        // And deletion is correctly refused as in-use rather than silently orphaning the record.
+        assert!(matches!(v.remove_asset_type("Crypto"), Ok(CategoryRemoval::InUse(1))));
+        assert!(matches!(v.remove_account_subtype("Brokerage", "Margin"), Ok(CategoryRemoval::InUse(1))));
         cleanup(&path);
     }
 
