@@ -3234,19 +3234,40 @@ impl App {
     }
 
     fn draw_browse(&self, frame: &mut Frame) {
+        // The tab bar spans TWO rows of titles, so its block is 4 lines tall (two
+        // content lines plus the top/bottom border) rather than 3.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)])
+            .constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(3)])
             .split(frame.area());
 
-        // `.collect::<Vec<_>>()` is the "turbofish" syntax telling `collect` which
-        // collection to build (a `Vec`; `_` lets the compiler infer the element
-        // type). Here it gathers every tab's title into a list for the tab bar.
-        let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
-            .select(self.tab.index())
-            .block(Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-8) "))
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD));
-        frame.render_widget(tabs, chunks[0]);
+        // Lay the eight tabs across two rows (first half on top, second half below)
+        // instead of one long row. `Tabs` is a single-line widget, so we draw the
+        // bordered block ourselves, split its interior into two 1-line rows, and
+        // render a borderless `Tabs` on each — highlighting the active tab only on
+        // the row that holds it (`None` leaves the other row unselected). `idx` is
+        // the global tab index; `checked_sub` maps it into the bottom row's local
+        // range (and yields `None` for a top-row tab, avoiding underflow).
+        let titles: Vec<&str> = Tab::ALL.iter().map(|t| t.title()).collect();
+        let mid = titles.len().div_ceil(2);
+        let idx = self.tab.index();
+        let hl = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+        let tabs_block = Block::default().borders(Borders::ALL).title(" Tabs (←/→ or 1-8) ");
+        let tabs_inner = tabs_block.inner(chunks[0]);
+        frame.render_widget(tabs_block, chunks[0]);
+        let tab_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(tabs_inner);
+        let top_tabs = Tabs::new(titles[..mid].to_vec())
+            .select((idx < mid).then_some(idx))
+            .highlight_style(hl);
+        let bottom_tabs = Tabs::new(titles[mid..].to_vec())
+            .select(idx.checked_sub(mid))
+            .highlight_style(hl);
+        frame.render_widget(top_tabs, tab_rows[0]);
+        frame.render_widget(bottom_tabs, tab_rows[1]);
 
         // The Summary tab renders a read-only aggregate TABLE instead of the record list.
         if self.tab == Tab::Summary {

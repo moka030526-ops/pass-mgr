@@ -98,8 +98,9 @@ dependency tried.
 
 ## 4. Data model
 
-The model lives in `records.rs` and serializes to JSON. The app is a seven-tab
-estate vault: each tab is a `Vec` of one record type. Every record shares an
+The model lives in `records.rs` and serializes to JSON. The app is an eight-tab
+estate vault: seven tabs are each a `Vec` of one record type; the eighth
+(**Summary**) is a read-only aggregate view with no records of its own. Every record shares an
 `id` (128-bit random hex, stable across edits), `created_at`/`updated_at`, and an
 append-only `history: Vec<Change>` (req. 4, 5). The shared insert/edit/diff logic
 is the `Record` trait + generic `upsert`/`remove`.
@@ -618,16 +619,18 @@ UI-independent. Adding or changing a front-end touches no security-critical code
 
 - **Graphical (`gui.rs`, the default)** — `egui`/`eframe`, immediate-mode,
   on-screen buttons and tabs. Needs a desktop (X11/Wayland). Each screen's content
-  (Auth, the per-tab browse/edit area, and Config) and the tab toolbar sit in
+  (Auth, the per-tab browse/edit area, and Config) and the two-row top bar — a tabs
+  row above an actions row, each its own horizontal scroll area — sit in
   scroll areas, so a window smaller than the content shows **vertical + horizontal
   scrollbars** instead of clipping — the fixed top bar and bottom status line stay
   put, and scrollbars appear only on genuine overflow.
 - **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
   headless. Key bindings are shown on-screen at all times; no mouse required.
 
-The desktop front-ends present the estate vault as **seven tabs**, one per record
-type — Instructions, Trust & Will, Assets & Liabilities, Accounts, Real Estate,
-Taxes, and General Documents — over four screens. (The read-only mobile viewer, §8,
+The desktop front-ends present the estate vault as **eight tabs**, laid out in two
+rows — seven record-type tabs (Instructions, Trust & Will, Assets & Liabilities,
+Accounts, Real Estate, Taxes, General Documents) plus a read-only **Summary**
+aggregate — over four screens. (The read-only mobile viewer, §8,
 currently exposes the first five record types.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
