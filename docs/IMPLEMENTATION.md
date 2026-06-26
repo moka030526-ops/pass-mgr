@@ -56,8 +56,8 @@ crates/
 │   │                 which re-exports the core modules so `pass_mgr::…`/`crate::…`
 │   │                 paths resolve unchanged). Builds two binaries.
 │   └── src/
-│       ├── gui.rs           egui/eframe GUI — seven tabs incl. multi-document Taxes & RE.
-│       ├── ui.rs            ratatui TUI (`--tui`) — the same seven tabs.
+│       ├── gui.rs           egui/eframe GUI — eight tabs (2-row bar) incl. multi-doc Taxes & RE + Summary.
+│       ├── ui.rs            ratatui TUI (`--tui`) — the same eight tabs (2-row bar).
 │       ├── single_instance.rs  GUI single-instance guard (§6.4).
 │       ├── launch.rs        Vault-path/flag resolution shared by both binaries.
 │       ├── main.rs          Console binary `pass-mgr` (CLI + `--tui` + subcommands).

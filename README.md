@@ -112,9 +112,9 @@ create it — the folder is made for you under the root. (In the plain read-only
 you can *pick* any existing vault to view it, but you can't create one — relaunch in
 Edit mode for that.)
 
-## The six sections (tabs)
+## The eight sections (tabs)
 
-Across the top are seven tabs. Click a tab to switch:
+Across the top are eight tabs, laid out in two rows. Click a tab to switch:
 
 1. **Instructions** — notes and instructions for your family/executor (funeral
    wishes, who to contact, where to find things).
@@ -140,6 +140,9 @@ Across the top are seven tabs. Click a tab to switch:
 7. **General Documents** — anything else worth keeping: a title, a description,
    and **one uploaded file** per entry (passport scan, birth certificate, a
    contract). Use one entry per document.
+8. **Summary** — a **read-only** overview table: each owner's totals across assets
+   and liabilities. It has no records of its own — it aggregates the **Assets and
+   Liabilities** entries by owner.
 
 ## Adding or changing an entry (step by step)
 
@@ -543,7 +546,7 @@ on the Vault row, `←/→` cycle through the vaults found one level under the r
 next/submit · `Esc` quit. The open target is `<root>/<vault>`; an existing one is
 **Unlock**, a new name is **Create** (needs `--write`).
 
-**Browse:** `←/→` or `1`–`5` switch tab · `↑/↓` select · `Enter` edit · `n` new ·
+**Browse:** `←/→` or `1`–`8` switch tab · `↑/↓` select · `Enter` edit · `n` new ·
 `d` delete · `t`/`s`/`o`/`v` Account filters (type/subtype/owner/review) ·
 `c` Config · `p` change passwords · `q` quit.
 

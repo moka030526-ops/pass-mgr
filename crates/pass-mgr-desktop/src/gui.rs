@@ -1152,10 +1152,12 @@ impl GuiApp {
         // below: reveal is meant to be a momentary, in-context action, so it must not
         // persist into a later visit and expose every password to a bystander.
         let prev_tab = self.tab;
-        // Horizontal scroll so the tab/action row stays fully reachable when the
-        // window is narrower than the toolbar (otherwise the rightmost tabs would be
-        // clipped and unselectable). No vertical scroll — the row is one line tall.
-        egui::ScrollArea::horizontal().id_salt("topbar_scroll").show(ui, |ui| {
+        // Two-row toolbar: the record-type tabs on the first row, the global actions
+        // (passwords / config / help / quit + the read-only badge) on the second. Each
+        // row is its own horizontal ScrollArea so it stays fully reachable when the
+        // window is narrower than the row (otherwise the rightmost items would be
+        // clipped and unselectable); no vertical scroll — each row is one line tall.
+        egui::ScrollArea::horizontal().id_salt("topbar_tabs_scroll").show(ui, |ui| {
             ui.horizontal(|ui| {
                 tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
                 tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
@@ -1165,7 +1167,10 @@ impl GuiApp {
                 tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
                 tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
                 tab_button(ui, &mut self.tab, Tab::Summary, "Summary");
-                ui.separator();
+            });
+        });
+        egui::ScrollArea::horizontal().id_salt("topbar_actions_scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
                 // Change-password is a write; only offer it when writable.
                 // `&&` short-circuits: the button is only drawn/evaluated when
                 // `self.writable` is true, so read-only mode hides it entirely.
@@ -1266,7 +1271,8 @@ impl GuiApp {
                 "Tabs & records",
                 &[
                     "Instructions · Trust & Will · Assets & Liabilities · Accounts · Real Estate · \
-                     Taxes · General Documents. Switch with the top tabs (or 1–7 in the TUI).",
+                     Taxes · General Documents · Summary (a read-only overview). Switch with the \
+                     top tabs (or 1–8 in the TUI).",
                     "Accounts can be shown as a grouped tree (owner → type → subtype → title); \
                      title and owner are required. Filters cross-narrow each other, and the search \
                      box matches a username OR a title.",
