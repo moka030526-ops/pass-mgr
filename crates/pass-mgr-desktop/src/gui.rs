@@ -618,7 +618,9 @@ impl GuiApp {
         // saved preference (so startups share a default root), pre-selecting the launched
         // vault's folder when appropriate; then derive the directory/path from root+name.
         let saved_root = crate::load_vault_root();
-        let (vault_root, vault_name) = crate::launch::initial_root_and_name(&path, &saved_root);
+        let saved_vault = crate::load_last_vault();
+        let (vault_root, vault_name) =
+            crate::launch::initial_root_and_name(&path, &saved_root, &saved_vault);
         // Default the backup destination to the root (see the `backup_dest` field).
         let backup_dest = vault_root.clone();
         let vault_dir = crate::launch::join_root_name(&vault_root, &vault_name);
@@ -904,6 +906,10 @@ impl GuiApp {
                 // local prefs.json preference — never written into the vault). Done on a
                 // successful open/create, the natural point at which the root is "confirmed".
                 crate::save_vault_root(self.vault_root.trim());
+                // Remember which vault was opened so the next startup pre-selects it in the
+                // dropdown. Saved verbatim (the raw folder name) so it round-trips through
+                // `discover_vaults`/`join_root_name`.
+                crate::save_last_vault(&self.vault_name);
                 // If the live vault.pmv was unreadable and we recovered from an
                 // in-place redundant copy (§12.8), that notice takes priority — the
                 // user needs to know a roll-forward/rollback happened.

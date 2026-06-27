@@ -528,7 +528,9 @@ impl App {
         // saved preference (so startups share a default root), pre-selecting the launched
         // vault's folder when appropriate; then derive the directory/path from root+name.
         let saved_root = crate::load_vault_root();
-        let (auth_root, auth_name) = crate::launch::initial_root_and_name(&path, &saved_root);
+        let saved_vault = crate::load_last_vault();
+        let (auth_root, auth_name) =
+            crate::launch::initial_root_and_name(&path, &saved_root, &saved_vault);
         // Default the backup destination to the root (see the `cfg_backup_dest` field).
         let cfg_backup_dest = auth_root.clone();
         let auth_dir = crate::launch::join_root_name(&auth_root, &auth_name);
@@ -1132,6 +1134,10 @@ impl App {
                 // local prefs.json preference — never written into the vault), at the natural
                 // point the root is "confirmed" by a successful open/create.
                 crate::save_vault_root(self.auth_root.trim());
+                // Remember which vault was opened so the next startup pre-selects it in the
+                // picker. Saved verbatim (the raw folder name) so it round-trips through
+                // `discover_vaults`/`join_root_name`.
+                crate::save_last_vault(&self.auth_name);
                 // A recovery from an in-place redundant copy (§12.8) takes priority —
                 // the user needs to know a roll-forward/rollback happened.
                 let recovered = v.recovery_notice().map(|s| s.to_string());

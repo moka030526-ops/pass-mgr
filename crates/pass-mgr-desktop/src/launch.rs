@@ -58,15 +58,19 @@ pub fn join_root_name(root: &str, name: &str) -> String {
 }
 
 /// Compute the start page's initial `(root, vault_name)` for a launched vault `path`,
-/// given the persisted root preference `saved_root` ("" if unset).
+/// given the persisted root preference `saved_root` and last-opened vault `saved_vault`
+/// ("" if unset).
 ///
 /// An **explicitly launched** vault (a `path` differing from the per-user default) always
 /// wins: its parent becomes the root and its folder the selected name, so `pass-mgr DIR`
-/// opens exactly `DIR`. For a **default** launch, the saved root preference (if any) seeds
-/// the root instead — that is what makes "remember my root across startups" work — and the
-/// name is pre-selected only when the default vault actually lives directly under that root
-/// (otherwise it is empty and the user picks from the dropdown).
-pub fn initial_root_and_name(path: &Path, saved_root: &str) -> (String, String) {
+/// opens exactly `DIR` — the saved last vault is ignored, since the user named a specific
+/// target. For a **default** launch, the saved root preference (if any) seeds the root —
+/// that is what makes "remember my root across startups" work — and the name is the
+/// remembered `saved_vault` (so the last opened vault is pre-selected), falling back to the
+/// default vault's folder only when it lives directly under that root, else empty (the user
+/// picks from the dropdown). A `saved_vault` that no longer exists under the root simply
+/// resolves to "Create" via the caller's `path.exists()` check — harmless, not an error.
+pub fn initial_root_and_name(path: &Path, saved_root: &str, saved_vault: &str) -> (String, String) {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir_parent = dir.and_then(|d| d.parent()).filter(|p| !p.as_os_str().is_empty());
     let parent_str = dir_parent.map(|p| p.display().to_string());
@@ -78,11 +82,17 @@ pub fn initial_root_and_name(path: &Path, saved_root: &str) -> (String, String) 
         // Honor the launched vault: root = its parent, name = its folder.
         (parent_str.unwrap_or_else(|| ".".into()), leaf.unwrap_or_default())
     } else {
-        // Default launch + a saved root: browse that root. Pre-select the default vault's
-        // folder only when it lives directly under the saved root.
-        let name = match (&parent_str, &leaf) {
-            (Some(p), Some(l)) if p == saved => l.clone(),
-            _ => String::new(),
+        // Default launch + a saved root: browse that root. Prefer the remembered last vault;
+        // otherwise pre-select the default vault's folder when it lives directly under the
+        // root. The name is used VERBATIM (matching `discover_vaults`/`join_root_name`), so
+        // only the emptiness decision trims.
+        let name = if !saved_vault.trim().is_empty() {
+            saved_vault.to_string()
+        } else {
+            match (&parent_str, &leaf) {
+                (Some(p), Some(l)) if p == saved => l.clone(),
+                _ => String::new(),
+            }
         };
         (saved.to_string(), name)
     }
@@ -253,23 +263,44 @@ mod tests {
     fn initial_root_and_name_honors_explicit_launch_and_saved_root() {
         // An explicit launch (path != default) always wins: parent is the root, folder the name.
         let p = PathBuf::from("/vaults/work/vault.pmv");
-        assert_eq!(initial_root_and_name(&p, ""), ("/vaults".to_string(), "work".to_string()));
+        assert_eq!(initial_root_and_name(&p, "", ""), ("/vaults".to_string(), "work".to_string()));
         // ...even when a (different) saved root exists — the explicit arg is not overridden.
-        assert_eq!(initial_root_and_name(&p, "/elsewhere"), ("/vaults".to_string(), "work".to_string()));
+        assert_eq!(initial_root_and_name(&p, "/elsewhere", ""), ("/vaults".to_string(), "work".to_string()));
+        // ...and even when a saved last-vault exists: an explicit launch ignores it.
+        assert_eq!(initial_root_and_name(&p, "/elsewhere", "personal"), ("/vaults".to_string(), "work".to_string()));
 
         // A DEFAULT launch with a saved root browses that root; the name is empty unless the
-        // default vault lives directly under it.
+        // default vault lives directly under it (and no last-vault is remembered).
         let def = default_vault_path();
-        let (root, name) = initial_root_and_name(&def, "/my/vaults");
+        let (root, name) = initial_root_and_name(&def, "/my/vaults", "");
         assert_eq!(root, "/my/vaults");
         assert!(name.is_empty(), "default vault isn't under the saved root → no pre-selection");
 
         // A default launch with NO saved root falls back to the default's own parent/leaf.
-        let (root2, name2) = initial_root_and_name(&def, "");
+        let (root2, name2) = initial_root_and_name(&def, "", "");
         let def_parent = def.parent().unwrap().parent().unwrap().display().to_string();
         let def_leaf = def.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string();
         assert_eq!(root2, def_parent);
         assert_eq!(name2, def_leaf);
+    }
+
+    #[test]
+    fn initial_root_and_name_prefers_saved_last_vault_on_default_launch() {
+        // A default launch with a saved root AND a remembered last vault pre-selects that
+        // vault, so the start page reopens where the user left off.
+        let def = default_vault_path();
+        let (root, name) = initial_root_and_name(&def, "/my/vaults", "personal");
+        assert_eq!(root, "/my/vaults");
+        assert_eq!(name, "personal", "remembered last vault is pre-selected");
+
+        // The remembered name is used VERBATIM (it round-trips with `discover_vaults`, which
+        // returns raw folder names) — only the emptiness decision trims.
+        let (_, spaced) = initial_root_and_name(&def, "/my/vaults", " my vault ");
+        assert_eq!(spaced, " my vault ", "name kept verbatim, not trimmed");
+
+        // A whitespace-only last vault counts as unset → no pre-selection.
+        let (_, blank) = initial_root_and_name(&def, "/my/vaults", "   ");
+        assert!(blank.is_empty(), "whitespace-only last vault → no pre-selection");
     }
 
     #[test]

@@ -243,6 +243,34 @@ pub(crate) fn save_vault_root_to(path: &Path, dir: &str) {
     write_prefs_obj(path, &obj);
 }
 
+/// The **last opened vault** — the name (the folder leaf under the vault root) of the most
+/// recently unlocked/created vault ("" if none yet). Saved on a successful open/create and
+/// read at startup so the start page pre-selects it in the vault dropdown. Like `vault_root`
+/// this is a bootstrap key (it decides which vault among the root to highlight, read before
+/// any vault is open), so it lives in the config dir alone — no vault-root fallback.
+pub(crate) fn load_last_vault() -> String {
+    prefs_path().map(|p| load_last_vault_from(&p)).unwrap_or_default()
+}
+pub(crate) fn load_last_vault_from(path: &Path) -> String {
+    read_prefs_obj(path).get("last_vault").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+/// Persist the last opened vault name, preserving any other prefs keys. Skipped under
+/// `cfg(test)` (reached from the unlock/create flow the unit tests drive) so the suite never
+/// clobbers the developer's real prefs; the write logic stays covered via `save_last_vault_to`.
+pub(crate) fn save_last_vault(name: &str) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(path) = prefs_path() {
+        save_last_vault_to(&path, name);
+    }
+}
+pub(crate) fn save_last_vault_to(path: &Path, name: &str) {
+    let mut obj = read_prefs_obj(path);
+    obj.insert("last_vault".into(), serde_json::Value::String(name.to_string()));
+    write_prefs_obj(path, &obj);
+}
+
 // --- View defaults: three local UI preferences (NOT vault content) -----------
 //
 // Each is a bool persisted in the shared `prefs.json` and read at startup by BOTH
@@ -445,6 +473,26 @@ mod tests {
         assert_eq!(load_export_dir_from(&p), "/exports", "export_dir preserved");
         save_vault_root_to(&p, "/other-vaults");
         assert_eq!(load_vault_root_from(&p), "/other-vaults");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_vault_round_trips_and_coexists_with_other_keys() {
+        let dir = tmp_prefs_dir();
+        let p = dir.join("prefs.json");
+        // Absent -> empty (no vault remembered yet), so the start page falls back to its
+        // launch/derived default.
+        assert_eq!(load_last_vault_from(&p), "");
+        // Round-trips, and the read-modify-write preserves a co-resident root + export dir.
+        save_vault_root_to(&p, "/vaults");
+        save_export_dir_to(&p, "/exports");
+        save_last_vault_to(&p, "personal");
+        assert_eq!(load_last_vault_from(&p), "personal");
+        assert_eq!(load_vault_root_from(&p), "/vaults", "vault_root preserved");
+        assert_eq!(load_export_dir_from(&p), "/exports", "export_dir preserved");
+        // Re-saving overwrites with the newly opened vault.
+        save_last_vault_to(&p, "work");
+        assert_eq!(load_last_vault_from(&p), "work");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
