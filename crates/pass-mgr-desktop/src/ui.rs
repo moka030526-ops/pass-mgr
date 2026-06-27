@@ -541,9 +541,12 @@ impl App {
         // and the grouped/flat view state so a freshly opened vault honours the user's
         // preferences; the pref values are retained on the struct so the Config checkboxes
         // show the saved default and `switch_tab` can re-apply reveal.
-        let reveal_default = crate::load_reveal_all_default();
-        let group_assets_default = crate::load_group_assets_default();
-        let group_accounts_default = crate::load_group_accounts_default();
+        let reveal_default = crate::load_reveal_all_default(&auth_root);
+        let group_assets_default = crate::load_group_assets_default(&auth_root);
+        let group_accounts_default = crate::load_group_accounts_default(&auth_root);
+        // Hoisted above the struct literal because `auth_root` is moved into the struct
+        // below; the vault-root fallback needs to read it before that move.
+        let cfg_export_dir = crate::load_export_dir(&auth_root);
         App {
             path,
             writable,
@@ -593,7 +596,7 @@ impl App {
             // tracks the root while on the start page; once unlocked it's the user's.
             cfg_backup_dest,
             cfg_redundancy: String::new(),
-            cfg_export_dir: crate::load_export_dir(),
+            cfg_export_dir,
             status: String::new(),
             clipboard_dirty: false,
             clipboard_clear_at: None,

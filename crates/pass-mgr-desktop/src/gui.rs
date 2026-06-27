@@ -634,9 +634,12 @@ impl GuiApp {
         // toggles and the grouped/flat view state so a freshly opened vault honours the
         // user's preferences. The pref values are also retained on the struct so the Config
         // checkboxes show the saved default and the tab-switch reset can re-apply reveal.
-        let reveal_default = crate::load_reveal_all_default();
-        let group_assets_default = crate::load_group_assets_default();
-        let group_accounts_default = crate::load_group_accounts_default();
+        let reveal_default = crate::load_reveal_all_default(&vault_root);
+        let group_assets_default = crate::load_group_assets_default(&vault_root);
+        let group_accounts_default = crate::load_group_accounts_default(&vault_root);
+        // Hoisted above the struct literal because `vault_root` is moved into the struct
+        // below; the vault-root fallback needs to read it before that move.
+        let export_dir = crate::load_export_dir(&vault_root);
         GuiApp {
             path,
             writable,
@@ -699,7 +702,7 @@ impl GuiApp {
             doc_subfolder: String::new(),
             doc_filename: String::new(),
             doc_source: String::new(),
-            export_dir: crate::load_export_dir(),
+            export_dir,
             status: String::new(),
             error: None,
             clipboard_dirty: false,

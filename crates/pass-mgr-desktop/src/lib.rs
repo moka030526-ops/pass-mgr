@@ -109,6 +109,15 @@ pub(crate) fn fmt_money(v: f64) -> String {
 // is what lets a read-only user (an heir) set where to extract documents. Both
 // front-ends read/write the same file through these helpers, and every write is a
 // read-modify-write so the theme and export-dir keys never clobber each other.
+//
+// Vault-root fallback: when a key is absent from the config-dir file, the loaders fall
+// back to a `prefs.json` sitting in the open vault's root folder. This lets a
+// self-contained / portable vault (see `docs/SELF_CONTAINED_BACKUP.md`) carry its own UI
+// defaults so they travel with the vault to a new machine. The fallback is READ-only:
+// the config-dir file always wins when it sets a key, and every `save_*` keeps writing
+// to the config dir, so a local choice is never silently overridden by the vault. The
+// `vault_root` key itself is the one exception — it bootstraps which vault is open, so it
+// is read from the config dir alone (a vault can't tell us where to find itself).
 
 use std::path::{Path, PathBuf};
 
@@ -147,10 +156,50 @@ pub(crate) fn write_prefs_obj(path: &Path, obj: &serde_json::Map<String, serde_j
     }
 }
 
-/// The saved export-destination directory ("" if unset).
-pub(crate) fn load_export_dir() -> String {
-    prefs_path().map(|p| load_export_dir_from(&p)).unwrap_or_default()
+/// Path to the vault-local `prefs.json` (`<vault_root>/prefs.json`), or `None` when no
+/// vault root is known yet (e.g. on the start page before a root is chosen). This file is
+/// a read-only fallback that lets a portable vault carry its own UI defaults.
+pub(crate) fn vault_prefs_path(vault_root: &str) -> Option<PathBuf> {
+    (!vault_root.trim().is_empty()).then(|| Path::new(vault_root).join("prefs.json"))
 }
+
+/// Overlay `config` onto `fallback`: every key present in `config` wins, while keys found
+/// only in `fallback` survive. Split out from `effective_prefs_obj` so the precedence rule
+/// (config-dir beats vault-root) is unit-tested without touching the real config dir.
+pub(crate) fn merge_prefs(
+    config: serde_json::Map<String, serde_json::Value>,
+    fallback: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut obj = fallback;
+    for (k, v) in config {
+        obj.insert(k, v);
+    }
+    obj
+}
+
+/// The effective prefs object for the given vault root: the config-dir `prefs.json`
+/// overlaid (key-by-key) onto the vault-root `prefs.json` fallback. A missing/corrupt file
+/// on either side contributes nothing (see `read_prefs_obj`), so the worst case is an empty
+/// map and today's built-in defaults.
+pub(crate) fn effective_prefs_obj(vault_root: &str) -> serde_json::Map<String, serde_json::Value> {
+    effective_prefs_obj_from(prefs_path().as_deref(), vault_root)
+}
+/// Path-parametrized core of `effective_prefs_obj` (testable without the real config dir).
+pub(crate) fn effective_prefs_obj_from(
+    config_path: Option<&Path>,
+    vault_root: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let config = config_path.map(read_prefs_obj).unwrap_or_default();
+    let fallback = vault_prefs_path(vault_root).map(|p| read_prefs_obj(&p)).unwrap_or_default();
+    merge_prefs(config, fallback)
+}
+
+/// The saved export-destination directory ("" if unset), with the vault-root fallback.
+pub(crate) fn load_export_dir(vault_root: &str) -> String {
+    effective_prefs_obj(vault_root).get("export_dir").and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+/// Single-path read (no fallback) — retained for the prefs round-trip tests.
+#[cfg(test)]
 pub(crate) fn load_export_dir_from(path: &Path) -> String {
     read_prefs_obj(path).get("export_dir").and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
@@ -209,12 +258,13 @@ pub(crate) fn save_vault_root_to(path: &Path, dir: &str) {
 
 /// "Reveal all passwords by default" — when set, every tab that has passwords opens
 /// with its reveal-all toggle ON instead of masked.
-pub(crate) fn load_reveal_all_default() -> bool {
+pub(crate) fn load_reveal_all_default(vault_root: &str) -> bool {
     if cfg!(test) {
         return false;
     }
-    prefs_path().map(|p| load_reveal_all_default_from(&p)).unwrap_or(false)
+    effective_prefs_obj(vault_root).get("reveal_all_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
+#[cfg(test)]
 pub(crate) fn load_reveal_all_default_from(path: &Path) -> bool {
     read_prefs_obj(path).get("reveal_all_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -234,12 +284,13 @@ pub(crate) fn save_reveal_all_default_to(path: &Path, on: bool) {
 }
 
 /// "Group assets by default" — when set, the Assets & Liabilities view opens grouped.
-pub(crate) fn load_group_assets_default() -> bool {
+pub(crate) fn load_group_assets_default(vault_root: &str) -> bool {
     if cfg!(test) {
         return false;
     }
-    prefs_path().map(|p| load_group_assets_default_from(&p)).unwrap_or(false)
+    effective_prefs_obj(vault_root).get("group_assets_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
+#[cfg(test)]
 pub(crate) fn load_group_assets_default_from(path: &Path) -> bool {
     read_prefs_obj(path).get("group_assets_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -259,12 +310,13 @@ pub(crate) fn save_group_assets_default_to(path: &Path, on: bool) {
 }
 
 /// "Group accounts by default" — when set, the Accounts view opens grouped.
-pub(crate) fn load_group_accounts_default() -> bool {
+pub(crate) fn load_group_accounts_default(vault_root: &str) -> bool {
     if cfg!(test) {
         return false;
     }
-    prefs_path().map(|p| load_group_accounts_default_from(&p)).unwrap_or(false)
+    effective_prefs_obj(vault_root).get("group_accounts_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
+#[cfg(test)]
 pub(crate) fn load_group_accounts_default_from(path: &Path) -> bool {
     read_prefs_obj(path).get("group_accounts_default").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -412,6 +464,51 @@ mod tests {
             std::os::unix::fs::symlink(&real, &link).unwrap();
             assert!(read_prefs_obj(&link).is_empty(), "symlinked prefs refused");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_prefs_config_wins_key_by_key() {
+        // Config-dir keys override the vault-root fallback; fallback-only keys survive.
+        let mut config = serde_json::Map::new();
+        config.insert("export_dir".into(), serde_json::Value::String("/config".into()));
+        let mut fallback = serde_json::Map::new();
+        fallback.insert("export_dir".into(), serde_json::Value::String("/vault".into()));
+        fallback.insert("reveal_all_default".into(), serde_json::Value::Bool(true));
+        let merged = merge_prefs(config, fallback);
+        assert_eq!(merged.get("export_dir").and_then(|v| v.as_str()), Some("/config"), "config wins on shared key");
+        assert_eq!(merged.get("reveal_all_default").and_then(|v| v.as_bool()), Some(true), "fallback-only key survives");
+    }
+
+    #[test]
+    fn vault_root_prefs_json_is_a_read_fallback() {
+        // A `prefs.json` in the vault root seeds keys the config-dir file leaves unset, but
+        // never overrides a key the config-dir file does set.
+        let dir = tmp_prefs_dir();
+        let config = dir.join("config-prefs.json");
+        let vault_root = dir.join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        let vault_prefs = vault_root.join("prefs.json");
+        let vroot = vault_root.to_str().unwrap();
+
+        // Vault carries its own defaults; config dir is absent entirely.
+        std::fs::write(&vault_prefs, br#"{"export_dir":"/from/vault","reveal_all_default":true}"#).unwrap();
+        let eff = effective_prefs_obj_from(Some(&config), vroot);
+        assert_eq!(eff.get("export_dir").and_then(|v| v.as_str()), Some("/from/vault"), "vault seeds export_dir");
+        assert_eq!(eff.get("reveal_all_default").and_then(|v| v.as_bool()), Some(true), "vault seeds a bool flag");
+
+        // Now the config dir sets export_dir: it wins; the vault still seeds the unset bool.
+        std::fs::write(&config, br#"{"export_dir":"/from/config"}"#).unwrap();
+        let eff = effective_prefs_obj_from(Some(&config), vroot);
+        assert_eq!(eff.get("export_dir").and_then(|v| v.as_str()), Some("/from/config"), "config-dir export_dir wins");
+        assert_eq!(eff.get("reveal_all_default").and_then(|v| v.as_bool()), Some(true), "vault flag still seeds when config unset");
+
+        // An empty vault root disables the fallback (start page, before a root is chosen).
+        assert!(vault_prefs_path("").is_none(), "no vault-root path without a root");
+        assert!(vault_prefs_path("   ").is_none(), "whitespace-only root is treated as unset");
+        let eff = effective_prefs_obj_from(Some(&config), "");
+        assert_eq!(eff.get("reveal_all_default"), None, "no fallback contribution without a vault root");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
