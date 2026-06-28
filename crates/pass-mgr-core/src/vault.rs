@@ -815,6 +815,10 @@ impl OpenVault {
             // state, so disabling the feature also stops leaving old secrets on disk.
             cleanup_redundancy(&self.path);
         }
+        // The change is now durably committed (write_vault_file above succeeded, else we
+        // returned early). Refresh the `last_update_<UTC>` marker — strictly AFTER the commit,
+        // never before, so a failed save can't bump it. Best-effort; see touch_last_update.
+        touch_last_update(&parent_dir(&self.path));
         Ok(())
     }
 
@@ -2373,6 +2377,10 @@ fn sweep_stale_temps(dir: &Path) {
     };
     sweep(dir, &format!(".{VAULT_FILE}")); // .vault.pmv* / .vault.pmv.mirror* / .vault.pmv.bakN*
     sweep(&dir.join("manifest"), ".manifest"); // .manifest.N* manifest-commit temps
+    // `.last_update_<ts>.<rand>.tmp` temps leaked by `touch_last_update` if a crash lands between
+    // its fsync and rename. The live marker (`last_update_<ts>`, no leading dot, no `.tmp`) is never
+    // matched, so only orphaned temps are reaped — otherwise they would accumulate across crashes.
+    sweep(dir, ".last_update_");
     // Reap orphaned `.volume.old` / `.manifest.old` trees. `replace_dir`'s OWN cleanup of
     // its `.old` sibling runs at the START of the next commit, but only on a RE-ENTRANT
     // rekey (staging still present). If the trailing best-effort `remove_dir_all` failed
@@ -2580,6 +2588,8 @@ fn commit_rekey(dir: &Path, staging: &Path) -> Result<(), VaultError> {
     cleanup_redundancy(&dir.join(VAULT_FILE));
     sync_parent_dir(&dir.join(VAULT_FILE));
     let _ = fs::remove_dir_all(staging);
+    // A rekey/compact is also a committed vault change — refresh the marker AFTER the swap.
+    touch_last_update(dir);
     Ok(())
 }
 
@@ -2901,6 +2911,57 @@ fn sync_parent_dir(path: &Path) {
 }
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
+
+/// Refresh the vault directory's single `last_update_<UTC>` marker after a committed change.
+///
+/// A glanceable CONVENIENCE hint — its NAME *and* contents are the commit time
+/// (`YYYYMMDD-HHMMSS` UTC) — so an external backup/sync can notice "the vault changed" without
+/// decrypting it. Called ONLY after the vault content is durably committed ([`OpenVault::
+/// save_internal`], [`commit_rekey`]), NEVER before: a failed/aborted save leaves it untouched.
+/// It is NOT written for the desktop `prefs.json` (a separate, non-vault file).
+///
+/// AUTHORITATIVE source of truth is `vault.pmv`'s own mtime, which the filesystem updates
+/// atomically with the temp+rename commit (zero gap). This marker can lag the real commit by one
+/// in the tiny crash window *between* the vault commit and this write, so a sync tool needing a
+/// HARD guarantee should key off `vault.pmv`'s mtime and treat this only as a fast hint.
+///
+/// Written atomically (unique temp → fsync → rename → dir fsync) so a concurrent reader never
+/// sees a half-written/empty marker and a crash can't leave it partial. Entirely BEST-EFFORT:
+/// the vault is already durably committed by the time this runs, so any failure here just leaves
+/// a slightly stale/missing hint and must never fail the operation. Ignored by every dir scan
+/// (the partition/manifest scanners match strict `vol.<N>`/`manifest.<N>` inside the `volume/`
+/// and `manifest/` SUBDIRS, not the vault root where this lives).
+fn touch_last_update(dir: &Path) {
+    let ts = records::compact_utc(records::unix_now());
+    let name = format!("last_update_{ts}");
+    let marker = dir.join(&name);
+    // Write the NEW marker first (atomic temp → fsync → rename → dir fsync). Writing before
+    // removing the old one means there is never a window with NO marker; putting the timestamp
+    // in the NAME means a same-second re-save reuses the same path (the rename just refreshes it)
+    // rather than self-deleting in the cleanup below.
+    let content = format!("{ts}\n");
+    let Ok(tmp) = sibling_tmp(&marker) else { return };
+    if write_new_file(&tmp, content.as_bytes(), &[]).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return; // leave the previous marker in place rather than risk a gap
+    }
+    if fs::rename(&tmp, &marker).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    sync_parent_dir(&marker);
+    // Remove any OTHER (older-named) `last_update_*` so exactly one remains. Skipping the file we
+    // just wrote keeps a same-second re-save (identical name) from deleting itself.
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let n = e.file_name();
+            let ns = n.to_string_lossy();
+            if ns.starts_with("last_update_") && ns != name {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+}
 
 /// Fuzzing entry point (hidden). The vault-file header parser; see `fuzz/`.
 // `mod fuzz { ... }` declares an inner module (a namespace). `#[doc(hidden)]`
@@ -4045,13 +4106,21 @@ mod tests {
         // Simulate atomic-write temps leaked by a crash mid-save.
         let stale_primary = dir.join(".vault.pmv.deadbeef.tmp");
         let stale_mirror = dir.join(".vault.pmv.mirror.cafef00d.tmp");
+        // A leaked last_update marker temp (crash between write_new_file and rename) must also be
+        // reaped — otherwise distinct-named orphans accumulate across crashes.
+        let stale_marker_tmp = dir.join(".last_update_19990101-000000.deadbeef.tmp");
         fs::write(&stale_primary, b"leaked encrypted temp").unwrap();
         fs::write(&stale_mirror, b"leaked encrypted temp").unwrap();
+        fs::write(&stale_marker_tmp, b"19990101-000000\n").unwrap();
+        assert_eq!(markers(&dir).len(), 1, "create() left one live marker");
         {
             let _ = OpenVault::open(path.clone(), b"a", b"b").unwrap(); // writable open sweeps
         }
         assert!(!stale_primary.exists(), "stale primary .tmp swept on writable open");
         assert!(!stale_mirror.exists(), "stale mirror .tmp swept on writable open");
+        assert!(!stale_marker_tmp.exists(), "leaked last_update marker temp swept too");
+        // The LIVE marker (no leading dot, no .tmp) must survive the sweep.
+        assert_eq!(markers(&dir).len(), 1, "the live last_update marker survives the sweep");
         cleanup(&path);
     }
 
@@ -4444,6 +4513,92 @@ mod tests {
         assert!(p2.file_name().unwrap().to_string_lossy().contains("_1"), "got: {p2:?}");
         assert_eq!(fs::read(&p1).unwrap(), b"col\r\na\r\n", "first export untouched by the second");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // Names of the `last_update_*` marker files currently in `dir`.
+    fn markers(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("last_update_").then_some(n)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn save_writes_a_single_last_update_marker_after_commit() {
+        let path = tmp_path("lastupd");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        // create() does its first on-disk commit (open.save()), so a marker already exists —
+        // the marker tracks "last time vault.pmv was committed", which includes creation.
+        let ms = markers(&dir);
+        assert_eq!(ms.len(), 1, "exactly one marker after the create commit: {ms:?}");
+        let ts = ms[0].strip_prefix("last_update_").unwrap();
+        assert_eq!(ts.len(), 15, "name carries a compact_utc YYYYMMDD-HHMMSS: {}", ms[0]);
+        // Contents = the same timestamp (+ newline); name and content agree.
+        assert_eq!(fs::read_to_string(dir.join(&ms[0])).unwrap(), format!("{ts}\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(dir.join(&ms[0])).unwrap().permissions().mode() & 0o777, 0o600, "marker is 0600");
+        }
+        // A subsequent committed save keeps it at exactly one (the old one is replaced).
+        v.save().unwrap();
+        assert_eq!(markers(&dir).len(), 1, "still exactly one marker after another save: {:?}", markers(&dir));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_replaces_any_existing_last_update_markers() {
+        let path = tmp_path("lastupd2");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        v.save().unwrap();
+        // Plant a STALE marker (as if from an earlier, different-second save).
+        fs::write(dir.join("last_update_19990101-000000"), b"19990101-000000\n").unwrap();
+        assert_eq!(markers(&dir).len(), 2, "two markers planted");
+        v.save().unwrap();
+        let ms = markers(&dir);
+        assert_eq!(ms.len(), 1, "exactly one marker remains after the next save: {ms:?}");
+        assert!(!ms[0].contains("19990101"), "the stale marker was replaced: {ms:?}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_session_does_not_touch_the_last_update_marker() {
+        let path = tmp_path("lastupd-ro");
+        drop(OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap());
+        let dir = path.parent().unwrap().to_path_buf();
+        let before = markers(&dir);
+        assert_eq!(before.len(), 1, "create left one marker");
+        // A read-only (heir) session never saves, so it must not add or replace the marker.
+        drop(OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap());
+        assert_eq!(markers(&dir), before, "read-only open left the marker unchanged");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn last_update_marker_does_not_break_reopen() {
+        let path = tmp_path("lastupd-reopen");
+        let id;
+        {
+            let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            let src = write_src("lu", b"doc bytes");
+            id = v.add_document("/d", "f.txt", &src).unwrap(); // add_document persists -> marks
+            fs::remove_file(&src).ok();
+        }
+        let dir = path.parent().unwrap().to_path_buf();
+        assert_eq!(markers(&dir).len(), 1, "one marker after add_document: {:?}", markers(&dir));
+        // Reopen with the marker sitting in the vault root — must open cleanly, data intact
+        // (the marker is ignored by the partition/manifest scanners, which read the subdirs).
+        let v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+        assert_eq!(&v.read_document(&id).unwrap()[..], b"doc bytes", "doc survives a reopen-with-marker");
+        cleanup(&path);
     }
 
     #[test]

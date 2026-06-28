@@ -441,6 +441,7 @@ mypath/vault.pmv          encrypted JSON vault (header + AEAD ciphertext)
 mypath/manifest/manifest.<N>  encrypted per-partition document index
 mypath/volume/vol.<N>         append-only, per-blob-encrypted document frames
 mypath/pass-mgr.lock          single-writer advisory lock (empty; writable opens only)
+mypath/last_update_<UTC>      non-secret change marker (exactly one; see §6.3) — NOT vault content
 ```
 
 ### 6.1 `vault.pmv`
@@ -494,6 +495,22 @@ offset  len  field
   range-checked before the memory-hard derivation runs, and `vault.pmv`, each
   manifest, and each document are size-capped before being read, so a crafted file
   cannot force a huge allocation (DoS) — see §9.13.
+- **The `last_update_<UTC>` marker:** after every committed change to `vault.pmv` —
+  a record edit, document add/remove, merge, compaction, password change, or the
+  initial create — the vault directory holds **exactly one** non-secret marker file
+  whose *name and contents* are the commit time (`YYYYMMDD-HHMMSS` UTC). It lets an
+  external backup/sync notice "the vault changed" by globbing one file, without
+  decrypting anything. The local `prefs.json` (theme, export dir, …) is **not** a
+  vault change and never writes a marker. The marker is written **strictly after** the
+  durable commit — never before, so a failed/aborted save can't bump it — and
+  **atomically** (unique temp → fsync → rename → dir fsync); the previous marker is then
+  removed so exactly one remains. It is entirely **best-effort** and is **not vault
+  content**: every directory scan ignores it (the partition scanners match strict
+  `vol.<N>`/`manifest.<N>` inside the `volume/`/`manifest/` subdirs). **Authoritative**
+  change detection should use `vault.pmv`'s own **mtime**, which the filesystem updates
+  atomically with its temp+rename commit (zero gap); the marker can lag the real commit by
+  one in the tiny crash window between the vault commit and the marker write, so tooling
+  needing a hard guarantee keys off the mtime and treats the marker as a fast hint.
 
 > Note: the current format is **version 4** (the partitioned document store of
 > §4.3/§11, with the category lists and a `settings` block embedded in the vault
