@@ -30,7 +30,7 @@
 //! in-memory exposure is not worth a counting-pass rewrite.
 
 use crate::records::{
-    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, TaxFiling, TrustWill,
+    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, TaxFiling, TrustWill, Vault,
 };
 
 /// The basename of a volume virtual path (`taxes/2024/<ts>/w2.pdf` -> `w2.pdf`).
@@ -222,6 +222,40 @@ pub fn general_documents_csv(rows: &[GeneralDocument], name_of: impl Fn(&str) ->
     out
 }
 
+// --- Tab dispatch (shared by both front-ends) --------------------------------
+
+/// Which record tab to export. Lets the GUI and TUI share ONE tab -> collection
+/// mapping (each front-end has its own `Tab` enum but maps it to this), so adding a
+/// record type or changing a base filename is a single-site change here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CsvTab {
+    Instructions,
+    TrustWill,
+    Assets,
+    Accounts,
+    RealEstate,
+    Taxes,
+    GeneralDocuments,
+}
+
+/// Build the CSV for one tab's records: returns the base filename (the front-ends append
+/// `-<timestamp>.csv`), the CSV text, and the record count. `name_of` resolves a document
+/// blob id to its file name. The text may contain plaintext passwords (Accounts / Real
+/// Estate) by the user's explicit opt-in; the front-ends hold it in `Zeroizing`.
+pub fn build_tab_csv(v: &Vault, tab: CsvTab, name_of: impl Fn(&str) -> String) -> (&'static str, String, usize) {
+    match tab {
+        CsvTab::Instructions => ("instructions", instructions_csv(&v.instructions), v.instructions.len()),
+        CsvTab::TrustWill => ("trust-will", trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
+        CsvTab::Assets => ("assets-liabilities", assets_csv(&v.assets, name_of), v.assets.len()),
+        CsvTab::Accounts => ("accounts", accounts_csv(&v.accounts), v.accounts.len()),
+        CsvTab::RealEstate => ("real-estate", real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
+        CsvTab::Taxes => ("taxes", tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
+        CsvTab::GeneralDocuments => {
+            ("general-documents", general_documents_csv(&v.general_documents, name_of), v.general_documents.len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +334,93 @@ mod tests {
         assert!(line.contains("1 Main St"));
         assert!(line.contains("secret"), "portal password kept in plaintext");
         assert!(line.contains("deed"), "document name resolved");
+    }
+
+    #[test]
+    fn assets_csv_header_columns_review_and_statement() {
+        let mut a = AssetLiability::new().unwrap();
+        a.id = "a1".into();
+        a.kind = "Asset".into();
+        a.description = "Brokerage".into();
+        a.owner = "Jane".into();
+        a.review = true;
+        a.statement = Some("stmt".into());
+        let out = assets_csv(&[a], echo);
+        let lines: Vec<&str> = out.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("id,kind,description,owner,title,approx_value"), "header field order: {}", lines[0]);
+        assert!(lines[0].ends_with(",statement,created,updated"));
+        assert!(lines[1].contains(",yes,"), "review=true -> yes");
+        assert!(lines[1].contains("stmt"), "statement doc id resolved to a name");
+    }
+
+    #[test]
+    fn trust_wills_and_general_documents_resolve_optional_file_or_empty() {
+        let mut tw = TrustWill::new().unwrap();
+        tw.id = "tw1".into();
+        tw.document = "Living Trust".into();
+        tw.file = Some("trust.pdf".into());
+        let twl = trust_wills_csv(&[tw], echo);
+        assert!(twl.split("\r\n").next().unwrap().starts_with("id,document,usage,file,"));
+        assert!(twl.split("\r\n").nth(1).unwrap().contains("trust.pdf"));
+
+        let mut g = GeneralDocument::new().unwrap();
+        g.id = "g1".into();
+        g.title = "Passport".into();
+        g.file = None; // no attachment -> empty file cell, no panic
+        let gl = general_documents_csv(&[g], echo);
+        let row = gl.split("\r\n").nth(1).unwrap();
+        // The penultimate column group is `file,created,updated`; file must be empty.
+        assert!(row.starts_with("g1,Passport,"), "row: {row}");
+    }
+
+    #[test]
+    fn join_names_drops_unresolved_ids_without_trailing_separator() {
+        // A resolver that fails to resolve "gone" (tombstoned/missing doc) -> empty name.
+        let resolve = |id: &str| if id == "gone" { String::new() } else { id.to_string() };
+        let mut t = TaxFiling::new().unwrap();
+        t.id = "t".into();
+        t.documents = vec!["deed".into(), "gone".into()];
+        let line = tax_filings_csv(&[t], resolve).split("\r\n").nth(1).unwrap().to_string();
+        assert!(line.contains("deed"), "live doc name present");
+        assert!(!line.contains("deed;"), "no dangling '; ' for the dropped unresolved id: {line}");
+        assert!(!line.contains("; "), "the only doc cell holds a single resolved name");
+    }
+
+    #[test]
+    fn u2028_line_separator_is_neutralized_in_a_cell() {
+        // U+2028 must not survive into a CSV cell as a real line break (regression guard
+        // for the display_safe gap). The whole record stays one physical line.
+        let mut a = Account::new().unwrap();
+        a.id = "x".into();
+        a.title = "a\u{2028}b".into();
+        let out = accounts_csv(&[a]);
+        assert_eq!(out.matches("\r\n").count(), 2, "header + exactly one record line");
+        assert!(out.contains("a_b"), "U+2028 replaced with '_'");
+    }
+
+    #[test]
+    fn build_tab_csv_maps_each_tab_to_its_collection() {
+        let mut v = Vault::default();
+        let mut acc = Account::new().unwrap();
+        acc.title = "Bank".into();
+        v.accounts.push(acc);
+        let mut tax = TaxFiling::new().unwrap();
+        tax.owner = "Joint".into();
+        v.tax_filings.push(tax);
+
+        let (base, text, n) = build_tab_csv(&v, CsvTab::Accounts, echo);
+        assert_eq!(base, "accounts");
+        assert_eq!(n, 1);
+        assert!(text.contains("Bank"));
+
+        let (base, text, n) = build_tab_csv(&v, CsvTab::Taxes, echo);
+        assert_eq!(base, "taxes");
+        assert_eq!(n, 1);
+        assert!(text.contains("Joint"));
+
+        // A tab with no records yields a header-only CSV and count 0.
+        let (base, _t, n) = build_tab_csv(&v, CsvTab::Instructions, echo);
+        assert_eq!((base, n), ("instructions", 0));
     }
 }

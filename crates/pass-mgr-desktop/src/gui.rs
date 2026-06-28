@@ -790,27 +790,27 @@ impl GuiApp {
         self.doc_source.clear();
     }
 
-    /// Build the CSV text for the current tab's records (ALL of them, ignoring any
-    /// display filter), plus a base filename and the record count. Returns `None` for
-    /// tabs without records (Summary). Document/file columns hold file NAMES, resolved
-    /// from the vault's document index. The result is wrapped in `Zeroizing` because it
-    /// can contain plaintext passwords (Accounts / Real Estate portals).
+    /// Build the CSV text for the current tab's records (ALL of them, ignoring any display
+    /// filter), plus a base filename and the record count. The tab -> collection mapping
+    /// lives in the shared `csv::build_tab_csv` core helper; this only maps the GUI's local
+    /// `Tab` to `csv::CsvTab`. The `Summary => None` arm keeps the match exhaustive — Summary
+    /// has no records and shows no CSV button, so it is unreachable from the GUI. Document/
+    /// file columns hold file NAMES. The result is wrapped in `Zeroizing` because it can
+    /// contain plaintext passwords (Accounts / Real Estate portals).
     fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
         let ov = self.vault.as_ref()?;
-        let v = &ov.vault;
-        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
-        let (base, text, n): (&'static str, String, usize) = match self.tab {
-            Tab::Instructions => ("instructions", csv::instructions_csv(&v.instructions), v.instructions.len()),
-            Tab::TrustWill => ("trust-will", csv::trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
-            Tab::Assets => ("assets-liabilities", csv::assets_csv(&v.assets, name_of), v.assets.len()),
-            Tab::Accounts => ("accounts", csv::accounts_csv(&v.accounts), v.accounts.len()),
-            Tab::RealEstate => ("real-estate", csv::real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
-            Tab::Taxes => ("taxes", csv::tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
-            Tab::GeneralDocuments => {
-                ("general-documents", csv::general_documents_csv(&v.general_documents, name_of), v.general_documents.len())
-            }
+        let tab = match self.tab {
+            Tab::Instructions => csv::CsvTab::Instructions,
+            Tab::TrustWill => csv::CsvTab::TrustWill,
+            Tab::Assets => csv::CsvTab::Assets,
+            Tab::Accounts => csv::CsvTab::Accounts,
+            Tab::RealEstate => csv::CsvTab::RealEstate,
+            Tab::Taxes => csv::CsvTab::Taxes,
+            Tab::GeneralDocuments => csv::CsvTab::GeneralDocuments,
             Tab::Summary => return None,
         };
+        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
+        let (base, text, n) = csv::build_tab_csv(&ov.vault, tab, name_of);
         Some((base, Zeroizing::new(text), n))
     }
 
@@ -819,7 +819,7 @@ impl GuiApp {
     fn export_current_tab_csv(&mut self) {
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
-            self.fail("Set an export directory in Config first (Config → Export destination).");
+            self.fail("Set an export directory in Config first (Config → Export directory).");
             return;
         }
         let Some((base, text, n)) = self.build_tab_csv() else {
@@ -840,7 +840,7 @@ impl GuiApp {
     fn export_doc_to_config_dir(&mut self, id: &str) {
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
-            self.status = "Set an export directory in Config first (Config → Export destination).".into();
+            self.status = "Set an export directory in Config first (Config → Export directory).".into();
             return;
         }
         if let Some(ov) = self.vault.as_ref() {
@@ -1642,7 +1642,7 @@ impl GuiApp {
 
             ui.add_space(16.0);
             ui.separator();
-            ui.label(egui::RichText::new("Export destination").strong());
+            ui.label(egui::RichText::new("Export directory").strong());
             ui.label(
                 egui::RichText::new(
                     "Where the per-document Export buttons write the decrypted file. Each export \

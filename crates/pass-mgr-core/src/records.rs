@@ -452,6 +452,8 @@ pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String 
 pub(crate) fn is_spoofy_format_char(c: char) -> bool {
     matches!(c,
         '\u{200B}'..='\u{200F}'   // zero-width space/joiners + LRM/RLM
+        | '\u{2028}'              // LINE SEPARATOR — a real line break that char::is_control misses
+        | '\u{2029}'              // PARAGRAPH SEPARATOR — likewise (keeps CSV cells one physical line)
         | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO override
         | '\u{2060}'              // word joiner
         | '\u{2066}'..='\u{2069}' // bidi isolates
@@ -2770,6 +2772,10 @@ mod tests {
         assert_eq!(display_safe("invoice\u{202e}fdp.exe"), "invoice_fdp.exe"); // RIGHT-TO-LEFT OVERRIDE
         assert_eq!(display_safe("a\u{200b}b\u{feff}c"), "a_b_c"); // zero-width space + BOM
         assert_eq!(display_safe("tab\tnl\n"), "tab_nl_"); // ASCII control
+        // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are real line breaks that
+        // char::is_control() does NOT catch — they must still be neutralized so a CSV cell
+        // (or a terminal preview / filename) cannot be split by an unquoted line break.
+        assert_eq!(display_safe("line\u{2028}sep\u{2029}end"), "line_sep_end");
         assert_eq!(display_safe("José café 北京"), "José café 北京"); // ordinary unicode preserved
         assert_eq!(display_safe("plain.txt"), "plain.txt");
     }

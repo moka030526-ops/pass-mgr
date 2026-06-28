@@ -15,6 +15,7 @@
 // `Path` is a borrowed filesystem path (a view, like `&str`); `PathBuf` is an
 // owned, growable path (like `String`). You hand out `&Path` to read, keep a
 // `PathBuf` to own.
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 // `Duration` = a length of time; `Instant` = a specific moment on the monotonic
 // clock (used for "do X after N seconds").
@@ -2300,27 +2301,26 @@ impl App {
         self.edit = Some(es);
     }
 
-    /// Build the CSV text for the current tab's records (ALL of them), plus a base
-    /// filename and the record count. Returns `None` for tabs without records (Summary).
-    /// Document/file columns hold file NAMES, resolved from the vault's document index.
-    /// The result is wrapped in `Zeroizing` because it can contain plaintext passwords
-    /// (Accounts / Real Estate portals).
+    /// Build the CSV text for the current tab's records (ALL of them), plus a base filename
+    /// and the record count. The tab -> collection mapping lives in the shared
+    /// `csv::build_tab_csv` core helper; this only maps the TUI's local `Tab` to `csv::CsvTab`.
+    /// Returns `None` for the Summary tab (which has no records — the 'e' key can fire there,
+    /// so this branch IS live in the TUI, unlike the GUI). Document/file columns hold file
+    /// NAMES. The result is wrapped in `Zeroizing` because it can contain plaintext passwords.
     fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
         let ov = self.vault.as_ref()?;
-        let v = &ov.vault;
-        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
-        let (base, text, n): (&'static str, String, usize) = match self.tab {
-            Tab::Instructions => ("instructions", csv::instructions_csv(&v.instructions), v.instructions.len()),
-            Tab::TrustWill => ("trust-will", csv::trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
-            Tab::Assets => ("assets-liabilities", csv::assets_csv(&v.assets, name_of), v.assets.len()),
-            Tab::Accounts => ("accounts", csv::accounts_csv(&v.accounts), v.accounts.len()),
-            Tab::RealEstate => ("real-estate", csv::real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
-            Tab::Taxes => ("taxes", csv::tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
-            Tab::GeneralDocuments => {
-                ("general-documents", csv::general_documents_csv(&v.general_documents, name_of), v.general_documents.len())
-            }
+        let tab = match self.tab {
+            Tab::Instructions => csv::CsvTab::Instructions,
+            Tab::TrustWill => csv::CsvTab::TrustWill,
+            Tab::Assets => csv::CsvTab::Assets,
+            Tab::Accounts => csv::CsvTab::Accounts,
+            Tab::RealEstate => csv::CsvTab::RealEstate,
+            Tab::Taxes => csv::CsvTab::Taxes,
+            Tab::GeneralDocuments => csv::CsvTab::GeneralDocuments,
             Tab::Summary => return None,
         };
+        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
+        let (base, text, n) = csv::build_tab_csv(&ov.vault, tab, name_of);
         Some((base, Zeroizing::new(text), n))
     }
 
@@ -3665,22 +3665,37 @@ impl App {
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(frame.area());
 
+        // Masked unless the single global "reveal all" for THIS record's tab is on (the only
+        // reveal control): the Accounts toggle for account edits, the Real Estate toggle for
+        // property edits. Scoping by `es.tab` keeps them independent. Computed once per frame.
+        let reveal_all_here = (self.reveal_all && es.tab == Tab::Accounts)
+            || (self.re_reveal_all && es.tab == Tab::RealEstate);
+        // When a password is REVEALED, hold the cleartext copy in a per-frame Zeroizing
+        // scratch (parallel to es.fields) so the render BORROWS it and it is WIPED when this
+        // function returns — instead of cloning cleartext into a plain String that ratatui
+        // drops un-zeroized. Because the event loop redraws at least every poll interval, a
+        // plain clone here would continuously orphan password fragments on the heap; this
+        // bounds the residue to one frame and wipes it, matching Field::password's discipline.
+        // Masked and non-secret fields allocate nothing here (`None`).
+        let secrets: Vec<Option<Zeroizing<String>>> = es
+            .fields
+            .iter()
+            .map(|f| (reveal_all_here && matches!(f.kind, FieldKind::Password)).then(|| Zeroizing::new(f.value.clone())))
+            .collect();
+
         let mut lines: Vec<Line> = Vec::new();
         for (i, field) in es.fields.iter().enumerate() {
             let focused = i == es.focus;
             let marker = if focused { "> " } else { "  " };
-            // Decide what to display per field kind: a hidden password shows bullets
-            // (unless `reveal` is on); a Choice shows arrows around the value; others
-            // show their text verbatim. `&field.kind` matches by borrow.
-            // Masked unless the single global "reveal all" for THIS record's tab is on
-            // (the only reveal control): the Accounts toggle for account edits, the Real
-            // Estate toggle for property edits. Scoping by `es.tab` keeps them independent.
-            let reveal_all_here = (self.reveal_all && es.tab == Tab::Accounts)
-                || (self.re_reveal_all && es.tab == Tab::RealEstate);
-            let shown = match &field.kind {
-                FieldKind::Password if !reveal_all_here => "•".repeat(field.value.chars().count()),
-                FieldKind::Choice(_) => format!("◄ {} ►", field.value),
-                _ => field.value.clone(),
+            // Decide what to display per field kind: a hidden password shows bullets; a
+            // REVEALED password borrows its wiped-at-frame-end scratch copy; a Choice shows
+            // arrows around the value; others borrow their text verbatim. `&field.kind`
+            // matches by borrow; `Cow` avoids cloning the non-secret fields.
+            let shown: Cow<str> = match &field.kind {
+                FieldKind::Password if !reveal_all_here => Cow::Owned("•".repeat(field.value.chars().count())),
+                FieldKind::Password => Cow::Borrowed(secrets[i].as_ref().map_or("", |z| z.as_str())),
+                FieldKind::Choice(_) => Cow::Owned(format!("◄ {} ►", field.value)),
+                _ => Cow::Borrowed(field.value.as_str()),
             };
             let style = if focused {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -4605,6 +4620,33 @@ mod tests {
         let entry = std::fs::read_dir(&outdir).unwrap().next().unwrap().unwrap();
         let body = std::fs::read_to_string(entry.path()).unwrap();
         assert!(body.contains("w2.txt"), "document file name listed; body: {body}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_empty_dir_reports_and_writes_nothing() {
+        let (mut app, path) = app_unlocked("uicsvnodir");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.accounts, Account::new().unwrap());
+        }
+        app.tab = Tab::Accounts;
+        app.cfg_export_dir = "   ".into(); // blank/whitespace export dir
+        app.export_current_tab_csv();
+        assert!(app.status.contains("export directory"), "guides the user to Config: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_on_summary_tab_is_a_noop() {
+        let (mut app, path) = app_unlocked("uicsvsummary");
+        let outdir = path.parent().unwrap().join("uicsvsummary-out");
+        app.tab = Tab::Summary; // the 'e' key fires on any tab; Summary has no records
+        app.cfg_export_dir = outdir.to_string_lossy().into();
+        assert!(app.build_tab_csv().is_none(), "Summary -> no CSV");
+        app.export_current_tab_csv();
+        assert_eq!(app.status, "Nothing to export on this tab.");
+        assert!(!outdir.exists(), "no file written for the Summary tab");
         cleanup(&path);
     }
 
