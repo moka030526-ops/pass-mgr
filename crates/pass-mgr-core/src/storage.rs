@@ -350,10 +350,19 @@ impl VolumeStore {
         // A "let-chain": this `if` body runs only when BOTH (a) `self.entry(id)` is
         // `Some(expected)` (binding `expected`) AND (b) the stored path differs. If the
         // entry is `None`, the whole condition is false and the body is skipped.
-        if let Some(expected) = self.entry(id)
-            && frame_path != expected.path
-        {
-            return Err(StorageError::Corrupt(format!("frame path mismatch for {id}")));
+        if let Some(expected) = self.entry(id) {
+            if frame_path != expected.path {
+                return Err(StorageError::Corrupt(format!("frame path mismatch for {id}")));
+            }
+            // Verify the DECRYPTED body length matches the manifest-declared `size`. `size` is an
+            // independently-serialized field that nothing else cross-checks (read_frame_at only
+            // validates the frame `length`), so without this a crafted source vault could declare a
+            // small `size` for an authentic OVERSIZE frame to slip past the merge preview's
+            // MAX_DOC_SIZE guard, then abort apply post-approval. Checking it here hardens EVERY
+            // reader and guarantees an oversize body can never be served/copied under a small size.
+            if bytes.len() as u64 != expected.size {
+                return Err(StorageError::Corrupt(format!("frame size mismatch for {id}")));
+            }
         }
         Ok(bytes)
     }
@@ -1433,6 +1442,27 @@ mod tests {
         let s2 = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
         assert!(matches!(s2.read("a", &key), Err(StorageError::Corrupt(_))), "swap into a detected");
         assert!(matches!(s2.read("b", &key), Err(StorageError::Corrupt(_))), "swap into b detected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_size_that_lies_about_the_body() {
+        // The manifest `size` is an independently-serialized field; read() must verify the
+        // DECRYPTED body length against it. A crafted source vault could otherwise declare a
+        // SMALL size for an authentic OVERSIZE frame to slip past the merge oversize-preview
+        // guard, then abort apply post-approval. read() rejects any size mismatch as Corrupt.
+        let dir = tmp_dir("sizecheck");
+        let key = fast_key();
+        let mut s = VolumeStore::open(&dir, &key, "v", DEFAULT_VOLUME_MAX_SIZE).unwrap();
+        s.put("a", "/a", b"0123456789", 1, &key).unwrap(); // 10-byte body
+        assert_eq!(&*s.read("a", &key).unwrap(), b"0123456789", "reads with an honest size");
+        // Forge the manifest's declared size (the on-disk frame is untouched).
+        let e = s.manifests[0].entries.iter_mut().find(|e| e.id == "a").unwrap();
+        e.size = 0;
+        assert!(
+            matches!(s.read("a", &key), Err(StorageError::Corrupt(_))),
+            "a manifest size that disagrees with the real body is rejected, never served"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

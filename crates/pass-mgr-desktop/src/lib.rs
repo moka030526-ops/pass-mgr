@@ -83,8 +83,12 @@ pub(crate) fn clipboard_tick_decision(
 /// and TUI so both render identically: `1_234_567.8 -> "$1,234,568"`, `-2500.0 -> "-$2,500"`,
 /// `0.0 -> "$0"`. The summary is an approximation, so cents are rounded away for legibility.
 pub(crate) fn fmt_money(v: f64) -> String {
-    let neg = v < 0.0;
-    let digits = (v.abs().round() as u64).to_string();
+    let rounded = v.abs().round() as u64;
+    // Take the sign from the ROUNDED magnitude, not the raw float, so a value that rounds to 0
+    // never shows "-$0". A tiny negative residue is realistic on the Summary's Net column —
+    // assets minus an equal liability leaves e.g. -1e-17 from f64 subtraction.
+    let neg = v < 0.0 && rounded != 0;
+    let digits = rounded.to_string();
     let bytes = digits.as_bytes();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 2);
     for (i, b) in bytes.iter().enumerate() {
@@ -377,6 +381,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pmprefs-export-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn fmt_money_formats_and_never_shows_negative_zero() {
+        assert_eq!(fmt_money(0.0), "$0");
+        assert_eq!(fmt_money(1_234_567.8), "$1,234,568");
+        assert_eq!(fmt_money(-2500.0), "-$2,500");
+        // Anything that rounds to zero — including a tiny NEGATIVE f64 residue (realistic on the
+        // Summary Net column when assets exactly equal liabilities) — renders "$0", never "-$0".
+        assert_eq!(fmt_money(-1e-16), "$0");
+        assert_eq!(fmt_money(-0.4), "$0");
+        assert_eq!(fmt_money(0.4), "$0");
+        assert_eq!(fmt_money(-0.6), "-$1"); // rounds to a nonzero magnitude -> keeps its sign
     }
 
     #[test]
