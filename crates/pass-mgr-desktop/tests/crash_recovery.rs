@@ -47,13 +47,15 @@ fn run_crashop(dir: &Path, scenario: &str, crash_at: Option<&str>) -> bool {
     cmd.status().expect("spawn __crashop").success()
 }
 
-/// The content `setup` stores as the referenced document (doc-one == 0xA1 x600).
+/// The content `setup` stores as the referenced document (doc-one == 0xA1 x40_000).
+/// Must match the `body` size in main.rs::crashop — ~40 KB so that, at the 64 KiB volume
+/// floor, doc-two rolls into a SEPARATE partition (exercising new-volume creation).
 fn doc_one() -> Vec<u8> {
-    vec![0xA1u8; 600]
+    vec![0xA1u8; 40_000]
 }
-/// The content the clean `adddoc` stores (doc-two == 0xB2 x600).
+/// The content the clean `adddoc` stores (doc-two == 0xB2 x40_000).
 fn doc_two() -> Vec<u8> {
-    vec![0xB2u8; 600]
+    vec![0xB2u8; 40_000]
 }
 
 /// Bytes of every record-referenced document, sorted, for multi-doc assertions.

@@ -1907,6 +1907,13 @@ fn source_entry_validated(source: &OpenVault, id: &str) -> Result<Option<(String
             if e.path.len() > crate::storage::MAX_PATH_LEN {
                 return Err("references a document whose path is too long".into());
             }
+            // Likewise enforce the MAX_DOC_SIZE bound `VolumeStore::put` checks at apply time.
+            // `storage::read` accepts a frame slightly larger than MAX_DOC_SIZE, so a hand-crafted
+            // source volume could otherwise pass this preview and then abort apply_merge_from with
+            // TooLarge AFTER the user approved the plan. Surface it as a skipped preview record.
+            if e.size > crate::storage::MAX_DOC_SIZE {
+                return Err("references a document that is too large".into());
+            }
             Ok(Some((e.path.clone(), e.size)))
         }
     }
