@@ -105,7 +105,7 @@ Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id) |
 | Accounts | `Account` | title, account_type, account_subtype, owner, username, password, url, closed_as_of, description, review |
 | Real Estate | `RealEstate` | address, ownership, taxes, hoa, income/financing/payment account, financing_balance, four portal logins (property-management / insurance / HOA / tax — each url + username + password + comment), comments, `documents` (doc ids) |
-| Taxes | `TaxFiling` | year, notes, `documents` (doc ids) |
+| Taxes | `TaxFiling` | owner, year, notes, `documents` (doc ids); list label is `<owner> - <year>` |
 | General Documents | `GeneralDocument` | title, description, `file` (one doc id) |
 
 **Multi-document records & the uniform path layout.** Trust&Will, Assets, and General

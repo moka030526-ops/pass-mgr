@@ -36,6 +36,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::KdfParams;
+use crate::csv;
 use crate::password::{self, GenOptions};
 use crate::records::{
     self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
@@ -1350,6 +1351,11 @@ impl App {
                 self.cfg_focus = 0;
                 self.screen = Screen::Config;
             }
+            // Export every record on the current tab to a timestamped CSV in the
+            // configured export directory. A read action (writes a file, not the
+            // vault), so it works read-only too. NOTE: the Accounts / Real Estate
+            // CSVs contain passwords in plaintext.
+            KeyCode::Char('e') => self.export_current_tab_csv(),
             _ => {}
         }
         false
@@ -1893,6 +1899,7 @@ impl App {
                     id,
                     r.created_at,
                     vec![
+                        Field::text("Owner", r.owner.clone()),
                         Field::text("Filing year", r.year.clone()),
                         Field::multiline("Notes", r.notes.clone()),
                     ],
@@ -2293,6 +2300,51 @@ impl App {
         self.edit = Some(es);
     }
 
+    /// Build the CSV text for the current tab's records (ALL of them), plus a base
+    /// filename and the record count. Returns `None` for tabs without records (Summary).
+    /// Document/file columns hold file NAMES, resolved from the vault's document index.
+    /// The result is wrapped in `Zeroizing` because it can contain plaintext passwords
+    /// (Accounts / Real Estate portals).
+    fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
+        let ov = self.vault.as_ref()?;
+        let v = &ov.vault;
+        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
+        let (base, text, n): (&'static str, String, usize) = match self.tab {
+            Tab::Instructions => ("instructions", csv::instructions_csv(&v.instructions), v.instructions.len()),
+            Tab::TrustWill => ("trust-will", csv::trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
+            Tab::Assets => ("assets-liabilities", csv::assets_csv(&v.assets, name_of), v.assets.len()),
+            Tab::Accounts => ("accounts", csv::accounts_csv(&v.accounts), v.accounts.len()),
+            Tab::RealEstate => ("real-estate", csv::real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
+            Tab::Taxes => ("taxes", csv::tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
+            Tab::GeneralDocuments => {
+                ("general-documents", csv::general_documents_csv(&v.general_documents, name_of), v.general_documents.len())
+            }
+            Tab::Summary => return None,
+        };
+        Some((base, Zeroizing::new(text), n))
+    }
+
+    /// Export every record on the current tab to a timestamped CSV in the configured
+    /// export directory (e.g. `accounts-20240628-143000.csv`). Read-only safe; the
+    /// destination is set in Config (and editable even read-only, like document export).
+    fn export_current_tab_csv(&mut self) {
+        let dir = self.cfg_export_dir.trim().to_string();
+        if dir.is_empty() {
+            self.status = "Set an export directory in Config first (Config → Export directory).".into();
+            return;
+        }
+        let Some((base, text, n)) = self.build_tab_csv() else {
+            // Only reachable on the Summary tab (the TUI 'e' key fires on any tab).
+            self.status = "Nothing to export on this tab.".into();
+            return;
+        };
+        let filename = format!("{base}-{}.csv", records::compact_utc(records::unix_now()));
+        match crate::vault::write_export_bytes(Path::new(&dir), &filename, text.as_bytes()) {
+            Ok(p) => self.status = format!("Exported {n} record(s) to {}", p.display()),
+            Err(e) => self.status = format!("CSV export failed: {e}"),
+        }
+    }
+
     /// Export document `id` into the configured export directory (`cfg_export_dir`),
     /// recreating its volume folder structure under it. There is no per-export path
     /// prompt; the directory is set in Config and is settable even in read-only mode
@@ -2336,7 +2388,7 @@ impl App {
             return;
         }
         let rc = es.record_fields;
-        let year = es.fields[0].value.clone();
+        let year = es.fields[1].value.clone(); // field 0 is Owner, field 1 is Filing year
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
         let subfolder = es.fields[rc + 2].value.clone();
@@ -2675,8 +2727,9 @@ impl App {
                 let mut r = TaxFiling::default();
                 r.id = id;
                 r.created_at = es.created_at;
-                r.year = f(0);
-                r.notes = f(1);
+                r.owner = f(0);
+                r.year = f(1);
+                r.notes = f(2);
                 r.documents = es.tax_docs.clone();
                 r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.tax_filings, r);
@@ -3534,17 +3587,17 @@ impl App {
         } else {
             match self.tab {
                 Tab::Accounts if self.acct_grouped => {
-                    "↑↓ · Enter expand/edit · n new · d del · t/s/o/l filter · r reveal-all · g flat list · / search · ←→ tab · q quit"
+                    "↑↓ · Enter expand/edit · n new · d del · t/s/o/l filter · r reveal-all · g flat list · / search · e CSV · ←→ tab · q quit"
                 }
                 Tab::Accounts => {
-                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · g grouped · T trim-all · / search · ←→ tab · c config · p pw · q quit"
+                    "↑↓ · Enter edit · n new · d del · t/s/o/l filter · v review · r reveal-all · g grouped · T trim-all · / search · e CSV · ←→ tab · c config · p pw · q quit"
                 }
                 Tab::Assets if self.asset_grouped => {
-                    "↑↓ · Enter expand/edit · n new · d del · v review · g flat list · ←→ tab · c config · p pw · q quit"
+                    "↑↓ · Enter expand/edit · n new · d del · v review · g flat list · e CSV · ←→ tab · c config · p pw · q quit"
                 }
-                Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · g grouped · ←→ tab · c config · p pw · q quit",
-                Tab::RealEstate => "↑↓ · Enter edit · n new · d del · r reveal-all (portals) · ←→ tab · c config · p pw · q quit",
-                _ => "↑↓ · Enter edit · n new · d del · ←→ tab · c config · p passwords · q quit",
+                Tab::Assets => "↑↓ · Enter edit · n new · d del · v review filter · g grouped · e CSV · ←→ tab · c config · p pw · q quit",
+                Tab::RealEstate => "↑↓ · Enter edit · n new · d del · r reveal-all (portals) · e CSV · ←→ tab · c config · p pw · q quit",
+                _ => "↑↓ · Enter edit · n new · d del · e CSV · ←→ tab · c config · p passwords · q quit",
             }
         };
         self.draw_footer(frame, chunks[2], hints);
@@ -3662,7 +3715,7 @@ impl App {
                 format!(
                     "Documents ({}) — under {}/<timestamp>/[subfolder]/",
                     es.tax_docs.len(),
-                    records::tax_doc_location(&es.fields[0].value)
+                    records::tax_doc_location(&es.fields[1].value) // field 1 is Filing year (field 0 is Owner)
                 ),
                 Style::default().fg(Color::Cyan),
             )));
@@ -4471,7 +4524,87 @@ mod tests {
         app.selected = 0;
         app.start_edit(true);
         let screen = render_to_string(&app);
+        assert!(screen.contains("Owner"), "Taxes edit form renders the new Owner field");
         assert!(screen.contains("Filing year"), "Taxes edit form renders its fields");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn tax_owner_survives_edit_commit_in_tui() {
+        let (mut app, path) = app_unlocked("uitaxowner");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.tax_filings, TaxFiling::new().unwrap());
+        }
+        app.tab = Tab::Taxes;
+        app.selected = 0;
+        app.start_edit(true);
+        app.edit.as_mut().unwrap().fields[0].value = "Jane".into(); // owner
+        app.edit.as_mut().unwrap().fields[1].value = "2024".into(); // filing year
+        let es = app.edit.take().unwrap();
+        app.commit_edit_record(&es);
+        // f(0)=owner / f(1)=year mapping must survive a UI save (a field reorder
+        // that silently dropped owner would fail here).
+        let r = &app.vault.as_ref().unwrap().vault.tax_filings[0];
+        assert_eq!(r.owner, "Jane");
+        assert_eq!(r.year, "2024");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_writes_accounts_with_password() {
+        let (mut app, path) = app_unlocked("uicsvacct");
+        let outdir = path.parent().unwrap().join("uicsvacct-out");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.title = "Bank".into();
+            a.owner = "Jane".into();
+            a.password = "hunter2".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.cfg_export_dir = outdir.to_string_lossy().into();
+        app.export_current_tab_csv();
+        assert!(app.status.starts_with("Exported 1 record"), "status: {}", app.status);
+        let entry = std::fs::read_dir(&outdir).unwrap().next().unwrap().unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("accounts-") && name.ends_with(".csv"), "timestamped name: {name}");
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(body.contains(",password,"), "header has password column");
+        assert!(body.contains("hunter2"), "password exported in plaintext (user opted in)");
+        assert!(body.contains("Bank"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_lists_document_file_names() {
+        let (mut app, path) = app_unlocked("uicsvdoc");
+        let dir = path.parent().unwrap().to_path_buf();
+        let outdir = dir.join("uicsvdoc-out");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            records::upsert(&mut v.tax_filings, TaxFiling::new().unwrap());
+        }
+        app.tab = Tab::Taxes;
+        app.selected = 0;
+        app.start_edit(true);
+        let rc = app.edit.as_ref().unwrap().record_fields;
+        app.edit.as_mut().unwrap().fields[1].value = "2024".into(); // filing year (field 0 is Owner)
+        let src = dir.join("w2.txt");
+        std::fs::write(&src, b"data").unwrap();
+        {
+            let es = app.edit.as_mut().unwrap();
+            es.fields[rc].value = "w2.txt".into();
+            es.fields[rc + 1].value = src.to_string_lossy().into();
+        }
+        app.attach_tax_document(); // uploads the doc and persists the filing
+        // The CSV's documents column must show the file NAME, not the internal blob id.
+        app.cfg_export_dir = outdir.to_string_lossy().into();
+        app.export_current_tab_csv();
+        let entry = std::fs::read_dir(&outdir).unwrap().next().unwrap().unwrap();
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(body.contains("w2.txt"), "document file name listed; body: {body}");
         cleanup(&path);
     }
 
@@ -4487,7 +4620,8 @@ mod tests {
         app.selected = 0;
         app.start_edit(true);
         let rc = app.edit.as_ref().unwrap().record_fields;
-        app.edit.as_mut().unwrap().fields[0].value = "2024".into(); // filing year
+        app.edit.as_mut().unwrap().fields[0].value = "Jane".into(); // owner
+        app.edit.as_mut().unwrap().fields[1].value = "2024".into(); // filing year
 
         // --- attach ---
         let src = dir.join("w2.txt");
@@ -4681,7 +4815,8 @@ mod tests {
         assert_eq!(es.id.as_deref(), Some(target_id.as_str()));
         let expected =
             app.vault.as_ref().unwrap().vault.tax_filings.iter().find(|r| r.id == target_id).unwrap().year.clone();
-        assert_eq!(es.fields[0].value, expected, "loads the selected record's fields");
+        // field 0 is Owner, field 1 is the filing year.
+        assert_eq!(es.fields[1].value, expected, "loads the selected record's fields");
         cleanup(&path);
     }
 
