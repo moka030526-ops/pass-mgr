@@ -815,8 +815,15 @@ impl GuiApp {
     }
 
     /// Export every record on the current tab to a timestamped CSV in the configured
-    /// export directory (e.g. `accounts-20240628-143000.csv`). Read-only safe.
+    /// export directory (e.g. `accounts-20240628-143000.csv`). Requires WRITE mode: unlike
+    /// document export (which a read-only heir may use), a CSV can hold every record's
+    /// plaintext password, so a read-only session must not be able to bulk-dump it.
     fn export_current_tab_csv(&mut self) {
+        // Defense in depth — the per-tab "⤓ CSV" buttons are also hidden when not writable.
+        if !self.writable {
+            self.fail("Export to CSV needs write mode (re-open the vault with write access).");
+            return;
+        }
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
             self.fail("Set an export directory in Config first (Config → Export directory).");
@@ -1398,7 +1405,7 @@ impl GuiApp {
                 "Config",
                 &[
                     "Color theme (10 palettes) · Asset/Account types & subtypes (add, or delete when \
-                     unused) · Export destination directory · Backup · Storage volume size · Vault \
+                     unused) · Export directory · Backup · Storage volume size · Vault \
                      file redundancy.",
                     "Backup copies the encrypted vault + document store into a timestamped folder \
                      (nothing is decrypted). Redundancy keeps extra in-place encrypted copies of the \
@@ -2426,7 +2433,7 @@ impl GuiApp {
                     let lp = &mut c[0];
                     lp.horizontal(|ui| {
                         ui.heading("Assets and Liabilities");
-                        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
                             export = true;
                         }
                         if self.writable && ui.button("➕ New").clicked() {
@@ -2842,7 +2849,7 @@ impl GuiApp {
                     let lp = &mut c[0];
                     lp.horizontal(|ui| {
                         ui.heading("Accounts");
-                        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
                             export = true;
                         }
                         if self.writable && ui.button("➕ New").clicked() {
@@ -3939,9 +3946,9 @@ fn list_panel(
     let mut export = false;
     ui.horizontal(|ui| {
         ui.heading(title);
-        // "Export to CSV" is a read action (writes a file, not the vault), so it is
-        // offered even read-only; the destination is the Config export directory.
-        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+        // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
+        // only (offered only when writable) — a read-only heir must not bulk-export secrets.
+        if writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
             export = true;
         }
     });
@@ -4623,6 +4630,28 @@ mod tests {
         let body = std::fs::read_to_string(entry.path()).unwrap();
         assert!(body.contains("hunter2"), "password exported in plaintext (user opted in)");
         assert!(body.contains("Bank"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_is_refused_in_read_only_mode_in_gui() {
+        // Write-mode-only: a read-only (heir) session must not bulk-export plaintext passwords.
+        let (mut app, path) = app_unlocked("guicsvro");
+        let outdir = path.parent().unwrap().join("guicsvro-out");
+        {
+            let ov = app.vault.as_mut().unwrap();
+            let mut a = Account::new().unwrap();
+            a.title = "Bank".into();
+            a.owner = "Jane".into();
+            a.password = "hunter2".into();
+            records::upsert(&mut ov.vault.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.export_dir = outdir.to_string_lossy().into();
+        app.writable = false; // simulate a read-only session
+        app.export_current_tab_csv();
+        assert!(app.status.contains("write mode"), "refused with a write-mode message: {}", app.status);
+        assert!(!outdir.exists(), "no CSV written in read-only mode");
         cleanup(&path);
     }
 

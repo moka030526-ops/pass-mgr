@@ -1352,10 +1352,10 @@ impl App {
                 self.cfg_focus = 0;
                 self.screen = Screen::Config;
             }
-            // Export every record on the current tab to a timestamped CSV in the
-            // configured export directory. A read action (writes a file, not the
-            // vault), so it works read-only too. NOTE: the Accounts / Real Estate
-            // CSVs contain passwords in plaintext.
+            // Export every record on the current tab to a timestamped CSV in the configured
+            // export directory. Because the Accounts / Real Estate CSVs contain passwords in
+            // PLAINTEXT, this requires WRITE mode (export_current_tab_csv gates on
+            // require_writable) — a read-only heir must not bulk-dump every secret.
             KeyCode::Char('e') => self.export_current_tab_csv(),
             _ => {}
         }
@@ -2325,9 +2325,13 @@ impl App {
     }
 
     /// Export every record on the current tab to a timestamped CSV in the configured
-    /// export directory (e.g. `accounts-20240628-143000.csv`). Read-only safe; the
-    /// destination is set in Config (and editable even read-only, like document export).
+    /// export directory (e.g. `accounts-20240628-143000.csv`). Requires WRITE mode: unlike
+    /// document export (which a read-only heir may use), a CSV can hold every record's
+    /// plaintext password, so a read-only session must not be able to bulk-dump it.
     fn export_current_tab_csv(&mut self) {
+        if !self.require_writable() {
+            return; // sets the "Read-only — relaunch with --write" status hint
+        }
         let dir = self.cfg_export_dir.trim().to_string();
         if dir.is_empty() {
             self.status = "Set an export directory in Config first (Config → Export directory).".into();
@@ -4647,6 +4651,27 @@ mod tests {
         app.export_current_tab_csv();
         assert_eq!(app.status, "Nothing to export on this tab.");
         assert!(!outdir.exists(), "no file written for the Summary tab");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_current_tab_csv_is_refused_in_read_only_mode() {
+        // A CSV can hold every record's plaintext password, so export requires WRITE mode —
+        // a read-only (heir) session must not be able to bulk-dump secrets.
+        let (mut app, path) = app_unlocked("uicsvro");
+        let outdir = path.parent().unwrap().join("uicsvro-out");
+        {
+            let v = &mut app.vault.as_mut().unwrap().vault;
+            let mut a = Account::new().unwrap();
+            a.password = "hunter2".into();
+            records::upsert(&mut v.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.cfg_export_dir = outdir.to_string_lossy().into();
+        app.writable = false; // simulate a read-only session
+        app.export_current_tab_csv();
+        assert!(app.status.contains("Read-only"), "refused with a read-only hint: {}", app.status);
+        assert!(!outdir.exists(), "no CSV written in read-only mode");
         cleanup(&path);
     }
 

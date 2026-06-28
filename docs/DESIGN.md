@@ -721,10 +721,13 @@ currently exposes the first five record types.) The four screens are:
    header; TUI: the `e` key) — it writes **all** of that tab's records, one row per
    record, to a timestamped file (`<tab>-<YYYYMMDD-HHMMSS>.csv`) in the same export
    directory via `csv::*` + `vault::write_export_bytes` (0600, no-clobber `_N`, fsync).
-   Document/file columns hold the file **names** (not blob ids). Like document export
-   it is a read action, so it works **read-only** too. The Accounts and Real-Estate
-   CSVs contain **passwords in plaintext** by design (for migrating into another
-   manager); the in-memory CSV is held in `Zeroizing` and the file is mode 0600.
+   Document/file columns hold the file **names** (not blob ids). The Accounts and
+   Real-Estate CSVs contain **passwords in plaintext** by design (for migrating into
+   another manager); the in-memory CSV is held in `Zeroizing` and the file is mode 0600.
+   Because a CSV can bulk-dump every record's plaintext password, Export to CSV requires
+   **write mode** — UNLIKE document export, which a read-only heir may still use. The GUI
+   hides the "⤓ CSV" button when not writable; the TUI `e` key (and `export_current_tab_csv`)
+   gate on `require_writable`, so a read-only/heir session cannot bulk-export secrets.
 4. **Config.** Edit the category lists (asset types, account types + subtypes), the
    **volume size** (`volume_max_size`), and the **redundancy** depth, and run a
    `backup` — all **write-mode only**, persisting into the encrypted vault (no external
