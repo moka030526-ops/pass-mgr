@@ -3607,13 +3607,14 @@ impl App {
         self.draw_footer(frame, chunks[2], hints);
     }
 
-    /// Render the read-only Summary table: one row per owner, asset buckets (Real Estate /
-    /// Before Tax / After Tax) then liability buckets (Before/After Tax), per-owner Asset and
-    /// Liability totals + Net, and a bold grand-total row. Before Tax = retirement + HSA.
+    /// Render the read-only Summary table: one row per owner, the asset buckets (Real Estate /
+    /// Cash / Before Tax / After Tax) + Asset total, then a SINGLE Liability column (liabilities
+    /// are not tax-split) and Net, plus a bold grand-total row. Before Tax = retirement + HSA;
+    /// Cash = cash/savings/checking (assets).
     fn draw_summary(&self, frame: &mut Frame, area: Rect) {
         let data = records::owner_value_summary(self.vault_ref().vault.assets.iter());
         let block = Block::default().borders(Borders::ALL).title(
-            " Summary of Assets & Liabilities — Before Tax = retirement + HSA · After Tax = everything else ",
+            " Summary of Assets & Liabilities — Cash = cash/savings/checking · Before Tax = retirement + HSA · After Tax = everything else ",
         );
         if data.is_empty() {
             let p = Paragraph::new("No assets or liabilities yet — add some on the Assets & Liabilities tab.").block(block);
@@ -3623,39 +3624,37 @@ impl App {
         let mut total = records::OwnerValueRow { owner: "TOTAL".to_string(), ..Default::default() };
         for r in &data {
             total.asset_real_estate += r.asset_real_estate;
+            total.asset_cash += r.asset_cash;
             total.asset_before_tax += r.asset_before_tax;
             total.asset_after_tax += r.asset_after_tax;
-            total.liab_before_tax += r.liab_before_tax;
-            total.liab_after_tax += r.liab_after_tax;
+            total.liability += r.liability;
         }
         let row_of = |r: &records::OwnerValueRow| {
             vec![
                 r.owner.clone(),
                 crate::fmt_money(r.asset_real_estate),
+                crate::fmt_money(r.asset_cash),
                 crate::fmt_money(r.asset_before_tax),
                 crate::fmt_money(r.asset_after_tax),
                 crate::fmt_money(r.asset_total()),
-                crate::fmt_money(r.liab_before_tax),
-                crate::fmt_money(r.liab_after_tax),
-                crate::fmt_money(r.liability_total()),
+                crate::fmt_money(r.liability),
                 crate::fmt_money(r.net()),
             ]
         };
         let mut rows: Vec<Row> = data.iter().map(|r| Row::new(row_of(r))).collect();
         rows.push(Row::new(row_of(&total)).style(Style::default().add_modifier(Modifier::BOLD)));
         let header = Row::new(vec![
-            "Owner", "Asset RE", "Asset Bef-Tax", "Asset Aft-Tax", "Asset Σ", "Liab Bef-Tax", "Liab Aft-Tax", "Liab Σ", "Net",
+            "Owner", "Asset RE", "Asset Cash", "Asset Bef-Tax", "Asset Aft-Tax", "Asset Σ", "Liability", "Net",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
         let widths = [
             Constraint::Min(8),
             Constraint::Length(11),
+            Constraint::Length(11),
             Constraint::Length(13),
             Constraint::Length(13),
             Constraint::Length(12),
             Constraint::Length(13),
-            Constraint::Length(13),
-            Constraint::Length(12),
             Constraint::Length(12),
         ];
         let table = Table::new(rows, widths).header(header).column_spacing(1).block(block);
