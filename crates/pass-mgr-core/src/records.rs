@@ -1045,6 +1045,11 @@ pub struct RealEstate {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
 pub struct TaxFiling {
     pub id: String,
+    /// Who the filing is for (e.g. "Jane", "Joint"). `#[serde(default)]` keeps
+    /// older vaults (which predate this field) loadable — it defaults to "".
+    /// Shown together with the year in the list label ("<owner> - <year>").
+    #[serde(default)]
+    pub owner: String,
     /// The filing/tax year, e.g. "2024". Also names the document folder.
     pub year: String,
     pub notes: String,
@@ -1429,6 +1434,7 @@ impl_record!(
 impl_record!(
     TaxFiling,
     |s: &TaxFiling, n: &TaxFiling, at: i64, out: &mut Vec<Change>| {
+        track(out, at, "owner", &s.owner, &n.owner);
         track(out, at, "year", &s.year, &n.year);
         track(out, at, "notes", &s.notes, &n.notes);
         // Log document-count changes without exposing the volume file ids.
@@ -1440,8 +1446,19 @@ impl_record!(
             });
         }
     },
-    |l: &TaxFiling| if l.year.is_empty() { "(no year)".to_string() } else { format!("Taxes {}", l.year) },
-    |r: &mut TaxFiling| trim_strings_in_place(&mut [&mut r.year, &mut r.notes])
+    // List label: "<owner> - <year>" when both are set. Falls back to just the
+    // owner, the legacy "Taxes <year>" (owner-less vaults), or "(no year)".
+    |l: &TaxFiling| {
+        let owner = l.owner.trim();
+        let year = l.year.trim();
+        match (owner.is_empty(), year.is_empty()) {
+            (false, false) => format!("{owner} - {year}"),
+            (false, true) => owner.to_string(),
+            (true, false) => format!("Taxes {year}"),
+            (true, true) => "(no year)".to_string(),
+        }
+    },
+    |r: &mut TaxFiling| trim_strings_in_place(&mut [&mut r.owner, &mut r.year, &mut r.notes])
 );
 
 impl_record!(
@@ -2049,11 +2066,16 @@ mod tests {
         assert_eq!(t.label(), "(no year)");
         t.year = "2024".into();
         assert_eq!(t.label(), "Taxes 2024");
+        // With an owner the label becomes "<owner> - <year>".
+        t.owner = "Jane".into();
+        assert_eq!(t.label(), "Jane - 2024");
 
         let mut edited = t.clone();
+        edited.owner = "Joint".into();
         edited.notes = "filed late".into();
         edited.documents.push("blobid".into());
         let changes = t.diff(&edited, unix_now());
+        assert!(changes.iter().any(|c| c.detail.contains("owner")));
         assert!(changes.iter().any(|c| c.detail.contains("notes")));
         assert!(changes.iter().any(|c| c.detail.contains("documents") && c.detail.contains("0 -> 1")));
         assert!(t.diff(&t.clone(), unix_now()).is_empty(), "unchanged record yields no diff");
@@ -2254,8 +2276,9 @@ mod tests {
         assert_ne!(t.id, other.id, "ids are distinct");
     }
 
-    /// `TaxFiling::label()` shows the placeholder when blank and `Taxes <year>`
-    /// otherwise — including odd, non-sanitized year strings (label is verbatim).
+    /// `TaxFiling::label()`: placeholder when fully blank, legacy `Taxes <year>` when
+    /// only a year is set, and `<owner> - <year>` (or just the owner) once an owner is
+    /// present — including odd, non-sanitized year strings (the label is verbatim).
     #[test]
     fn tax_filing_label_variants() {
         let mut t = TaxFiling::default();
@@ -2265,6 +2288,11 @@ mod tests {
         // The label does NOT sanitize; it echoes the raw year.
         t.year = "FY-2024 (amended)".into();
         assert_eq!(t.label(), "Taxes FY-2024 (amended)");
+        // Owner present: "<owner> - <year>". Owner-only drops the year part.
+        t.owner = "Jane".into();
+        assert_eq!(t.label(), "Jane - FY-2024 (amended)");
+        t.year = String::new();
+        assert_eq!(t.label(), "Jane");
     }
 
     /// Every TaxFiling field that the diff tracks, exercised individually.
@@ -2272,6 +2300,12 @@ mod tests {
     fn tax_filing_diff_covers_each_field() {
         let base = TaxFiling::default();
         let now = unix_now();
+
+        // owner
+        let mut n = base.clone();
+        n.owner = "Jane".into();
+        let c = base.diff(&n, now);
+        assert!(c.iter().any(|x| x.detail.contains("owner") && x.detail.contains("Jane")));
 
         // year
         let mut n = base.clone();
@@ -3086,7 +3120,7 @@ mod tests {
         assert_wiped(re, "RealEstate");
 
         let mut tax = TaxFiling::default();
-        tax.id = s(); tax.year = s(); tax.notes = s(); tax.documents = vec![s()];
+        tax.id = s(); tax.owner = s(); tax.year = s(); tax.notes = s(); tax.documents = vec![s()];
         tax.created_at = 7; tax.updated_at = 9; tax.history = hist();
         assert_wiped(tax, "TaxFiling");
 

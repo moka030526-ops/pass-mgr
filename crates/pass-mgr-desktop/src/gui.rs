@@ -32,6 +32,7 @@ use eframe::egui;
 // zeros); `Zeroizing<T>` is a wrapper that auto-zeroes its contents on drop.
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::csv;
 use crate::password::{self, GenOptions};
 use crate::records::{
     self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
@@ -787,6 +788,49 @@ impl GuiApp {
         self.doc_subfolder.clear();
         self.doc_filename.clear();
         self.doc_source.clear();
+    }
+
+    /// Build the CSV text for the current tab's records (ALL of them, ignoring any
+    /// display filter), plus a base filename and the record count. Returns `None` for
+    /// tabs without records (Summary). Document/file columns hold file NAMES, resolved
+    /// from the vault's document index. The result is wrapped in `Zeroizing` because it
+    /// can contain plaintext passwords (Accounts / Real Estate portals).
+    fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
+        let ov = self.vault.as_ref()?;
+        let v = &ov.vault;
+        let name_of = |id: &str| ov.doc_path(id).map(|p| csv::basename(&p)).unwrap_or_default();
+        let (base, text, n): (&'static str, String, usize) = match self.tab {
+            Tab::Instructions => ("instructions", csv::instructions_csv(&v.instructions), v.instructions.len()),
+            Tab::TrustWill => ("trust-will", csv::trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
+            Tab::Assets => ("assets-liabilities", csv::assets_csv(&v.assets, name_of), v.assets.len()),
+            Tab::Accounts => ("accounts", csv::accounts_csv(&v.accounts), v.accounts.len()),
+            Tab::RealEstate => ("real-estate", csv::real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
+            Tab::Taxes => ("taxes", csv::tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
+            Tab::GeneralDocuments => {
+                ("general-documents", csv::general_documents_csv(&v.general_documents, name_of), v.general_documents.len())
+            }
+            Tab::Summary => return None,
+        };
+        Some((base, Zeroizing::new(text), n))
+    }
+
+    /// Export every record on the current tab to a timestamped CSV in the configured
+    /// export directory (e.g. `accounts-20240628-143000.csv`). Read-only safe.
+    fn export_current_tab_csv(&mut self) {
+        let dir = self.export_dir.trim().to_string();
+        if dir.is_empty() {
+            self.fail("Set an export directory in Config first (Config → Export destination).");
+            return;
+        }
+        let Some((base, text, n)) = self.build_tab_csv() else {
+            self.status = "Nothing to export on this tab.".into();
+            return;
+        };
+        let filename = format!("{base}-{}.csv", records::compact_utc(records::unix_now()));
+        match vault::write_export_bytes(Path::new(&dir), &filename, text.as_bytes()) {
+            Ok(p) => self.status = format!("Exported {n} record(s) to {}", p.display()),
+            Err(e) => self.fail(format!("CSV export failed: {e}")),
+        }
     }
 
     /// Export document `id` into the configured export directory, recreating its volume
@@ -2117,6 +2161,7 @@ impl GuiApp {
         // Deferred-action flags (filled during rendering, acted on afterwards).
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
 
         // `ui.columns(2, |c| ...)`: `c` is a slice of two child UIs (left/right).
@@ -2124,7 +2169,7 @@ impl GuiApp {
             // Destructuring assignment into the outer `new`/`select` vars.
             // `cur.as_deref()` turns `Option<String>` into `Option<&str>` (a
             // borrowed view) without consuming `cur`.
-            (new, select) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable, None);
+            (new, select, export) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable, None);
             // Shadow `ui` with a mutable borrow of the right column. "Shadowing"
             // reuses the name `ui` for a new binding within this block.
             let ui = &mut c[1];
@@ -2146,6 +2191,9 @@ impl GuiApp {
         });
 
         // Now apply the deferred actions outside the render closure.
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             // `Instruction::new()` returns a `Result`; `.ok()` discards any error
             // and yields `Option<Instruction>` (Some on success, None on error).
@@ -2194,11 +2242,12 @@ impl GuiApp {
             self.attached_label(self.edit_trustwill.as_ref().and_then(|r| r.file.clone())).into_iter().collect();
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable, None);
+            (new, select, export) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -2225,6 +2274,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_trustwill = TrustWill::new().ok();
             self.clear_doc_inputs();
@@ -2263,11 +2315,12 @@ impl GuiApp {
             self.attached_label(self.edit_general.as_ref().and_then(|r| r.file.clone())).into_iter().collect();
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut docreq = DocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) =
+            (new, select, export) =
                 list_panel(&mut c[0], "General Documents", "➕ New", &labels, cur.as_deref(), self.writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_general.as_mut() {
@@ -2295,6 +2348,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_general = GeneralDocument::new().ok();
             self.clear_doc_inputs();
@@ -2358,6 +2414,7 @@ impl GuiApp {
         let asset_types = self.vault_ref().categories().asset.clone();
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut docreq = DocReq::None;
 
@@ -2369,6 +2426,9 @@ impl GuiApp {
                     let lp = &mut c[0];
                     lp.horizontal(|ui| {
                         ui.heading("Assets and Liabilities");
+                        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+                            export = true;
+                        }
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
@@ -2381,7 +2441,7 @@ impl GuiApp {
                     });
                 }
                 None => {
-                    (new, select) =
+                    (new, select, export) =
                         list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
@@ -2439,6 +2499,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_asset = AssetLiability::new().ok();
             self.clear_doc_inputs();
@@ -2754,6 +2817,7 @@ impl GuiApp {
         let nav_target = list_nav_target(ui, !self.acct_grouped, &labels, cur.as_deref());
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut generate = false;
         // Deferred password-copy: `None` unless the user clicks copy, in which
@@ -2778,6 +2842,9 @@ impl GuiApp {
                     let lp = &mut c[0];
                     lp.horizontal(|ui| {
                         ui.heading("Accounts");
+                        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+                            export = true;
+                        }
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
@@ -2790,7 +2857,7 @@ impl GuiApp {
                     });
                 }
                 None => {
-                    (new, select) =
+                    (new, select, export) =
                         list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
@@ -2853,6 +2920,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_account = self.new_account_from_filters();
         }
@@ -2947,12 +3017,13 @@ impl GuiApp {
         let writable = self.writable;
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut copy_pw: Option<Zeroizing<String>> = None;
         let mut docreq = ReDocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable, None);
+            (new, select, export) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_realestate.as_mut() {
                 // No inner ScrollArea here: the whole tab is already wrapped in the
@@ -3008,6 +3079,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_realestate = RealEstate::new().ok();
             self.clear_doc_inputs();
@@ -3069,14 +3143,16 @@ impl GuiApp {
         let writable = self.writable;
         let mut new = false;
         let mut select = None;
+        let mut export = false;
         let mut action = FormAction::None;
         let mut docreq = TaxDocReq::None;
 
         ui.columns(2, |c| {
-            (new, select) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable, None);
+            (new, select, export) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable, None);
             let ui = &mut c[1];
             if let Some(r) = self.edit_taxfiling.as_mut() {
                 egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    text_row(ui, "Owner", &mut r.owner, writable);
                     text_row(ui, "Filing year", &mut r.year, writable);
                 });
                 ui.label("Notes");
@@ -3111,6 +3187,9 @@ impl GuiApp {
             }
         });
 
+        if export {
+            self.export_current_tab_csv();
+        }
         if new {
             self.edit_taxfiling = TaxFiling::new().ok();
             self.clear_doc_inputs();
@@ -3854,11 +3933,17 @@ fn list_panel(
     // When `Some(i)`, scroll so row `i` is visible (set only on the frame the user navigates
     // with the arrow keys, so it never fights manual scrolling).
     scroll_to: Option<usize>,
-) -> (bool, Option<usize>) {
+) -> (bool, Option<usize>, bool) {
     let mut new = false;
     let mut select = None;
+    let mut export = false;
     ui.horizontal(|ui| {
         ui.heading(title);
+        // "Export to CSV" is a read action (writes a file, not the vault), so it is
+        // offered even read-only; the destination is the Config export directory.
+        if ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory").clicked() {
+            export = true;
+        }
     });
     // "New" is a write; only offered when writable.
     if writable && ui.button(new_label).clicked() {
@@ -3882,7 +3967,7 @@ fn list_panel(
             }
         }
     });
-    (new, select)
+    (new, select, export)
 }
 
 /// Save / Delete buttons; returns the chosen action. Renders nothing (and stays
@@ -4514,6 +4599,31 @@ mod tests {
         assert_eq!(account_required_field_error(&a), Some("Owner is required — every account must have an owner."));
         a.owner = "Alice".into();
         assert_eq!(account_required_field_error(&a), None, "title + owner present -> savable");
+    }
+
+    #[test]
+    fn export_current_tab_csv_writes_accounts_file_in_gui() {
+        let (mut app, path) = app_unlocked("guicsv");
+        let outdir = path.parent().unwrap().join("guicsv-out");
+        {
+            let ov = app.vault.as_mut().unwrap();
+            let mut a = Account::new().unwrap();
+            a.title = "Bank".into();
+            a.owner = "Jane".into();
+            a.password = "hunter2".into();
+            records::upsert(&mut ov.vault.accounts, a);
+        }
+        app.tab = Tab::Accounts;
+        app.export_dir = outdir.to_string_lossy().into();
+        app.export_current_tab_csv();
+        assert!(app.status.starts_with("Exported 1 record"), "status: {}", app.status);
+        let entry = std::fs::read_dir(&outdir).unwrap().next().unwrap().unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("accounts-") && name.ends_with(".csv"), "timestamped name: {name}");
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(body.contains("hunter2"), "password exported in plaintext (user opted in)");
+        assert!(body.contains("Bank"));
+        cleanup(&path);
     }
 
     #[test]

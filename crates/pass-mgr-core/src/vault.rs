@@ -2804,6 +2804,18 @@ fn unique_export_path(p: PathBuf) -> PathBuf {
     p // pathological fallback: let the O_EXCL write surface the collision as an error
 }
 
+/// Write `data` to `<dir>/<filename>`, creating `dir` (and parents) if missing, NEVER
+/// overwriting an existing file (a `_N` suffix is appended, like document export), with
+/// 0600 perms and an fsync. Returns the path actually written. Backs the front-ends'
+/// "Export to CSV" action, which drops a timestamped CSV into the configured export dir.
+pub fn write_export_bytes(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, VaultError> {
+    fs::create_dir_all(dir)?;
+    harden_dir(dir); // best-effort 0700 on the export dir (no-op off unix)
+    let path = unique_export_path(dir.join(filename));
+    write_new_bytes(&path, data)?;
+    Ok(path)
+}
+
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
     harden_file(path)?;

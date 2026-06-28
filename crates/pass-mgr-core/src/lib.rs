@@ -35,6 +35,7 @@
 // FFI wrapper, and the fuzz targets can all reach into them. Items inside a
 // module are private by default unless they too are marked `pub`.
 pub mod crypto; // security-critical: key derivation + authenticated encryption
+pub mod csv; // plain-CSV export of the record tabs (used by the front-ends' "Export to CSV")
 pub mod fault; // crash-safety fault-injection hooks (no-op without the feature)
 pub mod merge; // cross-vault "update from another vault" patch/plan types + diff helpers
 pub mod password; // random password generator

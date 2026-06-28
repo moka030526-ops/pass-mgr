@@ -119,7 +119,7 @@ Vault
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
 │                                     //   financing_balance, 4 portal logins (mgmt/insurance/HOA/tax: url+username+password+comment),
 │                                     //   comments, documents (doc ids; folder real-estate/<address>/)
-├── tax_filings:   Vec<TaxFiling>     // Tab 6: year, notes, documents (doc ids)
+├── tax_filings:   Vec<TaxFiling>     // Tab 6: owner, year, notes, documents (doc ids)
 ├── general_documents: Vec<GeneralDocument> // Tab 7: title, description, file (one doc id)
 ├── categories: TypeLists        // the editable dropdown lists (in-vault, §5/§4.2)
 ├── settings: VaultSettings      // { volume_max_size, redundancy }  (Config screen, §4.3)
@@ -717,6 +717,14 @@ currently exposes the first five record types.) The four screens are:
    overwrites — `_N` suffix). The GUI exposes one global **Export** button per page; the
    TUI exports the document whose 1-based number is in the **Doc #** field (`Ctrl+E`).
    Both read the export directory from the shared `prefs.json` (see Config below).
+   Each record tab also offers **Export to CSV** (GUI: a "⤓ CSV" button in the list
+   header; TUI: the `e` key) — it writes **all** of that tab's records, one row per
+   record, to a timestamped file (`<tab>-<YYYYMMDD-HHMMSS>.csv`) in the same export
+   directory via `csv::*` + `vault::write_export_bytes` (0600, no-clobber `_N`, fsync).
+   Document/file columns hold the file **names** (not blob ids). Like document export
+   it is a read action, so it works **read-only** too. The Accounts and Real-Estate
+   CSVs contain **passwords in plaintext** by design (for migrating into another
+   manager); the in-memory CSV is held in `Zeroizing` and the file is mode 0600.
 4. **Config.** Edit the category lists (asset types, account types + subtypes), the
    **volume size** (`volume_max_size`), and the **redundancy** depth, and run a
    `backup` — all **write-mode only**, persisting into the encrypted vault (no external
