@@ -1147,7 +1147,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
     let body = |marker: u8| vec![marker; 40_000];
     match scenario {
         // Create a vault (fast KDF), shrink the volume cap, and add one committed,
-        // record-referenced document (doc-one == 0xA1 x600) in partition 0.
+        // record-referenced document (doc-one == 0xA1 x40_000) in partition 0.
         "setup" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             let mut v = OpenVault::create(path, b"a", b"b", params)?;
@@ -1159,7 +1159,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             records::upsert(&mut v.vault.trust_wills, tw);
             v.save()?;
         }
-        // Add a second document (0xB2 x600) — rolls into a NEW partition (vol.1)
+        // Add a second document (0xB2 x40_000) — rolls into a NEW partition (vol.1)
         // given the 64 KiB floor — link it + save. Crash points put.*/vault.* fire.
         "adddoc" => {
             let mut v = OpenVault::open(path, b"a", b"b")?;

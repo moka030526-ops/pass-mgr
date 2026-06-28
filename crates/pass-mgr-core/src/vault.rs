@@ -619,6 +619,35 @@ impl OpenVault {
         // would let the set grow unbounded across export/import cycles and, worse, a carried
         // tombstone whose id collides with a re-imported live blob would silently suppress it.
         vault.deleted_docs.clear();
+        // The mirror's `categories` were adopted WHOLESALE from the untrusted vault.json. import_tree
+        // is the FOURTH untrusted-category path (alongside plan_merge_from / apply_merge_from /
+        // sync_types_from_records) and the ONLY one that does not route through the add_* mutators, so
+        // a crafted mirror could otherwise inject bidi/zero-width/control-spoofed type names straight
+        // into TypeLists (then rendered raw in the Config screen + the type/subtype dropdowns). Rebuild
+        // the lists through display_safe + the case-insensitive add_* dedup, exactly like
+        // sync_types_from_records, so import stays consistent with the rest of the triad.
+        let raw_cats = std::mem::take(&mut vault.categories);
+        let mut clean = crate::types::TypeLists::default();
+        for t in &raw_cats.asset {
+            let t = records::display_safe(t.trim());
+            if !t.is_empty() {
+                clean.add_asset_type(&t);
+            }
+        }
+        for at in &raw_cats.account {
+            let t = records::display_safe(at.name.trim());
+            if t.is_empty() {
+                continue;
+            }
+            clean.add_account_type(&t);
+            for st in &at.subtypes {
+                let st = records::display_safe(st.trim());
+                if !st.is_empty() {
+                    clean.add_account_subtype(&t, &st);
+                }
+            }
+        }
+        vault.categories = clean;
         let dir = parent_dir(dest);
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
@@ -4591,6 +4620,54 @@ mod tests {
             OpenVault::import_tree(&mirror, &dest, b"x", b"y", fast()),
             Err(VaultError::AlreadyExists(_))
         ));
+
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(&dest_dir).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_tree_sanitizes_spoofed_category_names() {
+        // import_tree adopts vault.categories WHOLESALE from an UNTRUSTED mirror. add_* never
+        // sanitizes, so the source stores RAW spoofed names (simulating a crafted mirror); import
+        // must display_safe-neutralize them — the fourth untrusted-category path, now consistent
+        // with plan/apply/sync.
+        let path = tmp_path("imp-cat-src");
+        let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+        v.vault.categories.add_asset_type("Bank\u{202e}x"); // RLO override (stored raw)
+        v.vault.categories.add_account_type("Cre\u{200b}dit"); // zero-width space
+        v.vault.categories.add_account_subtype("Cre\u{200b}dit", "Vi\u{200c}sa");
+        v.save().unwrap();
+
+        let mirror = std::env::temp_dir().join(format!("pmcatmirror-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        let dest_dir = std::env::temp_dir().join(format!("pmcatimp-{}", nanos()));
+        let dest = dest_dir.join(VAULT_FILE);
+        drop(OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()).unwrap());
+
+        let imported = OpenVault::open(dest.clone(), b"n1", b"n2").unwrap();
+        let san_asset = records::display_safe("Bank\u{202e}x");
+        let san_type = records::display_safe("Cre\u{200b}dit");
+        let san_sub = records::display_safe("Vi\u{200c}sa");
+        assert!(imported.vault.categories.asset.iter().any(|x| x.as_str() == san_asset));
+        assert!(
+            !imported.vault.categories.asset.iter().any(|x| x.as_str().contains('\u{202e}')),
+            "raw bidi-spoofed asset type must NOT survive import"
+        );
+        assert!(
+            imported
+                .vault
+                .categories
+                .account
+                .iter()
+                .any(|a| a.name == san_type && a.subtypes.iter().any(|s| s.as_str() == san_sub)),
+            "account type + subtype sanitized on import: {:?}",
+            imported.vault.categories.account
+        );
+        assert!(
+            !imported.vault.categories.account.iter().any(|a| a.name.contains('\u{200b}')),
+            "raw zero-width-spoofed account type must NOT survive import"
+        );
 
         std::fs::remove_dir_all(&mirror).ok();
         std::fs::remove_dir_all(&dest_dir).ok();
