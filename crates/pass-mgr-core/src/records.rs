@@ -283,7 +283,11 @@ pub fn parse_approx_value(s: &str) -> Option<f64> {
     let cleaned: String =
         digits.chars().filter(|c| !matches!(c, '$' | '€' | '£' | '¥' | ',' | ' ' | '_')).collect();
     let v: f64 = cleaned.parse().ok()?;
-    v.is_finite().then_some(v * mult)
+    // Check finiteness of the SCALED value, not the bare mantissa: a finite mantissa can overflow
+    // to ±inf once multiplied by the k/m/b/t suffix (e.g. "1e300t"). Returning Some(inf) here would
+    // pass save-time validation and then poison the Summary aggregate (inf totals), so reject it.
+    let scaled = v * mult;
+    scaled.is_finite().then_some(scaled)
 }
 
 /// One owner's row in the value summary. Each field sums the parseable `approx_value`s for
@@ -2810,6 +2814,12 @@ mod tests {
         assert_eq!(parse_approx_value("about 5"), None);
         assert_eq!(parse_approx_value("$"), None);
         assert_eq!(parse_approx_value("tbd"), None);
+        // A finite mantissa that OVERFLOWS once scaled by the suffix must be rejected (not
+        // Some(inf)) — else it passes save-time validation and poisons the Summary totals.
+        assert_eq!(parse_approx_value("1e300t"), None);
+        assert_eq!(parse_approx_value("1e308k"), None);
+        assert_eq!(parse_approx_value("1e400"), None); // already inf before the suffix path
+        assert!(parse_approx_value("9e11t").unwrap().is_finite(), "a large-but-finite scaled value still parses");
     }
 
     #[test]
