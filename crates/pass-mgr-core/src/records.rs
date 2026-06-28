@@ -223,25 +223,29 @@ pub fn asset_tree<'a>(assets: impl IntoIterator<Item = &'a AssetLiability>) -> A
 // --- Value summary (owner × asset/liability buckets) -------------------------
 //
 // The "Summary" tab aggregates every Asset/Liability's `approx_value` into a small matrix:
-// one ROW per owner, columns split by kind (Asset vs Liability) and a coarse tax bucket.
-// Assets get three buckets — Real Estate, Before Tax (retirement + HSA), After Tax
-// (everything else); Liabilities get two (Before Tax, After Tax). The bucket is inferred by
-// keyword from the entry's Type + Institution — the only fields that carry that meaning.
+// one ROW per owner, columns split by kind (Asset vs Liability). ASSETS get four buckets —
+// Real Estate, Cash (cash/savings/checking), Before Tax (retirement + HSA), After Tax
+// (everything else); the asset bucket is inferred by keyword from the entry's Type + Institution.
+// LIABILITIES are NOT tax-split (there is no meaningful "before tax" liability) — every liability
+// aggregates into one Liability column.
 
 /// Which summary column an Asset/Liability falls into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ValueBucket {
     RealEstate,
+    Cash,
     BeforeTax,
     AfterTax,
 }
 
 /// Keyword-classify an entry by its `asset_type` + `institution`. `is_liability` suppresses
-/// the Real-Estate bucket (liabilities only split Before/After tax).
+/// the Real-Estate bucket (the summary doesn't tax-split liabilities anyway).
 ///
-/// BEFORE TAX = retirement accounts (401k/403b/457/IRA/Roth/pension/annuity/TSP) AND pre-tax
-/// HEALTH accounts (HSA / "Health Equity"). REAL ESTATE = property / real estate. Everything
-/// else is AFTER TAX. The keyword lists are intentionally simple — extend them here if a
+/// REAL ESTATE = property / real estate. BEFORE TAX = retirement accounts
+/// (401k/403b/457/IRA/Roth/pension/annuity/TSP) AND pre-tax HEALTH accounts (HSA / "Health
+/// Equity"). CASH = cash / savings / checking. Everything else is AFTER TAX. Precedence:
+/// real estate, then before-tax (so a "Roth savings" counts as retirement, not cash), then
+/// cash, then after-tax. The keyword lists are intentionally simple — extend them here if a
 /// holding isn't bucketed the way you expect.
 pub fn value_bucket(asset_type: &str, institution: &str, is_liability: bool) -> ValueBucket {
     let hay = format!("{asset_type} {institution}").to_lowercase();
@@ -251,10 +255,13 @@ pub fn value_bucket(asset_type: &str, institution: &str, is_liability: bool) -> 
         "health equity", "healthequity", "health savings",
     ];
     const REAL_ESTATE: &[&str] = &["real estate", "real-estate", "realestate", "property", "rental"];
+    const CASH: &[&str] = &["cash", "saving", "checking", "chequing", "money market"];
     if !is_liability && has(REAL_ESTATE) {
         ValueBucket::RealEstate
     } else if has(BEFORE_TAX) {
         ValueBucket::BeforeTax
+    } else if has(CASH) {
+        ValueBucket::Cash
     } else {
         ValueBucket::AfterTax
     }
@@ -292,18 +299,21 @@ pub fn parse_approx_value(s: &str) -> Option<f64> {
 pub struct OwnerValueRow {
     pub owner: String,
     pub asset_real_estate: f64,
+    /// Cash-like assets (cash / savings / checking), segregated from After Tax.
+    pub asset_cash: f64,
     pub asset_before_tax: f64,
     pub asset_after_tax: f64,
-    pub liab_before_tax: f64,
-    pub liab_after_tax: f64,
+    /// All of this owner's liabilities. Liabilities are NOT split by tax bucket — there is no
+    /// meaningful "before tax" liability — so they aggregate into this single column.
+    pub liability: f64,
 }
 
 impl OwnerValueRow {
     pub fn asset_total(&self) -> f64 {
-        self.asset_real_estate + self.asset_before_tax + self.asset_after_tax
+        self.asset_real_estate + self.asset_cash + self.asset_before_tax + self.asset_after_tax
     }
     pub fn liability_total(&self) -> f64 {
-        self.liab_before_tax + self.liab_after_tax
+        self.liability
     }
     pub fn net(&self) -> f64 {
         self.asset_total() - self.liability_total()
@@ -324,12 +334,17 @@ pub fn owner_value_summary<'a>(items: impl IntoIterator<Item = &'a AssetLiabilit
         let row = map
             .entry(disp.to_lowercase())
             .or_insert_with(|| OwnerValueRow { owner: disp.to_string(), ..Default::default() });
-        match (is_liab, value_bucket(&a.asset_type, &a.institution, is_liab)) {
-            (false, ValueBucket::RealEstate) => row.asset_real_estate += val,
-            (false, ValueBucket::BeforeTax) => row.asset_before_tax += val,
-            (false, ValueBucket::AfterTax) => row.asset_after_tax += val,
-            (true, ValueBucket::BeforeTax) => row.liab_before_tax += val,
-            (true, _) => row.liab_after_tax += val, // liabilities have no Real-Estate column
+        // Assets fall into Real-Estate / Before-Tax / After-Tax buckets; ALL liabilities go into
+        // the single liability column (liabilities are not tax-split — see the module comment).
+        if is_liab {
+            row.liability += val;
+        } else {
+            match value_bucket(&a.asset_type, &a.institution, false) {
+                ValueBucket::RealEstate => row.asset_real_estate += val,
+                ValueBucket::Cash => row.asset_cash += val,
+                ValueBucket::BeforeTax => row.asset_before_tax += val,
+                ValueBucket::AfterTax => row.asset_after_tax += val,
+            }
         }
     }
     map.into_values().collect()
@@ -2813,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn value_bucket_classifies_real_estate_retirement_hsa_and_other() {
+    fn value_bucket_classifies_real_estate_retirement_cash_and_other() {
         use ValueBucket::*;
         assert_eq!(value_bucket("Real Estate", "", false), RealEstate);
         assert_eq!(value_bucket("Rental Property", "", false), RealEstate);
@@ -2821,8 +2836,15 @@ mod tests {
         assert_eq!(value_bucket("Roth IRA", "Vanguard", false), BeforeTax);
         assert_eq!(value_bucket("HSA", "Health Equity", false), BeforeTax);
         assert_eq!(value_bucket("Brokerage", "Health Equity", false), BeforeTax); // institution alone
+        // Cash = cash / savings / checking, segregated out of After Tax.
+        assert_eq!(value_bucket("Savings", "Ally Bank", false), Cash);
+        assert_eq!(value_bucket("Checking", "Chase", false), Cash);
+        assert_eq!(value_bucket("Cash", "", false), Cash);
+        assert_eq!(value_bucket("Money Market", "Schwab", false), Cash);
+        // Precedence: a retirement keyword beats cash (a "Roth savings" is retirement, not cash).
+        assert_eq!(value_bucket("Roth Savings", "Vanguard", false), BeforeTax);
         assert_eq!(value_bucket("Brokerage", "Schwab", false), AfterTax); // everything else
-        // Liabilities never use the Real-Estate bucket.
+        // Liabilities never use the Real-Estate bucket (the summary doesn't tax-split them).
         assert_eq!(value_bucket("Real Estate", "", true), AfterTax);
         assert_eq!(value_bucket("Loan", "401k", true), BeforeTax);
     }
@@ -2843,18 +2865,24 @@ mod tests {
             mk("Alice", "Asset", "401k", "Fidelity", "200000"),
             mk("Alice", "Asset", "HSA", "Health Equity", "10000"),
             mk("Alice", "Asset", "Brokerage", "Schwab", "50000"),
+            mk("Alice", "Asset", "Savings", "Ally Bank", "25000"), // cash/savings/checking -> Cash column
             mk("Alice", "Liability", "Mortgage", "", "300000"),
+            // A liability whose keywords WOULD have matched the old "before tax" bucket — it must
+            // now land in the single liability column, not a separate before-tax liability column.
+            mk("Alice", "Liability", "401k Loan", "Fidelity", "5000"),
             mk("Bob", "Asset", "Brokerage", "", "not-a-number"), // unparseable → 0
             mk("", "Asset", "Cash", "", "1000"),                  // blank owner → "(no owner)"
         ];
         let rows = owner_value_summary(items.iter());
         let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
         assert_eq!(alice.asset_real_estate, 500_000.0);
+        assert_eq!(alice.asset_cash, 25_000.0, "savings is segregated into the Cash column");
         assert_eq!(alice.asset_before_tax, 210_000.0, "401k + HSA");
-        assert_eq!(alice.asset_after_tax, 50_000.0);
-        assert_eq!(alice.liab_after_tax, 300_000.0, "mortgage is not retirement");
-        assert_eq!(alice.asset_total(), 760_000.0);
-        assert_eq!(alice.net(), 460_000.0);
+        assert_eq!(alice.asset_after_tax, 50_000.0, "cash is NOT in after-tax");
+        assert_eq!(alice.liability, 305_000.0, "all liabilities (mortgage + 401k loan) in one column");
+        assert_eq!(alice.asset_total(), 785_000.0);
+        assert_eq!(alice.liability_total(), 305_000.0);
+        assert_eq!(alice.net(), 480_000.0);
         let bob = rows.iter().find(|r| r.owner == "Bob").unwrap();
         assert_eq!(bob.asset_after_tax, 0.0, "unparseable value contributes 0");
         assert!(rows.iter().any(|r| r.owner == "(no owner)"));

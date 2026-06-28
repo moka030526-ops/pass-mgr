@@ -2565,7 +2565,7 @@ impl GuiApp {
         ui.heading("Summary of Assets & Liabilities");
         ui.label(
             egui::RichText::new(
-                "Aggregated approximate values by owner. Before Tax = retirement + HSA; After Tax = everything else.",
+                "Aggregated approximate values by owner. Cash = cash/savings/checking; Before Tax = retirement + HSA; After Tax = everything else.",
             )
             .weak(),
         );
@@ -2581,26 +2581,22 @@ impl GuiApp {
             total.asset_real_estate += r.asset_real_estate;
             total.asset_before_tax += r.asset_before_tax;
             total.asset_after_tax += r.asset_after_tax;
-            total.liab_before_tax += r.liab_before_tax;
-            total.liab_after_tax += r.liab_after_tax;
+            total.liability += r.liability;
         }
         egui::ScrollArea::both().auto_shrink([false, false]).id_salt("summary_scroll").show(ui, |ui| {
-            egui::Grid::new("summary_grid").striped(true).num_columns(9).spacing([18.0, 6.0]).show(ui, |ui| {
-                // Group header: ASSETS over its 4 value columns, LIABILITIES over its 3.
+            egui::Grid::new("summary_grid").striped(true).num_columns(8).spacing([18.0, 6.0]).show(ui, |ui| {
+                // Group header: ASSETS over its 5 value columns, LIABILITIES over its 1.
                 ui.label("");
                 ui.label(egui::RichText::new("ASSETS").strong().color(egui::Color32::from_rgb(40, 120, 60)));
                 ui.label("");
                 ui.label("");
                 ui.label("");
+                ui.label("");
                 ui.label(egui::RichText::new("LIABILITIES").strong().color(egui::Color32::from_rgb(170, 70, 70)));
                 ui.label("");
-                ui.label("");
-                ui.label("");
                 ui.end_row();
-                // Column headers.
-                for h in
-                    ["Owner", "Real Estate", "Before Tax", "After Tax", "Assets Σ", "Before Tax", "After Tax", "Liab. Σ", "Net"]
-                {
+                // Column headers (Cash = cash/savings/checking; liabilities are not tax-split).
+                for h in ["Owner", "Real Estate", "Cash", "Before Tax", "After Tax", "Assets Σ", "Liability", "Net"] {
                     ui.label(egui::RichText::new(h).strong());
                 }
                 ui.end_row();
@@ -2608,12 +2604,11 @@ impl GuiApp {
                 for r in &rows {
                     ui.label(r.owner.as_str());
                     ui.monospace(crate::fmt_money(r.asset_real_estate));
+                    ui.monospace(crate::fmt_money(r.asset_cash));
                     ui.monospace(crate::fmt_money(r.asset_before_tax));
                     ui.monospace(crate::fmt_money(r.asset_after_tax));
                     ui.monospace(crate::fmt_money(r.asset_total()));
-                    ui.monospace(crate::fmt_money(r.liab_before_tax));
-                    ui.monospace(crate::fmt_money(r.liab_after_tax));
-                    ui.monospace(crate::fmt_money(r.liability_total()));
+                    ui.monospace(crate::fmt_money(r.liability));
                     ui.monospace(crate::fmt_money(r.net()));
                     ui.end_row();
                 }
@@ -2621,12 +2616,11 @@ impl GuiApp {
                 ui.label(egui::RichText::new(total.owner.as_str()).strong());
                 for v in [
                     total.asset_real_estate,
+                    total.asset_cash,
                     total.asset_before_tax,
                     total.asset_after_tax,
                     total.asset_total(),
-                    total.liab_before_tax,
-                    total.liab_after_tax,
-                    total.liability_total(),
+                    total.liability,
                     total.net(),
                 ] {
                     ui.label(egui::RichText::new(crate::fmt_money(v)).strong().monospace());
