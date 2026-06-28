@@ -388,6 +388,16 @@ mod tests {
     }
 
     #[test]
+    fn iso_utc_is_fixed_width_for_extreme_timestamps() {
+        // civil_from_unix clamps the domain, so the CSV created/updated columns stay fixed-width
+        // even for a crafted i64::MAX/MIN timestamp (no widened year breaking the column).
+        assert_eq!(iso_utc(0), "1970-01-01 00:00:00Z");
+        assert!(iso_utc(i64::MAX).starts_with("9999-12-31"));
+        assert_eq!(iso_utc(i64::MAX).len(), iso_utc(0).len(), "fixed width regardless of value");
+        assert_eq!(iso_utc(i64::MIN), "1970-01-01 00:00:00Z");
+    }
+
+    #[test]
     fn u2028_line_separator_is_neutralized_in_a_cell() {
         // U+2028 must not survive into a CSV cell as a real line break (regression guard
         // for the display_safe gap). The whole record stays one physical line.
