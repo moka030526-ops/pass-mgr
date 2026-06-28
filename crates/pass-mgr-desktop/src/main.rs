@@ -1140,17 +1140,18 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
     let dir = pos.get(2).cloned().ok_or_else(|| anyhow::anyhow!("crashop: missing DIR"))?;
     let path = vault_file(&dir);
     let src = PathBuf::from(&dir).join("__crashop_src.bin");
-    // 600-byte doc bodies + a tiny volume cap so documents land in SEPARATE
-    // partitions — the crash tests then exercise new-volume creation, not just
-    // appends to an existing volume. Distinct first bytes identify each doc.
-    let body = |marker: u8| vec![marker; 600];
+    // ~40 KB doc bodies + the 64 KiB volume floor (the smallest cap set_volume_max_size
+    // allows — sub-floor values clamp up to it) so two documents can't share one partition:
+    // each lands in a SEPARATE partition and the crash tests exercise new-volume creation,
+    // not just appends to an existing volume. Distinct first bytes identify each doc.
+    let body = |marker: u8| vec![marker; 40_000];
     match scenario {
         // Create a vault (fast KDF), shrink the volume cap, and add one committed,
-        // record-referenced document (doc-one == 0xA1 x600) in partition 0.
+        // record-referenced document (doc-one == 0xA1 x40_000) in partition 0.
         "setup" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             let mut v = OpenVault::create(path, b"a", b"b", params)?;
-            v.set_volume_max_size(1024)?;
+            v.set_volume_max_size(64 * 1024)?;
             std::fs::write(&src, body(0xA1))?;
             let id = v.add_document("/w", "d1.txt", &src)?;
             let mut tw = records::TrustWill::new()?;
@@ -1158,8 +1159,8 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             records::upsert(&mut v.vault.trust_wills, tw);
             v.save()?;
         }
-        // Add a second document (0xB2 x600) — rolls into a NEW partition (vol.1)
-        // given the tiny cap — link it + save. Crash points put.*/vault.* fire.
+        // Add a second document (0xB2 x40_000) — rolls into a NEW partition (vol.1)
+        // given the 64 KiB floor — link it + save. Crash points put.*/vault.* fire.
         "adddoc" => {
             let mut v = OpenVault::open(path, b"a", b"b")?;
             std::fs::write(&src, body(0xB2))?;
@@ -1174,7 +1175,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         "setup_redundant" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             let mut v = OpenVault::create(path, b"a", b"b", params)?;
-            v.set_volume_max_size(1024)?;
+            v.set_volume_max_size(64 * 1024)?;
             v.set_redundancy(2)?;
             std::fs::write(&src, body(0xA1))?;
             let id = v.add_document("/w", "d1.txt", &src)?;
@@ -1241,13 +1242,13 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         // Build a CURRENT vault (a/b) holding an OLDER record "shared" referencing
         // doc-one (0xA1), and a SOURCE vault (s/t) under <DIR>/__merge_src holding a
         // NEWER "shared" (same id) referencing a fresh doc-two (0xB2). A merge then
-        // pulls the newer record + copies doc-two. The tiny volume cap forces the
+        // pulls the newer record + copies doc-two. The 64 KiB volume floor forces the
         // copied blob into its own partition (exercises new-volume creation on copy).
         "setup_merge" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             // CURRENT: older shared record, references doc-one.
             let mut v = OpenVault::create(path.clone(), b"a", b"b", params)?;
-            v.set_volume_max_size(1024)?;
+            v.set_volume_max_size(64 * 1024)?;
             std::fs::write(&src, body(0xA1))?;
             let id1 = v.add_document("/w", "d1.txt", &src)?;
             let mut tw = records::TrustWill::new()?;
@@ -1260,7 +1261,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             let src_dir = PathBuf::from(&dir).join("__merge_src");
             std::fs::create_dir_all(&src_dir)?;
             let mut s = OpenVault::create(src_dir.join("vault.pmv"), b"s", b"t", params)?;
-            s.set_volume_max_size(1024)?;
+            s.set_volume_max_size(64 * 1024)?;
             std::fs::write(&src, body(0xB2))?;
             let id2 = s.add_document("/w", "d2.txt", &src)?;
             let mut tw2 = records::TrustWill::new()?;
@@ -1276,7 +1277,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
         "setup_merge_redundant" => {
             let params = pass_mgr::crypto::KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
             let mut v = OpenVault::create(path.clone(), b"a", b"b", params)?;
-            v.set_volume_max_size(1024)?;
+            v.set_volume_max_size(64 * 1024)?;
             v.set_redundancy(2)?;
             std::fs::write(&src, body(0xA1))?;
             let id1 = v.add_document("/w", "d1.txt", &src)?;
@@ -1289,7 +1290,7 @@ fn crashop(pos: &[String]) -> anyhow::Result<()> {
             let src_dir = PathBuf::from(&dir).join("__merge_src");
             std::fs::create_dir_all(&src_dir)?;
             let mut s = OpenVault::create(src_dir.join("vault.pmv"), b"s", b"t", params)?;
-            s.set_volume_max_size(1024)?;
+            s.set_volume_max_size(64 * 1024)?;
             std::fs::write(&src, body(0xB2))?;
             let id2 = s.add_document("/w", "d2.txt", &src)?;
             let mut tw2 = records::TrustWill::new()?;

@@ -452,6 +452,8 @@ pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String 
 pub(crate) fn is_spoofy_format_char(c: char) -> bool {
     matches!(c,
         '\u{200B}'..='\u{200F}'   // zero-width space/joiners + LRM/RLM
+        | '\u{2028}'              // LINE SEPARATOR — a real line break that char::is_control misses
+        | '\u{2029}'              // PARAGRAPH SEPARATOR — likewise (keeps CSV cells one physical line)
         | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO override
         | '\u{2060}'              // word joiner
         | '\u{2066}'..='\u{2069}' // bidi isolates
@@ -554,9 +556,13 @@ pub fn effective_doc_filename(name: &str, source: &str) -> String {
 // `pub(crate)` = visible anywhere in this crate but not to outside users.
 // The return type `(i64, i64, ...)` is a *tuple*: several values bundled together.
 pub fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
-    // `let ts = ...` here *shadows* the parameter `ts`: a new binding reusing the
-    // name. `.max(0)` clamps negatives to 0 (so pre-epoch times become the epoch).
-    let ts = ts.max(0);
+    // `let ts = ...` here *shadows* the parameter `ts`: a new binding reusing the name.
+    // `.clamp(lo, hi)` keeps the value inside the representable 4-digit-year calendar: negatives
+    // become the epoch, and anything past 9999-12-31T23:59:59Z is capped there. This guarantees
+    // year ∈ [1970, 9999], so the `{:04}`/`{:02}` formatters (iso_utc, compact_utc, format_time,
+    // fmt_unix) always emit fixed-width fields — a crafted/odd created_at/updated_at (up to
+    // i64::MAX) can never widen the year and desync a CSV column or a timestamped filename.
+    let ts = ts.clamp(0, 253_402_300_799); // 253_402_300_799 = unix_from_civil(9999, 12, 31, 23, 59, 59)
     let days = ts.div_euclid(86_400);
     let sod = ts.rem_euclid(86_400);
     let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
@@ -2207,6 +2213,19 @@ mod tests {
     }
 
     #[test]
+    fn civil_from_unix_clamps_to_the_four_digit_year_calendar() {
+        // A huge/odd created_at or updated_at (up to i64::MAX) must NOT widen the year past 4
+        // digits, or the fixed-width {:04}/{:02} formatters (compact_utc, csv::iso_utc,
+        // ui::format_time) would desync a CSV column or a timestamped export filename.
+        assert_eq!(civil_from_unix(i64::MAX), (9999, 12, 31, 23, 59, 59));
+        assert_eq!(compact_utc(i64::MAX), "99991231-235959");
+        assert_eq!(compact_utc(i64::MAX).len(), 15, "YYYYMMDD-HHMMSS stays fixed-width");
+        // Negatives still clamp to the epoch (unchanged low bound).
+        assert_eq!(civil_from_unix(i64::MIN), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(compact_utc(-1), "19700101-000000");
+    }
+
+    #[test]
     fn days_from_civil_inverts_civil_from_unix() {
         // Round-trip midnight timestamps across centuries + leap days.
         for ts in [0i64, 86_400, 951_782_400, 1_709_164_800, 4_102_444_800, 253_370_764_800] {
@@ -2770,6 +2789,10 @@ mod tests {
         assert_eq!(display_safe("invoice\u{202e}fdp.exe"), "invoice_fdp.exe"); // RIGHT-TO-LEFT OVERRIDE
         assert_eq!(display_safe("a\u{200b}b\u{feff}c"), "a_b_c"); // zero-width space + BOM
         assert_eq!(display_safe("tab\tnl\n"), "tab_nl_"); // ASCII control
+        // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are real line breaks that
+        // char::is_control() does NOT catch — they must still be neutralized so a CSV cell
+        // (or a terminal preview / filename) cannot be split by an unquoted line break.
+        assert_eq!(display_safe("line\u{2028}sep\u{2029}end"), "line_sep_end");
         assert_eq!(display_safe("José café 北京"), "José café 北京"); // ordinary unicode preserved
         assert_eq!(display_safe("plain.txt"), "plain.txt");
     }

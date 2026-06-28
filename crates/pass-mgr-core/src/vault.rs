@@ -619,6 +619,35 @@ impl OpenVault {
         // would let the set grow unbounded across export/import cycles and, worse, a carried
         // tombstone whose id collides with a re-imported live blob would silently suppress it.
         vault.deleted_docs.clear();
+        // The mirror's `categories` were adopted WHOLESALE from the untrusted vault.json. import_tree
+        // is the FOURTH untrusted-category path (alongside plan_merge_from / apply_merge_from /
+        // sync_types_from_records) and the ONLY one that does not route through the add_* mutators, so
+        // a crafted mirror could otherwise inject bidi/zero-width/control-spoofed type names straight
+        // into TypeLists (then rendered raw in the Config screen + the type/subtype dropdowns). Rebuild
+        // the lists through display_safe + the case-insensitive add_* dedup, exactly like
+        // sync_types_from_records, so import stays consistent with the rest of the triad.
+        let raw_cats = std::mem::take(&mut vault.categories);
+        let mut clean = crate::types::TypeLists::default();
+        for t in &raw_cats.asset {
+            let t = records::display_safe(t.trim());
+            if !t.is_empty() {
+                clean.add_asset_type(&t);
+            }
+        }
+        for at in &raw_cats.account {
+            let t = records::display_safe(at.name.trim());
+            if t.is_empty() {
+                continue;
+            }
+            clean.add_account_type(&t);
+            for st in &at.subtypes {
+                let st = records::display_safe(st.trim());
+                if !st.is_empty() {
+                    clean.add_account_subtype(&t, &st);
+                }
+            }
+        }
+        vault.categories = clean;
         let dir = parent_dir(dest);
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
@@ -1101,14 +1130,19 @@ impl OpenVault {
         self.vault.settings.volume_max_size
     }
 
-    /// Set the per-partition volume-size cap (bytes, clamped to >= 1). Updates the
-    /// saved settings and the live store so the change governs **future**
-    /// placement this session, then persists. Existing partitions are untouched.
+    /// Set the per-partition volume-size cap (bytes, clamped to the same
+    /// [MIN_VOLUME_MAX_SIZE, MAX_VOLUME_MAX_SIZE] window as import_tree). Updates the
+    /// saved settings and the live store so the change governs **future** placement this
+    /// session, then persists. Existing partitions are untouched.
     pub fn set_volume_max_size(&mut self, bytes: u64) -> Result<(), VaultError> {
         if self.read_only {
             return Err(VaultError::ReadOnly);
         }
-        let bytes = bytes.max(1); // shadow `bytes` with a clamped copy (floor of 1)
+        // Clamp to the same bounds import_tree uses (single source of truth): a sub-64-KiB cap
+        // would put nearly every new document in its own partition (vol.N/manifest.N + fsync +
+        // dir-sync per doc) — self-inflicted disk/inode/IO amplification — and an absurd ceiling
+        // is likewise rejected. A floor of 1 (the old value) did NOT prevent this fragmentation.
+        let bytes = bytes.clamp(MIN_VOLUME_MAX_SIZE, MAX_VOLUME_MAX_SIZE);
         self.vault.settings.volume_max_size = bytes;
         self.storage.set_max_size(bytes);
         self.vault.audit.push(Change::new("volume_size_changed", bytes.to_string()));
@@ -1207,7 +1241,9 @@ impl OpenVault {
     /// 0600; fails if `dest` exists).
     pub fn export_document(&self, file_id: &str, dest: &Path) -> Result<(), VaultError> {
         let data = self.read_document(file_id)?;
-        write_new_bytes(dest, &data)
+        write_new_bytes(dest, &data)?;
+        sync_parent_dir(dest); // dir entry durable too (best-effort; no-op off unix), like CSV export
+        Ok(())
     }
 
     /// Export a stored document into `root`, **recreating its virtual folder structure**
@@ -1259,6 +1295,7 @@ impl OpenVault {
         }
         let dest = unique_export_path(dest); // never overwrite an existing export
         write_new_bytes(&dest, &data)?;
+        sync_parent_dir(&dest); // dir entry durable too (best-effort; no-op off unix), like CSV export
         Ok(dest)
     }
 
@@ -1383,18 +1420,18 @@ impl OpenVault {
             if !asset_ids.contains(a.id.as_str()) || !done_assets.insert(a.id.as_str()) {
                 continue;
             }
-            let t = a.asset_type.trim();
-            // `to_ascii_lowercase` (not `to_lowercase`) so the preview's dedup key matches the
-            // case-fold the apply-time list uses (`eq_ignore_ascii_case`) — else a non-ASCII
-            // case-distinct type makes the preview count drift from what apply adds.
+            // Sanitize the UNTRUSTED source type with display_safe UP FRONT, then make the
+            // existence + dedup decisions on that SAME value apply_merge_from stores — otherwise
+            // two raw types that sanitize equal, or a raw type that sanitizes to an existing
+            // category, make the previewed new-category count drift from what apply actually adds
+            // (and a crafted source vault must never inject bidi/escape chars into the screen the
+            // user authorizes). `to_ascii_lowercase` matches the apply-time `eq_ignore_ascii_case`.
+            let t = records::display_safe(a.asset_type.trim());
             if !t.is_empty()
-                && !cats.asset.iter().any(|x| x.eq_ignore_ascii_case(t))
+                && !cats.asset.iter().any(|x| x.eq_ignore_ascii_case(&t))
                 && seen_cat.insert(format!("a\u{1f}{}", t.to_ascii_lowercase()))
             {
-                // Sanitize the UNTRUSTED source type string for the approval screen, exactly
-                // like the record labels above: a crafted source vault must not inject terminal
-                // escapes / bidi chars into the new-category list the user authorizes.
-                plan.new_categories.push(format!("asset type \u{201c}{}\u{201d}", records::display_safe(t)));
+                plan.new_categories.push(format!("asset type \u{201c}{t}\u{201d}"));
             }
         }
         let acct_ids = accepted_ids(crate::merge::RecordKind::Account);
@@ -1403,23 +1440,19 @@ impl OpenVault {
             if !acct_ids.contains(a.id.as_str()) || !done_accounts.insert(a.id.as_str()) {
                 continue; // first-occurrence-wins, like the asset loop above
             }
-            let t = a.account_type.trim();
+            let t = records::display_safe(a.account_type.trim()); // sanitized up front, as above
             if !t.is_empty() {
-                if !cats.account.iter().any(|x| x.name.eq_ignore_ascii_case(t))
+                if !cats.account.iter().any(|x| x.name.eq_ignore_ascii_case(&t))
                     && seen_cat.insert(format!("c\u{1f}{}", t.to_ascii_lowercase()))
                 {
-                    plan.new_categories.push(format!("account type \u{201c}{}\u{201d}", records::display_safe(t)));
+                    plan.new_categories.push(format!("account type \u{201c}{t}\u{201d}"));
                 }
-                let st = a.account_subtype.trim();
+                let st = records::display_safe(a.account_subtype.trim());
                 if !st.is_empty()
-                    && !cats.subtypes_for(t).iter().any(|x| x.eq_ignore_ascii_case(st))
+                    && !cats.subtypes_for(&t).iter().any(|x| x.eq_ignore_ascii_case(&st))
                     && seen_cat.insert(format!("s\u{1f}{}\u{1f}{}", t.to_ascii_lowercase(), st.to_ascii_lowercase()))
                 {
-                    plan.new_categories.push(format!(
-                        "subtype \u{201c}{}\u{201d} under \u{201c}{}\u{201d}",
-                        records::display_safe(st),
-                        records::display_safe(t)
-                    ));
+                    plan.new_categories.push(format!("subtype \u{201c}{st}\u{201d} under \u{201c}{t}\u{201d}"));
                 }
             }
         }
@@ -1444,12 +1477,15 @@ impl OpenVault {
         for sel in crate::merge::collection_changes(current, src) {
             let s = &src[sel.source_index];
             let docs = docs_of(s);
-            // Resolve into a SCRATCH blob map first: a blocked record must not leak its
-            // docs into the committed plan's blob list.
-            let mut scratch = blobs.clone();
+            // Resolve into a fresh PER-RECORD scratch map: a blocked record (resolve -> Err)
+            // must not leak its docs into the committed plan's blob list. Using a small empty
+            // map and `extend`-ing on success keeps the planner linear in total doc references
+            // (the old `blobs.clone()` per record was O(records x accumulated-blobs); `resolve`
+            // only inserts via entry().or_insert(), so the deduped union is identical).
+            let mut scratch = std::collections::BTreeMap::new();
             match resolve(self, &docs, &mut scratch) {
                 Ok(()) => {
-                    *blobs = scratch;
+                    blobs.extend(scratch);
                     plan.records.push(crate::merge::PlannedRecord {
                         kind,
                         change: sel.change,
@@ -1563,8 +1599,12 @@ impl OpenVault {
             if !asset_ids.contains(a.id.as_str()) || !done_assets.insert(a.id.as_str()) {
                 continue;
             }
-            let t = a.asset_type.trim();
-            if !t.is_empty() && self.vault.categories.add_asset_type(t) {
+            // Sanitize the UNTRUSTED source type with display_safe BEFORE storing it, exactly
+            // as plan_merge_from did for the approval preview — otherwise the category the user
+            // approved (cleaned) and the one persisted (raw, possibly bidi/zero-width-spoofed)
+            // would diverge, letting a crafted source vault slip a spoofed type into the lists.
+            let t = records::display_safe(a.asset_type.trim());
+            if !t.is_empty() && self.vault.categories.add_asset_type(&t) {
                 report.categories_added += 1;
             }
         }
@@ -1574,13 +1614,13 @@ impl OpenVault {
             if !acct_ids.contains(a.id.as_str()) || !done_accounts.insert(a.id.as_str()) {
                 continue; // first-occurrence-wins, like the asset loop above
             }
-            let t = a.account_type.trim();
+            let t = records::display_safe(a.account_type.trim()); // sanitized to match the preview
             if !t.is_empty() {
-                if self.vault.categories.add_account_type(t) {
+                if self.vault.categories.add_account_type(&t) {
                     report.categories_added += 1;
                 }
-                let st = a.account_subtype.trim();
-                if !st.is_empty() && self.vault.categories.add_account_subtype(t, st) {
+                let st = records::display_safe(a.account_subtype.trim());
+                if !st.is_empty() && self.vault.categories.add_account_subtype(&t, &st) {
                     report.categories_added += 1;
                 }
             }
@@ -1684,23 +1724,28 @@ impl OpenVault {
         // category lists are mutated (the `add_*` are case-insensitive dedup).
         let asset_types: Vec<String> = self.vault.assets.iter().map(|a| a.asset_type.clone()).collect();
         for t in &asset_types {
-            let t = t.trim();
-            if !t.is_empty() && self.vault.categories.add_asset_type(t) {
+            // Sanitize with display_safe BEFORE the type enters the category list. A record's
+            // type field can be UNTRUSTED (it arrived via merge or import_tree), and this sync
+            // runs automatically on every writable open — so without this, a bidi/zero-width-
+            // spoofed record type would be re-injected RAW here, silently undoing the exact
+            // sanitization apply_merge_from does (idempotent + a no-op for normal names).
+            let t = records::display_safe(t.trim());
+            if !t.is_empty() && self.vault.categories.add_asset_type(&t) {
                 added += 1;
             }
         }
         let accts: Vec<(String, String)> =
             self.vault.accounts.iter().map(|a| (a.account_type.clone(), a.account_subtype.clone())).collect();
         for (t, st) in &accts {
-            let t = t.trim();
+            let t = records::display_safe(t.trim()); // sanitize untrusted record type, as above
             if t.is_empty() {
                 continue;
             }
-            if self.vault.categories.add_account_type(t) {
+            if self.vault.categories.add_account_type(&t) {
                 added += 1;
             }
-            let st = st.trim();
-            if !st.is_empty() && self.vault.categories.add_account_subtype(t, st) {
+            let st = records::display_safe(st.trim());
+            if !st.is_empty() && self.vault.categories.add_account_subtype(&t, &st) {
                 added += 1;
             }
         }
@@ -1890,6 +1935,13 @@ fn source_entry_validated(source: &OpenVault, id: &str) -> Result<Option<(String
             // aborting the merge with a hard error after the user already approved the plan.
             if e.path.len() > crate::storage::MAX_PATH_LEN {
                 return Err("references a document whose path is too long".into());
+            }
+            // Likewise enforce the MAX_DOC_SIZE bound `VolumeStore::put` checks at apply time.
+            // `storage::read` accepts a frame slightly larger than MAX_DOC_SIZE, so a hand-crafted
+            // source volume could otherwise pass this preview and then abort apply_merge_from with
+            // TooLarge AFTER the user approved the plan. Surface it as a skipped preview record.
+            if e.size > crate::storage::MAX_DOC_SIZE {
+                return Err("references a document that is too large".into());
             }
             Ok(Some((e.path.clone(), e.size)))
         }
@@ -2806,23 +2858,29 @@ fn unique_export_path(p: PathBuf) -> PathBuf {
 
 /// Write `data` to `<dir>/<filename>`, creating `dir` (and parents) if missing, NEVER
 /// overwriting an existing file (a `_N` suffix is appended, like document export), with
-/// 0600 perms and an fsync. Returns the path actually written. Backs the front-ends'
-/// "Export to CSV" action, which drops a timestamped CSV into the configured export dir.
+/// 0600 perms, an fsync of the file contents, AND an fsync of the parent directory so the
+/// new file's directory entry is crash-durable. Returns the path actually written. Backs
+/// the front-ends' "Export to CSV" action, which drops a timestamped CSV into the export dir.
 pub fn write_export_bytes(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, VaultError> {
     fs::create_dir_all(dir)?;
     harden_dir(dir); // best-effort 0700 on the export dir (no-op off unix)
     let path = unique_export_path(dir.join(filename));
     write_new_bytes(&path, data)?;
+    // Make the freshly-created file's directory entry durable too — the contents are
+    // fsync'd in write_new_bytes, but without this the link can be lost on power loss
+    // right after the call returns. Best-effort, no-op off unix (matches the other writers).
+    sync_parent_dir(&path);
     Ok(path)
 }
 
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let mut f = create_new_0600(path)?;
-    harden_file(path)?;
-    // `.and_then(|()| f.sync_all())` chains the fsync onto the write: it runs only
-    // if `write_all` returned `Ok(())`, and the whole expression is `Err` if either
-    // step failed. On failure: close the file, delete the partial output, return.
-    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+    // Harden perms, then write + fsync, as one fail-cleanup unit: if hardening OR the
+    // write OR the fsync fails, close the handle and unlink the just-created file so a
+    // failure never leaves a partial (or empty) file behind — the no-clobber / "partial
+    // file removed on error" contract the CSV and document exporters rely on.
+    let res = harden_file(path).and_then(|()| f.write_all(data)).and_then(|()| f.sync_all());
+    if let Err(e) = res {
         drop(f); // close the handle before unlinking (matters on some platforms)
         let _ = fs::remove_file(path);
         return Err(e.into());
@@ -4367,6 +4425,28 @@ mod tests {
     }
 
     #[test]
+    fn write_export_bytes_creates_dir_hardens_and_never_clobbers() {
+        let dir = std::env::temp_dir().join(format!("pmcsv-{}", nanos()));
+        assert!(!dir.exists(), "starts from a non-existent dir");
+        // Creates the (missing) export dir and writes the file 0600.
+        let p1 = write_export_bytes(&dir, "accounts-20240101-000000.csv", b"col\r\na\r\n").unwrap();
+        assert!(p1.exists());
+        assert_eq!(fs::read(&p1).unwrap(), b"col\r\na\r\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&p1).unwrap().permissions().mode() & 0o777, 0o600, "export file is 0600");
+        }
+        // Same dir+filename again must NOT clobber — it gets a `_N` suffix and the first
+        // file is left byte-for-byte intact.
+        let p2 = write_export_bytes(&dir, "accounts-20240101-000000.csv", b"other\r\n").unwrap();
+        assert_ne!(p1, p2, "second export does not overwrite the first");
+        assert!(p2.file_name().unwrap().to_string_lossy().contains("_1"), "got: {p2:?}");
+        assert_eq!(fs::read(&p1).unwrap(), b"col\r\na\r\n", "first export untouched by the second");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn generation_increments_and_is_surfaced() {
         let path = tmp_path("gen");
         let created = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
@@ -4547,6 +4627,54 @@ mod tests {
     }
 
     #[test]
+    fn import_tree_sanitizes_spoofed_category_names() {
+        // import_tree adopts vault.categories WHOLESALE from an UNTRUSTED mirror. add_* never
+        // sanitizes, so the source stores RAW spoofed names (simulating a crafted mirror); import
+        // must display_safe-neutralize them — the fourth untrusted-category path, now consistent
+        // with plan/apply/sync.
+        let path = tmp_path("imp-cat-src");
+        let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+        v.vault.categories.add_asset_type("Bank\u{202e}x"); // RLO override (stored raw)
+        v.vault.categories.add_account_type("Cre\u{200b}dit"); // zero-width space
+        v.vault.categories.add_account_subtype("Cre\u{200b}dit", "Vi\u{200c}sa");
+        v.save().unwrap();
+
+        let mirror = std::env::temp_dir().join(format!("pmcatmirror-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        let dest_dir = std::env::temp_dir().join(format!("pmcatimp-{}", nanos()));
+        let dest = dest_dir.join(VAULT_FILE);
+        drop(OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()).unwrap());
+
+        let imported = OpenVault::open(dest.clone(), b"n1", b"n2").unwrap();
+        let san_asset = records::display_safe("Bank\u{202e}x");
+        let san_type = records::display_safe("Cre\u{200b}dit");
+        let san_sub = records::display_safe("Vi\u{200c}sa");
+        assert!(imported.vault.categories.asset.iter().any(|x| x.as_str() == san_asset));
+        assert!(
+            !imported.vault.categories.asset.iter().any(|x| x.as_str().contains('\u{202e}')),
+            "raw bidi-spoofed asset type must NOT survive import"
+        );
+        assert!(
+            imported
+                .vault
+                .categories
+                .account
+                .iter()
+                .any(|a| a.name == san_type && a.subtypes.iter().any(|s| s.as_str() == san_sub)),
+            "account type + subtype sanitized on import: {:?}",
+            imported.vault.categories.account
+        );
+        assert!(
+            !imported.vault.categories.account.iter().any(|a| a.name.contains('\u{200b}')),
+            "raw zero-width-spoofed account type must NOT survive import"
+        );
+
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(&dest_dir).ok();
+        cleanup(&path);
+    }
+
+    #[test]
     fn import_tree_rejects_a_non_contiguous_mirror() {
         // A mirror with a missing MIDDLE manifest must FAIL CLOSED, never silently drop the
         // documents in the surviving higher partitions — symmetric with VolumeStore::open's
@@ -4641,13 +4769,16 @@ mod tests {
     fn set_volume_max_size_governs_future_placement() {
         let path = tmp_path("volcfg");
         let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
-        // Default cap is large: two small docs share partition 0.
-        let src = write_src("vc", &vec![7u8; 600]);
+        // Default cap (256 MiB) is large: two ~30 KiB docs share partition 0.
+        let src = write_src("vc", &vec![7u8; 30_000]);
         v.add_document("/a", "a.bin", &src).unwrap();
         v.add_document("/b", "b.bin", &src).unwrap();
-        // Shrink the cap live; it persists and updates the running store.
+        // Shrink the cap live; it persists and updates the running store. A sub-floor request
+        // (1024) is clamped UP to MIN_VOLUME_MAX_SIZE (64 KiB) so a tiny cap can't fragment the
+        // store into one partition per document. At the 64 KiB floor the two existing ~30 KiB
+        // docs still fit partition 0, but a third no longer does.
         v.set_volume_max_size(1024).unwrap();
-        assert_eq!(v.volume_max_size(), 1024);
+        assert_eq!(v.volume_max_size(), MIN_VOLUME_MAX_SIZE, "sub-floor cap clamped up to the 64 KiB floor");
         // A further doc now rolls into a fresh partition.
         v.add_document("/c", "c.bin", &src).unwrap();
         drop(v);
@@ -4656,11 +4787,22 @@ mod tests {
         assert_eq!(p1.len(), 1, "the post-resize doc landed in partition 1");
         let all = OpenVault::export_manifests(&path, b"a", b"b", None).unwrap();
         assert_eq!(all.len(), 3);
-        // The persisted setting is read back on reopen.
+        // The persisted (clamped) setting is read back on reopen.
         let reopened = OpenVault::open(path.clone(), b"a", b"b").unwrap();
-        assert_eq!(reopened.volume_max_size(), 1024);
+        assert_eq!(reopened.volume_max_size(), MIN_VOLUME_MAX_SIZE);
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn set_volume_max_size_clamps_to_min_and_max() {
+        let path = tmp_path("volclamp");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_volume_max_size(1).unwrap(); // absurdly small -> floored
+        assert_eq!(v.volume_max_size(), MIN_VOLUME_MAX_SIZE);
+        v.set_volume_max_size(u64::MAX).unwrap(); // absurdly large -> capped
+        assert_eq!(v.volume_max_size(), MAX_VOLUME_MAX_SIZE);
+        cleanup(&path);
     }
 
     // ---- Phase 4: exhaustive rekey crash-injection -------------------------
@@ -6326,6 +6468,77 @@ mod tests {
     }
 
     #[test]
+    fn merge_apply_stores_sanitized_category_type_matching_the_preview() {
+        // A crafted SOURCE asset's type carries a bidi override (U+202E). The approval preview
+        // shows the SANITIZED name (display_safe -> '_'); apply must persist that SAME sanitized
+        // type into the category list, not the raw spoofed string — otherwise what the user
+        // approved and what gets stored diverge (preview/apply spoof divergence).
+        let s_path = tmp_path("merge-san-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a = records::AssetLiability::new().unwrap();
+        a.id = "spoof".into();
+        a.asset_type = "Bank\u{202e}x".into();
+        a.updated_at = 100;
+        s.vault.assets.push(a);
+        s.save().unwrap();
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        let c_path = tmp_path("merge-san-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        let sanitized = records::display_safe("Bank\u{202e}x"); // "Bank_x"
+        // Preview already shows the sanitized name (round-2 fix); apply must agree.
+        let plan = c.plan_merge_from(&source).unwrap();
+        assert!(plan.new_categories.iter().any(|s| s.contains(&sanitized)));
+        c.apply_merge_from(&source).unwrap();
+        assert!(
+            c.vault.categories.asset.iter().any(|x| x.as_str() == sanitized),
+            "stored category is the sanitized name the user previewed: {:?}",
+            c.vault.categories.asset
+        );
+        assert!(
+            !c.vault.categories.asset.iter().any(|x| x.as_str().contains('\u{202e}')),
+            "the raw bidi-spoofed type must NOT be persisted"
+        );
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
+    fn merge_preview_count_matches_apply_for_sanitize_colliding_types() {
+        // Preview and apply must dedup category types on the SAME (display_safe-sanitized) value,
+        // or plan.new_categories drifts from report.categories_added. Two accepted source assets
+        // whose types differ only by a zero-width char both sanitize to "Acme_": the preview must
+        // show ONE new asset category and apply must add ONE (not 2 previewed vs 1 applied).
+        let s_path = tmp_path("merge-div-src");
+        let mut s = OpenVault::create(s_path.clone(), b"s1", b"s2", fast()).unwrap();
+        let mut a1 = records::AssetLiability::new().unwrap();
+        a1.id = "a1".into();
+        a1.asset_type = "Acme\u{200b}".into(); // ZERO WIDTH SPACE
+        a1.updated_at = 100;
+        let mut a2 = records::AssetLiability::new().unwrap();
+        a2.id = "a2".into();
+        a2.asset_type = "Acme\u{200c}".into(); // ZERO WIDTH NON-JOINER -> also "Acme_"
+        a2.updated_at = 100;
+        s.vault.assets.push(a1);
+        s.vault.assets.push(a2);
+        s.save().unwrap();
+        let source = OpenVault::open_read_only(s_path.clone(), b"s1", b"s2").unwrap();
+
+        let c_path = tmp_path("merge-div-cur");
+        let mut c = OpenVault::create(c_path.clone(), b"c1", b"c2", fast()).unwrap();
+        let plan = c.plan_merge_from(&source).unwrap();
+        let previewed_asset_cats = plan.new_categories.iter().filter(|l| l.contains("asset type")).count();
+        assert_eq!(previewed_asset_cats, 1, "two collapse to one previewed category");
+        let report = c.apply_merge_from(&source).unwrap();
+        assert_eq!(
+            previewed_asset_cats, report.categories_added,
+            "previewed new-category count must equal what apply added (no preview/apply drift)"
+        );
+        cleanup(&s_path);
+        cleanup(&c_path);
+    }
+
+    #[test]
     fn merge_preview_sanitizes_untrusted_source_record_labels() {
         // A crafted SOURCE vault must not inject bidi/zero-width characters into the merge
         // preview label the user authorizes (terminal/TUI/GUI spoofing). The label is cleaned
@@ -6557,6 +6770,35 @@ mod tests {
         drop(v);
         let mut ro = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
         assert!(matches!(ro.sync_types_from_records(), Err(VaultError::ReadOnly)));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn sync_types_from_records_sanitizes_spoofed_category_types() {
+        // A record's type field can be UNTRUSTED (delivered via merge/import). sync runs
+        // automatically on every writable open, so it must NOT re-inject a raw bidi/zero-width
+        // spoofed type into the category list — it must sanitize identically to apply_merge_from.
+        let path = tmp_path("sync-spoof");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let mut a = records::AssetLiability::new().unwrap();
+        a.asset_type = "Bank\u{202e}x".into(); // RIGHT-TO-LEFT OVERRIDE mid-string
+        v.vault.assets.push(a);
+        let mut acct = sample_account("u", "p");
+        acct.account_type = "Cre\u{200b}dit".into(); // ZERO WIDTH SPACE
+        v.vault.accounts.push(acct);
+        v.sync_types_from_records().unwrap();
+        let san_asset = records::display_safe("Bank\u{202e}x");
+        let san_acct = records::display_safe("Cre\u{200b}dit");
+        assert!(v.vault.categories.asset.iter().any(|x| x.as_str() == san_asset));
+        assert!(v.vault.categories.account.iter().any(|x| x.name == san_acct));
+        assert!(
+            !v.vault.categories.asset.iter().any(|x| x.as_str().contains('\u{202e}')),
+            "raw bidi-spoofed asset type must NOT be synced"
+        );
+        assert!(
+            !v.vault.categories.account.iter().any(|x| x.name.contains('\u{200b}')),
+            "raw zero-width-spoofed account type must NOT be synced"
+        );
         cleanup(&path);
     }
 
