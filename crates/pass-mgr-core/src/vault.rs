@@ -490,6 +490,12 @@ impl OpenVault {
         // false for the same net reason — no real generation is being superseded. A
         // genuine `save()` (an actual edit) still rotates via `rotate_ring=true`.
         if !read_only {
+            // Reap any cross-epoch (old-password) redundancy leftover before the refresh
+            // save (audit F3): a rekey whose best-effort cleanup partially failed can strand
+            // an old-key bak/mirror that the rotate_ring=false refresh below would NOT remove
+            // (it never rotates and only prunes ABOVE the configured depth). The recovered
+            // open's salt is the current epoch's, so this only deletes genuinely foreign copies.
+            sweep_foreign_epoch_copies(&open.path, &open.salt);
             let _ = open.save_internal(false);
         }
         Ok(open)
@@ -617,13 +623,17 @@ impl OpenVault {
                 // Human-browsable copy at the document's virtual-path tree (like `extract`). The
                 // canonical round-trip source remains the id-keyed volume/ above, because two docs
                 // may legitimately share a virtual path (so a pure path-tree can't round-trip them).
+                //
+                // This copy is COSMETIC and best-effort: `import_tree` reads only volume/ +
+                // manifest, never documents/. So a failure to place it — ENAMETOOLONG on a
+                // ~255-byte filename component (a legal single-component name plus a `_N`/id suffix
+                // can exceed NAME_MAX), a symlink-guard rejection, ENOSPC — must NEVER propagate
+                // and truncate the AUTHORITATIVE mirror (later partitions' volume/manifest and the
+                // per-tab CSVs are still unwritten at this point). On any error we skip just this
+                // one viewing copy; the document is fully present and recoverable from volume/
+                // (audit F2). `let _ =` discards the best-effort Result.
                 let tree_dest = unique_export_path(docs_dir.join(doc_tree_relpath(&e.path, &e.id)), Some(&e.id));
-                if let Some(parent) = tree_dest.parent() {
-                    reject_symlinked_descendants(out, parent)?; // no symlink redirect out of `out`
-                    fs::create_dir_all(parent)?;
-                    harden_dir(parent);
-                }
-                write_new_bytes(&tree_dest, &bytes)?;
+                let _ = write_human_tree_copy(out, &tree_dest, &bytes);
             }
         }
         // Per-tab CSV exports (records in cleartext, consistent with vault.json) under `csv/`.
@@ -2575,6 +2585,28 @@ fn redundancy_candidates(primary: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Defensively remove any redundancy copy (mirror / `bakN`) whose header salt does NOT
+/// match the live primary's salt — a cross-epoch leftover from a password change whose
+/// best-effort [`cleanup_redundancy`] partially failed (audit F3). The salt changes only
+/// on rekey and is authenticated AAD, so an old-epoch copy was written under a PREVIOUS
+/// password's salt: it cannot decode under the current password, is therefore useless for
+/// recovery, and only lingers as old-key plaintext-equivalent ciphertext at rest — a
+/// forward-secrecy leftover after a password change. Removing it can never drop a
+/// recovery-useful copy (recovery only ever uses a copy that decodes under the current
+/// password, i.e. the current salt). Same defensive posture as the stale-temp / `.old`-dir
+/// sweeps; only runs on a writable open. A copy whose header is unreadable is LEFT ALONE —
+/// we never delete what we cannot positively classify as foreign (a salt-damaged copy is
+/// already unrecoverable and harmless).
+fn sweep_foreign_epoch_copies(primary: &Path, current_salt: &[u8; SALT_LEN]) {
+    for c in redundancy_candidates(primary) {
+        if let Ok(h) = read_header_of(&c)
+            && &h.salt != current_salt
+        {
+            let _ = fs::remove_file(&c);
+        }
+    }
+}
+
 /// Encrypt `vault` under `key` and write it atomically to `path` (new nonce, full
 /// header as AAD, temp → fsync → rename → dir fsync).
 /// Serialize a SECRET-bearing value (the decrypted `Vault`) to JSON in a single,
@@ -3006,6 +3038,21 @@ pub fn write_export_bytes(dir: &Path, filename: &str, data: &[u8]) -> Result<Pat
     // right after the call returns. Best-effort, no-op off unix (matches the other writers).
     sync_parent_dir(&path);
     Ok(path)
+}
+
+/// Write one COSMETIC human-tree document copy under `out` at `dest`, rejecting a
+/// symlinked intermediate dir first (so a planted symlink can't redirect plaintext
+/// outside `out`). Returns an error instead of propagating it via `?` at the call site,
+/// so a failed viewing copy (e.g. an over-long filename component) never aborts the
+/// authoritative `export_tree` mirror (audit F2). Even on the error path, plaintext only
+/// ever lands under `out` (the symlink guard runs before any write).
+fn write_human_tree_copy(out: &Path, dest: &Path, data: &[u8]) -> Result<(), VaultError> {
+    if let Some(parent) = dest.parent() {
+        reject_symlinked_descendants(out, parent)?; // no symlink redirect out of `out`
+        fs::create_dir_all(parent)?;
+        harden_dir(parent);
+    }
+    write_new_bytes(dest, data)
 }
 
 pub fn write_new_bytes(path: &Path, data: &[u8]) -> Result<(), VaultError> {
@@ -4076,6 +4123,47 @@ mod tests {
     }
 
     #[test]
+    fn open_sweeps_old_key_redundancy_leftover_after_a_failed_rekey_cleanup() {
+        // Audit F3: a password change whose best-effort cleanup_redundancy fails to remove an
+        // old-key bak leaves a full pre-rekey vault copy decryptable under the OLD password.
+        // A subsequent writable open must reap that foreign-epoch leftover (forward secrecy).
+        let path = tmp_path("f3-leftover");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(1).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("keep", "p"));
+        v.save().unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("two", "p"));
+        v.save().unwrap();
+        // Capture the OLD-key bak1 (decryptable under a/b).
+        let old_bak1 = read_capped_vault(&bak_path(&path, 1)).unwrap();
+        assert!(decode_vault_bytes(&old_bak1, b"a", b"b").is_ok(), "precondition: bak1 decodes under the old password");
+        // Change the password: cleanup_redundancy + refresh rewrite the ring under c/d.
+        v.change_password(b"c", b"d").unwrap();
+        drop(v);
+        // Simulate cleanup_redundancy PARTIALLY failing: re-plant the old-key bak1 bytes (as if
+        // its remove_file had failed while the sibling staging-dir unlink succeeded).
+        fs::write(bak_path(&path, 1), &old_bak1).unwrap();
+        assert!(
+            decode_vault_bytes(&read_capped_vault(&bak_path(&path, 1)).unwrap(), b"a", b"b").is_ok(),
+            "planted old-key leftover decodes under the OLD password before the sweep"
+        );
+        // A writable open must reap the foreign-epoch leftover.
+        let v2 = OpenVault::open(path.clone(), b"c", b"d").unwrap();
+        assert!(v2.recovery_notice().is_none(), "healthy open (primary intact)");
+        drop(v2);
+        // No surviving redundancy copy decodes under the OLD password.
+        for c in redundancy_candidates(&path) {
+            let bytes = read_capped_vault(&c).unwrap();
+            assert!(
+                decode_vault_bytes(&bytes, b"a", b"b").is_err(),
+                "no old-key-decodable copy survives the open: {}",
+                c.display()
+            );
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn create_discards_stale_rekey_staging() {
         // A leftover `.rekey/READY` from an aborted rekey of a since-removed vault must
         // NOT be rolled forward over a freshly created vault on the next open.
@@ -5033,6 +5121,50 @@ mod tests {
 
         std::fs::remove_dir_all(&mirror).ok();
         let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_tree_completes_when_a_cosmetic_human_copy_name_is_too_long() {
+        // Audit F2: two documents that legitimately share a ~255-byte single-component
+        // filename collide in the human documents/ tree; the second's disambiguated name
+        // (`stem_1` or `stem_<id>`) exceeds NAME_MAX, so its create fails ENAMETOOLONG.
+        // That COSMETIC copy must be skipped, NOT abort the whole export — the authoritative
+        // id-keyed volume/ + manifest + CSV mirror must still complete and round-trip.
+        let path = tmp_path("exptree-longname");
+        let body1 = vec![1u8; 64];
+        let body2 = vec![2u8; 64];
+        let src1 = write_src("exptree-longname-1", &body1);
+        let src2 = write_src("exptree-longname-2", &body2);
+        // A 255-byte single filename component: virtual_path("", name) == "/" + 255 == MAX_PATH_LEN.
+        let name = format!("{}.pdf", "a".repeat(storage::MAX_PATH_LEN - 1 - 4));
+        assert_eq!(virtual_path("", &name).len(), storage::MAX_PATH_LEN);
+        let (id1, id2) = {
+            let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+            let id1 = v.add_document("", &name, &src1).unwrap();
+            let id2 = v.add_document("", &name, &src2).unwrap(); // legitimately shares the virtual path
+            v.save().unwrap();
+            (id1, id2)
+        };
+        let mirror = std::env::temp_dir().join(format!("pmmirror-longname-{}", nanos()));
+        // COMPLETES despite the second cosmetic copy's name being too long (pre-F2 this aborted).
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        // Authoritative mirror is complete: both id-keyed blobs + manifest + CSVs present.
+        assert!(mirror.join("volume/vol.0").join(&id1).exists(), "id1 blob written");
+        assert!(mirror.join("volume/vol.0").join(&id2).exists(), "id2 blob written");
+        assert!(mirror.join("manifest/manifest.0.json").exists(), "manifest written");
+        assert!(mirror.join("csv/accounts.csv").exists(), "CSVs written (the loop ran to completion)");
+        // And it round-trips: both documents restore from the id-keyed mirror under new passwords.
+        let dest_dir = std::env::temp_dir().join(format!("pmimport-longname-{}", nanos()));
+        let dest = dest_dir.join(VAULT_FILE);
+        drop(OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()).unwrap());
+        let v = OpenVault::open(dest.clone(), b"n1", b"n2").unwrap();
+        assert_eq!(&v.read_document(&id1).unwrap()[..], &body1[..], "doc1 round-trips");
+        assert_eq!(&v.read_document(&id2).unwrap()[..], &body2[..], "doc2 round-trips");
+        std::fs::remove_dir_all(&mirror).ok();
+        std::fs::remove_dir_all(&dest_dir).ok();
+        let _ = std::fs::remove_file(&src1);
+        let _ = std::fs::remove_file(&src2);
         cleanup(&path);
     }
 

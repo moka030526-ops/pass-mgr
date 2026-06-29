@@ -764,6 +764,9 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
         return Ok(());
     }
 
+    // Snapshot the directory BEFORE writing so a failure warning names only what this run
+    // created, not the user's pre-existing files (audit F1).
+    let before = dir_entry_names(&out_dir);
     std::fs::create_dir_all(&out_dir)?;
     vault::harden_dir(&out_dir); // 0700 on unix (filenames/paths are sensitive)
     // The write loop is not transactional: a mid-loop failure leaves already-extracted
@@ -808,7 +811,7 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
             Ok(())
         }
         Err(e) => {
-            warn_partial_plaintext(&out_dir);
+            warn_partial_plaintext(&out_dir, &before);
             Err(e)
         }
     }
@@ -829,32 +832,61 @@ fn cli_export_tree(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     );
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
+    // Snapshot the directory BEFORE writing so a failure warning names only what this run
+    // created, not the user's pre-existing files (audit F1).
+    let before = dir_entry_names(&out_dir);
     // export_tree writes plaintext incrementally and is NOT transactional: a mid-walk
     // failure (ENOSPC, a bit-rotted frame failing AEAD, a symlinked dir, …) can leave
     // PARTIAL unencrypted files already on disk. If anything landed, warn loudly so the
     // user securely deletes it rather than assuming "error ⇒ nothing was written" (audit L1).
     if let Err(e) = vault::OpenVault::export_tree(&path, pw1.as_bytes(), pw2.as_bytes(), &out_dir) {
-        warn_partial_plaintext(&out_dir);
+        warn_partial_plaintext(&out_dir, &before);
         return Err(e.into());
     }
     eprintln!("Wrote a decrypted mirror to {} (re-encrypt it with `import-tree`).", out_dir.display());
     Ok(())
 }
 
-/// If `out_dir` exists and is non-empty after a failed plaintext export, warn that it
-/// may hold PARTIAL unencrypted secrets that must be securely deleted. Only fires when
-/// something was actually written (the hardened writers remove a single failed file, so
-/// a first-write failure leaves the dir empty and no warning is emitted). Audit L1.
-fn warn_partial_plaintext(out_dir: &std::path::Path) {
-    let non_empty = std::fs::read_dir(out_dir).map(|mut it| it.next().is_some()).unwrap_or(false);
-    if non_empty {
-        eprintln!(
-            "WARNING: the export failed after writing PARTIAL UNENCRYPTED files to {}.\n\
-             Those cleartext fragments are still on disk — securely delete the directory \
-             (e.g. `shred -u` per file, `srm -r`, or `rm -rf` on an encrypted disk) before discarding.",
-            out_dir.display()
-        );
+/// Snapshot the names of the top-level entries currently in `dir` (an empty set if `dir`
+/// does not exist). Captured BEFORE a plaintext export so [`warn_partial_plaintext`] can
+/// attribute exactly which entries *this run* created — never the user's own pre-existing,
+/// unrelated files (audit F1).
+fn dir_entry_names(dir: &std::path::Path) -> std::collections::HashSet<std::ffi::OsString> {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name()).collect()
+}
+
+/// After a failed plaintext export, warn about the cleartext entries THIS run wrote — the
+/// top-level entries that appeared since the `before` snapshot. Stays silent when nothing
+/// new landed (a clean first-write failure, or a pre-existing dir we never added to), and
+/// names only the new entries so the user is never told to delete their own pre-existing
+/// files. Audit L1 (warn at all) + F1 (attribute precisely). All `export_tree`/extract
+/// writes create new top-level entries (`vault.json`, `manifest/`, `volume/`, `documents/`,
+/// `csv/`, or the per-document subtree), so a top-level diff captures every addition.
+fn new_entries_since(out_dir: &std::path::Path, before: &std::collections::HashSet<std::ffi::OsString>) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|name| !before.contains(name))
+        .map(|name| out_dir.join(name))
+        .collect()
+}
+
+fn warn_partial_plaintext(out_dir: &std::path::Path, before: &std::collections::HashSet<std::ffi::OsString>) {
+    let new_entries = new_entries_since(out_dir, before);
+    if new_entries.is_empty() {
+        return; // nothing of ours landed — don't implicate the user's pre-existing files
     }
+    eprintln!("WARNING: the export failed after writing PARTIAL UNENCRYPTED files to {}:", out_dir.display());
+    for p in &new_entries {
+        eprintln!("    {}", p.display());
+    }
+    eprintln!(
+        "Those cleartext entries were created by this run — securely delete THEM (e.g. \
+         `shred -u` each file, `srm -r` the new directories) before discarding. Any \
+         pre-existing files in the directory were not written by this run."
+    );
 }
 
 /// Build a NEW encrypted vault (at `dest`'s directory) from a plaintext mirror at
@@ -1759,5 +1791,34 @@ mod tests {
         assert!(super::extract_part_flag(vec![s("--part")]).is_err());
         assert!(super::extract_part_flag(vec![s("--part"), s("abc")]).is_err());
         assert!(super::extract_part_flag(vec![s("--part=-1")]).is_err());
+    }
+
+    #[test]
+    fn partial_plaintext_warning_attributes_only_new_entries() {
+        // Audit F1: after a failed plaintext export, only the entries THIS run created are
+        // flagged — never the user's pre-existing files (so the shred advice can never
+        // target their unrelated data).
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("passmgr-f1-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-existing, unrelated user files in the chosen output directory.
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        std::fs::write(dir.join("photo.jpg"), b"mine").unwrap();
+        let before = super::dir_entry_names(&dir);
+        // Before any of our writes, nothing is attributed to this run.
+        assert!(super::new_entries_since(&dir, &before).is_empty(), "pre-existing files are never attributed");
+        // Simulate this run writing a partial mirror (a file and a subdir).
+        std::fs::write(dir.join("vault.json"), b"secret").unwrap();
+        std::fs::create_dir_all(dir.join("volume")).unwrap();
+        let new: std::collections::HashSet<std::ffi::OsString> = super::new_entries_since(&dir, &before)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert!(new.contains(std::ffi::OsStr::new("vault.json")), "newly-written file is flagged");
+        assert!(new.contains(std::ffi::OsStr::new("volume")), "newly-written dir is flagged");
+        assert!(!new.contains(std::ffi::OsStr::new("notes.txt")), "pre-existing file NOT flagged");
+        assert!(!new.contains(std::ffi::OsStr::new("photo.jpg")), "pre-existing file NOT flagged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
