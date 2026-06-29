@@ -2873,57 +2873,109 @@ impl App {
         };
         // Collect any attached document blob to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
+        // Roll back the in-memory removal if the save fails (same data-loss class as the GUI's
+        // delete_current): re-insert the removed record VERBATIM and truncate the remove() audit
+        // entry, so a later successful save can't silently commit a deletion the user was told
+        // failed. Re-insert with push (not upsert) to keep the record's own updated_at + history.
+        let mut rollback: Option<Box<dyn FnOnce(&mut Self)>> = None;
         if let Some(ov) = self.vault.as_mut() {
             let v = &mut ov.vault;
+            let audit_len = v.audit.len();
             match self.tab {
                 Tab::Instructions => {
-                    records::remove(&mut v.instructions, &id, &mut v.audit, "Instruction");
+                    if let Some(r) = v.instructions.iter().find(|r| r.id == id).cloned() {
+                        records::remove(&mut v.instructions, &id, &mut v.audit, "Instruction");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.instructions.push(r);
+                            }
+                        }));
+                    }
                 }
                 Tab::TrustWill => {
-                    if let Some(r) = v.trust_wills.iter().find(|r| r.id == id)
-                        && let Some(f) = &r.file
-                    {
-                        doc_ids.push(f.clone());
+                    if let Some(r) = v.trust_wills.iter().find(|r| r.id == id).cloned() {
+                        if let Some(f) = &r.file {
+                            doc_ids.push(f.clone());
+                        }
+                        records::remove(&mut v.trust_wills, &id, &mut v.audit, "Trust/Will");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.trust_wills.push(r);
+                            }
+                        }));
                     }
-                    records::remove(&mut v.trust_wills, &id, &mut v.audit, "Trust/Will");
                 }
                 Tab::Assets => {
-                    if let Some(r) = v.assets.iter().find(|r| r.id == id)
-                        && let Some(f) = &r.statement
-                    {
-                        doc_ids.push(f.clone());
+                    if let Some(r) = v.assets.iter().find(|r| r.id == id).cloned() {
+                        if let Some(f) = &r.statement {
+                            doc_ids.push(f.clone());
+                        }
+                        records::remove(&mut v.assets, &id, &mut v.audit, "Asset/Liability");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.assets.push(r);
+                            }
+                        }));
                     }
-                    records::remove(&mut v.assets, &id, &mut v.audit, "Asset/Liability");
                 }
                 Tab::Accounts => {
-                    records::remove(&mut v.accounts, &id, &mut v.audit, "Account");
+                    if let Some(r) = v.accounts.iter().find(|r| r.id == id).cloned() {
+                        records::remove(&mut v.accounts, &id, &mut v.audit, "Account");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.accounts.push(r);
+                            }
+                        }));
+                    }
                 }
                 Tab::RealEstate => {
-                    // Reclaim every document attached to this property.
-                    if let Some(r) = v.real_estate.iter().find(|r| r.id == id) {
+                    if let Some(r) = v.real_estate.iter().find(|r| r.id == id).cloned() {
+                        // Reclaim every document attached to this property.
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
+                        records::remove(&mut v.real_estate, &id, &mut v.audit, "Real Estate");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.real_estate.push(r);
+                            }
+                        }));
                     }
-                    records::remove(&mut v.real_estate, &id, &mut v.audit, "Real Estate");
                 }
                 Tab::Taxes => {
-                    // Reclaim every document attached to this filing year.
-                    if let Some(r) = v.tax_filings.iter().find(|r| r.id == id) {
+                    if let Some(r) = v.tax_filings.iter().find(|r| r.id == id).cloned() {
+                        // Reclaim every document attached to this filing year.
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
+                        records::remove(&mut v.tax_filings, &id, &mut v.audit, "Tax filing");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.tax_filings.push(r);
+                            }
+                        }));
                     }
-                    records::remove(&mut v.tax_filings, &id, &mut v.audit, "Tax filing");
                 }
                 Tab::GeneralDocuments => {
-                    // Reclaim the single attached file, if any.
-                    if let Some(r) = v.general_documents.iter().find(|r| r.id == id)
-                        && let Some(f) = &r.file
-                    {
-                        doc_ids.push(f.clone());
+                    if let Some(r) = v.general_documents.iter().find(|r| r.id == id).cloned() {
+                        // Reclaim the single attached file, if any.
+                        if let Some(f) = &r.file {
+                            doc_ids.push(f.clone());
+                        }
+                        records::remove(&mut v.general_documents, &id, &mut v.audit, "General document");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.general_documents.push(r);
+                            }
+                        }));
                     }
-                    records::remove(&mut v.general_documents, &id, &mut v.audit, "General document");
                 }
                 // The Summary tab has no record to delete.
                 Tab::Summary => {}
@@ -2939,9 +2991,11 @@ impl App {
                 }
             }
             self.status = "Deleted.".into();
+        } else if let Some(rb) = rollback {
+            // persist() already set "Save failed: …"; undo the in-memory removal so a later
+            // successful save cannot silently commit the deletion the user was told failed.
+            rb(self);
         }
-        // On failure persist() has already set the "Save failed: …" status, and the
-        // record is still on disk — so do not claim it was deleted.
         self.clamp_selection();
     }
 

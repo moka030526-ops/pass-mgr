@@ -3637,7 +3637,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.instructions, r.clone());
+                                ov.vault.instructions.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_instruction = Some(r);
                         }));
@@ -3652,7 +3652,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.trust_wills, r.clone());
+                                ov.vault.trust_wills.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_trustwill = Some(r);
                         }));
@@ -3667,7 +3667,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.assets, r.clone());
+                                ov.vault.assets.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_asset = Some(r);
                         }));
@@ -3679,7 +3679,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.accounts, r.clone());
+                                ov.vault.accounts.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_account = Some(r);
                         }));
@@ -3695,7 +3695,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.real_estate, r.clone());
+                                ov.vault.real_estate.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_realestate = Some(r);
                         }));
@@ -3711,7 +3711,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.tax_filings, r.clone());
+                                ov.vault.tax_filings.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_taxfiling = Some(r);
                         }));
@@ -3726,7 +3726,7 @@ impl GuiApp {
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
                                 ov.vault.audit.truncate(audit_len);
-                                records::upsert(&mut ov.vault.general_documents, r.clone());
+                                ov.vault.general_documents.push(r.clone()); // verbatim: keep original updated_at + history
                             }
                             s.edit_general = Some(r);
                         }));

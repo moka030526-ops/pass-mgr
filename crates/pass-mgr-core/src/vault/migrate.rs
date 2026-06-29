@@ -52,7 +52,18 @@ fn new_doc_path(old_path: &str, target: &DocTarget, uploaded_at: i64) -> String 
     // `<ts>_` prefix (so a re-run is idempotent); then the manifest's uploaded_at.
     let ts_dir_idx = dirs.iter().position(|c| records::is_compact_utc(c));
     let (ts, bare): (String, &str) = if let Some(i) = ts_dir_idx {
-        (dirs[i].to_string(), filename_raw)
+        // Strip an existing `<ts>_` filename prefix (left by a PRIOR run) so a re-run on a path
+        // that also carries a stray ts-shaped directory doesn't double-stamp the filename.
+        let bare = if filename_raw.len() >= 16
+            && filename_raw.is_char_boundary(15)
+            && filename_raw.as_bytes()[15] == b'_'
+            && records::is_compact_utc(&filename_raw[..15])
+        {
+            &filename_raw[16..]
+        } else {
+            filename_raw
+        };
+        (dirs[i].to_string(), bare)
     } else if filename_raw.len() >= 16
         && filename_raw.is_char_boundary(15)
         && filename_raw.as_bytes()[15] == b'_'

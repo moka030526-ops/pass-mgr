@@ -1946,6 +1946,9 @@ fn highest_mirror_manifest(dir: &Path) -> Option<u32> {
             && let Some(rest) = name.strip_prefix("manifest.")
             && let Some(num) = rest.strip_suffix(".json")
             && !num.is_empty()
+            // Canonical decimal only (no leading zeros), matching storage::highest_partition_index
+            // so a foreign mis-named mirror file can't spuriously trip the contiguity guard.
+            && (num == "0" || !num.starts_with('0'))
             && num.bytes().all(|b| b.is_ascii_digit())
             && let Ok(n) = num.parse::<u32>()
         {
