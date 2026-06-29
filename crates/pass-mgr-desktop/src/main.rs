@@ -747,6 +747,15 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
     }
+    // Refuse a symlinked OUT root (audit R4-1: a pre-planted symlink would redirect the
+    // decrypted documents outside the chosen dir) and refuse extracting INTO the live vault
+    // directory (audit R4-4: plaintext next to vault.pmv gets swept into the next backup).
+    vault::reject_symlink_dir(&out_dir)?;
+    if let Some(vault_dir) = path.parent()
+        && dest_inside(vault_dir, &out_dir)
+    {
+        anyhow::bail!("extract destination must be OUTSIDE the vault directory");
+    }
     // Build a human-readable scope string depending on whether one partition or
     // all were requested. `format!` returns an owned `String`; `{n}` interpolates.
     let scope = match part {
@@ -824,6 +833,16 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
 fn cli_export_tree(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("no vault found at {}", path.display());
+    }
+    // Refuse exporting the whole-vault cleartext mirror INTO the live encrypted vault directory:
+    // it would strand vault.json (every password) + the per-tab CSVs next to vault.pmv, where the
+    // user's next backup/sync of that directory sweeps the plaintext up — and then abort on the
+    // volume/ name collision anyway (audit R4-4). Mirror cmd_compact's backup-destination guard.
+    // (export_tree itself rejects a symlinked OUT root — audit R4-1.)
+    if let Some(vault_dir) = path.parent()
+        && dest_inside(vault_dir, &out_dir)
+    {
+        anyhow::bail!("export-tree destination must be OUTSIDE the vault directory");
     }
     eprintln!(
         "Decrypting the ENTIRE vault into {} — vault.json + manifests + volume blobs + a documents/ \

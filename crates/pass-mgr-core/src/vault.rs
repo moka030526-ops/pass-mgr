@@ -69,6 +69,11 @@ const HEADER_LEN: usize = 61;
 const MAX_VAULT_SIZE: u64 = 256 * 1024 * 1024;
 /// Fixed vault-file name inside the user's directory.
 const VAULT_FILE: &str = "vault.pmv";
+/// Sidecar file in an export-tree mirror's `manifest/` dir recording the authoritative
+/// partition count, so `import_tree` can fail closed against a TAIL-truncated mirror
+/// (audit R4-3). Distinct from the `manifest.<N>.json` names, so it never trips the
+/// contiguity scan. A mirror without it (legacy/hand-built) keeps the middle-gap-only guard.
+const MIRROR_PARTITIONS_FILE: &str = "partitions";
 /// Staging directory used during a password-change re-encryption.
 const REKEY_DIR: &str = ".rekey";
 const REKEY_READY: &str = "READY";
@@ -586,6 +591,13 @@ impl OpenVault {
         }
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
 
+        // Refuse a symlinked export ROOT before writing any cleartext into it: create_dir_all
+        // and harden_dir both follow a symlink, and create_new's O_EXCL guards only the final
+        // filename — so without this a symlink pre-planted at `out` (by a local process winning a
+        // predictable/reused export path) would redirect the ENTIRE decrypted mirror (vault.json +
+        // manifests + blobs + CSVs) outside the chosen directory and chmod the target 0700 (audit
+        // R4-1). Same root guard backup() applies; the subdirs below get reject_symlinked_descendants.
+        reject_symlink_dir(out)?;
         fs::create_dir_all(out)?;
         harden_dir(out);
         // vault.json — pretty for human inspection; the buffer wipes on drop and is
@@ -597,16 +609,26 @@ impl OpenVault {
         let man_dir = out.join("manifest");
         let vol_root = out.join("volume");
         let docs_dir = out.join("documents"); // human-browsable tree (round-trip source stays volume/)
+        // Create + guard the manifest dir up front (the AUTHORITATIVE secret-bearing subdirs are
+        // guarded the same way the cosmetic documents/ tree is: create_dir_all follows a symlinked
+        // parent and the O_EXCL write guards only the leaf, so a pre-planted out/manifest or
+        // out/volume symlink would otherwise redirect the decrypted manifest + blobs outside the
+        // export root — audit R4-2). Then record the authoritative partition count BEFORE writing
+        // any partition, so import_tree can fail closed against a TAIL-truncated mirror: a mid-export
+        // abort leaves the full count on disk but fewer partitions, which import detects (audit R4-3).
+        reject_symlinked_descendants(out, &man_dir)?;
+        fs::create_dir_all(&man_dir)?;
+        harden_dir(&man_dir);
+        write_new_bytes(&man_dir.join(MIRROR_PARTITIONS_FILE), store.partition_count().to_string().as_bytes())?;
         // Walk every partition: write its manifest as JSON and each blob by id.
         for p in 0..store.partition_count() as u32 {
             // Skip tombstoned ids so a "deleted" secret is never written into the plaintext mirror.
             let entries: Vec<ManifestEntry> =
                 store.partition_entries(p).filter(|e| !vault.deleted_docs.iter().any(|d| d == &e.id)).cloned().collect();
-            fs::create_dir_all(&man_dir)?;
-            harden_dir(&man_dir);
             let man_json = serde_json::to_vec_pretty(&entries)?;
             write_new_bytes(&man_dir.join(format!("manifest.{p}.json")), &man_json)?;
             let vol_dir = vol_root.join(format!("vol.{p}"));
+            reject_symlinked_descendants(out, &vol_dir)?;
             fs::create_dir_all(&vol_dir)?;
             harden_dir(&vol_dir);
             for e in &entries {
@@ -638,6 +660,7 @@ impl OpenVault {
         }
         // Per-tab CSV exports (records in cleartext, consistent with vault.json) under `csv/`.
         let csv_dir = out.join("csv");
+        reject_symlinked_descendants(out, &csv_dir)?; // CSVs carry every password — same guard (audit R4-2)
         fs::create_dir_all(&csv_dir)?;
         harden_dir(&csv_dir);
         // doc id -> file basename for the CSV "documents" columns; tombstoned ids -> empty
@@ -801,6 +824,26 @@ impl OpenVault {
                 store.put(&e.id, &e.path, &bytes, e.uploaded_at, &key)?;
             }
             p += 1;
+        }
+        // FAIL CLOSED on a TAIL-truncated mirror (audit R4-3): the loop stops at the first absent
+        // `manifest.<N>.json`, so a mirror missing only its HIGHER (tail) partitions is a valid-looking
+        // contiguous prefix 0..k that the middle-gap check below cannot catch (no surviving higher
+        // manifest). export_tree records the authoritative partition count up front; require the number
+        // read to equal it, so a partial export (e.g. aborted at a partition boundary, then re-imported
+        // despite the "partial mirror — shred it" warning) cannot silently drop the orphan documents in
+        // the unwritten tail partitions. A mirror without the count (legacy / hand-built) keeps the
+        // middle-gap-only guard below.
+        if let Ok(raw) = read_capped(&man_dir.join(MIRROR_PARTITIONS_FILE), 32) {
+            let expected: u32 = std::str::from_utf8(&raw)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| VaultError::Storage(StorageError::Corrupt("unreadable partition count in mirror".into())))?;
+            if p != expected {
+                return Err(VaultError::Storage(StorageError::Corrupt(format!(
+                    "truncated mirror: imported {p} partition(s) but the export recorded {expected} \
+                     (an aborted/partial export-tree must not be imported)"
+                ))));
+            }
         }
         // FAIL CLOSED on a NON-CONTIGUOUS mirror, exactly like `VolumeStore::open`: the loop
         // above stops at the first absent `manifest.<N>.json`, so a lost MIDDLE partition (a
@@ -2029,7 +2072,7 @@ fn source_entry_validated(source: &OpenVault, id: &str) -> Result<Option<(String
 /// `read_bounded` apply O_NOFOLLOW to the final component only, so without this a
 /// symlinked parent directory could still redirect a blob/manifest read outside the
 /// mirror. A non-existent path is fine here (the subsequent read fails on its own).
-fn reject_symlink_dir(path: &Path) -> Result<(), VaultError> {
+pub fn reject_symlink_dir(path: &Path) -> Result<(), VaultError> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -3029,6 +3072,11 @@ fn unique_export_path(p: PathBuf, fallback_token: Option<&str>) -> PathBuf {
 /// new file's directory entry is crash-durable. Returns the path actually written. Backs
 /// the front-ends' "Export to CSV" action, which drops a timestamped CSV into the export dir.
 pub fn write_export_bytes(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, VaultError> {
+    // Refuse a symlinked export dir: the CSV carries every password in cleartext, and
+    // create_dir_all + harden_dir both follow a symlink, so without this a pre-planted
+    // symlink at `dir` would redirect the plaintext CSV outside the chosen directory and
+    // chmod the target 0700 (audit R4-1, same root guard as export_tree / backup).
+    reject_symlink_dir(dir)?;
     fs::create_dir_all(dir)?;
     harden_dir(dir); // best-effort 0700 on the export dir (no-op off unix)
     let path = unique_export_path(dir.join(filename), None);
@@ -5165,6 +5213,85 @@ mod tests {
         std::fs::remove_dir_all(&dest_dir).ok();
         let _ = std::fs::remove_file(&src1);
         let _ = std::fs::remove_file(&src2);
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_tree_refuses_a_symlinked_out_root() {
+        // Audit R4-1: a symlink pre-planted at the export OUT root must not redirect the
+        // whole-vault cleartext (vault.json etc.) into the attacker's directory.
+        use std::os::unix::fs::symlink;
+        let path = tmp_path("exptree-symroot");
+        let src = write_src("exptree-symroot", b"doc");
+        {
+            let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+            v.add_document("general-documents/x", "x.pdf", &src).unwrap();
+            let mut a = records::Account::new().unwrap();
+            a.owner = "o".into();
+            a.username = "u".into();
+            a.password = "secret".into();
+            records::upsert(&mut v.vault.accounts, a);
+            v.save().unwrap();
+        }
+        let attacker = std::env::temp_dir().join(format!("pmattacker-root-{}", nanos()));
+        fs::create_dir_all(&attacker).unwrap();
+        let out = std::env::temp_dir().join(format!("pmout-symroot-{}", nanos()));
+        symlink(&attacker, &out).unwrap();
+        let res = OpenVault::export_tree(&path, b"o1", b"o2", &out);
+        assert!(res.is_err(), "export_tree must refuse a symlinked OUT root");
+        assert!(!attacker.join("vault.json").exists(), "no cleartext escaped into the symlink target");
+        fs::remove_file(&out).ok();
+        fs::remove_dir_all(&attacker).ok();
+        let _ = fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_tree_refuses_a_symlinked_subdir() {
+        // Audit R4-2: a symlink pre-planted at an AUTHORITATIVE subdir (out/volume) must not
+        // redirect decrypted document blobs outside the export root.
+        use std::os::unix::fs::symlink;
+        let path = tmp_path("exptree-symsub");
+        let src = write_src("exptree-symsub", b"docbytes");
+        let id = {
+            let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+            let id = v.add_document("general-documents/x", "x.pdf", &src).unwrap();
+            v.save().unwrap();
+            id
+        };
+        let out = std::env::temp_dir().join(format!("pmout-symsub-{}", nanos()));
+        fs::create_dir_all(&out).unwrap();
+        let attacker = std::env::temp_dir().join(format!("pmattacker-sub-{}", nanos()));
+        fs::create_dir_all(&attacker).unwrap();
+        symlink(&attacker, out.join("volume")).unwrap(); // pre-plant out/volume -> attacker
+        let res = OpenVault::export_tree(&path, b"o1", b"o2", &out);
+        assert!(res.is_err(), "export_tree must refuse a symlinked volume/ subdir");
+        assert!(!attacker.join("vol.0").join(&id).exists(), "no blob written through the symlinked subdir");
+        fs::remove_dir_all(&out).ok();
+        fs::remove_dir_all(&attacker).ok();
+        let _ = fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_tree_rejects_a_tail_truncated_mirror() {
+        // Audit R4-3: a mirror missing its HIGHER (tail) partitions is a clean contiguous prefix
+        // the middle-gap guard cannot catch; the recorded partition count makes import fail closed.
+        let (path, _docs) = seed_multi_partition("tailtrunc", b"o1", b"o2");
+        let mirror = std::env::temp_dir().join(format!("pmtail-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        let hi = highest_mirror_manifest(&mirror.join("manifest")).expect("multi-partition mirror");
+        assert!(hi >= 1, "seed must produce >1 partition (highest {hi})");
+        // Truncate the tail: remove the highest partition's manifest + volume dir, as an export
+        // aborted at a partition boundary would leave. The lower partitions stay a clean prefix.
+        fs::remove_file(mirror.join("manifest").join(format!("manifest.{hi}.json"))).unwrap();
+        fs::remove_dir_all(mirror.join("volume").join(format!("vol.{hi}"))).unwrap();
+        let dest = std::env::temp_dir().join(format!("pmtail-imp-{}", nanos())).join(VAULT_FILE);
+        let res = OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast());
+        assert!(res.is_err(), "import must refuse a tail-truncated mirror (partition-count mismatch)");
+        fs::remove_dir_all(&mirror).ok();
         cleanup(&path);
     }
 
