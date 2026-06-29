@@ -2188,12 +2188,13 @@ impl App {
             self.edit = Some(es);
             return;
         }
-        // The auto-group level is derived from the record's identifying field; the
-        // user controls only the subfolder and filename. Build the uniform
-        // <root>/<auto-group>/<timestamp>[/<subfolder>] directory.
+        // The prefix comes from the record: Assets use the kind as the root
+        // (assets/liabilities, no auto-group); Trust&Will/General slug an auto-group from
+        // the identifying field. The user controls only the subfolder and filename. Build
+        // the uniform <root>[/<auto-group>]/<timestamp>[/<subfolder>] directory.
         let prefix = match es.tab {
             Tab::TrustWill => records::trust_will_doc_location(&es.fields[0].value),
-            Tab::Assets => records::asset_doc_location(&es.fields[1].value),
+            Tab::Assets => records::asset_doc_location(&es.fields[0].value), // fields[0] = Asset/Liability kind
             Tab::GeneralDocuments => records::general_doc_location(&es.fields[0].value),
             _ => {
                 self.edit = Some(es);

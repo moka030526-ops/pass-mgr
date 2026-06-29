@@ -111,12 +111,13 @@ Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 **Multi-document records & the uniform path layout.** Trust&Will, Assets, and General
 Documents hold a *single* attached document (`file`/`statement`); the Taxes and Real
 Estate tabs hold *many* (`documents: Vec<String>`). Every tab files its uploads under
-one scheme — `<root>/<auto-group>/<timestamp>/[subfolder]/<filename>` — built by
+one scheme — `<root>[/<auto-group>]/<timestamp>/[subfolder]/<filename>` — built by
 `records::doc_upload_dir(prefix, compact_utc(unix_now()), subfolder)` where `prefix`
 is the `<root>/<auto-group>` from a per-tab helper (`tax_doc_location` →
 `taxes/<year>`, `real_estate_doc_location` → `real-estate/<address>`,
-`trust_will_doc_location`, `asset_doc_location`, `general_doc_location`). The
-auto-group keeps a record's documents clustered; the per-upload `compact_utc`
+`trust_will_doc_location`, `general_doc_location`, and `asset_doc_location` →
+`assets`/`liabilities` — the record's *kind*, with **no** auto-group level). The
+auto-group keeps a record's documents clustered (Assets/Liabilities have none); the per-upload `compact_utc`
 timestamp makes each path unique; the user controls only the optional `subfolder` and
 the `filename`. `doc_slug` (auto-group + subfolder: lowercased ASCII-alphanumeric,
 `-`-separated, ≤40) and `doc_filename` (separators/control chars neutralized, ≤120,

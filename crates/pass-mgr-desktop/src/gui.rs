@@ -3361,15 +3361,17 @@ impl GuiApp {
                     self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
-                // The auto-group level comes from the record's identifying field; the
-                // user controls only the subfolder and filename. Build the uniform
-                // <root>/<auto-group>/<timestamp>[/<subfolder>] directory.
+                // The prefix comes from the record: Assets use the kind as the root
+                // (assets/liabilities, no auto-group); Trust&Will/General slug an auto-group
+                // from the identifying field. The user controls only the subfolder and
+                // filename. Build the uniform <root>[/<auto-group>]/<timestamp>[/<subfolder>]
+                // directory.
                 let prefix = match target {
                     DocTarget::TrustWill => records::trust_will_doc_location(
                         self.edit_trustwill.as_ref().map(|r| r.document.as_str()).unwrap_or(""),
                     ),
                     DocTarget::Asset => records::asset_doc_location(
-                        self.edit_asset.as_ref().map(|r| r.description.as_str()).unwrap_or(""),
+                        self.edit_asset.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
                     ),
                     DocTarget::General => records::general_doc_location(
                         self.edit_general.as_ref().map(|r| r.title.as_str()).unwrap_or(""),

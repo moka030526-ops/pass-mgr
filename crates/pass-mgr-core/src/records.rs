@@ -421,14 +421,19 @@ pub fn doc_slug(s: &str, fallback: &str) -> String {
     if out.is_empty() { fallback.to_string() } else { out }
 }
 
-/// The `<root>/<auto-group>` prefix for the Trust & Will, Assets, and General
-/// Documents tabs (the multi-doc Taxes/Real-Estate tabs have their own prefix
-/// helpers above). The group is slugged from the record's identifying field.
+/// The `<root>/<auto-group>` prefix for the Trust & Will and General Documents tabs
+/// (the multi-doc Taxes/Real-Estate tabs have their own prefix helpers above; Assets
+/// uses [`asset_doc_location`] below, which is kind-based with no slugged group). The
+/// group is slugged from the record's identifying field.
 pub fn trust_will_doc_location(document: &str) -> String {
     format!("trust-will/{}", doc_slug(document, "document"))
 }
-pub fn asset_doc_location(description: &str) -> String {
-    format!("assets/{}", doc_slug(description, "asset"))
+/// The root for an Asset/Liability document: `liabilities` when the record's `kind` is
+/// "Liability" (case-insensitive), else `assets`. Unlike the other doc tabs this has NO
+/// slugged auto-group level — uploads are filed directly under the kind root, then
+/// `<timestamp>[/<subfolder>]/<filename>` via [`doc_upload_dir`].
+pub fn asset_doc_location(kind: &str) -> String {
+    if kind.trim().eq_ignore_ascii_case("Liability") { "liabilities".to_string() } else { "assets".to_string() }
 }
 pub fn general_doc_location(title: &str) -> String {
     format!("general-documents/{}", doc_slug(title, "untitled"))
@@ -2946,8 +2951,11 @@ mod tests {
         assert_eq!(general_doc_location(""), "general-documents/untitled");
         assert_eq!(trust_will_doc_location("Living Trust"), "trust-will/living-trust");
         assert_eq!(trust_will_doc_location(""), "trust-will/document");
-        assert_eq!(asset_doc_location("Brokerage #1"), "assets/brokerage-1");
-        assert_eq!(asset_doc_location(""), "assets/asset");
+        // Assets/Liabilities are kind-based with NO slugged auto-group: the root IS the kind.
+        assert_eq!(asset_doc_location("Asset"), "assets");
+        assert_eq!(asset_doc_location("Liability"), "liabilities");
+        assert_eq!(asset_doc_location("liability"), "liabilities"); // case-insensitive
+        assert_eq!(asset_doc_location(""), "assets"); // blank/unknown kind defaults to assets
     }
 
     #[test]
