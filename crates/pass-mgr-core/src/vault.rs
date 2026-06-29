@@ -513,7 +513,13 @@ impl OpenVault {
         }
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
         // Collect entries first so the immutable borrow for reads is clean.
-        let entries: Vec<ManifestEntry> = selected_entries(&store, part)?;
+        let mut entries: Vec<ManifestEntry> = selected_entries(&store, part)?;
+        // Honor deletion tombstones: remove_document is two durable commits (tombstone-save,
+        // then storage.remove); a crash/ENOSPC in that gap leaves a tombstoned-but-present
+        // frame. The standalone export paths read the manifest directly, so filter the
+        // tombstoned ids here (mirroring is_tombstoned) — otherwise a "deleted" secret would be
+        // resurrected into an UNENCRYPTED export and re-admitted by import_tree.
+        entries.retain(|e| !vault.deleted_docs.iter().any(|d| d == &e.id));
         let mut out = Vec::new(); // a growable, initially-empty result vector
         for e in entries { // `e` is moved out of the vector on each iteration
             let bytes = store.read(&e.id, &key)?; // decrypt this doc's plaintext
@@ -536,7 +542,10 @@ impl OpenVault {
             return Err(VaultError::RekeyPending);
         }
         let store = VolumeStore::open(&dir, &key, &vault.id, vault.settings.volume_max_size)?;
-        selected_entries(&store, part)
+        let mut entries = selected_entries(&store, part)?;
+        // Drop tombstoned ids so a "deleted" doc never surfaces in an exported manifest.
+        entries.retain(|e| !vault.deleted_docs.iter().any(|d| d == &e.id));
+        Ok(entries)
     }
 
     /// Decrypt the **entire** vault directory into a plaintext mirror at `out`
@@ -567,7 +576,9 @@ impl OpenVault {
         let vol_root = out.join("volume");
         // Walk every partition: write its manifest as JSON and each blob by id.
         for p in 0..store.partition_count() as u32 {
-            let entries: Vec<ManifestEntry> = store.partition_entries(p).cloned().collect();
+            // Skip tombstoned ids so a "deleted" secret is never written into the plaintext mirror.
+            let entries: Vec<ManifestEntry> =
+                store.partition_entries(p).filter(|e| !vault.deleted_docs.iter().any(|d| d == &e.id)).cloned().collect();
             fs::create_dir_all(&man_dir)?;
             harden_dir(&man_dir);
             let man_json = serde_json::to_vec_pretty(&entries)?;

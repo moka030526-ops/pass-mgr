@@ -1072,7 +1072,7 @@ fn read_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
 fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
     // Function-local `use`: these imports are only in scope inside this function.
     // `self` in `{self, Event, ...}` imports the `event` module itself too.
-    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     // RAII guard: restore cooked/echo mode on EVERY exit path — including a panic unwinding
@@ -1103,6 +1103,17 @@ fn read_line_no_echo() -> anyhow::Result<Zeroizing<String>> {
             // dispatches on which key it was.
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Enter => break Ok(()),
+                // Ctrl+C / Ctrl+D cancel the prompt. In raw mode ISIG is off, so the kernel
+                // does NOT turn Ctrl+C into SIGINT — it arrives as Char('c')+CONTROL. Without
+                // this arm it would push a literal 'c'/'d' into the invisible password buffer,
+                // silently corrupting an otherwise-correct passphrase. Treat like Esc.
+                KeyCode::Char('c' | 'd') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.clear();
+                    break Err(anyhow::anyhow!("input cancelled"));
+                }
+                // Ignore any other control-modified key (Ctrl+U/Ctrl+W/…) instead of inserting a
+                // literal char; only real text reaches the buffer.
+                KeyCode::Char(_) if k.modifiers.contains(KeyModifiers::CONTROL) => {}
                 // `KeyCode::Char(c)` binds the typed character to `c`.
                 KeyCode::Char(c) => input.push(c),
                 KeyCode::Backspace => {

@@ -2173,6 +2173,21 @@ impl App {
             self.edit = Some(es);
             return;
         }
+        // Don't let an attach commit+persist an INVALID record that the Save path rejects:
+        // an Asset needs an owner (field 2) and a numeric approx. value (field 5), else the
+        // Summary silently treats the value as 0. Validate before any write. (Mirrors save_edit.)
+        if es.tab == Tab::Assets {
+            if es.fields[2].value.trim().is_empty() {
+                self.status = "Owner is required before attaching (every asset/liability must have an owner).".into();
+                self.edit = Some(es);
+                return;
+            }
+            if records::parse_approx_value(&es.fields[5].value).is_none() {
+                self.status = "Approximate value must be a number before attaching (e.g. 1500, 12,000.50, 250k).".into();
+                self.edit = Some(es);
+                return;
+            }
+        }
         let rc = es.record_fields;
         let filename = es.fields[rc].value.clone();
         let source = es.fields[rc + 1].value.clone();
@@ -5636,6 +5651,8 @@ mod tests {
         {
             let es = app.edit.as_mut().unwrap();
             let rc = es.record_fields;
+            es.fields[2].value = "Jane Doe".into(); // owner (now required before attach)
+            es.fields[5].value = "1000".into(); // approx value (numeric, now required)
             es.fields[rc].value = "f".repeat(crate::storage::MAX_PATH_LEN); // filename (huge)
             es.fields[rc + 1].value = src.display().to_string(); // upload from
         }

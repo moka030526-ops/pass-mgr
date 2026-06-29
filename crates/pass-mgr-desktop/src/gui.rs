@@ -3366,6 +3366,16 @@ impl GuiApp {
                     self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
+                // Don't upload+persist an INVALID asset that the Save path rejects (empty owner
+                // or non-numeric value → the Summary silently treats it as 0). Validate first,
+                // mirroring the Save path's records::asset_validation_error gate.
+                if let DocTarget::Asset = target
+                    && let Some(r) = self.edit_asset.as_ref()
+                    && let Some(msg) = records::asset_validation_error(r)
+                {
+                    self.fail(msg);
+                    return;
+                }
                 // Owner-first prefix: Assets nest under the owner initials + kind root
                 // (/<INITIALS>/assets|liabilities); Trust&Will/General have no owner and keep
                 // their slugged group. The timestamp is folded into the filename, so the
@@ -4996,7 +5006,10 @@ mod tests {
         let src = std::env::temp_dir().join(format!("passmgr-guisrc-{}.txt", nanos()));
         std::fs::write(&src, b"will body").unwrap();
 
-        app.edit_asset = Some(AssetLiability::new().unwrap());
+        let mut asset = AssetLiability::new().unwrap();
+        asset.owner = "Jane Doe".into(); // owner + numeric value are now required before attach
+        asset.approx_value = "1000".into();
+        app.edit_asset = Some(asset);
         app.doc_subfolder = "wills".into();
         app.doc_filename = "will.txt".into();
         app.doc_source = src.display().to_string();
@@ -5027,7 +5040,10 @@ mod tests {
         let (mut app, path) = app_unlocked("guipath");
         let src = std::env::temp_dir().join(format!("passmgr-guipath-{}.txt", nanos()));
         std::fs::write(&src, b"x").unwrap();
-        app.edit_asset = Some(AssetLiability::new().unwrap());
+        let mut asset = AssetLiability::new().unwrap();
+        asset.owner = "Jane Doe".into(); // owner + numeric value are now required before attach
+        asset.approx_value = "1000".into();
+        app.edit_asset = Some(asset);
         app.doc_subfolder = "d".into();
         app.doc_filename = "f".repeat(crate::storage::MAX_PATH_LEN);
         app.doc_source = src.display().to_string();
