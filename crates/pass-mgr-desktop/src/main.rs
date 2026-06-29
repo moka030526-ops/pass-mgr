@@ -772,6 +772,9 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
         // `.parent()` is the containing directory, if any. `if let Some(parent)`
         // runs only when there is one, binding it for use inside the block.
         if let Some(parent) = dest.parent() {
+            // Reject a symlinked intermediate dir before create_dir_all, so a symlink
+            // seeded in a shared OUT dir can't redirect decrypted plaintext outside it.
+            vault::reject_symlinked_descendants(&out_dir, parent)?;
             std::fs::create_dir_all(parent)?;
             vault::harden_dir(parent);
         }

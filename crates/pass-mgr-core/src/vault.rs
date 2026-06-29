@@ -1188,7 +1188,7 @@ impl OpenVault {
         // HARD ceiling rather than the unbounded `fs::read`: a file that grows between
         // the stat and the read — or a special file that slips past the is_file()
         // check on an exotic filesystem — still cannot exhaust memory.
-        let data = Zeroizing::new(read_file_capped(source, MAX_DOC_SIZE)?);
+        let data = read_file_capped(source, MAX_DOC_SIZE)?;
         let id = records::random_id()?;
         self.storage.put(&id, &vpath, &data, records::unix_now(), &self.key)?;
         Ok(id)
@@ -1298,6 +1298,11 @@ impl OpenVault {
         }
         let data = self.read_document(file_id)?;
         if let Some(parent) = dest.parent() {
+            // The components above are sanitized, but `root` is a user-chosen, reused dir a
+            // local process could have seeded with a symlinked component; `create_dir_all`
+            // would follow it and write plaintext outside `root`. Reject symlinked ancestors
+            // first (same guard the import side uses), then create + harden.
+            reject_symlinked_descendants(root, parent)?;
             fs::create_dir_all(parent)?;
             harden_dir(parent);
         }
@@ -1966,9 +1971,27 @@ fn reject_symlink_dir(path: &Path) -> Result<(), VaultError> {
         && meta.file_type().is_symlink()
     {
         return Err(VaultError::Storage(StorageError::Corrupt(format!(
-            "refusing to import through a symlinked directory: {}",
+            "refusing to traverse a symlinked directory: {}",
             path.display()
         ))));
+    }
+    Ok(())
+}
+
+/// Reject a pre-planted symlink anywhere on the chain of INTERMEDIATE directories from
+/// `root` (exclusive — the trusted, user-chosen destination) down to `leaf` (inclusive).
+/// Used before `create_dir_all` on a document EXPORT: `create_dir_all` follows a symlinked
+/// component and the final O_EXCL write only guards the last name, so without this a symlink
+/// seeded in a shared/reused export dir (e.g. `taxes -> ~/.ssh`) could redirect freshly
+/// decrypted plaintext outside `root`. Same discipline the import side already uses.
+pub fn reject_symlinked_descendants(root: &Path, leaf: &Path) -> Result<(), VaultError> {
+    let Ok(rel) = leaf.strip_prefix(root) else {
+        return Ok(()); // leaf not under root (shouldn't happen) — the O_EXCL write still guards the file
+    };
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        reject_symlink_dir(&cur)?;
     }
     Ok(())
 }
@@ -2020,13 +2043,17 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
 /// bound). Reads at most `max + 1` bytes — one past the limit — so an over-size
 /// source is detected and rejected without ever allocating more than `max + 1`.
 /// Follows symlinks (the caller has already vetted the target with `fs::metadata`).
-fn read_file_capped(path: &Path, max: u64) -> Result<Vec<u8>, VaultError> {
+fn read_file_capped(path: &Path, max: u64) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     use std::io::Read;
     let f = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    // `take(max + 1)` bounds the read; `read_to_end` grows `buf` only as needed (so a
-    // small file does not pre-allocate the whole ceiling). The returned Vec is moved
-    // into the caller's `Zeroizing` wrapper, so its bytes are wiped on drop.
+    // Pre-size to the file's actual length (clamped to the ceiling, +1 to still detect an
+    // over-size file) so `read_to_end` never REALLOCATES. A growing Vec frees each smaller
+    // backing buffer WITHOUT zeroizing, stranding cleartext fragments in freed heap; with
+    // exact capacity the only live buffer is this `Zeroizing` one, wiped on drop. The
+    // `take(max + 1)` bound still lets an over-size source be rejected without allocating
+    // past the ceiling.
+    let hint = f.metadata().map(|m| m.len()).unwrap_or(0).min(max).saturating_add(1);
+    let mut buf = Zeroizing::new(Vec::with_capacity(hint as usize));
     f.take(max.saturating_add(1)).read_to_end(&mut buf)?;
     if buf.len() as u64 > max {
         return Err(VaultError::TooLarge);
@@ -3109,6 +3136,41 @@ mod tests {
 
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn export_document_into_rejects_symlinked_intermediate() {
+        // M1 regression: a symlink pre-planted as an intermediate component of the export
+        // root must NOT be followed by create_dir_all (else the decrypted plaintext escapes
+        // the root into the symlink target).
+        use std::os::unix::fs::symlink;
+        let path = tmp_path("expsym");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        let body = vec![9u8; 64];
+        let src = write_src("expsym", &body);
+        let id = v.add_document("taxes/2024", "leak.pdf", &src).unwrap(); // -> /taxes/2024/leak.pdf
+
+        let base = parent_dir(&path);
+        let root = base.join("exproot");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // Pre-plant `exproot/taxes -> outside`; the export must refuse to traverse it.
+        symlink(&outside, root.join("taxes")).unwrap();
+
+        let err = v.export_document_into(&id, &root).unwrap_err();
+        assert!(
+            matches!(&err, VaultError::Storage(StorageError::Corrupt(m)) if m.contains("symlink")),
+            "must reject the symlinked intermediate, got {err:?}"
+        );
+        // The decrypted plaintext must NOT have escaped through the symlink.
+        assert!(!outside.join("2024").exists(), "plaintext escaped via the symlinked intermediate");
+
+        cleanup(&path);
+        fs::remove_file(&src).ok();
+        fs::remove_dir_all(&outside).ok();
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -6207,7 +6269,7 @@ mod tests {
         let exact = write_src("rfc_exact", &vec![0x11u8; max as usize]);
         let got = read_file_capped(&exact, max).expect("a file of exactly `max` bytes must read OK");
         assert_eq!(got.len() as u64, max);
-        assert_eq!(got, vec![0x11u8; max as usize]);
+        assert_eq!(&got[..], vec![0x11u8; max as usize].as_slice());
         fs::remove_file(&exact).ok();
 
         let over = write_src("rfc_over", &vec![0x22u8; (max + 1) as usize]);

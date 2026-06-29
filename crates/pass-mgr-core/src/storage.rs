@@ -137,6 +137,10 @@ struct Located {
     partition: u32,
     offset: u64,
     length: u64,
+    /// Position of this id's entry within its partition's `entries` Vec, so `entry()` is
+    /// O(1) instead of a linear scan (kept in sync by `reindex` after every mutation; a
+    /// stale value is caught by the id check in `entry`, which falls back to a scan).
+    entry_index: u32,
 }
 
 /// The partitioned document store for one vault directory.
@@ -248,10 +252,10 @@ impl VolumeStore {
         // `.iter().enumerate()` yields `(p, m)` pairs: `p` is the index (the
         // partition number), `m` is a shared reference to each Manifest.
         for (p, m) in self.manifests.iter().enumerate() {
-            for e in &m.entries { // `&m.entries` iterates by reference (no copy/move)
+            for (i, e) in m.entries.iter().enumerate() { // `i` = position within this partition
                 self.index.insert(
                     e.id.clone(), // map keys are owned; clone the id String to store it
-                    Located { partition: p as u32, offset: e.offset, length: e.length },
+                    Located { partition: p as u32, offset: e.offset, length: e.length, entry_index: i as u32 },
                 );
             }
         }
@@ -277,9 +281,15 @@ impl VolumeStore {
     // the first entry matching the closure `|e| e.id == id`.
     pub fn entry(&self, id: &str) -> Option<&ManifestEntry> {
         let loc = self.index.get(id)?;
-        self.manifests
-            .get(loc.partition as usize)
-            .and_then(|m| m.entries.iter().find(|e| e.id == id))
+        let m = self.manifests.get(loc.partition as usize)?;
+        // O(1): the index records the entry's slot, refreshed by `reindex` after every
+        // mutation. Verify the id still matches there; on a (theoretical) desync, fall back
+        // to a linear scan so a stale index can never serve the wrong entry. This removes the
+        // per-read linear scan that made bulk paths (export/compact/migrate/merge) O(N^2).
+        match m.entries.get(loc.entry_index as usize) {
+            Some(e) if e.id == id => Some(e),
+            _ => m.entries.iter().find(|e| e.id == id),
+        }
     }
 
     /// Iterate every stored document's metadata.

@@ -15,8 +15,10 @@
 //!   export strictly one physical line per record (embedded newlines become `_`) and
 //!   prevents a crafted field from spoofing a spreadsheet/terminal. It does NOT alter
 //!   ordinary printable text, so realistic data — including generated passwords — round
-//!   trips unchanged. Values are NOT otherwise mangled (no anti-formula prefixing), so a
-//!   plaintext-password export stays faithful for migrating into another manager.
+//!   trips unchanged. As an anti-formula-injection guard, a cell that BEGINS with `=`,
+//!   `+`, `-`, or `@` is additionally prefixed with a single quote so spreadsheets render
+//!   it as text (a crafted field cannot become a live `=HYPERLINK`/DDE formula that
+//!   exfiltrates the neighboring cleartext-password cells); the quote is a display marker.
 //! * Line endings are CRLF, per RFC 4180.
 //!
 //! Secret handling: the Accounts / Real-Estate CSVs contain plaintext passwords by the
@@ -45,16 +47,25 @@ pub fn basename(virtual_path: &str) -> String {
 /// so quoting is only ever needed for commas, quotes, and edge spaces.
 fn esc(s: &str) -> String {
     let safe = records::display_safe(s);
+    // Anti-CSV-formula-injection: a cell beginning with '=', '+', '-', or '@' is parsed as
+    // a formula by spreadsheets. A crafted field (e.g. a value merged in from a hostile
+    // vault) could then run =HYPERLINK/IMPORTXML/WEBSERVICE to exfiltrate the neighboring
+    // plaintext-password cells, or legacy DDE to execute. Prefix it with a single quote so
+    // the spreadsheet treats it as text. display_safe already stripped any leading TAB/CR.
+    let guarded = match safe.chars().next() {
+        Some('=' | '+' | '-' | '@') => format!("'{safe}"),
+        _ => safe,
+    };
     let needs_quote =
-        safe.contains(',') || safe.contains('"') || safe.starts_with(' ') || safe.ends_with(' ');
+        guarded.contains(',') || guarded.contains('"') || guarded.starts_with(' ') || guarded.ends_with(' ');
     if needs_quote {
-        let mut out = String::with_capacity(safe.len() + 2);
+        let mut out = String::with_capacity(guarded.len() + 2);
         out.push('"');
-        out.push_str(&safe.replace('"', "\"\""));
+        out.push_str(&guarded.replace('"', "\"\""));
         out.push('"');
         out
     } else {
-        safe
+        guarded
     }
 }
 
@@ -281,6 +292,19 @@ mod tests {
         assert_eq!(esc("trailing "), "\"trailing \"");
         // Control chars (here a newline) are neutralized to '_', not quoted.
         assert_eq!(esc("line1\nline2"), "line1_line2");
+    }
+
+    #[test]
+    fn esc_neutralizes_leading_formula_triggers() {
+        // A cell starting with a spreadsheet formula trigger is prefixed with a quote.
+        assert_eq!(esc("=1+1"), "'=1+1");
+        assert_eq!(esc("+CALL"), "'+CALL");
+        assert_eq!(esc("-2"), "'-2");
+        assert_eq!(esc("@SUM"), "'@SUM");
+        // Quoting still applies on top when the (guarded) cell needs it (here a comma).
+        assert_eq!(esc("=A1,B1"), "\"'=A1,B1\"");
+        // A trigger char NOT at the start is untouched — realistic passwords round-trip.
+        assert_eq!(esc("p@ss=w0rd"), "p@ss=w0rd");
     }
 
     #[test]
