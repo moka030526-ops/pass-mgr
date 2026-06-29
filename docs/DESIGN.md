@@ -543,12 +543,26 @@ OUTDIR/vault.json                 # the decrypted Vault (records, categories,
 OUTDIR/manifest/manifest.<N>.json # the decrypted manifest of partition N
                                   #   (entries: {id, path, size, uploaded_at, ...})
 OUTDIR/volume/vol.<N>/<id>        # each document's raw decrypted bytes, by id,
-                                  #   grouped by the partition it lived in
+                                  #   grouped by the partition it lived in — the
+                                  #   CANONICAL round-trip source import-tree reads
+OUTDIR/documents/<virtual/path>   # the SAME documents recreated in their human-
+                                  #   browsable folder tree (like `extract`; duplicate
+                                  #   virtual paths get a `_N` suffix). VIEW-ONLY.
+OUTDIR/csv/<tab>.csv              # a CSV export of every record tab
 ```
 
 `export-tree` decrypts the vault once (one Argon2 derivation), then walks every
-partition writing the three kinds of file; it refuses a half-committed rekey
-(`RekeyPending`) so the mirror is always self-consistent.
+partition writing the id-keyed blob, its human-tree copy, and the manifest; finally
+it writes a CSV per record tab. It refuses a half-committed rekey (`RekeyPending`)
+so the mirror is always self-consistent.
+
+The id-keyed `volume/vol.<N>/<id>` layout is what `import-tree` reads, because two
+documents may legitimately share a virtual path (the round-trip test stores several
+at one path) — so the human `documents/` tree, which de-dups colliding paths with a
+`_N` suffix, is for browsing only and is **not** the round-trip source. The CSVs are
+likewise informational. Both reuse the hardened export sanitizers (`doc_tree_relpath`,
+the symlink-rejecting directory creation) so a crafted/reused OUTDIR can't redirect a
+write outside it.
 
 `import-tree` reverses it: read `vault.json` (preserving the records, categories,
 settings, and vault `id`), then re-encrypt every document from the mirror — using

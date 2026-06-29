@@ -549,10 +549,16 @@ impl OpenVault {
     }
 
     /// Decrypt the **entire** vault directory into a plaintext mirror at `out`
-    /// (DESIGN.md §6.3): `out/vault.json`, `out/manifest/manifest.<N>.json`, and
-    /// `out/volume/vol.<N>/<id>` (the raw decrypted document bytes). This reuses the
-    /// standard decrypt + store-read paths — it adds no new crypto — and refuses a
-    /// half-committed rekey. The inverse is [`OpenVault::import_tree`].
+    /// (DESIGN.md §6.3). It writes:
+    /// - `out/vault.json` — all records/settings;
+    /// - `out/manifest/manifest.<N>.json` + `out/volume/vol.<N>/<id>` — the id-keyed document
+    ///   store, which is the canonical, unambiguous source [`OpenVault::import_tree`] reads back
+    ///   (two documents may legitimately share a virtual path, so this round-trips them exactly);
+    /// - `out/documents/<virtual/path>` — the SAME documents recreated in their human-browsable
+    ///   folder tree (like `extract`; duplicate paths get a `_N` suffix). For viewing only.
+    /// - `out/csv/<tab>.csv` — a CSV export of every record tab.
+    /// Reuses the standard decrypt + store-read paths (no new crypto) and refuses a
+    /// half-committed rekey.
     ///
     /// WARNING: the output is UNENCRYPTED (every password + document in the clear);
     /// see DESIGN.md §9.17. Files are written 0600 with `create_new` (no clobber).
@@ -574,6 +580,7 @@ impl OpenVault {
 
         let man_dir = out.join("manifest");
         let vol_root = out.join("volume");
+        let docs_dir = out.join("documents"); // human-browsable tree (round-trip source stays volume/)
         // Walk every partition: write its manifest as JSON and each blob by id.
         for p in 0..store.partition_count() as u32 {
             // Skip tombstoned ids so a "deleted" secret is never written into the plaintext mirror.
@@ -597,7 +604,42 @@ impl OpenVault {
                 }
                 let bytes = store.read(&e.id, &key)?; // decrypts + verifies id/path
                 write_new_bytes(&vol_dir.join(&e.id), &bytes)?;
+                // Human-browsable copy at the document's virtual-path tree (like `extract`). The
+                // canonical round-trip source remains the id-keyed volume/ above, because two docs
+                // may legitimately share a virtual path (so a pure path-tree can't round-trip them).
+                let tree_dest = unique_export_path(docs_dir.join(doc_tree_relpath(&e.path, &e.id)));
+                if let Some(parent) = tree_dest.parent() {
+                    reject_symlinked_descendants(out, parent)?; // no symlink redirect out of `out`
+                    fs::create_dir_all(parent)?;
+                    harden_dir(parent);
+                }
+                write_new_bytes(&tree_dest, &bytes)?;
             }
+        }
+        // Per-tab CSV exports (records in cleartext, consistent with vault.json) under `csv/`.
+        let csv_dir = out.join("csv");
+        fs::create_dir_all(&csv_dir)?;
+        harden_dir(&csv_dir);
+        // doc id -> file basename for the CSV "documents" columns; tombstoned ids -> empty
+        // (matching the front-end CSV export's tombstone-aware resolver).
+        let name_of = |id: &str| {
+            if vault.deleted_docs.iter().any(|d| d == id) {
+                String::new()
+            } else {
+                store.entry(id).map(|e| crate::csv::basename(&e.path)).unwrap_or_default()
+            }
+        };
+        for tab in [
+            crate::csv::CsvTab::Instructions,
+            crate::csv::CsvTab::TrustWill,
+            crate::csv::CsvTab::Assets,
+            crate::csv::CsvTab::Accounts,
+            crate::csv::CsvTab::RealEstate,
+            crate::csv::CsvTab::Taxes,
+            crate::csv::CsvTab::GeneralDocuments,
+        ] {
+            let (base, text, _) = crate::csv::build_tab_csv(&vault, tab, &name_of);
+            write_new_bytes(&csv_dir.join(format!("{base}.csv")), text.as_bytes())?;
         }
         Ok(())
     }
@@ -1290,35 +1332,10 @@ impl OpenVault {
     pub fn export_document_into(&self, file_id: &str, root: &Path) -> Result<PathBuf, VaultError> {
         let vpath =
             self.doc_path(file_id).ok_or_else(|| StorageError::NotFound(file_id.to_string()))?;
-        let mut dest = root.to_path_buf();
-        for part in vpath.split('/') {
-            let p = part.trim();
-            if p.is_empty() || p == "." || p == ".." || p.contains(['\\', ':', '\0']) {
-                continue; // never let a component traverse out of `root`
-            }
-            // Defense-in-depth for already-stored docs: neutralize a Windows reserved device
-            // name in any component (`con`, `nul`, `com1`, …) so the export writes a real file
-            // on Windows instead of opening a device or colliding. New docs are already
-            // sanitized at store time by `records::doc_filename`; this covers legacy paths.
-            // Trailing dots/spaces are likewise stripped (silently dropped by the Win32 layer).
-            // Neutralize control + bidi/zero-width spoof chars (e.g. U+202E RLO) exactly as
-            // the store-time sanitizer `records::doc_filename` does, so a legacy or merge-
-            // imported manifest path can't write a SPOOFED real filename on disk (e.g.
-            // `invoice\u{202e}fdp.exe` rendering as `invoiceexe.pdf` in the heir's file
-            // manager). New docs are sanitized at store time; this is the legacy backstop.
-            let p = records::display_safe(p.trim_end_matches(['.', ' ']));
-            if p.is_empty() {
-                continue;
-            } else if records::is_windows_reserved_name(&p) {
-                dest.push(format!("_{p}"));
-            } else {
-                dest.push(&p);
-            }
-        }
-        if dest == root {
-            // Degenerate virtual path — fall back to an id-named file under root.
-            dest.push(format!("{file_id}.bin"));
-        }
+        // Recreate the virtual folder tree under `root` via the shared, hardened sanitizer
+        // (drops `..`/separators/`:`/NUL, neutralizes control+bidi + Windows reserved names,
+        // strips edge dots/spaces; degenerate path -> `<id>.bin`) so it can never escape `root`.
+        let dest = root.join(doc_tree_relpath(&vpath, file_id));
         let data = self.read_document(file_id)?;
         if let Some(parent) = dest.parent() {
             // The components above are sanitized, but `root` is a user-chosen, reused dir a
@@ -2002,6 +2019,35 @@ fn reject_symlink_dir(path: &Path) -> Result<(), VaultError> {
         ))));
     }
     Ok(())
+}
+
+/// The sanitized RELATIVE on-disk path a document gets when recreating its virtual folder tree
+/// under an export root. Each `/`-component of the virtual path is re-cleaned defense-in-depth
+/// (drop empty / `.` / `..` / `\\` / `:` / NUL components; neutralize control+bidi spoof chars and
+/// Windows reserved device names; strip trailing dots/spaces) so the result can NEVER escape the
+/// root. A degenerate path (no usable component) falls back to `<id>.bin`. Shared by
+/// `export_document_into` and `export_tree`'s `documents/` view. (The desktop `extract` CLI has
+/// its own equivalent `safe_relative_path`.)
+fn doc_tree_relpath(virtual_path: &str, id: &str) -> PathBuf {
+    let mut rel = PathBuf::new();
+    for part in virtual_path.split('/') {
+        let p = part.trim();
+        if p.is_empty() || p == "." || p == ".." || p.contains(['\\', ':', '\0']) {
+            continue;
+        }
+        let p = records::display_safe(p.trim_end_matches(['.', ' ']));
+        if p.is_empty() {
+            continue;
+        } else if records::is_windows_reserved_name(&p) {
+            rel.push(format!("_{p}"));
+        } else {
+            rel.push(&p);
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(format!("{id}.bin"));
+    }
+    rel
 }
 
 /// Reject a pre-planted symlink anywhere on the chain of INTERMEDIATE directories from
@@ -4870,6 +4916,48 @@ mod tests {
 
         std::fs::remove_dir_all(&mirror).ok();
         std::fs::remove_dir_all(&dest_dir).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_tree_writes_documents_tree_and_per_tab_csv() {
+        // export_tree also writes a human-browsable documents/<virtual-path> tree (alongside the
+        // id-keyed volume/ that import reads) and one CSV per record tab.
+        let path = tmp_path("exptree-extras");
+        let body = vec![7u8; 200];
+        let src = write_src("exptree-extras", &body);
+        {
+            let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+            let id = v.add_document("general-documents/passport", "scan.pdf", &src).unwrap();
+            let mut gd = records::GeneralDocument::new().unwrap();
+            gd.title = "Passport".into();
+            gd.file = Some(id);
+            records::upsert(&mut v.vault.general_documents, gd);
+            let mut a = records::Account::new().unwrap();
+            a.owner = "Jane".into();
+            a.username = "jane".into();
+            a.password = "pw".into();
+            records::upsert(&mut v.vault.accounts, a);
+            v.save().unwrap();
+        }
+        let mirror = std::env::temp_dir().join(format!("pmmirror-extras-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+
+        // Human tree: the document recreated at its virtual path, with the decrypted bytes.
+        let tree_file = mirror.join("documents/general-documents/passport/scan.pdf");
+        assert!(tree_file.exists(), "documents/ tree file missing: {}", tree_file.display());
+        assert_eq!(std::fs::read(&tree_file).unwrap(), body, "tree copy has the decrypted bytes");
+        // A CSV per tab; the accounts CSV carries the row.
+        for f in ["accounts.csv", "general-documents.csv", "assets-liabilities.csv", "real-estate.csv", "taxes.csv", "trust-will.csv", "instructions.csv"] {
+            assert!(mirror.join("csv").join(f).exists(), "missing csv/{f}");
+        }
+        assert!(std::fs::read_to_string(mirror.join("csv/accounts.csv")).unwrap().contains("jane"));
+        // The id-keyed volume + manifest (import's canonical round-trip source) are still written.
+        assert!(mirror.join("manifest/manifest.0.json").exists());
+        assert!(mirror.join("volume/vol.0").exists());
+
+        std::fs::remove_dir_all(&mirror).ok();
+        let _ = std::fs::remove_file(&src);
         cleanup(&path);
     }
 

@@ -809,7 +809,8 @@ fn cli_export_tree(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("no vault found at {}", path.display());
     }
     eprintln!(
-        "Decrypting the ENTIRE vault into {} — vault.json + manifests + documents, all UNENCRYPTED.",
+        "Decrypting the ENTIRE vault into {} — vault.json + manifests + volume blobs + a documents/ \
+         folder tree + per-tab CSVs, all UNENCRYPTED.",
         out_dir.display()
     );
     let pw1 = read_password("Password 1: ")?;
