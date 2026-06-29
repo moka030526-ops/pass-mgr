@@ -811,8 +811,13 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     f.seek(SeekFrom::Start(start))?;
     crate::fault::point("volume.write")?; // inject ENOSPC before the volume append
     f.write_all(frame)?; // `frame: &[u8]` is borrowed, not consumed
-    // Drop any pre-existing garbage tail beyond the new committed end.
-    f.set_len(start + frame.len() as u64)?;
+    // Drop any pre-existing garbage tail beyond the new committed end. Use checked_add so the
+    // end offset can never silently wrap (and never panic under overflow-checks); restores the
+    // saturating/checked discipline used for `end_offset` on the put path.
+    let new_len = start
+        .checked_add(frame.len() as u64)
+        .ok_or_else(|| StorageError::Corrupt(format!("frame end offset overflow at {start} in {}", path.display())))?;
+    f.set_len(new_len)?;
     f.sync_all()?; // fsync: force the bytes (and metadata) to durable storage
     // Make the (possibly newly created) vol.<N> directory entry durable BEFORE its
     // referencing manifest is committed, so a crash can never leave a committed
@@ -859,6 +864,9 @@ fn highest_partition_index(dir: &Path, prefix: &str) -> Option<u32> {
         if let Some(name) = entry.file_name().to_str()
             && let Some(rest) = name.strip_prefix(prefix)
             && !rest.is_empty()
+            // Canonical decimal only — reject leading zeros (vol.007) so a foreign/mis-named
+            // sibling can't be counted as a partition and spuriously trip the contiguity guard.
+            && (rest == "0" || !rest.starts_with('0'))
             && rest.bytes().all(|b| b.is_ascii_digit())
             && let Ok(n) = rest.parse::<u32>()
         {

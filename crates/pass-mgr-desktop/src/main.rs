@@ -1059,7 +1059,12 @@ fn read_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     } else {
         let mut line = String::new();
         // `&mut line` lends the buffer exclusively so `read_line` can append into it.
-        std::io::stdin().lock().read_line(&mut line)?;
+        let n = std::io::stdin().lock().read_line(&mut line)?;
+        // EOF with no bytes (piped fewer lines than prompts) would otherwise yield a SILENT
+        // empty password and a confusing downstream AEAD failure — fail loudly instead.
+        if n == 0 {
+            anyhow::bail!("unexpected end of input while reading {prompt}");
+        }
         // Strip the trailing newline(s) and copy into a self-wiping buffer...
         let pw = Zeroizing::new(line.trim_end_matches(['\n', '\r']).to_string());
         // ...then explicitly scrub the original `line`, which still holds the secret.

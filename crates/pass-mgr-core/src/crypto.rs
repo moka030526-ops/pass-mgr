@@ -121,6 +121,12 @@ impl KdfParams {
             || self.t_cost > Self::MAX_T_COST
             || self.p_cost < 1
             || self.p_cost > Self::MAX_P_COST
+            // argon2 ADDITIONALLY requires m_cost >= 8 * p_cost (Params::new returns
+            // MemoryTooLittle otherwise). Enforce it here so validate() is the complete,
+            // faithful gate for the KDF: a tampered header (e.g. m_cost=8, p_cost=2) then
+            // surfaces the precise BadParams rather than an opaque later derive failure.
+            // u64 math so the *8 can't overflow (p_cost is capped at 16 above regardless).
+            || (self.p_cost as u64) * 8 > self.m_cost as u64
         {
             return Err(CryptoError::KdfParams);
         }
@@ -513,8 +519,14 @@ mod tests {
             "t_cost == MAX must validate"
         );
         assert!(
-            KdfParams { m_cost: KdfParams::MIN_M_COST, t_cost: 1, p_cost: KdfParams::MAX_P_COST }.validate().is_ok(),
-            "p_cost == MAX must validate"
+            KdfParams { m_cost: 8 * KdfParams::MAX_P_COST, t_cost: 1, p_cost: KdfParams::MAX_P_COST }.validate().is_ok(),
+            "p_cost == MAX must validate (with m_cost >= 8*p_cost, the argon2 floor)"
+        );
+        // The argon2 cross-invariant m_cost >= 8*p_cost is now enforced by validate(): a
+        // shape-valid-but-derivation-failing combo (m_cost=8, p_cost=2) is rejected up front.
+        assert!(
+            KdfParams { m_cost: 8, t_cost: 1, p_cost: 2 }.validate().is_err(),
+            "m_cost < 8*p_cost must be rejected (argon2 MemoryTooLittle)"
         );
 
         // One over each ceiling: must be rejected.

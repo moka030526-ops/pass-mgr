@@ -2291,6 +2291,13 @@ impl App {
         }
         // `.take()` clears the attachment and returns the old id (if any).
         let id = es.attached_file_id.take();
+        // Nothing attached → no-op: don't mint an id, commit, persist, bump updated_at, or
+        // claim "Removed document". Just report and restore the buffer.
+        if id.is_none() {
+            self.status = "No document attached.".into();
+            self.edit = Some(es);
+            return;
+        }
         if let Err(e) = Self::ensure_id(&mut es) {
             self.status = e;
             self.edit = Some(es);

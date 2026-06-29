@@ -480,7 +480,16 @@ pub fn compact_utc(unix_secs: i64) -> String {
 /// in a stored path or filename prefix.
 pub fn is_compact_utc(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 15 && b[8] == b'-' && b[..8].iter().all(u8::is_ascii_digit) && b[9..].iter().all(u8::is_ascii_digit)
+    if b.len() != 15 || b[8] != b'-' || !b[..8].iter().all(u8::is_ascii_digit) || !b[9..].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    // Validate the date/time components are PLAUSIBLE (not merely digit-shaped) so an arbitrary
+    // all-digit directory or year (e.g. "12345678-901234") can't be misread as a timestamp by the
+    // migration. All slices are ASCII digits, so parse always succeeds.
+    let n = |lo: usize, hi: usize| s[lo..hi].parse::<u32>().unwrap_or(u32::MAX);
+    let (mo, d, h, mi, sec) = (n(4, 6), n(6, 8), n(9, 11), n(11, 13), n(13, 15));
+    (1..=12).contains(&mo) && (1..=31).contains(&d) && h < 24 && mi < 60 && sec < 60
 }
 
 /// Prefix an already-sanitized filename with the upload timestamp: `<ts>_<name>`.
@@ -828,7 +837,13 @@ fn track_bool(out: &mut Vec<Change>, at: i64, name: &str, old: bool, new: bool) 
 /// four RealEstate portal passwords). The UIs use this to mask secret values in
 /// the history pane.
 pub fn detail_is_secret(detail: &str) -> bool {
-    detail.split_once(':').map(|(name, _)| name).unwrap_or(detail).trim_end().ends_with("password")
+    // Only a real "field: old -> new" diff (which always contains a colon) can be a secret.
+    // Require the colon so a colon-less history label that merely ENDS in "password" (e.g. an
+    // Instruction titled "Reset my password") is not over-masked into "password: <hidden> -> …".
+    match detail.split_once(':') {
+        Some((name, _)) => name.trim_end().ends_with("password"),
+        None => false,
+    }
 }
 
 /// A history `Change.detail` formatted for display, with the before/after values

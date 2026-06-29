@@ -47,16 +47,18 @@ fn new_doc_path(old_path: &str, target: &DocTarget, uploaded_at: i64) -> String 
         return old_path.to_string(); // degenerate (no components) — leave unchanged
     };
 
-    // (timestamp, bare filename): prefer an existing `<ts>_` filename prefix (idempotency),
-    // then a standalone timestamp directory, then the manifest's uploaded_at.
-    let (ts, bare): (String, &str) = if filename_raw.len() >= 16
+    // (timestamp, bare filename): PREFER a standalone `<ts>` directory (the real upload time)
+    // over a user filename that merely LOOKS like `<ts>_…`; then the migrated filename's own
+    // `<ts>_` prefix (so a re-run is idempotent); then the manifest's uploaded_at.
+    let ts_dir_idx = dirs.iter().position(|c| records::is_compact_utc(c));
+    let (ts, bare): (String, &str) = if let Some(i) = ts_dir_idx {
+        (dirs[i].to_string(), filename_raw)
+    } else if filename_raw.len() >= 16
         && filename_raw.is_char_boundary(15)
         && filename_raw.as_bytes()[15] == b'_'
         && records::is_compact_utc(&filename_raw[..15])
     {
         (filename_raw[..15].to_string(), &filename_raw[16..])
-    } else if let Some(dir_ts) = dirs.iter().copied().find(|c| records::is_compact_utc(c)) {
-        (dir_ts.to_string(), filename_raw)
     } else {
         (records::compact_utc(uploaded_at), filename_raw)
     };
@@ -76,8 +78,10 @@ fn new_doc_path(old_path: &str, target: &DocTarget, uploaded_at: i64) -> String 
             virtual_path(&prefix, &filename)
         }
         DocTarget::Plain => {
-            // Keep the existing directories, minus the timestamp component (if any).
-            let kept: Vec<&str> = dirs.iter().copied().filter(|c| !records::is_compact_utc(c)).collect();
+            // Keep the existing directories, removing ONLY the single component used as the
+            // timestamp source (so a legitimately ts-shaped subfolder name is preserved).
+            let kept: Vec<&str> =
+                dirs.iter().copied().enumerate().filter(|(i, _)| Some(*i) != ts_dir_idx).map(|(_, c)| c).collect();
             virtual_path(&kept.join("/"), &filename)
         }
     }
