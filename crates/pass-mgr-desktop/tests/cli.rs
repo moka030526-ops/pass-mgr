@@ -45,6 +45,21 @@ fn too_many_positionals_is_a_usage_error_with_nonzero_exit() {
 }
 
 #[test]
+fn interactive_launch_rejects_extra_positionals() {
+    // No subcommand: `pass-mgr [DIR]` takes at most one positional (the optional vault DIR).
+    // A 2nd positional (here the first token isn't a known subcommand, so this is the
+    // interactive path) must be rejected — returning before any UI launches — rather than
+    // silently opening the first and ignoring the rest.
+    let out = Command::new(bin()).args(["some-vault-dir", "stray-extra-arg"]).output().expect("run");
+    assert!(!out.status.success(), "extra interactive positional exits non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized extra arguments") || stderr.contains("Usage: pass-mgr"),
+        "got stderr: {stderr}"
+    );
+}
+
+#[test]
 fn missing_required_output_dir_is_a_usage_error() {
     // `extract` requires an OUTPUT_DIR; with only the subcommand the arity is wrong.
     let out = Command::new(bin()).arg("extract").output().expect("run extract");

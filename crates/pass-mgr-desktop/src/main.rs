@@ -419,19 +419,31 @@ fn main() -> ExitCode {
         // the interactive UI (graphical by default, terminal with --tui). In a build
         // without the `gui` feature there is no graphical UI, so always run the TUI.
         _ => {
-            let path = vault_dir_arg(0);
-            #[cfg(feature = "gui")]
-            {
-                if tui {
-                    run_ui(path, writable)
-                } else {
-                    gui::run(path, writable)
+            // Interactive launch: `pass-mgr [DIR] [--write] [--tui]` — at most ONE positional
+            // (the optional vault DIR; there is no subcommand here). Reject a 2nd+ positional
+            // (a stray token, or a mistyped subcommand like `extarct OUT`) instead of silently
+            // ignoring it and opening pos[0] — matching the explicit arity checks on every
+            // subcommand above.
+            if pos.len() > 1 {
+                Err(anyhow::anyhow!(
+                    "unrecognized extra arguments: {:?}\nUsage: pass-mgr [DIR] [--write] [--tui], or a subcommand (run `pass-mgr --help`).",
+                    &pos[1..]
+                ))
+            } else {
+                let path = vault_dir_arg(0);
+                #[cfg(feature = "gui")]
+                {
+                    if tui {
+                        run_ui(path, writable)
+                    } else {
+                        gui::run(path, writable)
+                    }
                 }
-            }
-            #[cfg(not(feature = "gui"))]
-            {
-                let _ = tui; // the flag is accepted but the TUI is the only UI here
-                run_ui(path, writable)
+                #[cfg(not(feature = "gui"))]
+                {
+                    let _ = tui; // the flag is accepted but the TUI is the only UI here
+                    run_ui(path, writable)
+                }
             }
         }
     };

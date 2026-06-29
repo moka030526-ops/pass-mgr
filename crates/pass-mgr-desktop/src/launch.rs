@@ -172,7 +172,7 @@ pub fn discover_vaults(root: &str) -> VaultScan {
 /// This is the windowed launcher's whole command line — it has no console, so it
 /// deliberately understands only what an interactive launch needs and leaves the
 /// CLI subcommands to the console binary.
-pub fn resolve_interactive(args: &[String]) -> (PathBuf, bool) {
+pub fn resolve_interactive(args: &[String]) -> Result<(PathBuf, bool), String> {
     let writable = args.iter().any(|a| a == "--write");
     // Treat ONLY the exact known flags as flags — NOT any '-'-prefixed token. A blanket
     // `starts_with('-')` filter silently ignored a vault directory whose name begins with
@@ -180,12 +180,18 @@ pub fn resolve_interactive(args: &[String]) -> (PathBuf, bool) {
     // exact `--write`/`--tui` tokens, treated it as the directory — so `pass-mgr DIR` and
     // `pass-mgr-gui DIR` could open DIFFERENT vaults. Matching the exact set keeps both
     // binaries' resolution identical (the module's stated guarantee).
-    let path = args
-        .iter()
-        .find(|a| !matches!(a.as_str(), "--write" | "--tui"))
-        .map(|d| vault_file(d))
-        .unwrap_or_else(default_vault_path);
-    (path, writable)
+    let positionals: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "--write" | "--tui")).collect();
+    // At most ONE positional (the optional vault DIR). Reject extras instead of silently
+    // opening the first and ignoring the rest — matching the console binary's arity checks.
+    if positionals.len() > 1 {
+        return Err(format!(
+            "too many arguments: expected at most one vault DIR, got {}: {:?}. Usage: pass-mgr-gui [DIR] [--write]",
+            positionals.len(),
+            positionals
+        ));
+    }
+    let path = positionals.first().map(|d| vault_file(d)).unwrap_or_else(default_vault_path);
+    Ok((path, writable))
 }
 
 #[cfg(test)]
@@ -205,26 +211,36 @@ mod tests {
     #[test]
     fn resolve_interactive_reads_dir_and_write_flag() {
         // No args → default path, read-only.
-        let (p, w) = resolve_interactive(&[]);
+        let (p, w) = resolve_interactive(&[]).unwrap();
         assert!(p.ends_with("vault.pmv"));
         assert!(!w);
 
         // A positional dir is used; flag order doesn't matter.
-        let (p, w) = resolve_interactive(&["--write".into(), "/v".into()]);
+        let (p, w) = resolve_interactive(&["--write".into(), "/v".into()]).unwrap();
         assert_eq!(p, PathBuf::from("/v/vault.pmv"));
         assert!(w);
 
         // The first NON-flag argument is the directory.
-        let (p, w) = resolve_interactive(&["/v".into(), "--write".into()]);
+        let (p, w) = resolve_interactive(&["/v".into(), "--write".into()]).unwrap();
         assert_eq!(p, PathBuf::from("/v/vault.pmv"));
         assert!(w);
 
         // A directory whose NAME begins with '-' is still recognized (only the exact known
         // flags are treated as flags), so this binary opens the same vault the console
         // binary would — not the silent default.
-        let (p, w) = resolve_interactive(&["-weird-dir".into()]);
+        let (p, w) = resolve_interactive(&["-weird-dir".into()]).unwrap();
         assert_eq!(p, PathBuf::from("-weird-dir/vault.pmv"));
         assert!(!w);
+    }
+
+    #[test]
+    fn resolve_interactive_rejects_extra_positionals() {
+        // More than one vault DIR is an error (arg-count validation), not a silent open of the
+        // first with the rest ignored. Flags don't count toward the positional total.
+        assert!(resolve_interactive(&["/a".into(), "/b".into()]).is_err());
+        assert!(resolve_interactive(&["/a".into(), "--write".into(), "/b".into()]).is_err());
+        // Exactly one positional (with any flags) is still fine.
+        assert!(resolve_interactive(&["/a".into(), "--write".into(), "--tui".into()]).is_ok());
     }
 
     #[test]

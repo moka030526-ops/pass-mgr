@@ -23,7 +23,14 @@ fn main() -> ExitCode {
     // interactive launch (optional vault DIR + `--write`); CLI subcommands belong to
     // the console binary, which can actually show their output.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (path, writable) = pass_mgr::launch::resolve_interactive(&args);
+    // Reject a malformed command line (e.g. more than one vault DIR) before opening a window.
+    let (path, writable) = match pass_mgr::launch::resolve_interactive(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pass-mgr error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     match pass_mgr::gui::run(path, writable) {
         Ok(()) => ExitCode::SUCCESS,
