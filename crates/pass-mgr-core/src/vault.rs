@@ -270,15 +270,27 @@ impl WriteLock {
         let path = dir.join(LOCK_FILE); // `.join()` appends a path component
         // The lock file carries no contents; never truncate it (avoids racing a
         // concurrent holder's handle), just ensure it exists and is lockable.
-        // The trailing `?` propagates any I/O error: on `Err` it returns it from
-        // this function immediately (after `#[from]`-converting it to VaultError).
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        // NOTE: deliberately do NOT chmod this path. `open(create)` follows a
-        // symlink, and `harden_file` (metadata + set_permissions) would then chmod
-        // the symlink's *target* — a chmod-through-symlink primitive an attacker
-        // could aim at another of the user's files. The lock file holds no secrets,
-        // and its parent directory is already 0700, so leaving it at the default
-        // umask mode is safe. (append_frame guards its own path the same way.)
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        // On Unix, open with O_NOFOLLOW so a symlink planted at the lock path is REFUSED
+        // (ELOOP) rather than followed — matching single_instance.rs and append_frame, and
+        // closing the one attacker-reachable open that previously followed symlinks. A
+        // symlinked lock path is surfaced as `Locked`; we do NOT remove it (it lives in the
+        // shared vault dir, and removing it could disrupt a legitimate concurrent holder).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(VaultError::Locked),
+            Err(e) => return Err(VaultError::Io(e)),
+        };
+        // NOTE: deliberately do NOT chmod this path — the lock file holds no secrets and its
+        // parent directory is already 0700. (With O_NOFOLLOW above, a symlinked lock path is
+        // now refused outright, so the old chmod-through-symlink concern cannot arise.)
         // `match` examines every possible variant of the Result and picks one arm.
         // `try_lock` returns `Ok(())` if we got the lock, or specific errors otherwise.
         match file.try_lock() {
