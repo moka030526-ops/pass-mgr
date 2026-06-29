@@ -421,17 +421,46 @@ pub fn doc_slug(s: &str, fallback: &str) -> String {
     if out.is_empty() { fallback.to_string() } else { out }
 }
 
-/// The `<root>/<auto-group>` prefix for the Trust & Will and General Documents tabs
-/// (the multi-doc Taxes/Real-Estate tabs have their own prefix helpers above; Assets
-/// uses [`asset_doc_location`] below, which is kind-based with no slugged group). The
-/// group is slugged from the record's identifying field.
+/// Uppercased initials of an owner for the owner-first directory level: the first
+/// ASCII-alphanumeric character of each whitespace-separated word, uppercased and
+/// concatenated, capped at 8 chars. No connector special-casing ("Michael and Sarah"
+/// -> "MAS", "Michael & Sarah" -> "MS", "Joint" -> "J"). Returns "" when the owner is
+/// blank or has no alphanumeric — callers then OMIT the initials level entirely.
+pub fn owner_initials(owner: &str) -> String {
+    let mut out = String::new();
+    for word in owner.split_whitespace() {
+        if let Some(c) = word.chars().find(char::is_ascii_alphanumeric) {
+            out.push(c.to_ascii_uppercase());
+            if out.len() >= 8 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Prepend the owner-initials top-level folder to a `<root>[/<group>]` base, giving the
+/// owner-first layout `[<INITIALS>/]<base>`. When `owner` is `None` (tabs without an
+/// owner) or the initials are empty (blank owner), `base` is returned unchanged.
+pub fn owner_prefix(owner: Option<&str>, base: &str) -> String {
+    match owner.map(owner_initials).filter(|i| !i.is_empty()) {
+        Some(init) => format!("{init}/{base}"),
+        None => base.to_string(),
+    }
+}
+
+/// The per-tab `<root>[/<group>]` base for the Trust & Will and General Documents tabs
+/// (the multi-doc Taxes/Real-Estate tabs have their own helpers above; Assets uses
+/// [`asset_doc_location`] below = the kind root). The group is slugged from the record's
+/// identifying field. The owner-initials top level (for owner-bearing tabs) is layered on
+/// by [`owner_prefix`].
 pub fn trust_will_doc_location(document: &str) -> String {
     format!("trust-will/{}", doc_slug(document, "document"))
 }
-/// The root for an Asset/Liability document: `liabilities` when the record's `kind` is
-/// "Liability" (case-insensitive), else `assets`. Unlike the other doc tabs this has NO
-/// slugged auto-group level — uploads are filed directly under the kind root, then
-/// `<timestamp>[/<subfolder>]/<filename>` via [`doc_upload_dir`].
+/// The kind root for an Asset/Liability document: `liabilities` when the record's `kind`
+/// is "Liability" (case-insensitive), else `assets`. Used as the `base` for
+/// [`owner_prefix`], giving the owner-first `<INITIALS>/assets|liabilities`. No slugged
+/// auto-group level (assets are grouped by owner, not description).
 pub fn asset_doc_location(kind: &str) -> String {
     if kind.trim().eq_ignore_ascii_case("Liability") { "liabilities".to_string() } else { "assets".to_string() }
 }
@@ -439,22 +468,37 @@ pub fn general_doc_location(title: &str) -> String {
     format!("general-documents/{}", doc_slug(title, "untitled"))
 }
 
-/// A compact UTC timestamp `YYYYMMDD-HHMMSS` for the per-upload folder level, from
-/// Unix seconds. Sortable, fixed-width, and filesystem-safe.
+/// A compact UTC timestamp `YYYYMMDD-HHMMSS` from Unix seconds, prefixed onto each
+/// uploaded filename ([`timestamped_filename`]). Sortable, fixed-width, filesystem-safe.
 pub fn compact_utc(unix_secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-/// Build the virtual *directory* a freshly-uploaded document is stored under, the
-/// uniform layout shared by every document tab:
-///   `<root>/<auto-group>/<timestamp>[/<subfolder>]`
-/// `prefix` is the `<root>/<auto-group>` from one of the `*_doc_location` helpers,
-/// `timestamp` is [`compact_utc`], and `subfolder` is the optional user level
-/// (slugged, omitted when blank). The caller appends the (user-controlled)
-/// filename via `vault::virtual_path`.
-pub fn doc_upload_dir(prefix: &str, timestamp: &str, subfolder: &str) -> String {
-    let mut dir = format!("{prefix}/{timestamp}");
+/// True if `s` is exactly a compact-UTC stamp `YYYYMMDD-HHMMSS` (8 digits, '-', 6 digits
+/// = 15 chars). Used by the throwaway migration to locate/recognize the upload timestamp
+/// in a stored path or filename prefix.
+pub fn is_compact_utc(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 15 && b[8] == b'-' && b[..8].iter().all(u8::is_ascii_digit) && b[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// Prefix an already-sanitized filename with the upload timestamp: `<ts>_<name>`.
+/// `name` must be [`doc_filename`] output (<=120 B sanitized); `ts` is [`compact_utc`]
+/// (15 B). The result is <=136 B for the last path component — well under MAX_PATH_LEN.
+pub fn timestamped_filename(ts: &str, name: &str) -> String {
+    format!("{ts}_{name}")
+}
+
+/// Build the virtual *directory* a freshly-uploaded document is filed under:
+///   `<prefix>[/<subfolder>]`
+/// `prefix` is the owner-first `[<INITIALS>/]<root>[/<group>]` (see [`owner_prefix`] plus
+/// the per-tab `*_doc_location` helpers); `subfolder` is the optional user level (slugged,
+/// omitted when blank). The per-upload timestamp is NOT a directory level any more — it is
+/// folded into the filename via [`timestamped_filename`]. The caller appends the filename
+/// with `vault::virtual_path`.
+pub fn doc_upload_dir(prefix: &str, subfolder: &str) -> String {
+    let mut dir = prefix.to_string();
     let sub = subfolder.trim();
     if !sub.is_empty() {
         dir.push('/');
@@ -1008,7 +1052,11 @@ pub struct Account {
 pub struct RealEstate {
     pub id: String,
     pub address: String,
-    pub ownership: String,
+    /// Who owns the property. Renamed from `ownership`; `#[serde(alias = "ownership")]`
+    /// keeps older vaults (whose JSON key is `ownership`) loadable with their value
+    /// intact — they re-save under `owner`. Also feeds the owner-first document folder.
+    #[serde(alias = "ownership")]
+    pub owner: String,
     pub taxes: String,
     pub hoa: String,
     pub income_account: String,
@@ -1395,7 +1443,7 @@ impl_record!(
     RealEstate,
     |s: &RealEstate, n: &RealEstate, at: i64, out: &mut Vec<Change>| {
         track(out, at, "address", &s.address, &n.address);
-        track(out, at, "ownership", &s.ownership, &n.ownership);
+        track(out, at, "owner", &s.owner, &n.owner);
         track(out, at, "taxes", &s.taxes, &n.taxes);
         track(out, at, "hoa", &s.hoa, &n.hoa);
         track(out, at, "income_account", &s.income_account, &n.income_account);
@@ -1433,7 +1481,7 @@ impl_record!(
         // ids), id, timestamps, and history are excluded.
         trim_strings_in_place(&mut [
             &mut r.address,
-            &mut r.ownership,
+            &mut r.owner,
             &mut r.taxes,
             &mut r.hoa,
             &mut r.income_account,
@@ -2533,13 +2581,13 @@ mod tests {
         let old = RealEstate::default();
         let mut new = old.clone();
         new.address = "1 A St".into();
-        new.ownership = "JT".into();
+        new.owner = "JT".into();
         new.taxes = "5000".into();
         new.income_account = "inc".into();
         new.financing_account = "fin".into();
         new.payment_account = "pay".into();
         let c = old.diff(&new, unix_now());
-        for field in ["address", "ownership", "taxes", "income_account", "financing_account", "payment_account"] {
+        for field in ["address", "owner", "taxes", "income_account", "financing_account", "payment_account"] {
             assert!(c.iter().any(|x| x.detail.contains(field)), "missing diff for {field}");
         }
     }
@@ -2552,7 +2600,7 @@ mod tests {
         let old = RealEstate::default();
         let mut n = old.clone();
         n.address = "a".into();
-        n.ownership = "b".into();
+        n.owner = "b".into();
         n.taxes = "c".into();
         n.hoa = "d".into();
         n.income_account = "e".into();
@@ -2743,16 +2791,54 @@ mod tests {
 
     #[test]
     fn doc_upload_dir_builds_the_uniform_layout() {
-        // <root>/<auto-group>/<timestamp>[/<subfolder>] — auto-group above timestamp.
+        // <prefix>[/<subfolder>] — the timestamp now lives in the filename, not a dir level.
         let prefix = tax_doc_location("2024"); // "taxes/2024"
-        assert_eq!(doc_upload_dir(&prefix, "20240102-030405", "federal"), "taxes/2024/20240102-030405/federal");
+        assert_eq!(doc_upload_dir(&prefix, "federal"), "taxes/2024/federal");
         // Blank subfolder is omitted entirely.
-        assert_eq!(doc_upload_dir(&prefix, "20240102-030405", "   "), "taxes/2024/20240102-030405");
+        assert_eq!(doc_upload_dir(&prefix, "   "), "taxes/2024");
         // Subfolder is slugged (no separators/traversal leak into the path).
-        assert_eq!(
-            doc_upload_dir("general-documents/passport", "20240102-030405", "../ids"),
-            "general-documents/passport/20240102-030405/ids"
-        );
+        assert_eq!(doc_upload_dir("general-documents/passport", "../ids"), "general-documents/passport/ids");
+    }
+
+    #[test]
+    fn owner_initials_takes_first_letter_of_each_word() {
+        assert_eq!(owner_initials("Jane Doe"), "JD");
+        assert_eq!(owner_initials("michael kaissi"), "MK");
+        assert_eq!(owner_initials("Michael and Sarah"), "MAS"); // no connector special-casing
+        assert_eq!(owner_initials("Michael & Sarah"), "MS"); // '&' has no alphanumeric -> skipped
+        assert_eq!(owner_initials("Joint"), "J");
+        assert_eq!(owner_initials("  spaced   out  "), "SO");
+        assert_eq!(owner_initials("(John) [Q] Public"), "JQP"); // first ALNUM of each word
+        assert_eq!(owner_initials(""), ""); // blank -> empty (caller omits the level)
+        assert_eq!(owner_initials("   "), "");
+        assert_eq!(owner_initials("a b c d e f g h i j"), "ABCDEFGH"); // capped at 8
+    }
+
+    #[test]
+    fn owner_prefix_is_owner_first_and_omits_blank() {
+        assert_eq!(owner_prefix(Some("Jane Doe"), "assets"), "JD/assets");
+        assert_eq!(owner_prefix(Some("Jane Doe"), "taxes/2024"), "JD/taxes/2024");
+        assert_eq!(owner_prefix(Some("  "), "assets"), "assets"); // blank owner -> no level
+        assert_eq!(owner_prefix(None, "trust-will/living-trust"), "trust-will/living-trust");
+    }
+
+    #[test]
+    fn is_compact_utc_matches_only_the_exact_stamp() {
+        assert!(is_compact_utc("20240102-030405"));
+        assert!(is_compact_utc("19700101-000000"));
+        assert!(!is_compact_utc("2024010-030405")); // too short
+        assert!(!is_compact_utc("20240102_030405")); // wrong separator
+        assert!(!is_compact_utc("2024010a-030405")); // non-digit before '-'
+        assert!(!is_compact_utc("20240102-03040")); // one char short
+        assert!(!is_compact_utc("20240102-030405x")); // trailing char (16 long)
+    }
+
+    #[test]
+    fn timestamped_filename_prefixes_with_underscore() {
+        assert_eq!(timestamped_filename("20240102-030405", "return.pdf"), "20240102-030405_return.pdf");
+        // Round-trips with is_compact_utc on the 15-char prefix (the migration's idempotency key).
+        let f = timestamped_filename(&compact_utc(0), "x.pdf");
+        assert!(is_compact_utc(&f[..15]) && f.as_bytes()[15] == b'_');
     }
 
     #[test]
@@ -3174,7 +3260,7 @@ mod tests {
         assert_wiped(acc, "Account");
 
         let mut re = RealEstate::default();
-        re.id = s(); re.address = s(); re.ownership = s(); re.taxes = s(); re.hoa = s();
+        re.id = s(); re.address = s(); re.owner = s(); re.taxes = s(); re.hoa = s();
         re.income_account = s(); re.financing_account = s(); re.payment_account = s();
         re.financing_balance = s();
         re.property_mgmt_url = s(); re.property_mgmt_username = s();
@@ -3288,12 +3374,12 @@ mod tests {
             prop_assert!(!f.starts_with('.') && !f.ends_with('.'));
         }
 
-        /// doc_upload_dir keeps the trusted root/timestamp prefix and never introduces
-        /// a space, traversal segment, or empty component — for ANY user subfolder.
+        /// doc_upload_dir keeps the trusted prefix and never introduces a space, traversal
+        /// segment, or empty component — for ANY user subfolder.
         #[test]
         fn prop_doc_upload_dir_is_safe(sub in ".*") {
-            let dir = doc_upload_dir("taxes/2024", "20240102-030405", &sub);
-            prop_assert!(dir.starts_with("taxes/2024/20240102-030405"));
+            let dir = doc_upload_dir("taxes/2024", &sub);
+            prop_assert!(dir.starts_with("taxes/2024"));
             prop_assert!(!dir.contains(' '));
             prop_assert!(!dir.contains("/../") && !dir.contains("/./") && !dir.ends_with("/.."));
             prop_assert!(dir.split('/').all(|c| !c.is_empty()));

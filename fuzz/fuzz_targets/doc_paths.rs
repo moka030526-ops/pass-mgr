@@ -33,9 +33,10 @@ fuzz_target!(|data: &[u8]| {
     );
     assert!(!fname.starts_with('.') && !fname.ends_with('.'), "no edge dot: {fname:?}");
 
-    // Full upload directory with a trusted root/timestamp prefix + the attacker subfolder.
-    let dir = doc_upload_dir("taxes/2024", "20240102-030405", &s);
-    assert!(dir.starts_with("taxes/2024/20240102-030405"), "prefix preserved: {dir:?}");
+    // Full upload directory with a trusted prefix + the attacker subfolder (timestamp now
+    // lives in the filename, not a dir level).
+    let dir = doc_upload_dir("taxes/2024", &s);
+    assert!(dir.starts_with("taxes/2024"), "prefix preserved: {dir:?}");
     assert!(!dir.contains(' '), "no space in dir: {dir:?}");
     assert!(!dir.contains("/../") && !dir.contains("/./") && !dir.ends_with("/.."), "no traversal: {dir:?}");
     for comp in dir.split('/') {

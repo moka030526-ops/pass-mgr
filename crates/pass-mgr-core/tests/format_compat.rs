@@ -87,7 +87,7 @@ fn taxes_and_expanded_real_estate_survive_save_and_reopen() {
         // ---- An expanded real-estate record: portals + balance + comments + doc ----
         let mut re = RealEstate::new().unwrap();
         re.address = "123 Main St".into();
-        re.ownership = "Joint".into();
+        re.owner = "Joint".into();
         re.financing_balance = "250000".into();
         re.comments = "tenant occupied through 2026".into();
         re.property_mgmt_url = "https://pm.example".into();
@@ -331,7 +331,7 @@ fn fully_populated_vault_round_trips_through_json() {
 
     let mut re = RealEstate::new().unwrap();
     re.address = "5 Round Trip Ln".into();
-    re.ownership = "Joint".into();
+    re.owner = "Joint".into();
     re.financing_balance = "750000".into();
     re.comments = "multi\nline\ncomment".into();
     re.property_mgmt_url = "https://pm.example".into();

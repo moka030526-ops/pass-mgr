@@ -111,20 +111,35 @@ Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
 **Multi-document records & the uniform path layout.** Trust&Will, Assets, and General
 Documents hold a *single* attached document (`file`/`statement`); the Taxes and Real
 Estate tabs hold *many* (`documents: Vec<String>`). Every tab files its uploads under
-one scheme — `<root>[/<auto-group>]/<timestamp>/[subfolder]/<filename>` — built by
-`records::doc_upload_dir(prefix, compact_utc(unix_now()), subfolder)` where `prefix`
-is the `<root>/<auto-group>` from a per-tab helper (`tax_doc_location` →
-`taxes/<year>`, `real_estate_doc_location` → `real-estate/<address>`,
-`trust_will_doc_location`, `general_doc_location`, and `asset_doc_location` →
-`assets`/`liabilities` — the record's *kind*, with **no** auto-group level). The
-auto-group keeps a record's documents clustered (Assets/Liabilities have none); the per-upload `compact_utc`
-timestamp makes each path unique; the user controls only the optional `subfolder` and
-the `filename`. `doc_slug` (auto-group + subfolder: lowercased ASCII-alphanumeric,
-`-`-separated, ≤40) and `doc_filename` (separators/control chars neutralized, ≤120,
-no `.`/`..`-only) are the sanitisation barrier — so no crafted year/address/title or
-user input can inject path separators or `..` traversal (`normalize_dir` downstream
-does not strip `..`); pinned by adversarial tests. Document bytes live in the
-encrypted volume; records hold only opaque doc-id references.
+one scheme — `[<owner-initials>/]<root>[/<group>][/<subfolder>]/<timestamp>_<filename>`
+— built by `records::doc_upload_dir(prefix, subfolder)` (which yields `<prefix>[/<sub>]`)
+plus `records::timestamped_filename(compact_utc(unix_now()), doc_filename(name))` for the
+filename. `prefix` is `records::owner_prefix(owner, base)`: records that have an owner
+(assets/liabilities, taxes, real-estate) file **owner-first** under the uppercased
+`owner_initials` (first letter of each word, ≤8); `base` is the per-tab `<root>[/<group>]`
+helper (`tax_doc_location` → `taxes/<year>`, `real_estate_doc_location` →
+`real-estate/<address>`, `trust_will_doc_location`, `general_doc_location`, and
+`asset_doc_location` → `assets`/`liabilities` by the record's *kind*, no group). The
+group clusters a record's documents; the `compact_utc` timestamp is folded into the
+**filename** (so each upload's path is unique); the user controls only the optional
+`subfolder` and the `filename`. `doc_slug` (initials/group/subfolder: ASCII, `-`-separated,
+≤40) and `doc_filename` (separators/control chars neutralized, ≤120, no `.`/`..`-only) are
+the sanitisation barrier — so no crafted year/address/title/owner or user input can inject
+path separators or `..` traversal (`normalize_dir` downstream does not strip `..`); pinned
+by adversarial tests. Document bytes live in the encrypted volume; records hold only opaque
+doc-id references (never the path), so reorganizing paths never touches `vault.pmv`'s
+record→doc links.
+
+**Throwaway path migration (`migrate-doc-paths`).** A one-shot CLI subcommand
+(`crates/pass-mgr-desktop/src/migrate_cli.rs` + `crates/pass-mgr-core/src/vault/migrate.rs`,
+both self-contained and deletable) rewrites an existing vault's stored document paths to the
+owner-first / ts-in-filename scheme, **deletes history** (per-record + the vault audit), and
+**compacts** the volume to shrink the vault. It re-`put`s each blob under its new path
+(same id + `uploaded_at`, so record links are untouched), then reuses `OpenVault::compact`
+for the atomic volume repack + history drop. It is idempotent (an already-migrated path maps
+to itself), backs up first by default (`--no-backup` to skip), and `--dry-run` previews every
+old→new path without writing. The id↔record linkage is invariant, so only the manifest and
+volume frames (which both embed the authenticated path) are rewritten, never the records.
 `vault::referenced_doc_ids` collects the ids from all of `TrustWill.file`,
 `Asset.statement`, every `Taxes`/`RealEstate` `documents`, and each
 `GeneralDocument.file`, so compaction never reclaims a live document and deletes

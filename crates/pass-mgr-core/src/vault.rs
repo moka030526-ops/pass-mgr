@@ -45,6 +45,10 @@ use crate::records::{self, Change, Vault};
 use crate::storage::{self, MAX_DOC_SIZE, ManifestEntry, StorageError, VolumeStore};
 use crate::types::TypeLists;
 
+// THROWAWAY: one-shot owner-first / ts-in-filename document-path migration + history
+// deletion + compaction. Delete this line and `src/vault/migrate.rs` to remove it.
+pub mod migrate;
+
 /// A decrypted document returned to the CLI: its manifest metadata plus its
 /// plaintext bytes (which wipe on drop).
 // `type` is an alias (a nickname for a longer type). A tuple `(A, B)` pairs two

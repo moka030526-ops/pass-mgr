@@ -308,7 +308,7 @@ fn map_real_estate(r: &records::RealEstate) -> RealEstate {
     RealEstate {
         id: r.id.clone(),
         address: r.address.clone(),
-        ownership: r.ownership.clone(),
+        ownership: r.owner.clone(),
         taxes: r.taxes.clone(),
         hoa: r.hoa.clone(),
         income_account: r.income_account.clone(),
@@ -700,7 +700,7 @@ mod tests {
 
         let mut re = records::RealEstate::new().unwrap();
         re.address = "123 Main St".into();
-        re.ownership = "Joint".into();
+        re.owner = "Joint".into();
         re.taxes = "6000/yr".into();
         re.hoa = "Sunset HOA".into();
         re.income_account = "rent-acct".into();

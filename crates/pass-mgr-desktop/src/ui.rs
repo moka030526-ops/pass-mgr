@@ -1861,7 +1861,7 @@ impl App {
                     r.created_at,
                     vec![
                         Field::text("Address", r.address.clone()),
-                        Field::text("Ownership", r.ownership.clone()),
+                        Field::text("Owner", r.owner.clone()),
                         Field::text("Taxes", r.taxes.clone()),
                         Field::text("HOA dues/info", r.hoa.clone()),
                         Field::text("Income account", r.income_account.clone()),
@@ -1933,7 +1933,8 @@ impl App {
         // the extra doc-upload inputs (so the two groups can be told apart later).
         let record_fields = fields.len();
         // Uniform document-upload inputs for every document-bearing tab. The stored
-        // location is auto-derived as <root>/<auto-group>/<timestamp>[/<subfolder>];
+        // location is auto-derived as [<owner-initials>/]<root>[/<group>][/<subfolder>],
+        // with the timestamp folded into the filename (<ts>_<file>);
         // the user controls only the filename and the optional subfolder. There is no
         // per-export path: Ctrl+E exports into the configured export directory (set in
         // Config), recreating the document's folder structure there. The multi-document
@@ -2188,21 +2189,25 @@ impl App {
             self.edit = Some(es);
             return;
         }
-        // The prefix comes from the record: Assets use the kind as the root
-        // (assets/liabilities, no auto-group); Trust&Will/General slug an auto-group from
-        // the identifying field. The user controls only the subfolder and filename. Build
-        // the uniform <root>[/<auto-group>]/<timestamp>[/<subfolder>] directory.
+        // Owner-first prefix: Assets nest under the owner's initials then the kind root
+        // (/<INITIALS>/assets|liabilities); Trust&Will/General have no owner and keep their
+        // slugged group. The user controls only the subfolder and filename. The timestamp is
+        // folded into the filename, so the directory is <prefix>[/<subfolder>].
         let prefix = match es.tab {
             Tab::TrustWill => records::trust_will_doc_location(&es.fields[0].value),
-            Tab::Assets => records::asset_doc_location(&es.fields[0].value), // fields[0] = Asset/Liability kind
+            Tab::Assets => records::owner_prefix(
+                Some(&es.fields[2].value),                          // fields[2] = Owner
+                &records::asset_doc_location(&es.fields[0].value),  // fields[0] = Asset/Liability kind
+            ),
             Tab::GeneralDocuments => records::general_doc_location(&es.fields[0].value),
             _ => {
                 self.edit = Some(es);
                 return;
             }
         };
-        let fname = records::doc_filename(&filename);
-        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
+        let ts = records::compact_utc(records::unix_now());
+        let fname = records::timestamped_filename(&ts, &records::doc_filename(&filename));
+        let location = records::doc_upload_dir(&prefix, &subfolder);
         // Reject an over-length virtual path up front (same limit the core
         // enforces) so the upload key gives a clear message, not a generic error.
         let vpath_len = crate::vault::virtual_path(&location, &fname).len();
@@ -2409,9 +2414,10 @@ impl App {
             self.edit = Some(es);
             return;
         }
-        let prefix = records::tax_doc_location(&year);
-        let fname = records::doc_filename(&filename);
-        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
+        let prefix = records::owner_prefix(Some(&es.fields[0].value), &records::tax_doc_location(&year)); // fields[0] = Owner
+        let ts = records::compact_utc(records::unix_now());
+        let fname = records::timestamped_filename(&ts, &records::doc_filename(&filename));
+        let location = records::doc_upload_dir(&prefix, &subfolder);
         let vpath_len = crate::vault::virtual_path(&location, &fname).len();
         if vpath_len > crate::storage::MAX_PATH_LEN {
             self.status =
@@ -2529,9 +2535,10 @@ impl App {
             self.edit = Some(es);
             return;
         }
-        let prefix = records::real_estate_doc_location(&address);
-        let fname = records::doc_filename(&filename);
-        let location = records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &subfolder);
+        let prefix = records::owner_prefix(Some(&es.fields[1].value), &records::real_estate_doc_location(&address)); // fields[1] = Owner
+        let ts = records::compact_utc(records::unix_now());
+        let fname = records::timestamped_filename(&ts, &records::doc_filename(&filename));
+        let location = records::doc_upload_dir(&prefix, &subfolder);
         let vpath_len = crate::vault::virtual_path(&location, &fname).len();
         if vpath_len > crate::storage::MAX_PATH_LEN {
             self.status =
@@ -2700,7 +2707,7 @@ impl App {
                 r.id = id;
                 r.created_at = es.created_at;
                 r.address = f(0);
-                r.ownership = f(1);
+                r.owner = f(1);
                 r.taxes = f(2);
                 r.hoa = f(3);
                 r.income_account = f(4);
@@ -3732,7 +3739,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
                     es.tax_docs.len(),
                     records::tax_doc_location(&es.fields[1].value) // field 1 is Filing year (field 0 is Owner)
                 ),
@@ -3752,7 +3759,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
                     es.re_docs.len(),
                     records::real_estate_doc_location(&es.fields[0].value)
                 ),
@@ -4796,15 +4803,20 @@ mod tests {
         assert!(id.is_some(), "attached; status: {}", app.status);
         let id = id.unwrap();
 
-        // Uniform layout: /general-documents/<title>/<timestamp>/<subfolder>/<filename>
-        // (virtual paths are normalized with a leading slash).
+        // Uniform layout: /general-documents/<title>/<subfolder>/<ts>_<filename>
+        // (no owner on this tab; the timestamp is folded into the filename).
         let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
         let parts: Vec<&str> = vpath.trim_start_matches('/').split('/').collect();
+        assert_eq!(parts.len(), 4, "no timestamp folder level anymore: {vpath}");
         assert_eq!(parts[0], "general-documents");
         assert_eq!(parts[1], "passport", "auto-group from title");
-        assert_eq!(parts[2].len(), 15, "timestamp folder YYYYMMDD-HHMMSS, got {:?}", parts.get(2));
-        assert_eq!(parts[3], "ids", "user subfolder");
-        assert_eq!(parts[4], "passport.pdf", "user filename");
+        assert_eq!(parts[2], "ids", "user subfolder");
+        let fname = parts[3];
+        assert!(fname.ends_with("_passport.pdf"), "user filename, got {fname}");
+        assert!(
+            records::is_compact_utc(&fname[..15]) && fname.as_bytes()[15] == b'_',
+            "filename carries the timestamp prefix, got {fname}"
+        );
 
         // Export into the configured export dir, recreating the volume folder structure.
         let export_root = dir.join("exports");
@@ -5004,7 +5016,7 @@ mod tests {
         assert_eq!(app.edit.as_ref().unwrap().re_docs.len(), 1, "uploaded with defaulted filename (status: {})", app.status);
         let id = app.edit.as_ref().unwrap().re_docs[0].clone();
         let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
-        assert!(vpath.ends_with("/Deed.PDF"), "empty filename used the source basename: {vpath}");
+        assert!(vpath.ends_with("_Deed.PDF"), "empty filename used the source basename: {vpath}");
         cleanup(&path);
     }
 

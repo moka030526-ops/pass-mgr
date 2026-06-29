@@ -28,6 +28,7 @@ fn help_lists_every_subcommand_and_exits_zero() {
         "import-tree",
         "update-from",
         "compact",
+        "migrate-doc-paths",
         "--write",
         "--tui",
     ] {

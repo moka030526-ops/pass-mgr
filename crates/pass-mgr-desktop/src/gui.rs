@@ -561,8 +561,9 @@ struct GuiApp {
     /// each time the Config screen is opened.
     cfg_redundancy: u32,
     // Shared document-attach input buffers. The storage location is auto-derived
-    // (<root>/<auto-group>/<timestamp>/[subfolder]); the user controls only the
-    // optional subfolder and the filename.
+    // ([<owner-initials>/]<root>[/<group>][/subfolder], timestamp folded into the
+    // filename as <ts>_<file>); the user controls only the optional subfolder and the
+    // filename.
     doc_subfolder: String,
     doc_filename: String,
     doc_source: String,
@@ -3033,7 +3034,7 @@ impl GuiApp {
                 // scroll nothing, while the outer area never saw the event.
                 egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     text_row(ui, "Address", &mut r.address, writable);
-                    text_row(ui, "Ownership", &mut r.ownership, writable);
+                    text_row(ui, "Owner", &mut r.owner, writable);
                     text_row(ui, "Taxes", &mut r.taxes, writable);
                     text_row(ui, "HOA dues / info", &mut r.hoa, writable);
                     text_row(ui, "Income account", &mut r.income_account, writable);
@@ -3053,7 +3054,7 @@ impl GuiApp {
 
                 ui.separator();
                 ui.label(format!(
-                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
                     r.documents.len(),
                     records::real_estate_doc_location(&r.address)
                 ));
@@ -3160,9 +3161,9 @@ impl GuiApp {
                 field_multiline(ui, &mut r.notes, writable, 4);
                 ui.separator();
 
-                // Attached documents — all live under taxes/<year>/<timestamp>/…
+                // Attached documents — all live under <owner>/taxes/<year>/…/<ts>_<file>
                 ui.label(format!(
-                    "Documents ({}) — under {}/<timestamp>/[subfolder]/",
+                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
                     r.documents.len(),
                     records::tax_doc_location(&r.year)
                 ));
@@ -3238,10 +3239,13 @@ impl GuiApp {
                     return;
                 }
                 let address = self.edit_realestate.as_ref().map(|r| r.address.clone()).unwrap_or_default();
-                let prefix = records::real_estate_doc_location(&address);
-                let name = records::doc_filename(&name);
-                let loc =
-                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
+                let prefix = records::owner_prefix(
+                    self.edit_realestate.as_ref().map(|r| r.owner.as_str()),
+                    &records::real_estate_doc_location(&address),
+                );
+                let ts = records::compact_utc(records::unix_now());
+                let name = records::timestamped_filename(&ts, &records::doc_filename(&name));
+                let loc = records::doc_upload_dir(&prefix, &self.doc_subfolder);
                 let vpath = vault::virtual_path(&loc, &name);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
@@ -3361,25 +3365,25 @@ impl GuiApp {
                     self.status = "Filename is required (the source path has no file name).".into();
                     return;
                 }
-                // The prefix comes from the record: Assets use the kind as the root
-                // (assets/liabilities, no auto-group); Trust&Will/General slug an auto-group
-                // from the identifying field. The user controls only the subfolder and
-                // filename. Build the uniform <root>[/<auto-group>]/<timestamp>[/<subfolder>]
-                // directory.
+                // Owner-first prefix: Assets nest under the owner initials + kind root
+                // (/<INITIALS>/assets|liabilities); Trust&Will/General have no owner and keep
+                // their slugged group. The timestamp is folded into the filename, so the
+                // directory is <prefix>[/<subfolder>].
                 let prefix = match target {
                     DocTarget::TrustWill => records::trust_will_doc_location(
                         self.edit_trustwill.as_ref().map(|r| r.document.as_str()).unwrap_or(""),
                     ),
-                    DocTarget::Asset => records::asset_doc_location(
-                        self.edit_asset.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
+                    DocTarget::Asset => records::owner_prefix(
+                        self.edit_asset.as_ref().map(|r| r.owner.as_str()),
+                        &records::asset_doc_location(self.edit_asset.as_ref().map(|r| r.kind.as_str()).unwrap_or("")),
                     ),
                     DocTarget::General => records::general_doc_location(
                         self.edit_general.as_ref().map(|r| r.title.as_str()).unwrap_or(""),
                     ),
                 };
-                let fname = records::doc_filename(&name);
-                let loc =
-                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
+                let ts = records::compact_utc(records::unix_now());
+                let fname = records::timestamped_filename(&ts, &records::doc_filename(&name));
+                let loc = records::doc_upload_dir(&prefix, &self.doc_subfolder);
                 let vpath = vault::virtual_path(&loc, &fname);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
@@ -3522,10 +3526,13 @@ impl GuiApp {
                 }
                 // The folder is derived from the filing year, NOT user-entered.
                 let year = self.edit_taxfiling.as_ref().map(|r| r.year.clone()).unwrap_or_default();
-                let prefix = records::tax_doc_location(&year);
-                let name = records::doc_filename(&name);
-                let loc =
-                    records::doc_upload_dir(&prefix, &records::compact_utc(records::unix_now()), &self.doc_subfolder);
+                let prefix = records::owner_prefix(
+                    self.edit_taxfiling.as_ref().map(|r| r.owner.as_str()),
+                    &records::tax_doc_location(&year),
+                );
+                let ts = records::compact_utc(records::unix_now());
+                let name = records::timestamped_filename(&ts, &records::doc_filename(&name));
+                let loc = records::doc_upload_dir(&prefix, &self.doc_subfolder);
                 let vpath = vault::virtual_path(&loc, &name);
                 if vpath.len() > crate::storage::MAX_PATH_LEN {
                     self.status = format!(
@@ -4225,8 +4232,9 @@ fn doc_section(
             ui.end_row();
         });
         // Approximate the virtual path length: the stored path also includes the
-        // auto-group and timestamp levels (~80 bytes, not visible here), so reserve
-        // for them. `handle_doc`/`handle_*_doc` do the authoritative check on write.
+        // owner-initials/group levels and the <ts>_ filename prefix (~80 bytes, not
+        // visible here), so reserve for them. `handle_doc`/`handle_*_doc` do the
+        // authoritative check on write.
         let vpath_len = vault::virtual_path(subfolder, filename).len() + 80;
         let over_limit = vpath_len > crate::storage::MAX_PATH_LEN;
         if over_limit {
@@ -4740,10 +4748,10 @@ mod tests {
             Some(id.as_str()),
             "persisted"
         );
-        // Uniform layout: /general-documents/<title>/<timestamp>/<subfolder>/<filename>.
+        // Uniform layout: /general-documents/<title>/<subfolder>/<ts>_<filename>.
         let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
-        assert!(vpath.trim_start_matches('/').starts_with("general-documents/passport/"), "got {vpath}");
-        assert!(vpath.ends_with("/ids/p.pdf"), "got {vpath}");
+        assert!(vpath.trim_start_matches('/').starts_with("general-documents/passport/ids/"), "got {vpath}");
+        assert!(vpath.ends_with("_p.pdf"), "ts-prefixed filename, got {vpath}");
 
         // Export goes to the configured export dir, recreating the volume folder structure.
         let export_root = dir.join("exports");
@@ -4839,7 +4847,7 @@ mod tests {
         app.handle_doc(DocReq::Attach, DocTarget::General);
         let id = app.edit_general.as_ref().unwrap().file.clone().expect("uploaded (status: ");
         let vpath = app.vault.as_ref().unwrap().doc_path(&id).unwrap();
-        assert!(vpath.ends_with("/MyDeed.PDF"), "empty filename falls back to the source basename: {vpath}");
+        assert!(vpath.ends_with("_MyDeed.PDF"), "empty filename falls back to the source basename: {vpath}");
         cleanup(&path);
     }
 

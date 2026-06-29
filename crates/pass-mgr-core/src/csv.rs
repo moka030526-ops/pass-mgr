@@ -170,7 +170,7 @@ pub fn real_estate_csv(rows: &[RealEstate], name_of: impl Fn(&str) -> String) ->
     row(
         &mut out,
         &[
-            "id", "address", "ownership", "taxes", "hoa", "income_account", "financing_account",
+            "id", "address", "owner", "taxes", "hoa", "income_account", "financing_account",
             "payment_account", "financing_balance", "property_mgmt_url", "property_mgmt_username",
             "property_mgmt_password", "property_mgmt_comment", "insurance_url", "insurance_username",
             "insurance_password", "insurance_comment", "hoa_url", "hoa_username", "hoa_password",
@@ -185,7 +185,7 @@ pub fn real_estate_csv(rows: &[RealEstate], name_of: impl Fn(&str) -> String) ->
         row(
             &mut out,
             &[
-                &r.id, &r.address, &r.ownership, &r.taxes, &r.hoa, &r.income_account,
+                &r.id, &r.address, &r.owner, &r.taxes, &r.hoa, &r.income_account,
                 &r.financing_account, &r.payment_account, &r.financing_balance, &r.property_mgmt_url,
                 &r.property_mgmt_username, &r.property_mgmt_password, &r.property_mgmt_comment,
                 &r.insurance_url, &r.insurance_username, &r.insurance_password, &r.insurance_comment,

@@ -62,6 +62,10 @@ use pass_mgr::{ui, vault};
 #[cfg(feature = "gui")]
 use pass_mgr::gui;
 
+// THROWAWAY: the one-shot `migrate-doc-paths` subcommand. Delete this line, its dispatch
+// arm, and `src/migrate_cli.rs` to remove the feature.
+mod migrate_cli;
+
 // `const` is a compile-time constant. `&str` is a borrowed string slice (a view
 // into text); this one points at a string literal baked into the binary. The
 // leading `\` on the first line is a line-continuation that swallows the newline.
@@ -113,6 +117,14 @@ USAGE:
                                       --backup DEST (where to back up; must be outside DIR),
                                       --no-backup (skip the pre-compaction backup).
                                     The vault-level audit log is always preserved.
+    pass-mgr migrate-doc-paths [DIR]
+                                    One-shot migration of stored document paths to the
+                                    owner-first layout (/<owner-initials>/<type>/…) with the
+                                    timestamp folded into the filename (<ts>_<file>). Also
+                                    DELETES all history and compacts the volume to shrink the
+                                    vault. Writable; backs up first by default. Options:
+                                      --dry-run (preview old->new paths, no changes),
+                                      --no-backup (skip the pre-migration backup).
     pass-mgr --help                 Show this help
 
 The vault is protected by two passwords entered in sequence. The interactive UI
@@ -202,6 +214,12 @@ impl CompactFlags {
             && !self.history_all
             && !self.no_backup
             && self.backup_dest.is_none()
+    }
+
+    /// True when only `--dry-run` and/or `--no-backup` are present (the compact-set subset the
+    /// THROWAWAY `migrate-doc-paths` command accepts). Delete with that command.
+    fn is_only_dry_run_or_no_backup(&self) -> bool {
+        !self.volume && !self.json && self.history_before.is_none() && !self.history_all && self.backup_dest.is_none()
     }
 }
 
@@ -307,7 +325,9 @@ fn main() -> ExitCode {
         // `update-from` reuses --dry-run for its preview; allow exactly that (and nothing
         // else from the compact set) for that command, but reject every other combination.
         let update_from_dry_run = cmd == Some("update-from") && cflags.is_only_dry_run();
-        if !update_from_dry_run {
+        // THROWAWAY: migrate-doc-paths accepts --dry-run and/or --no-backup (delete with it).
+        let migrate_ok = cmd == Some("migrate-doc-paths") && cflags.is_only_dry_run_or_no_backup();
+        if !(update_from_dry_run || migrate_ok) {
             eprintln!(
                 "pass-mgr error: --volume/--json/--history-before/--history-all/--backup/--no-backup only apply to 'compact'; --dry-run also applies to 'update-from'"
             );
@@ -393,6 +413,8 @@ fn main() -> ExitCode {
         },
         // `compact [DIR] <flags>` — reclaim dead volume bytes and/or trim history.
         Some("compact") => cli_compact(&pos, &cflags),
+        // THROWAWAY: `migrate-doc-paths [DIR]` — owner-first path migration + history drop + compact.
+        Some("migrate-doc-paths") => migrate_cli::run(&pos, &cflags),
         // Otherwise the (optional) positional argument is the vault directory for
         // the interactive UI (graphical by default, terminal with --tui). In a build
         // without the `gui` feature there is no graphical UI, so always run the TUI.
