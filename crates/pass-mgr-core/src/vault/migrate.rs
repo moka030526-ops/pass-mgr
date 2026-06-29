@@ -89,10 +89,12 @@ fn new_doc_path(old_path: &str, target: &DocTarget, uploaded_at: i64) -> String 
             virtual_path(&prefix, &filename)
         }
         DocTarget::Plain => {
-            // Keep the existing directories, removing ONLY the single component used as the
-            // timestamp source (so a legitimately ts-shaped subfolder name is preserved).
-            let kept: Vec<&str> =
-                dirs.iter().copied().enumerate().filter(|(i, _)| Some(*i) != ts_dir_idx).map(|(_, c)| c).collect();
+            // Drop ALL timestamp-shaped directory components (not just the ts source) so the result
+            // is idempotent even for a pathological path with two ts-shaped dirs. A user subfolder
+            // named exactly like a valid YYYYMMDD-HHMMSS stamp is astronomically unlikely (and the
+            // app only ever creates ONE ts dir), so dropping it in this one-shot reorganizing
+            // migration is harmless. `ts_dir_idx` above still picks the ts SOURCE.
+            let kept: Vec<&str> = dirs.iter().copied().filter(|c| !records::is_compact_utc(c)).collect();
             virtual_path(&kept.join("/"), &filename)
         }
     }

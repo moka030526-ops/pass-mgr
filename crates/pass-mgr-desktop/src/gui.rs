@@ -3633,14 +3633,18 @@ impl GuiApp {
                     // `None` behind (so the form clears after deletion) and giving
                     // us owned `r` to read its id.
                     if let Some(r) = self.edit_instruction.take() {
-                        records::remove(&mut v.instructions, &r.id, &mut v.audit, "Instruction");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.instructions.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_instruction = Some(r);
-                        }));
+                        // Only arm the rollback when a record was ACTUALLY removed. A New-but-
+                        // never-saved record isn't in the list (remove is a no-op), so the rollback
+                        // must NOT resurrect it on a persist failure — the user is discarding it.
+                        if records::remove(&mut v.instructions, &r.id, &mut v.audit, "Instruction") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.instructions.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_instruction = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::TrustWill => {
@@ -3648,14 +3652,15 @@ impl GuiApp {
                         if let Some(f) = &r.file {
                             doc_ids.push(f.clone());
                         }
-                        records::remove(&mut v.trust_wills, &r.id, &mut v.audit, "Trust/Will");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.trust_wills.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_trustwill = Some(r);
-                        }));
+                        if records::remove(&mut v.trust_wills, &r.id, &mut v.audit, "Trust/Will") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.trust_wills.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_trustwill = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::Assets => {
@@ -3663,26 +3668,28 @@ impl GuiApp {
                         if let Some(f) = &r.statement {
                             doc_ids.push(f.clone());
                         }
-                        records::remove(&mut v.assets, &r.id, &mut v.audit, "Asset/Liability");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.assets.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_asset = Some(r);
-                        }));
+                        if records::remove(&mut v.assets, &r.id, &mut v.audit, "Asset/Liability") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.assets.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_asset = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::Accounts => {
                     if let Some(r) = self.edit_account.take() {
-                        records::remove(&mut v.accounts, &r.id, &mut v.audit, "Account");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.accounts.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_account = Some(r);
-                        }));
+                        if records::remove(&mut v.accounts, &r.id, &mut v.audit, "Account") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.accounts.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_account = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::RealEstate => {
@@ -3691,14 +3698,15 @@ impl GuiApp {
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
-                        records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.real_estate.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_realestate = Some(r);
-                        }));
+                        if records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.real_estate.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_realestate = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::Taxes => {
@@ -3707,14 +3715,15 @@ impl GuiApp {
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
-                        records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.tax_filings.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_taxfiling = Some(r);
-                        }));
+                        if records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.tax_filings.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_taxfiling = Some(r);
+                            }));
+                        }
                     }
                 }
                 Tab::GeneralDocuments => {
@@ -3722,14 +3731,15 @@ impl GuiApp {
                         if let Some(f) = &r.file {
                             doc_ids.push(f.clone());
                         }
-                        records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document");
-                        rollback = Some(Box::new(move |s: &mut Self| {
-                            if let Some(ov) = s.vault.as_mut() {
-                                ov.vault.audit.truncate(audit_len);
-                                ov.vault.general_documents.push(r.clone()); // verbatim: keep original updated_at + history
-                            }
-                            s.edit_general = Some(r);
-                        }));
+                        if records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    ov.vault.general_documents.push(r.clone()); // verbatim: keep updated_at + history
+                                }
+                                s.edit_general = Some(r);
+                            }));
+                        }
                     }
                 }
                 // The Summary tab is read-only (no records of its own), so it never deletes.
