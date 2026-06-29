@@ -51,6 +51,23 @@ pub(crate) fn copy_secret_to_clipboard(text: &str) -> Result<(), arboard::Error>
     }
 }
 
+/// Copy a NON-secret (a URL or username) into the OS clipboard. Unlike
+/// [`copy_secret_to_clipboard`] this is a plain `set_text` on every platform: no
+/// `exclude_from_history` hint (a non-secret belongs in normal clipboard history so
+/// a clipboard manager can keep it) and the caller schedules NO auto-clear timer.
+/// Kept separate from the secret path so the two security contracts never blur: a
+/// password is always history-excluded + auto-cleared, a URL/username never is.
+///
+/// Gated on `gui` (which implies `clipboard`), not `clipboard`, because only the egui
+/// GUI has the URL/username copy buttons — the TUI copies via Ctrl+Y, which targets
+/// the password (secret) field. Gating on `clipboard` alone would make this dead code
+/// in a `clipboard`-without-`gui` build (e.g. the minimal TUI with OS-copy added back).
+#[cfg(feature = "gui")]
+pub(crate) fn copy_plain_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+    let mut cb = arboard::Clipboard::new()?;
+    cb.set_text(text.to_owned())
+}
+
 /// Pure decision for the clipboard auto-clear "tick", shared by the TUI (`ui.rs`) and
 /// GUI (`gui.rs`) so both obey the SAME security-relevant contract. Given the pending
 /// wipe `deadline` (if any), the current time `now`, and the current `status` line:

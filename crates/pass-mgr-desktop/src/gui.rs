@@ -2826,6 +2826,10 @@ impl GuiApp {
         // Deferred password-copy: `None` unless the user clicks copy, in which
         // case it holds the secret in a self-wiping `Zeroizing<String>`.
         let mut copy_pw: Option<Zeroizing<String>> = None;
+        // Deferred plain-copy for the non-secret URL / username buttons (acted on after
+        // rendering, like `copy_pw`, so the clipboard call sits outside the `self` borrow
+        // held by the form). A plain `String` — these are not secrets, so no zeroizing.
+        let mut copy_plain: Option<String> = None;
         // Subtypes for the record under edit, looked up from the vault's category lists
         // before the mutable borrow of `edit_account` below. The record's current subtype is
         // kept selectable even when off-list — `combo` prepends the current value, so no
@@ -2884,7 +2888,14 @@ impl GuiApp {
                     field_singleline(ui, &mut r.owner, w, 420.0);
                     ui.end_row();
                     ui.label("Username");
-                    field_singleline(ui, &mut r.username, w, 420.0);
+                    ui.horizontal(|ui| {
+                        field_singleline(ui, &mut r.username, w, 380.0);
+                        // Copy is a read, so it stays available even in read-only mode;
+                        // disabled only when the field is empty (nothing to copy).
+                        if ui.add_enabled(!r.username.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
+                            copy_plain = Some(r.username.clone());
+                        }
+                    });
                     ui.end_row();
                     ui.label("Password");
                     ui.horizontal(|ui| {
@@ -2905,7 +2916,12 @@ impl GuiApp {
                     });
                     ui.end_row();
                     ui.label("URL");
-                    field_singleline(ui, &mut r.url, w, 420.0);
+                    ui.horizontal(|ui| {
+                        field_singleline(ui, &mut r.url, w, 380.0);
+                        if ui.add_enabled(!r.url.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
+                            copy_plain = Some(r.url.clone());
+                        }
+                    });
                     ui.end_row();
                     ui.label("Closed as of");
                     field_singleline_hint(ui, &mut r.closed_as_of, w, 420.0, "YYYY-MM-DD");
@@ -2964,6 +2980,9 @@ impl GuiApp {
         if let Some(pw) = copy_pw {
             // `pw` is moved into the call and wiped when it drops there.
             self.copy_to_clipboard(pw);
+        }
+        if let Some(text) = copy_plain {
+            self.copy_plain(&text);
         }
         match action {
             FormAction::Save => {
@@ -3772,6 +3791,23 @@ impl GuiApp {
                 self.clipboard_dirty = true;
                 self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
                 self.status = "Copied (clipboard auto-clears in 15s, and on exit).".into();
+            }
+            Err(e) => self.fail(format!("Clipboard unavailable: {e}")),
+        }
+    }
+
+    /// Copy a NON-secret (a URL or username) to the OS clipboard. Unlike
+    /// [`Self::copy_to_clipboard`] this schedules NO 15 s auto-clear and uses the plain
+    /// (history-kept) clipboard path. The fresh non-secret has just overwritten whatever
+    /// was on the clipboard, so any pending secret auto-clear is cancelled and the dirty
+    /// flag cleared: there is no longer a copied password to wipe, and leaving the timer
+    /// armed would blank the user's freshly copied URL/username 15 s later.
+    fn copy_plain(&mut self, text: &str) {
+        match crate::copy_plain_to_clipboard(text) {
+            Ok(()) => {
+                self.clipboard_dirty = false;
+                self.clipboard_clear_at = None;
+                self.status = "Copied.".into();
             }
             Err(e) => self.fail(format!("Clipboard unavailable: {e}")),
         }

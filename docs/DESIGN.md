@@ -788,6 +788,24 @@ with every app and may be synced by the OS. We mitigate by offering a "clear
 clipboard" action, but cannot guarantee the OS hasn't already captured it. See
 §9.3.
 
+**Two clipboard paths, two contracts.** The Accounts form (egui GUI) offers a 📋 copy
+button on the **password**, the **username**, and the **URL**. These deliberately take
+*different* clipboard paths so the security contracts never blur:
+
+- **Password (a secret)** → `copy_secret_to_clipboard` + `copy_to_clipboard`: the Linux
+  history-exclusion hint (`x-kde-passwordManagerHint`, honoured by klipper/GPaste/clipman)
+  so clipboard managers don't log it, **plus** a 15 s auto-clear timer and an on-exit wipe
+  (`clipboard_dirty`). This is the same path Ctrl+Y uses in the TUI.
+- **Username / URL (not secrets)** → `copy_plain_to_clipboard` + `copy_plain`: a plain
+  `set_text` (no history exclusion — a non-secret belongs in normal clipboard history so a
+  manager can keep it) and **no** auto-clear. Because the plain copy has just overwritten
+  whatever was on the clipboard, it also **cancels** any pending password auto-clear and
+  clears `clipboard_dirty`: there is no longer a copied secret to wipe, and leaving the
+  timer armed would blank the user's freshly copied URL/username 15 s later. The copy
+  button is disabled when its field is empty, and is available in read-only mode (a copy is
+  a read, not an edit). The TUI has no plain-copy button — its Ctrl+Y targets the password
+  field only — so `copy_plain_to_clipboard` is gated on the `gui` feature.
+
 ## 8. Threat model
 
 **Adversary.** Someone who can read and/or write the on-disk vault *directory*
