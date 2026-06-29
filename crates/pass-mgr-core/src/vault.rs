@@ -475,12 +475,22 @@ impl OpenVault {
         // `let _ =` discards the Result: if this write fails we still hand back the
         // opened vault (the refresh is non-essential). When we recovered from a
         // redundant copy, this same save also HEALS the live tree — it rewrites a
-        // fresh `vault.pmv` (+ mirror) from the recovered state. On a heal we pass
-        // `rotate_ring=false` so the corrupt outgoing primary is NOT ringed into a
-        // generation slot (it would otherwise void that slot with un-decryptable bytes).
+        // fresh `vault.pmv` (+ mirror) from the recovered state.
+        //
+        // This open-time save passes `rotate_ring=false` and so NEVER rotates the
+        // redundancy ring (§12.8). It only refreshes `last_opened_at` (and, on a
+        // recovery, heals the primary) — it never reflects a user content edit, so it
+        // must not consume a "prior generation" slot. Rotating here (the prior behavior)
+        // ringed the outgoing primary on *every* writable open; because `last_opened_at`
+        // is refreshed just above, the bytes always differ, so a couple of routine no-edit
+        // opens silently overwrote the whole ring with copies of the current state —
+        // eroding the advertised undo/rollback depth the user opted into (audit M1, the
+        // owner's non-destructive guarantee). The heal case already required false (its
+        // outgoing primary is the corrupt file we recovered around); a normal open wants
+        // false for the same net reason — no real generation is being superseded. A
+        // genuine `save()` (an actual edit) still rotates via `rotate_ring=true`.
         if !read_only {
-            let rotate_ring = open.recovery_notice.is_none();
-            let _ = open.save_internal(rotate_ring);
+            let _ = open.save_internal(false);
         }
         Ok(open)
     }
@@ -607,7 +617,7 @@ impl OpenVault {
                 // Human-browsable copy at the document's virtual-path tree (like `extract`). The
                 // canonical round-trip source remains the id-keyed volume/ above, because two docs
                 // may legitimately share a virtual path (so a pure path-tree can't round-trip them).
-                let tree_dest = unique_export_path(docs_dir.join(doc_tree_relpath(&e.path, &e.id)));
+                let tree_dest = unique_export_path(docs_dir.join(doc_tree_relpath(&e.path, &e.id)), Some(&e.id));
                 if let Some(parent) = tree_dest.parent() {
                     reject_symlinked_descendants(out, parent)?; // no symlink redirect out of `out`
                     fs::create_dir_all(parent)?;
@@ -1346,7 +1356,7 @@ impl OpenVault {
             fs::create_dir_all(parent)?;
             harden_dir(parent);
         }
-        let dest = unique_export_path(dest); // never overwrite an existing export
+        let dest = unique_export_path(dest, None); // never overwrite an existing export
         write_new_bytes(&dest, &data)?;
         sync_parent_dir(&dest); // dir entry durable too (best-effort; no-op off unix), like CSV export
         Ok(dest)
@@ -2953,7 +2963,7 @@ fn write_new_file(path: &Path, part1: &[u8], part2: &[u8]) -> Result<(), VaultEr
 /// partial file on a write error. Shared by `export_document` and the CLI.
 /// Return `p` if it does not exist, else a sibling with a `_N` suffix, so an export
 /// never silently overwrites an existing file (mirrors the CLI extract's behaviour).
-fn unique_export_path(p: PathBuf) -> PathBuf {
+fn unique_export_path(p: PathBuf, fallback_token: Option<&str>) -> PathBuf {
     if !p.exists() {
         return p;
     }
@@ -2966,7 +2976,19 @@ fn unique_export_path(p: PathBuf) -> PathBuf {
             return cand;
         }
     }
-    p // pathological fallback: let the O_EXCL write surface the collision as an error
+    // Range exhausted: >10000 files already share this name. If the caller supplied a
+    // guaranteed-unique token (a document id), disambiguate with it so an O_EXCL create
+    // can't EEXIST and abort the whole export (audit L2) — the human documents/ tree is
+    // cosmetic, but its failure used to propagate via `?` and strand the already-written
+    // plaintext. Without a token, fall back to the colliding path and let the write
+    // surface the collision as an error (the prior behavior for the other callers).
+    match fallback_token {
+        Some(t) => {
+            let cand = parent.join(format!("{stem}_{t}{ext}"));
+            if cand.exists() { p } else { cand }
+        }
+        None => p,
+    }
 }
 
 /// Write `data` to `<dir>/<filename>`, creating `dir` (and parents) if missing, NEVER
@@ -2977,7 +2999,7 @@ fn unique_export_path(p: PathBuf) -> PathBuf {
 pub fn write_export_bytes(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, VaultError> {
     fs::create_dir_all(dir)?;
     harden_dir(dir); // best-effort 0700 on the export dir (no-op off unix)
-    let path = unique_export_path(dir.join(filename));
+    let path = unique_export_path(dir.join(filename), None);
     write_new_bytes(&path, data)?;
     // Make the freshly-created file's directory entry durable too — the contents are
     // fsync'd in write_new_bytes, but without this the link can be lost on power loss
@@ -3997,6 +4019,59 @@ mod tests {
         assert_eq!(gen_of(&mirror_path(&path)), prim, "mirror == current generation (lossless)");
         assert_eq!(gen_of(&bak_path(&path, 1)), prim - 1, "bak1 == previous generation");
         assert_eq!(gen_of(&bak_path(&path, 2)), prim - 2, "bak2 == two generations back");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn no_edit_reopen_preserves_prior_generations() {
+        // Audit M1 regression: a writable open does a metadata-only `last_opened_at`
+        // refresh (open_inner), which must NOT rotate the redundancy ring. Otherwise
+        // routine no-edit opens overwrite the "prior generations" (the undo/rollback
+        // depth, §12.8) with copies of the current state, silently eroding the depth the
+        // user opted into.
+        let path = tmp_path("rednoedit");
+        let mut v = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        for i in 0..3 {
+            records::upsert(&mut v.vault.accounts, sample_account(&format!("u{i}"), "p"));
+            v.save().unwrap();
+        }
+        drop(v);
+        // Decode each retained generation's account set.
+        let accts = |p: &Path| {
+            let raw = read_capped_vault(p).unwrap();
+            let mut u: Vec<String> = decode_vault_bytes(&raw, b"a", b"b")
+                .unwrap()
+                .0
+                .accounts
+                .iter()
+                .map(|a| a.username.clone())
+                .collect();
+            u.sort();
+            u
+        };
+        let bak1_before = accts(&bak_path(&path, 1));
+        let bak2_before = accts(&bak_path(&path, 2));
+        // bak2 is the OLDEST retained generation — a genuinely older (smaller) state here.
+        assert!(
+            bak2_before.len() < bak1_before.len(),
+            "precondition: bak2 ({:?}) is an older generation than bak1 ({:?})",
+            bak2_before,
+            bak1_before
+        );
+        // Re-open the HEALTHY vault several times with NO edits.
+        for _ in 0..3 {
+            let v = OpenVault::open(path.clone(), b"a", b"b").unwrap();
+            assert!(v.recovery_notice().is_none(), "a healthy open is not a recovery");
+            drop(v);
+        }
+        // The prior generations are unchanged: no-edit opens did not rotate the ring.
+        assert_eq!(accts(&bak_path(&path, 1)), bak1_before, "bak1 unchanged by no-edit reopens");
+        assert_eq!(
+            accts(&bak_path(&path, 2)),
+            bak2_before,
+            "bak2 (oldest) NOT overwritten with the current state by no-edit reopens"
+        );
         cleanup(&path);
     }
 

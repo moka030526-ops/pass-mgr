@@ -766,38 +766,52 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
 
     std::fs::create_dir_all(&out_dir)?;
     vault::harden_dir(&out_dir); // 0700 on unix (filenames/paths are sensitive)
-    // `0usize` is a zero literal typed as `usize` (the pointer-sized unsigned int
-    // used for counts/indices). `mut` because we increment it in the loop.
-    let mut written = 0usize;
-    // Iterate over `&docs` (borrowing, so `docs` stays usable afterwards). Each
-    // item is a `(meta, bytes)` tuple that this pattern destructures in place.
-    for (meta, bytes) in &docs {
-        // The manifest stores one combined virtual path ("/loc/file"); split it
-        // back into directory + filename for the sanitizer. Build a SAFE relative
-        // path so a crafted manifest can never escape out_dir (no `..`/absolute).
-        // `rsplit_once('/')` returns `Option<(&str, &str)>` — the parts before and
-        // after the last `/`. `.unwrap_or(default)` substitutes the default tuple
-        // when there is no `/` (the whole path is then treated as the filename).
-        let (location, filename) = meta.path.rsplit_once('/').unwrap_or(("", meta.path.as_str()));
-        let rel = safe_relative_path(location, filename, &meta.id);
-        let dest = unique_path(out_dir.join(rel));
-        // `.parent()` is the containing directory, if any. `if let Some(parent)`
-        // runs only when there is one, binding it for use inside the block.
-        if let Some(parent) = dest.parent() {
-            // Reject a symlinked intermediate dir before create_dir_all, so a symlink
-            // seeded in a shared OUT dir can't redirect decrypted plaintext outside it.
-            vault::reject_symlinked_descendants(&out_dir, parent)?;
-            std::fs::create_dir_all(parent)?;
-            vault::harden_dir(parent);
+    // The write loop is not transactional: a mid-loop failure leaves already-extracted
+    // documents on disk in the clear. Run it in a closure so an error can trigger the
+    // same partial-cleartext warning as export-tree (audit L1) before propagating.
+    let write_docs = || -> anyhow::Result<usize> {
+        // `0usize` is a zero literal typed as `usize` (the pointer-sized unsigned int
+        // used for counts/indices). `mut` because we increment it in the loop.
+        let mut written = 0usize;
+        // Iterate over `&docs` (borrowing, so `docs` stays usable afterwards). Each
+        // item is a `(meta, bytes)` tuple that this pattern destructures in place.
+        for (meta, bytes) in &docs {
+            // The manifest stores one combined virtual path ("/loc/file"); split it
+            // back into directory + filename for the sanitizer. Build a SAFE relative
+            // path so a crafted manifest can never escape out_dir (no `..`/absolute).
+            // `rsplit_once('/')` returns `Option<(&str, &str)>` — the parts before and
+            // after the last `/`. `.unwrap_or(default)` substitutes the default tuple
+            // when there is no `/` (the whole path is then treated as the filename).
+            let (location, filename) = meta.path.rsplit_once('/').unwrap_or(("", meta.path.as_str()));
+            let rel = safe_relative_path(location, filename, &meta.id);
+            let dest = unique_path(out_dir.join(rel));
+            // `.parent()` is the containing directory, if any. `if let Some(parent)`
+            // runs only when there is one, binding it for use inside the block.
+            if let Some(parent) = dest.parent() {
+                // Reject a symlinked intermediate dir before create_dir_all, so a symlink
+                // seeded in a shared OUT dir can't redirect decrypted plaintext outside it.
+                vault::reject_symlinked_descendants(&out_dir, parent)?;
+                std::fs::create_dir_all(parent)?;
+                vault::harden_dir(parent);
+            }
+            // Reuse the vault's hardened writer: create_new (O_EXCL, no symlink
+            // follow) + 0600, removing any partial fragment on a write error.
+            vault::write_new_bytes(&dest, bytes)?;
+            eprintln!("  {}", dest.display());
+            written += 1;
         }
-        // Reuse the vault's hardened writer: create_new (O_EXCL, no symlink
-        // follow) + 0600, removing any partial fragment on a write error.
-        vault::write_new_bytes(&dest, bytes)?;
-        eprintln!("  {}", dest.display());
-        written += 1;
+        Ok(written)
+    };
+    match write_docs() {
+        Ok(written) => {
+            eprintln!("Extracted {written} document(s) to {}", out_dir.display());
+            Ok(())
+        }
+        Err(e) => {
+            warn_partial_plaintext(&out_dir);
+            Err(e)
+        }
     }
-    eprintln!("Extracted {written} document(s) to {}", out_dir.display());
-    Ok(())
 }
 
 /// Decrypt the WHOLE vault into a plaintext mirror at `out_dir` that mirrors the
@@ -815,9 +829,32 @@ fn cli_export_tree(path: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
     );
     let pw1 = read_password("Password 1: ")?;
     let pw2 = read_password("Password 2: ")?;
-    vault::OpenVault::export_tree(&path, pw1.as_bytes(), pw2.as_bytes(), &out_dir)?;
+    // export_tree writes plaintext incrementally and is NOT transactional: a mid-walk
+    // failure (ENOSPC, a bit-rotted frame failing AEAD, a symlinked dir, …) can leave
+    // PARTIAL unencrypted files already on disk. If anything landed, warn loudly so the
+    // user securely deletes it rather than assuming "error ⇒ nothing was written" (audit L1).
+    if let Err(e) = vault::OpenVault::export_tree(&path, pw1.as_bytes(), pw2.as_bytes(), &out_dir) {
+        warn_partial_plaintext(&out_dir);
+        return Err(e.into());
+    }
     eprintln!("Wrote a decrypted mirror to {} (re-encrypt it with `import-tree`).", out_dir.display());
     Ok(())
+}
+
+/// If `out_dir` exists and is non-empty after a failed plaintext export, warn that it
+/// may hold PARTIAL unencrypted secrets that must be securely deleted. Only fires when
+/// something was actually written (the hardened writers remove a single failed file, so
+/// a first-write failure leaves the dir empty and no warning is emitted). Audit L1.
+fn warn_partial_plaintext(out_dir: &std::path::Path) {
+    let non_empty = std::fs::read_dir(out_dir).map(|mut it| it.next().is_some()).unwrap_or(false);
+    if non_empty {
+        eprintln!(
+            "WARNING: the export failed after writing PARTIAL UNENCRYPTED files to {}.\n\
+             Those cleartext fragments are still on disk — securely delete the directory \
+             (e.g. `shred -u` per file, `srm -r`, or `rm -rf` on an encrypted disk) before discarding.",
+            out_dir.display()
+        );
+    }
 }
 
 /// Build a NEW encrypted vault (at `dest`'s directory) from a plaintext mirror at

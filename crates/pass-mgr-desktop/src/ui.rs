@@ -905,6 +905,9 @@ impl App {
                     self.recompute_auth_path();
                 } else {
                     let idx = self.auth_field_index();
+                    // Master-password field: ensure headroom before the push so the insert
+                    // can't reallocate and strand cleartext in freed heap (audit L3).
+                    presize_secret(&mut self.auth.fields[idx].value);
                     self.auth.fields[idx].value.push(c);
                 }
             }
@@ -2135,6 +2138,12 @@ impl App {
             KeyCode::Char(c) if !ctrl && writable => {
                 let f = &mut es.fields[es.focus];
                 if !matches!(f.kind, FieldKind::Choice(_)) {
+                    // A password field grows by one char here; presize first so the push
+                    // never reallocates and strands cleartext in freed heap (audit L3). The
+                    // construction-time presize only covers the initial length + 128.
+                    if matches!(f.kind, FieldKind::Password) {
+                        presize_secret(&mut f.value);
+                    }
                     f.value.push(c);
                 }
             }
@@ -3170,8 +3179,16 @@ impl App {
         match key.code {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => match self.merge_focus {
                 0 => self.merge_src_dir.push(c),
-                1 => self.merge_pw1.push(c),
-                _ => self.merge_pw2.push(c),
+                // Source-vault passwords: presize before the push so typing past the
+                // initial capacity can't reallocate and strand cleartext (audit L3).
+                1 => {
+                    presize_secret(&mut self.merge_pw1);
+                    self.merge_pw1.push(c);
+                }
+                _ => {
+                    presize_secret(&mut self.merge_pw2);
+                    self.merge_pw2.push(c);
+                }
             },
             KeyCode::Backspace => match self.merge_focus {
                 0 => {
@@ -3951,6 +3968,27 @@ fn cycle_filter(current: &Option<String>, opts: &[String]) -> Option<String> {
             _ => None,
         },
     }
+}
+
+/// Give a secret `String` 128 bytes of spare capacity so a following per-keystroke
+/// `push` never reallocates — a realloc frees the old buffer WITHOUT zeroizing, stranding
+/// cleartext password fragments in freed heap (audit L3). Mirrors the GUI's identical
+/// `presize_secret` (gui.rs): calling `reserve` directly would itself reallocate (a
+/// freshly built/typed buffer can have capacity == len), committing the very leak it
+/// means to prevent — so we move the value into a roomier buffer and zeroize the original.
+/// A no-op once headroom exists, so it is cheap to call before every keystroke.
+///
+/// The TUI presizes a password field once at construction (`Field::password`), but typing
+/// past that headroom would reallocate; calling this before each secret `push` keeps the
+/// invariant continuously, matching the GUI's per-frame `presize_secret`.
+fn presize_secret(s: &mut String) {
+    if s.capacity() >= s.len() + 128 {
+        return;
+    }
+    let mut roomy = String::with_capacity(s.len() + 128);
+    roomy.push_str(s);
+    s.zeroize(); // wipe the smaller buffer before it is freed by the move below
+    *s = roomy;
 }
 
 // Best-effort wipe of the OS clipboard (set it to empty). `let _ =` discards the
@@ -6007,5 +6045,27 @@ mod tests {
         assert_eq!(re.vault.general_documents.iter().find(|g| g.id == "gd").unwrap().updated_at, 1000, "merge not persisted");
         cleanup(&s_path);
         cleanup(&c_path);
+    }
+
+    #[test]
+    fn presize_secret_keeps_headroom_and_content() {
+        // Audit L3: a secret String must always carry >= 128 bytes of spare capacity so the
+        // next per-keystroke push can't reallocate (a realloc frees the old buffer WITHOUT
+        // zeroizing, stranding cleartext password fragments in freed heap).
+        let mut s = String::from("hunter2");
+        presize_secret(&mut s);
+        assert!(s.capacity() >= s.len() + 128, "headroom reserved");
+        assert_eq!(s, "hunter2", "content preserved by presize");
+        // Simulate per-keystroke typing well past the initial headroom: the invariant must
+        // hold before every push, and the content must stay exactly what was typed.
+        let mut expected = String::from("hunter2");
+        for i in 0..400 {
+            presize_secret(&mut s);
+            assert!(s.capacity() >= s.len() + 128, "headroom holds before push #{i}");
+            let c = (b'a' + (i % 26) as u8) as char;
+            s.push(c);
+            expected.push(c);
+        }
+        assert_eq!(s, expected, "content intact across managed growth");
     }
 }
