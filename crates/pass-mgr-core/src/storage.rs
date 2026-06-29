@@ -193,6 +193,16 @@ impl VolumeStore {
             //     present; rebuild from it (the `?` re-raises a rebuild error).
             //   - Err(e): otherwise propagate the original error.
             let manifest = match store.load_manifest(part, key) {
+                // A present, valid manifest whose volume file is MISSING (partial restore /
+                // selective backup / FS damage) must fail closed: opening it would let the next
+                // put() create a fresh volume at the manifest's non-zero end_offset, zero-filling
+                // [0,end) and silently destroying every prior frame. Mirror the contiguity guard.
+                Ok(_) if !vpath.exists() => {
+                    return Err(StorageError::Corrupt(format!(
+                        "partition {part}: manifest present but its volume file is missing ({})",
+                        vpath.display()
+                    )));
+                }
                 Ok(m) => m,
                 // Genuine corruption (won't decrypt, won't parse, or truncated) with a
                 // present volume → rebuild by scanning the self-describing volume.
@@ -787,6 +797,17 @@ fn append_frame(path: &Path, start: u64, frame: &[u8]) -> Result<(), StorageErro
     // attacker could swap in a symlink between the open and a by-path chmod. fchmod acts
     // on the file we actually opened, with no path resolution.
     harden_file_fd(&f);
+    // Defense-in-depth: never write PAST the current end of the volume. A legitimate append has
+    // `start` == the file's current length; `start > len` would seek past EOF and leave a sparse
+    // zero hole over [len, start), corrupting every prior frame — e.g. if a fresh `vol.<N>` were
+    // created here at a non-zero `start` because the file had gone missing. Fail closed.
+    let cur_len = f.metadata()?.len();
+    if start > cur_len {
+        return Err(StorageError::Corrupt(format!(
+            "refusing to append at offset {start} past the end of {} (len {cur_len})",
+            path.display()
+        )));
+    }
     f.seek(SeekFrom::Start(start))?;
     crate::fault::point("volume.write")?; // inject ENOSPC before the volume append
     f.write_all(frame)?; // `frame: &[u8]` is borrowed, not consumed

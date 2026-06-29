@@ -2580,6 +2580,7 @@ impl GuiApp {
         let mut total = records::OwnerValueRow { owner: "All owners".to_string(), ..Default::default() };
         for r in &rows {
             total.asset_real_estate += r.asset_real_estate;
+            total.asset_cash += r.asset_cash; // BUG FIX: cash was omitted, understating Assets Σ / Net
             total.asset_before_tax += r.asset_before_tax;
             total.asset_after_tax += r.asset_after_tax;
             total.liability += r.liability;
@@ -3605,10 +3606,17 @@ impl GuiApp {
     fn delete_current(&mut self, tab: Tab) {
         // Collect any attached document ids to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
+        // Roll back the IN-MEMORY removal if the save fails. Without this, a failed persist
+        // would leave the record gone from memory (the user was told it failed) and a LATER
+        // successful save would silently serialize the whole vault and commit the deletion —
+        // unrecoverable data loss. The closure re-inserts the removed record, truncates the
+        // remove() audit entry, and restores the edit buffer. (Mirrors the merge path's care.)
+        let mut rollback: Option<Box<dyn FnOnce(&mut Self)>> = None;
         if let Some(ov) = self.vault.as_mut() {
             // `&mut ov.vault` is an exclusive borrow of the in-memory vault data,
             // reused below as `v` to keep the match arms terse.
             let v = &mut ov.vault;
+            let audit_len = v.audit.len(); // snapshot to undo the remove() audit entry on rollback
             match tab {
                 Tab::Instructions => {
                     // `.take()` moves the edited record out of the Option, leaving
@@ -3616,6 +3624,13 @@ impl GuiApp {
                     // us owned `r` to read its id.
                     if let Some(r) = self.edit_instruction.take() {
                         records::remove(&mut v.instructions, &r.id, &mut v.audit, "Instruction");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.instructions, r.clone());
+                            }
+                            s.edit_instruction = Some(r);
+                        }));
                     }
                 }
                 Tab::TrustWill => {
@@ -3624,6 +3639,13 @@ impl GuiApp {
                             doc_ids.push(f.clone());
                         }
                         records::remove(&mut v.trust_wills, &r.id, &mut v.audit, "Trust/Will");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.trust_wills, r.clone());
+                            }
+                            s.edit_trustwill = Some(r);
+                        }));
                     }
                 }
                 Tab::Assets => {
@@ -3632,11 +3654,25 @@ impl GuiApp {
                             doc_ids.push(f.clone());
                         }
                         records::remove(&mut v.assets, &r.id, &mut v.audit, "Asset/Liability");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.assets, r.clone());
+                            }
+                            s.edit_asset = Some(r);
+                        }));
                     }
                 }
                 Tab::Accounts => {
                     if let Some(r) = self.edit_account.take() {
                         records::remove(&mut v.accounts, &r.id, &mut v.audit, "Account");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.accounts, r.clone());
+                            }
+                            s.edit_account = Some(r);
+                        }));
                     }
                 }
                 Tab::RealEstate => {
@@ -3646,6 +3682,13 @@ impl GuiApp {
                             doc_ids.push(f.clone());
                         }
                         records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.real_estate, r.clone());
+                            }
+                            s.edit_realestate = Some(r);
+                        }));
                     }
                 }
                 Tab::Taxes => {
@@ -3655,6 +3698,13 @@ impl GuiApp {
                             doc_ids.push(f.clone());
                         }
                         records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.tax_filings, r.clone());
+                            }
+                            s.edit_taxfiling = Some(r);
+                        }));
                     }
                 }
                 Tab::GeneralDocuments => {
@@ -3663,6 +3713,13 @@ impl GuiApp {
                             doc_ids.push(f.clone());
                         }
                         records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                records::upsert(&mut ov.vault.general_documents, r.clone());
+                            }
+                            s.edit_general = Some(r);
+                        }));
                     }
                 }
                 // The Summary tab is read-only (no records of its own), so it never deletes.
@@ -3679,9 +3736,11 @@ impl GuiApp {
                 }
             }
             self.status = "Deleted.".into();
+        } else if let Some(rb) = rollback {
+            // persist() already set the "Save failed: …" status; undo the in-memory removal so
+            // a later successful save cannot silently commit the deletion the user was told failed.
+            rb(self);
         }
-        // On failure persist() has already set the "Save failed: …" status, and the
-        // record is still on disk — so do not claim it was deleted.
     }
 
     fn copy_to_clipboard(&mut self, text: Zeroizing<String>) {
