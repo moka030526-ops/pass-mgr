@@ -370,12 +370,20 @@ mod tests {
         #[test]
         fn prop_generate_length_and_charset(
             length in 1usize..=128,
-            lowercase in any::<bool>(),
-            uppercase in any::<bool>(),
-            digits in any::<bool>(),
-            symbols in any::<bool>(),
+            // Derive the four class flags from the bits of a NON-ZERO 4-bit mask, so at
+            // least one class is always enabled WITHOUT a `prop_assume!` reject. The old
+            // form (four independent bools + assume) discarded the all-false combo (1/16 of
+            // cases); past ~1024 such rejects proptest aborts with "Too many global rejects",
+            // so the property was silently un-runnable at a raised PROPTEST_CASES (it only
+            // passed at the default 256). This strategy enumerates all 15 non-empty class
+            // combinations with zero rejects, so the generator can be stress-tested at any
+            // case count.
+            mask in 1u8..=15,
         ) {
-            prop_assume!(lowercase || uppercase || digits || symbols); // need >=1 class
+            let lowercase = mask & 1 != 0;
+            let uppercase = mask & 2 != 0;
+            let digits = mask & 4 != 0;
+            let symbols = mask & 8 != 0;
             let opts = GenOptions { length, lowercase, uppercase, digits, symbols };
             let pw = generate(&opts).unwrap();
             prop_assert_eq!(pw.len(), length, "exact requested length (ASCII, 1 byte/char)");

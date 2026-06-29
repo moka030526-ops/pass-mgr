@@ -62,6 +62,15 @@ pub const MAX_PATH_LEN: usize = 256;
 pub const DEFAULT_VOLUME_MAX_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 /// Hard ceiling on a single manifest file (DoS guard).
 pub const MAX_MANIFEST_SIZE: u64 = 256 * 1024 * 1024;
+/// Hard ceiling on the NUMBER of entries in one partition manifest (round-1 L3 / audit
+/// R5-1). The byte cap above still admits millions of minimal (~70-byte) entries, and the
+/// per-document `put`/import loop re-serializes + re-encrypts the whole partition manifest
+/// each time — O(M) per entry, O(M²) overall — so a crafted mirror or vault packing millions
+/// of tiny documents into one partition (by adopting a huge `volume_max_size`) could hang
+/// open/import/merge/compact for hours. This caps a partition to ~100k entries — orders of
+/// magnitude above any real vault — and fails closed (`TooLarge`) on deserialize, before the
+/// quadratic loop runs.
+pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 
 const FRAME_PREFIX_LEN: u64 = 4; // the `[u32 frame_len]`
 /// Worst-case per-frame on-disk overhead (prefix + nonce + tag + the two length
@@ -548,6 +557,12 @@ impl VolumeStore {
         // `from_slice` parses JSON into a `Manifest` (type annotation tells serde which
         // type to build). `?` converts a parse error to `StorageError::Json`.
         let manifest: Manifest = serde_json::from_slice(&plain)?;
+        // Fail closed on an over-count manifest BEFORE any O(M) consumer touches it (round-1
+        // L3 / audit R5-1): the byte cap admits millions of tiny entries, which would make the
+        // per-document put/import/compact loop O(M²).
+        if manifest.entries.len() > MAX_MANIFEST_ENTRIES {
+            return Err(StorageError::TooLarge);
+        }
         Ok(manifest)
     }
 

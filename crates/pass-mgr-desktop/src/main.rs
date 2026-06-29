@@ -796,7 +796,7 @@ fn cli_extract(path: PathBuf, out_dir: PathBuf, part: Option<u32>) -> anyhow::Re
             // when there is no `/` (the whole path is then treated as the filename).
             let (location, filename) = meta.path.rsplit_once('/').unwrap_or(("", meta.path.as_str()));
             let rel = safe_relative_path(location, filename, &meta.id);
-            let dest = unique_path(out_dir.join(rel));
+            let dest = unique_path(out_dir.join(rel), Some(&meta.id));
             // `.parent()` is the containing directory, if any. `if let Some(parent)`
             // runs only when there is one, binding it for use inside the block.
             if let Some(parent) = dest.parent() {
@@ -1118,8 +1118,11 @@ fn safe_relative_path(location: &str, filename: &str, id: &str) -> PathBuf {
 }
 
 /// Return `p` if it does not exist, otherwise a sibling with a `_N` suffix so an
-/// extraction never silently overwrites a just-written file.
-fn unique_path(p: PathBuf) -> PathBuf {
+/// extraction never silently overwrites a just-written file. `fallback_token` (a
+/// document id) disambiguates when the `_1.._9999` range is exhausted, so >10000
+/// documents sharing one virtual path can't EEXIST-abort the whole extract and strand
+/// cleartext (audit R5-2 — the desktop twin of the core `unique_export_path` F2 fix).
+fn unique_path(p: PathBuf, fallback_token: Option<&str>) -> PathBuf {
     if !p.exists() {
         return p;
     }
@@ -1139,7 +1142,16 @@ fn unique_path(p: PathBuf) -> PathBuf {
             return candidate;
         }
     }
-    p
+    // Range exhausted (>10000 files share this name). Disambiguate with the unique doc
+    // id if the caller supplied one, so the O_EXCL write can't EEXIST-abort; otherwise
+    // fall back to the colliding path (the prior behavior).
+    match fallback_token {
+        Some(t) => {
+            let candidate = parent.join(format!("{stem}_{t}{ext}"));
+            if candidate.exists() { p } else { candidate }
+        }
+        None => p,
+    }
 }
 
 /// Prompt (on stderr) and read one password into a self-zeroizing buffer. When
@@ -1599,13 +1611,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("doc.txt");
         // Non-existing path is returned as-is.
-        assert_eq!(super::unique_path(p.clone()), p);
+        assert_eq!(super::unique_path(p.clone(), None), p);
         std::fs::write(&p, b"x").unwrap();
         // Existing path gets a `_N` suffix that doesn't yet exist.
-        let u = super::unique_path(p.clone());
+        let u = super::unique_path(p.clone(), None);
         assert_ne!(u, p);
         assert!(!u.exists());
         assert_eq!(u.file_name().unwrap().to_str().unwrap(), "doc_1.txt");
+        // With a fallback token, an existing path falls back to the id-disambiguated name
+        // (the _1..9999 range still wins first; this just verifies the token is wired).
+        let u2 = super::unique_path(p.clone(), Some("abc123"));
+        assert_ne!(u2, p);
+        assert!(!u2.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

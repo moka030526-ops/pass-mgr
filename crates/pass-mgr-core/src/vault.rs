@@ -799,6 +799,12 @@ impl OpenVault {
                 break; // partitions are contiguous from 0
             }
             let entries: Vec<ManifestEntry> = serde_json::from_slice(&read_capped(&man_path, storage::MAX_MANIFEST_SIZE)?)?;
+            // Fail closed on a crafted mirror packing millions of tiny entries into one
+            // partition, which would drive the per-entry store.put below O(M²) (round-1 L3 /
+            // audit R5-1). Same cap the live store enforces in load_manifest.
+            if entries.len() > storage::MAX_MANIFEST_ENTRIES {
+                return Err(VaultError::Storage(StorageError::TooLarge));
+            }
             let vol_dir = vol_root.join(format!("vol.{p}"));
             reject_symlink_dir(&vol_dir)?; // don't read blobs through a symlinked partition dir
             for e in &entries {
@@ -5292,6 +5298,40 @@ mod tests {
         let res = OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast());
         assert!(res.is_err(), "import must refuse a tail-truncated mirror (partition-count mismatch)");
         fs::remove_dir_all(&mirror).ok();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn import_tree_rejects_a_manifest_with_too_many_entries() {
+        // Audit R5-1 / round-1 L3: a crafted mirror packing > MAX_MANIFEST_ENTRIES tiny entries
+        // into one partition must be rejected (TooLarge) BEFORE the O(M^2) per-entry import loop,
+        // not hang for hours.
+        let path = tmp_path("import-overcount");
+        let src = write_src("import-overcount", b"x");
+        {
+            let mut v = OpenVault::create(path.clone(), b"o1", b"o2", fast()).unwrap();
+            v.add_document("general-documents/x", "x.pdf", &src).unwrap();
+            v.save().unwrap();
+        }
+        let mirror = std::env::temp_dir().join(format!("pmovercount-{}", nanos()));
+        OpenVault::export_tree(&path, b"o1", b"o2", &mirror).unwrap();
+        // Overwrite manifest.0.json with one more than the cap of minimal entries (the count
+        // check fires before any per-entry id/path validation, so identical dummies are fine).
+        let n = storage::MAX_MANIFEST_ENTRIES + 1;
+        let entries: Vec<ManifestEntry> = (0..n)
+            .map(|_| ManifestEntry { id: "a".into(), path: "/a".into(), size: 1, offset: 0, length: 1, uploaded_at: 0 })
+            .collect();
+        let man = serde_json::to_vec(&entries).unwrap();
+        fs::write(mirror.join("manifest").join("manifest.0.json"), &man).unwrap();
+        let dest = std::env::temp_dir().join(format!("pmovercount-imp-{}", nanos())).join(VAULT_FILE);
+        // `OpenVault` has no `Debug` (it holds secrets), so match rather than format the Ok arm.
+        match OpenVault::import_tree(&mirror, &dest, b"n1", b"n2", fast()) {
+            Err(VaultError::Storage(StorageError::TooLarge)) => {}
+            Err(e) => panic!("expected TooLarge, got Err({e:?})"),
+            Ok(_) => panic!("expected TooLarge, but import SUCCEEDED on an over-count manifest"),
+        }
+        fs::remove_dir_all(&mirror).ok();
+        let _ = fs::remove_file(&src);
         cleanup(&path);
     }
 
