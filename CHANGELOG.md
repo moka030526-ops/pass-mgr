@@ -16,6 +16,39 @@ These changes are committed but **not yet tagged** — the workspace crates are 
 at `0.1.0`. When cutting the release, rename this section to the chosen version +
 date and bump the crate versions to match.
 
+### Fixed
+
+- **Deep audit 2026-07-03** — a workspace-wide, adversarially-verified bug hunt and security
+  review (full write-up in [`docs/AUDIT_2026-07-03.md`](docs/AUDIT_2026-07-03.md)). Confirmed
+  and fixed:
+  - **Brick on ~100 k documents / hostile merge (High).** `VolumeStore::put` could grow a
+    partition manifest past the read-side `MAX_MANIFEST_ENTRIES` cap that the next `open`
+    rejects as unrecoverable — reachable by normal heavy use or by a hostile merge source
+    packing tiny blobs. `target_partition` now rolls partitions on the entry-count cap too.
+  - **Vault-file brick (Medium).** A large additive merge could push `vault.pmv` past the
+    read-side `MAX_VAULT_SIZE`; `write_vault_file` now fails closed before committing.
+  - **Silent password-change rollback (Medium, security).** Entering the OLD password after a
+    committed rekey that left a stranded old-epoch redundancy copy could "recover" the
+    pre-rekey vault and destroy the new-epoch copies. Recovery is now confined to the
+    current, corroborated salt (bit-rot recovery of a genuinely damaged salt still works).
+  - **Recovery-ring erosion (Low).** The outgoing generation is now validated (decodes under
+    the current key) before being ringed in, so a bit-rotted primary can't replace a good
+    generation.
+  - **GUI same-frame nav race (High, data-integrity).** A keyboard arrow landing in the same
+    frame as a Delete/confirm click could act on the neighboring record; the nav swap is now
+    suppressed when a record-targeted action is pending.
+  - **Cross-vault UI-state leak (Medium, security).** Edit buffers (holding cleartext
+    secrets), armed deletes, and filters no longer survive a lock→re-unlock into a different
+    vault.
+  - **Delete-rollback committed unsaved edits (Medium).** A failed-persist delete rollback now
+    restores the last-SAVED record, not the dirty edit buffer.
+  - **Partial-plaintext shred warning (Medium, security).** A failed `export-tree`/`extract`
+    into a non-empty directory now warns that pre-existing subtrees may also hold cleartext.
+  - **Supply chain:** `anyhow`/`memmap2` patch-bumped to clear unsoundness advisories;
+    `quick-xml`/`ttf-parser` advisories documented as build-time/bundled-only and ignored with
+    rationale. `cargo audit` and `cargo deny` are green.
+  - All six fuzz targets re-run (~128 M executions, zero crashes); full test suite green.
+
 ### Added
 
 - **Asset ↔ account links.** An asset/liability can now be linked to any number of

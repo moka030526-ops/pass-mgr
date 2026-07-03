@@ -498,11 +498,22 @@ impl VolumeStore {
         match self.manifests.last() {
             // Reserve the worst-case per-frame overhead (prefix + nonce + tag +
             // id/path length prefixes + a full-length path ~= 340 B; round up) so a
-            // partition does not overshoot `max_size`.
-            Some(m) if m.end_offset.saturating_add(doc_size).saturating_add(FRAME_OVERHEAD_EST) <= self.max_size => {
+            // partition does not overshoot `max_size`. Roll to a fresh partition when
+            // EITHER the byte cap OR the entry-count cap would be exceeded: `put` grows
+            // the active partition's manifest one entry per new id, and `load_manifest`
+            // fails CLOSED (`TooLarge`) on any manifest with more than MAX_MANIFEST_ENTRIES
+            // — a variant NOT in `open`'s rebuild set — so without this count roll a user
+            // (or a hostile merge/import packing many tiny docs into one partition under a
+            // large `max_size`) could write a manifest the very next open rejects,
+            // permanently BRICKING an otherwise-intact vault. Rolling on count keeps every
+            // partition manifest <= the read-side cap, so the write and read paths agree.
+            Some(m)
+                if m.end_offset.saturating_add(doc_size).saturating_add(FRAME_OVERHEAD_EST) <= self.max_size
+                    && m.entries.len() < MAX_MANIFEST_ENTRIES =>
+            {
                 (self.manifests.len() - 1) as u32
             }
-            Some(_) => self.manifests.len() as u32, // full → new partition
+            Some(_) => self.manifests.len() as u32, // full (bytes or entry count) → new partition
             None => 0,
         }
     }
@@ -1083,6 +1094,41 @@ mod tests {
             ),
             Err(e) => panic!("unexpected error variant: {e:?}"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn put_rolls_to_a_new_partition_at_the_manifest_entry_cap() {
+        // A partition manifest must never grow past MAX_MANIFEST_ENTRIES: the reader
+        // (load_manifest) fails CLOSED (`TooLarge`) on a larger one, and `open` does NOT
+        // treat that as rebuildable — so a write past the cap would BRICK an otherwise-intact
+        // vault on the next open. `target_partition` must roll to a fresh partition on the
+        // entry-count cap, exactly as it already does on the byte cap. (Audit 2026-07-03 A-1.)
+        let dir = tmp_dir("entrycap");
+        let key = fast_key();
+        // Huge byte cap so BYTE-based rollover never fires — isolate the entry-count path.
+        let mut s = VolumeStore::open(&dir, &key, "v", u64::MAX).unwrap();
+        s.put("real", "/real", b"x", 1, &key).unwrap();
+        assert_eq!(s.partition_count(), 1);
+        // Fill partition 0's manifest to the cap WITHOUT writing 100k real documents.
+        let start = s.manifests[0].entries.len();
+        for i in start..MAX_MANIFEST_ENTRIES {
+            s.manifests[0].entries.push(ManifestEntry {
+                id: format!("f{i}"),
+                path: "/f".into(),
+                size: 1,
+                offset: 0,
+                length: 1,
+                uploaded_at: 0,
+            });
+        }
+        assert_eq!(s.manifests[0].entries.len(), MAX_MANIFEST_ENTRIES);
+        // A brand-new id must NOT be placed into the full partition (that would push it to
+        // MAX+1, which the reader rejects) — it rolls to a fresh partition instead.
+        assert_eq!(s.target_partition("brand-new", 1), 1, "new id rolls to a fresh partition at the cap");
+        // An UPDATE to an existing id stays in its own partition: retain+push keeps the count
+        // constant, so it never grows past the cap.
+        assert_eq!(s.target_partition("real", 1), 0, "an update stays put — it doesn't grow the count");
         std::fs::remove_dir_all(&dir).ok();
     }
 

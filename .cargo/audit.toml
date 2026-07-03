@@ -1,0 +1,22 @@
+# cargo-audit policy (CI runs `cargo audit`; see also deny.toml for cargo-deny).
+#
+# Ignored advisories, each with its justification. Revisit on every dependency
+# bump — an entry must be REMOVED the moment the fix becomes reachable.
+
+[advisories]
+ignore = [
+    # quick-xml 0.39.x DoS advisories (quadratic duplicate-attribute check /
+    # unbounded namespace allocation). quick-xml is pulled in ONLY by
+    # `wayland-scanner`, a BUILD-TIME proc-macro that parses the vendored
+    # Wayland protocol XML shipped inside the wayland-* crates; it never
+    # parses attacker-controlled input and never ships in the produced
+    # binaries. wayland-scanner pins ^0.39, so the fixed 0.41 cannot be
+    # selected until upstream bumps — remove both entries when it does.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # ttf-parser is unmaintained (author statement). It reaches us via egui's text stack and
+    # only parses the fonts egui BUNDLES into the binary — the app loads no user/system fonts,
+    # so the parsing surface is trusted, shipped data. Migrating font parsers is upstream egui's
+    # call; drop this when egui moves off ttf-parser.
+    "RUSTSEC-2026-0192",
+]

@@ -931,13 +931,21 @@ impl OpenVault {
         write_vault_file(&self.path, &self.vault, &self.key, &self.salt, self.params)?;
 
         if depth > 0 {
+            // Ring the outgoing generation in ONLY if it still DECODES under the current key.
+            // `prev` was read with `read_capped_vault` (bytes only, no AEAD check), so a
+            // primary that bit-rotted on disk during this session — or a corrupt primary left
+            // behind by a heal whose best-effort re-save failed — would otherwise be ingested
+            // as bak1 WHILE `rotate_generations` deletes the oldest GOOD generation, replacing
+            // a recoverable snapshot with an unrecoverable one and eroding the ring. If the
+            // outgoing bytes don't decode, drop them and prune only. (Audit 2026-07-03 A-3.)
+            let prev_decodes = prev.as_deref().is_some_and(|b| decode_vault_with_key(b, &self.key).is_ok());
             match &prev {
-                // Normal save: ring the outgoing generation into bak1 (atomic +
+                // Normal save: ring the (validated) outgoing generation into bak1 (atomic +
                 // symlink-safe), shifting the rest and pruning beyond `depth`.
-                Some(bytes) => rotate_generations(&self.path, depth, bytes),
-                // First save, or a heal: no outgoing generation to ring in — just
-                // prune any slots beyond the configured depth (e.g. after lowering it).
-                None => prune_generations_above(&self.path, depth),
+                Some(bytes) if prev_decodes => rotate_generations(&self.path, depth, bytes),
+                // First save, a heal, OR a non-decoding outgoing primary: no good generation
+                // to ring in — just prune any slots beyond the configured depth.
+                _ => prune_generations_above(&self.path, depth),
             }
             // Best-effort same-generation mirror: a fresh, independent encryption of
             // the same vault (its own random nonce). Failing it does not fail the
@@ -2359,6 +2367,11 @@ fn decrypt_with_redundancy(
     }
     let mirror = mirror_path(path);
 
+    // The primary's own header salt (when its fixed-size header still parses), used below to
+    // block a cross-epoch rollback. See `restrict_salt` after PASS 1 for the full rationale
+    // and the corroboration condition that keeps salt-bit-rot recovery working.
+    let primary_salt = read_header_of(path).ok().map(|h| h.salt);
+
     // PASS 1 — collect up to MAX_RECOVERY_SALTS distinct candidate salts by reading
     // ONLY each candidate's fixed-size header (cheap), then derive one key per distinct
     // salt. CRITICAL: the live header is NOT a trusted key-derivation source — a
@@ -2401,6 +2414,22 @@ fn decrypt_with_redundancy(
         return Err(primary_err); // no candidate header parsed / wrong password
     }
 
+    // Cross-epoch rollback guard. Confine recovery to copies sharing the primary's salt —
+    // BUT ONLY when that salt is CORROBORATED by at least one redundant copy. The two cases
+    // this must separate:
+    //   * Wrong password on an INTACT primary (F3 rollback vector): the primary's salt is the
+    //     genuine current-epoch salt, and the same-epoch mirror/bak1 (rewritten at the new
+    //     epoch by `refresh_redundancy_copies` after a rekey) share it — so it IS corroborated.
+    //     A stranded OLD-epoch `bak` (cleanup failed on transient EIO/EACCES) has a DIFFERENT
+    //     salt; without this guard, entering the OLD password would decode it and silently roll
+    //     the password change back, then the heal/sweep would destroy the new-epoch copies.
+    //     Restricting to the corroborated current salt makes the old password fail closed.
+    //   * Bit-rot INSIDE the primary's salt bytes: the header still parses but the salt is
+    //     garbage that matches NO copy, so it is NOT corroborated and we do NOT restrict — the
+    //     intact mirror legitimately carries a different (correct) salt and must stay usable
+    //     (regression-tested by `recovers_from_mirror_when_primary_salt_corrupt`).
+    let restrict_salt = primary_salt.filter(|ps| key_salts.iter().any(|s| s == ps));
+
     // PASS 2 — try EACH candidate against ONLY the key derived from its OWN header salt,
     // holding at most one candidate buffer in memory at a time (an earlier version slurped
     // every candidate up front, risking OOM from planted max-size copies). Trying a
@@ -2413,6 +2442,14 @@ fn decrypt_with_redundancy(
     for (idx, c) in candidates.iter().enumerate() {
         let Ok(raw) = read_capped_vault_nofollow(c) else { continue };
         let Some(k) = cand_key[idx] else { continue }; // header unreadable / salt past the cap
+        // Cross-epoch guard (see `restrict_salt` above): when the primary's salt is known and
+        // corroborated, never recover from a copy under a DIFFERENT salt — that would roll
+        // back across a password change instead of healing a same-epoch bit-rot.
+        if let Some(ps) = restrict_salt
+            && key_salts[k] != ps
+        {
+            continue;
+        }
         if let Ok((vault, hdr)) = decode_vault_with_key(&raw, &keys[k]) {
             let key = keys.swap_remove(k); // take ownership of the matching key
             // Wording is keyed on the SOURCE only as a coarse hint — NOT a generation claim.
@@ -2711,6 +2748,19 @@ fn write_vault_file(
     let header = Header { params, salt: *salt, nonce };
     let header_bytes = header.to_bytes();
     let ciphertext = crypto::encrypt_with_nonce(key, &nonce, &plaintext, &header_bytes)?;
+
+    // Fail CLOSED if the encrypted file would exceed the read-side cap. `read_capped_vault`
+    // (and every reopen through it) rejects a `vault.pmv` larger than MAX_VAULT_SIZE, but
+    // the write path never checked — so a vault grown past the cap (a huge merge, or a
+    // record set with very large history) would commit successfully yet be UNOPENABLE on
+    // the next launch, a silent brick. Refusing the save here keeps the on-disk vault
+    // (the previous, still-openable generation) intact and surfaces the error to the caller
+    // instead. The file layout is exactly header ‖ ciphertext (see write_new_file), so its
+    // length is known before we touch the disk.
+    let file_len = (header_bytes.len() as u64).saturating_add(ciphertext.len() as u64);
+    if file_len > MAX_VAULT_SIZE {
+        return Err(VaultError::TooLarge);
+    }
 
     // A *let-chain*: the block runs only if `path.parent()` is `Some(parent)` AND
     // that parent is non-empty. `parent` is in scope for the whole condition + body.
@@ -4519,6 +4569,40 @@ mod tests {
         assert!(!parent_dir(&path).join(REKEY_DIR).exists());
         cleanup(&path);
         fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn old_password_cannot_roll_back_a_committed_rekey_via_a_stranded_bak() {
+        // Audit 2026-07-03 A-2 (forward-secrecy / silent rollback). After a committed password
+        // change, a stranded OLD-epoch `bak` (a best-effort cleanup that failed) must NOT let a
+        // user who types the OLD password "recover" the pre-rekey vault: that would undo the
+        // password change, re-validate the old credentials, and let the writable-open sweep/heal
+        // destroy the new-epoch copies. Recovery must stay confined to the current (corroborated)
+        // salt, so the old password fails closed.
+        let path = tmp_path("rollback");
+        let mut v = OpenVault::create(path.clone(), b"old1", b"old2", fast()).unwrap();
+        v.set_redundancy(2).unwrap();
+        records::upsert(&mut v.vault.accounts, sample_account("secret-user", "p"));
+        v.save().unwrap();
+        // Snapshot the OLD-epoch primary ciphertext, then rekey to new passwords.
+        let old_epoch_bytes = fs::read(&path).unwrap();
+        v.change_password(b"new1", b"new2").unwrap();
+        drop(v); // release the writer lock
+
+        // Simulate a cleanup that failed to remove an old-epoch bak: plant it as bak2.
+        fs::write(bak_path(&path, 2), &old_epoch_bytes).unwrap();
+
+        // The OLD password must NOT open the vault (no rollback to the pre-rekey epoch),
+        // even though a decodable old-epoch copy is sitting right there.
+        assert!(
+            OpenVault::open(path.clone(), b"old1", b"old2").is_err(),
+            "old password must fail closed — never roll back across the committed rekey"
+        );
+        // The NEW password still opens it, and the data is intact.
+        let reopened = OpenVault::open(path.clone(), b"new1", b"new2").unwrap();
+        assert_eq!(reopened.vault.accounts.len(), 1);
+        assert_eq!(reopened.vault.accounts[0].username, "secret-user");
+        cleanup(&path);
     }
 
     #[test]

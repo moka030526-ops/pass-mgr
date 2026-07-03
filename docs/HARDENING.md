@@ -67,6 +67,20 @@ tamper matrix, and full-crate mutation testing) on top of the static review.
   mitigation) so normal typing never grows — and therefore never reallocates and
   leaks — them.
 
+#### Core dumps (accepted residual — audit 2026-07-03 A-4)
+
+* **What:** A native crash of the desktop process can persist the whole decrypted vault to
+  disk in a core dump. `mlock` keeps the derived `Key` out of *swap*, but mlock'd pages **are**
+  captured in a core dump, so even the specially-protected key is exposed.
+* **Why not fixed in-process:** the standard mitigations — `prctl(PR_SET_DUMPABLE, 0)` and
+  `setrlimit(RLIMIT_CORE, 0)` — require raw `libc` calls, but the desktop crate is
+  `#![forbid(unsafe_code)]` (a load-bearing auditability property, DESIGN.md req. 13), and this
+  offline app deliberately minimizes dependencies. Weakening the unsafe-free guarantee or adding
+  a crate for a defense-in-depth item is not a good trade.
+* **Operational mitigation:** disable core dumps for the process the standard way — `ulimit -c 0`
+  in the launching shell, or `LimitCORE=0` in a systemd unit. On a shared/managed machine, a
+  system-wide `coredump` policy (e.g. `systemd-coredump` with `Storage=none`) covers it.
+
 #### F-2 (Medium) — Mobile clipboard auto-clear timer died with the field
 
 * **Where:** `mobile/composeApp/src/commonMain/kotlin/com/passmgr/App.kt`.

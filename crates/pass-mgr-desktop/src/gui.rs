@@ -989,6 +989,10 @@ impl GuiApp {
                         v.opened_generation()
                     )
                 };
+                // Start the new vault's UI from a clean slate — never inherit the previous
+                // session's edit buffers/filters/reveal (see reset_per_vault_ui_state). Done
+                // BEFORE installing the vault so nothing from vault A is ever rendered for B.
+                self.reset_per_vault_ui_state();
                 self.vault = Some(v);
                 // Bring the Config type lists into line with what records actually use, so a
                 // freshly opened (writable) vault's Config matches its data — types brought in
@@ -1068,6 +1072,42 @@ impl GuiApp {
         self.confirm2.zeroize();
         self.merge_pw1.zeroize();
         self.merge_pw2.zeroize();
+    }
+
+    /// Clear every piece of PER-VAULT UI state to its fresh-launch default. Called on each
+    /// successful open so a newly-unlocked vault never inherits the previous session's edit
+    /// buffers (which can hold cleartext passwords), armed delete, active filters/search, or
+    /// reveal toggles. Without this, an error path that drops the vault back to the unlock
+    /// screen WITHOUT going through the constructor (e.g. a change-password or merge-apply
+    /// failure) leaves vault A's state visible after vault B is opened — cross-vault secret
+    /// leakage and confusing filter carryover. The edit buffers are `Zeroize`-on-drop, so
+    /// replacing them here also wipes any secret they held.
+    fn reset_per_vault_ui_state(&mut self) {
+        self.tab = Tab::Instructions;
+        self.edit_instruction = None;
+        self.edit_trustwill = None;
+        self.edit_asset = None;
+        self.edit_account = None;
+        self.edit_realestate = None;
+        self.edit_taxfiling = None;
+        self.edit_general = None;
+        self.pending_account_delete = None;
+        // Reveal + grouping return to the saved view DEFAULTS (not hard false), matching the
+        // constructor and the tab-switch reset.
+        self.reveal_all = self.reveal_default;
+        self.re_reveal_all = self.reveal_default;
+        self.acct_grouped = self.group_accounts_default;
+        self.asset_grouped = self.group_assets_default;
+        // Filters + searches back to "no filter".
+        self.acct_filter_type.clear();
+        self.acct_filter_subtype.clear();
+        self.acct_filter_owner.clear();
+        self.acct_filter_title.clear();
+        self.acct_filter_review = false;
+        self.acct_search_user.clear();
+        self.asset_filter_review = false;
+        // Any half-typed document-upload inputs from the prior vault.
+        self.clear_doc_inputs();
     }
 
     /// Leave the merge flow: drop the opened source vault + computed plan and wipe the
@@ -3023,8 +3063,19 @@ impl GuiApp {
             // id no longer matches, so leaving it set could only go stale.
             self.pending_account_delete = None;
         }
-        // A click wins over keyboard nav (they can't both happen in one frame, but be safe).
-        select = select.or(nav_target);
+        // A pointer click on a list row (`select`) wins over keyboard nav. But a keyboard
+        // arrow (`nav_target`) CAN land in the same egui frame as a button click (events
+        // are batched per repaint), and the deferred actions below (Delete, confirm/cancel,
+        // Generate) were captured against the CURRENTLY shown record. Applying a same-frame
+        // nav swap first would retarget them at the NEIGHBOR — e.g. deleting or regenerating
+        // the wrong account. So suppress the keyboard nav whenever a record-targeted action
+        // is pending this frame; a click (`select`) cannot co-occur with another button
+        // click (one pointer), so it is always safe to honor.
+        let record_action_pending =
+            new || !matches!(action, FormAction::None) || confirm_delete || cancel_delete || generate;
+        if !record_action_pending {
+            select = select.or(nav_target);
+        }
         if let Some(i) = select {
             // `labels` is the FILTERED list, so resolve the clicked row to its id
             // and look the account up by id (a positional index into the
@@ -3841,6 +3892,10 @@ impl GuiApp {
                     // `None` behind (so the form clears after deletion) and giving
                     // us owned `r` to read its id.
                     if let Some(r) = self.edit_instruction.take() {
+                        // Snapshot the STORED record (its last-SAVED state) for the vault
+                        // rollback — NOT the edit buffer `r`, which may hold unsaved edits a
+                        // failed delete must not silently commit on a later save.
+                        let stored = v.instructions.iter().find(|x| x.id == r.id).cloned();
                         // Only arm the rollback when a record was ACTUALLY removed. A New-but-
                         // never-saved record isn't in the list (remove is a no-op), so the rollback
                         // must NOT resurrect it on a persist failure — the user is discarding it.
@@ -3848,9 +3903,11 @@ impl GuiApp {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.instructions.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.instructions.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_instruction = Some(r);
+                                s.edit_instruction = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -3860,13 +3917,18 @@ impl GuiApp {
                         if let Some(f) = &r.file {
                             doc_ids.push(f.clone());
                         }
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.trust_wills.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.trust_wills, &r.id, &mut v.audit, "Trust/Will") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.trust_wills.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.trust_wills.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_trustwill = Some(r);
+                                s.edit_trustwill = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -3876,26 +3938,38 @@ impl GuiApp {
                         if let Some(f) = &r.statement {
                             doc_ids.push(f.clone());
                         }
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.assets.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.assets, &r.id, &mut v.audit, "Asset/Liability") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.assets.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.assets.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_asset = Some(r);
+                                s.edit_asset = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
                 }
                 Tab::Accounts => {
                     if let Some(r) = self.edit_account.take() {
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm. Especially load-bearing here: the account edit
+                        // buffer can hold an unsaved password change that a failed delete must
+                        // never resurrect-and-commit.
+                        let stored = v.accounts.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.accounts, &r.id, &mut v.audit, "Account") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.accounts.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.accounts.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_account = Some(r);
+                                s.edit_account = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -3906,13 +3980,18 @@ impl GuiApp {
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.real_estate.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.real_estate, &r.id, &mut v.audit, "Real Estate") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.real_estate.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.real_estate.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_realestate = Some(r);
+                                s.edit_realestate = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -3923,13 +4002,18 @@ impl GuiApp {
                         for f in &r.documents {
                             doc_ids.push(f.clone());
                         }
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.tax_filings.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.tax_filings, &r.id, &mut v.audit, "Tax filing") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.tax_filings.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.tax_filings.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_taxfiling = Some(r);
+                                s.edit_taxfiling = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -3939,13 +4023,18 @@ impl GuiApp {
                         if let Some(f) = &r.file {
                             doc_ids.push(f.clone());
                         }
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.general_documents.iter().find(|x| x.id == r.id).cloned();
                         if records::remove(&mut v.general_documents, &r.id, &mut v.audit, "General document") {
                             rollback = Some(Box::new(move |s: &mut Self| {
                                 if let Some(ov) = s.vault.as_mut() {
                                     ov.vault.audit.truncate(audit_len);
-                                    ov.vault.general_documents.push(r.clone()); // verbatim: keep updated_at + history
+                                    if let Some(stored) = stored {
+                                        ov.vault.general_documents.push(stored); // restore the SAVED state verbatim
+                                    }
                                 }
-                                s.edit_general = Some(r);
+                                s.edit_general = Some(r); // restore the user's editing session (UI state)
                             }));
                         }
                     }
@@ -5513,6 +5602,66 @@ mod tests {
         let accounts = &app.vault.as_ref().unwrap().vault.accounts;
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, y_id, "exactly the armed record was deleted");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn opening_a_vault_clears_prior_per_vault_ui_state() {
+        // Audit 2026-07-03 A-8: a fresh open must not inherit the previous session's edit
+        // buffers (which can hold cleartext secrets), armed delete, active filters/search, or
+        // reveal toggles — otherwise an error path that drops to the unlock screen without going
+        // through the constructor leaks vault A's state into vault B.
+        let (mut app, path) = app_unlocked("resetui");
+        // Dirty a spread of per-vault state as a prior session would leave it.
+        let mut a = Account::new().unwrap();
+        a.password = "leaky-secret".into();
+        app.edit_account = Some(a);
+        app.pending_account_delete = Some("armed-id".into());
+        app.acct_filter_owner = "Alice".into();
+        app.acct_search_user = "bob".into();
+        app.reveal_all = true;
+        app.tab = Tab::Accounts;
+
+        app.reset_per_vault_ui_state();
+
+        assert!(app.edit_account.is_none(), "edit buffer cleared (its secret is wiped on drop)");
+        assert!(app.pending_account_delete.is_none(), "armed delete disarmed");
+        assert!(app.acct_filter_owner.is_empty(), "filters cleared");
+        assert!(app.acct_search_user.is_empty(), "search cleared");
+        assert_eq!(app.reveal_all, app.reveal_default, "reveal back to the saved default");
+        assert!(matches!(app.tab, Tab::Instructions), "tab back to the first");
+        cleanup(&path);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn delete_rollback_restores_the_saved_record_not_the_dirty_edit_buffer() {
+        // Audit 2026-07-03 A-6: on a failed-persist rollback the vault must be restored to the
+        // record's LAST-SAVED state, never the (possibly edited) edit buffer — otherwise a delete
+        // the user was told FAILED would silently commit the buffer's unsaved edits on a later save.
+        let (mut app, path) = app_unlocked("delrollback");
+        let id = {
+            let ov = app.vault.as_mut().unwrap();
+            let mut a = Account::new().unwrap();
+            a.title = "Bank".into();
+            a.password = "saved-pw".into();
+            let id = a.id.clone();
+            records::upsert(&mut ov.vault.accounts, a);
+            ov.save().unwrap();
+            id
+        };
+        // Load into the editor, then make an UNSAVED edit to the buffer.
+        app.edit_account = app.vault.as_ref().unwrap().vault.accounts.iter().find(|a| a.id == id).cloned();
+        app.edit_account.as_mut().unwrap().password = "unsaved-pw".into();
+        // Delete with the vault save forced to fail (full disk).
+        crate::fault::fail_at("vault.write", 1);
+        app.delete_current(Tab::Accounts);
+        crate::fault::clear();
+        assert!(app.status.contains("Save failed"), "status: {}", app.status);
+        // The record is back (rollback fired) with the SAVED password — the unsaved edit is gone.
+        let accounts = &app.vault.as_ref().unwrap().vault.accounts;
+        assert_eq!(accounts.len(), 1, "record restored by rollback");
+        assert_eq!(accounts[0].password, "saved-pw", "restored the SAVED state, not the dirty buffer");
         cleanup(&path);
     }
 

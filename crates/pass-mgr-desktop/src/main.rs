@@ -894,17 +894,32 @@ fn new_entries_since(out_dir: &std::path::Path, before: &std::collections::HashS
 
 fn warn_partial_plaintext(out_dir: &std::path::Path, before: &std::collections::HashSet<std::ffi::OsString>) {
     let new_entries = new_entries_since(out_dir, before);
-    if new_entries.is_empty() {
-        return; // nothing of ours landed — don't implicate the user's pre-existing files
+    // A top-level-name diff only catches entries this run CREATED. If OUT already held an
+    // entry of the same top-level name (e.g. a `documents/`/`csv/` dir from a prior export),
+    // `export_tree` writes fresh cleartext INTO that pre-existing subtree and the diff misses
+    // it entirely — so a non-empty pre-existing OUT means cleartext may have landed where we
+    // cannot attribute it precisely. Warn conservatively in that case, even when no NEW
+    // top-level entry appeared (audit 2026-07-03 A-9; extends L1/F1).
+    let preexisting_may_hold_cleartext = !before.is_empty();
+    if new_entries.is_empty() && !preexisting_may_hold_cleartext {
+        return; // truly nothing of ours could have landed
     }
-    eprintln!("WARNING: the export failed after writing PARTIAL UNENCRYPTED files to {}:", out_dir.display());
+    eprintln!("WARNING: the export failed after possibly writing PARTIAL UNENCRYPTED files to {}:", out_dir.display());
     for p in &new_entries {
-        eprintln!("    {}", p.display());
+        eprintln!("    {}  (created by this run)", p.display());
+    }
+    if preexisting_may_hold_cleartext {
+        eprintln!(
+            "    NOTE: {} already contained entries before this run. The export may have \
+             written cleartext INTO those pre-existing directories too, which cannot be \
+             listed separately — treat the ENTIRE directory as potentially holding \
+             decrypted secrets.",
+            out_dir.display()
+        );
     }
     eprintln!(
-        "Those cleartext entries were created by this run — securely delete THEM (e.g. \
-         `shred -u` each file, `srm -r` the new directories) before discarding. Any \
-         pre-existing files in the directory were not written by this run."
+        "Securely delete the cleartext (e.g. `shred -u` each file, `srm -r` the directories) \
+         before discarding."
     );
 }
 
