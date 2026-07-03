@@ -2321,7 +2321,8 @@ impl App {
         }
         let rc = es.record_fields;
         let filename = es.fields[rc].value.clone();
-        let source = es.fields[rc + 1].value.clone();
+        // Accept a path pasted with surrounding double quotes ("Copy as path").
+        let source = records::unquote_path(&es.fields[rc + 1].value).to_string();
         let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();
@@ -2554,7 +2555,8 @@ impl App {
         let rc = es.record_fields;
         let year = es.fields[1].value.clone(); // field 0 is Owner, field 1 is Filing year
         let filename = es.fields[rc].value.clone();
-        let source = es.fields[rc + 1].value.clone();
+        // Accept a path pasted with surrounding double quotes ("Copy as path").
+        let source = records::unquote_path(&es.fields[rc + 1].value).to_string();
         let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();
@@ -2675,7 +2677,8 @@ impl App {
         let rc = es.record_fields;
         let address = es.fields[0].value.clone();
         let filename = es.fields[rc].value.clone();
-        let source = es.fields[rc + 1].value.clone();
+        // Accept a path pasted with surrounding double quotes ("Copy as path").
+        let source = records::unquote_path(&es.fields[rc + 1].value).to_string();
         let subfolder = es.fields[rc + 2].value.clone();
         if source.trim().is_empty() {
             self.status = "'Upload from' is required.".into();

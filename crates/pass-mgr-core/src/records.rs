@@ -648,10 +648,30 @@ pub fn effective_doc_filename(name: &str, source: &str) -> String {
     if !n.is_empty() {
         return n.to_string();
     }
-    std::path::Path::new(source.trim())
+    std::path::Path::new(unquote_path(source))
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Normalize a user-typed "upload from" source path: trim surrounding whitespace, then
+/// strip a single MATCHED pair of surrounding ASCII double quotes. File managers'
+/// "Copy as path" (Windows Explorer) and shells wrap a path — especially one containing
+/// spaces — in double quotes, so accept that form and let the user paste it directly.
+/// Only a matched leading+trailing pair is removed; the content INSIDE the quotes is left
+/// exactly as-is (quotes preserve inner spaces, matching shell semantics), and a lone
+/// quote at just one end is left alone (it is a legitimate, if unusual, path character).
+pub fn unquote_path(s: &str) -> &str {
+    let t = s.trim();
+    // `strip_prefix`/`strip_suffix` return `None` when the affix is absent. Require BOTH
+    // (and length >= 2 so a single `"` isn't treated as an empty quoted string).
+    if t.len() >= 2
+        && let Some(inner) = t.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+    {
+        inner
+    } else {
+        t
+    }
 }
 
 /// Break a unix-seconds timestamp into civil UTC `(year, month, day, hour, min,
@@ -1830,6 +1850,32 @@ mod tests {
         assert!(changes.iter().any(|c| c.detail.contains("closed_as_of") && c.detail.contains("2026-06-18")));
         // Unchanged record yields no changes.
         assert!(old.diff(&old.clone(), now).is_empty());
+    }
+
+    #[test]
+    fn unquote_path_strips_only_a_matched_double_quote_pair() {
+        // A quoted "Copy as path" is accepted; the inner content (incl. spaces) is kept.
+        assert_eq!(unquote_path("\"/home/me/My File.pdf\""), "/home/me/My File.pdf");
+        assert_eq!(unquote_path("\"C:\\Users\\me\\a b.pdf\""), "C:\\Users\\me\\a b.pdf");
+        // Surrounding whitespace around the quotes is trimmed first.
+        assert_eq!(unquote_path("  \"/x/y.txt\"  "), "/x/y.txt");
+        // An unquoted path is only trimmed.
+        assert_eq!(unquote_path("  /x/y.txt  "), "/x/y.txt");
+        // A lone quote at one end is a real path char — left alone (still outer-trimmed).
+        assert_eq!(unquote_path("\"/x/y.txt"), "\"/x/y.txt");
+        assert_eq!(unquote_path("/x/y.txt\""), "/x/y.txt\"");
+        // Degenerate inputs don't panic.
+        assert_eq!(unquote_path("\""), "\"");
+        assert_eq!(unquote_path("\"\""), "");
+        assert_eq!(unquote_path(""), "");
+    }
+
+    #[test]
+    fn effective_doc_filename_uses_the_basename_of_a_quoted_source() {
+        // With no explicit name, the default filename is the source's basename — and a
+        // quoted source resolves to the right basename, not one with a stray quote.
+        assert_eq!(effective_doc_filename("", "\"/home/me/My File.pdf\""), "My File.pdf");
+        assert_eq!(effective_doc_filename("keep.pdf", "\"/x/other.pdf\""), "keep.pdf");
     }
 
     #[test]

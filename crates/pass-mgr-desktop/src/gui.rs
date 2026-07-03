@@ -3460,7 +3460,8 @@ impl GuiApp {
         match req {
             ReDocReq::None => {}
             ReDocReq::Upload => {
-                let src = self.doc_source.trim().to_string();
+                // Accept a path pasted with surrounding double quotes ("Copy as path").
+                let src = records::unquote_path(&self.doc_source).to_string();
                 if src.is_empty() {
                     self.status = "'Upload from' path is required.".into();
                     return;
@@ -3587,8 +3588,9 @@ impl GuiApp {
         match req {
             DocReq::None => {}
             DocReq::Attach => {
-                let src = self.doc_source.clone();
-                if src.trim().is_empty() {
+                // Accept a path pasted with surrounding double quotes ("Copy as path").
+                let src = records::unquote_path(&self.doc_source).to_string();
+                if src.is_empty() {
                     self.status = "'Upload from' path is required.".into();
                     return;
                 }
@@ -3756,7 +3758,8 @@ impl GuiApp {
         match req {
             TaxDocReq::None => {}
             TaxDocReq::Upload => {
-                let src = self.doc_source.trim().to_string();
+                // Accept a path pasted with surrounding double quotes ("Copy as path").
+                let src = records::unquote_path(&self.doc_source).to_string();
                 if src.is_empty() {
                     self.status = "'Upload from' path is required.".into();
                     return;
@@ -5550,6 +5553,37 @@ mod tests {
         app.handle_doc(DocReq::Remove, DocTarget::Asset);
         assert!(app.edit_asset.as_ref().unwrap().statement.is_none());
         assert!(!app.vault.as_ref().unwrap().has_document(&id));
+
+        let _ = std::fs::remove_file(&src);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn attach_accepts_a_double_quoted_upload_from_path() {
+        // A path pasted with surrounding double quotes ("Copy as path") uploads the same
+        // file as the unquoted path — the quotes are stripped, not treated as part of the name.
+        let (mut app, path) = app_unlocked("docq");
+        let src = std::env::temp_dir().join(format!("passmgr-guiq-{}.txt", nanos()));
+        std::fs::write(&src, b"quoted body").unwrap();
+
+        let mut asset = AssetLiability::new().unwrap();
+        asset.owner = "Jane Doe".into();
+        asset.approx_value = "1000".into();
+        app.edit_asset = Some(asset);
+        app.doc_subfolder = "wills".into();
+        // No explicit filename → it must default to the (quoted) source's basename.
+        app.doc_source = format!("\"{}\"", src.display()); // wrap the path in double quotes
+        app.handle_doc(DocReq::Attach, DocTarget::Asset);
+
+        let id = app.edit_asset.as_ref().unwrap().statement.clone();
+        assert!(id.is_some(), "quoted upload path was accepted and the doc attached");
+        let ov = app.vault.as_ref().unwrap();
+        let id = id.unwrap();
+        assert_eq!(&ov.read_document(&id).unwrap()[..], b"quoted body");
+        // The stored virtual path ends with the real filename, not a quote-mangled one.
+        let vpath = ov.doc_path(&id).unwrap_or_default();
+        let stem = src.file_stem().unwrap().to_string_lossy();
+        assert!(vpath.contains(&*stem) && !vpath.contains('"'), "clean filename in {vpath}");
 
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
