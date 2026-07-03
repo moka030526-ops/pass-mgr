@@ -32,7 +32,7 @@ crates/
 │       │                 The derived `Key` zeroizes on drop; its pages are mlock'd
 │       │                 (swap mitigation) only when the `mlock` feature is on (default
 │       │                 for desktop, OFF in the mobile build). CSPRNG `random_bytes`.
-│       ├── records.rs    The data model: the SEVEN record types, `Change`/history, the
+│       ├── records.rs    The data model: the EIGHT record types, `Change`/history, the
 │       │                 `Record` trait + generic `upsert`/`remove`, the `Vault`
 │       │                 aggregate, and shared helpers (`unix_now`, `random_id`, the
 │       │                 civil-date math, history compaction, and the uniform document
@@ -94,12 +94,13 @@ in the generated UniFFI scaffolding inside `pass-mgr-ffi`.
 
 ## 2. Data model (`records.rs`)
 
-Seven record types, one per UI tab. Each carries an `id` (128-bit hex, from
+Eight record types, one per UI tab. Each carries an `id` (128-bit hex, from
 `random_id`), `created_at`/`updated_at` timestamps, and an append-only
 `history: Vec<Change>`:
 
 | Tab | Type | Key fields |
 |-----|------|-----------|
+| URGENT | `Urgent` | title, description (free text; the first tab) |
 | Instructions | `Instruction` | title, description |
 | Trust and Will | `TrustWill` | document, usage, `file` (doc id) |
 | Assets and Liabilities | `AssetLiability` | kind (Asset/Liability), description, owner, beneficiary, approx_value, as_of_date, institution, type, url, review, `statement` (doc id), `linked_accounts` (Account record ids; see `docs/ASSET_ACCOUNT_LINKS.md`) |
@@ -170,7 +171,7 @@ trimmed by `compact --json` (§3.6); the audit log is always preserved and gets 
 *history*, and document bytes held in memory — are overwritten with zeros when
 they leave scope. Category names are not secrets and are `#[zeroize(skip)]`.
 
-**The `Vault` aggregate.** `Vault` owns the seven record `Vec`s plus: `categories`
+**The `Vault` aggregate.** `Vault` owns the eight record `Vec`s plus: `categories`
 (`TypeLists`, §5); a `settings` block (`VaultSettings { volume_max_size,
 redundancy }`); a stable random `id` that binds the volumes/manifests to this vault
 (a foreign or swapped volume/manifest then fails AEAD authentication); a `version`;
@@ -529,7 +530,7 @@ except on an explicit save. **Every field of every record type is left/right-tri
 on save** (`Record::trim_fields`, called from the GUI/TUI commit path of each tab) —
 secrets such as passwords included (chosen policy). A one-off **Trim all fields**
 maintenance action (GUI button on the Accounts filter row; TUI `T` from any tab) runs
-`records::trim_all_records` over the whole vault — all seven record kinds — routing
+`records::trim_all_records` over the whole vault — all eight record kinds — routing
 each changed record through `upsert` so the trim is recorded in that record's history
 (old → new) and reports how many changed. A password copied to the clipboard is auto-cleared after
 15 s (a deadline the event loop polls for — the GUI schedules a repaint so it fires

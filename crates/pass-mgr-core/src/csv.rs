@@ -32,7 +32,7 @@
 //! in-memory exposure is not worth a counting-pass rewrite.
 
 use crate::records::{
-    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, TaxFiling, TrustWill, Vault,
+    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, TaxFiling, TrustWill, Urgent, Vault,
 };
 
 /// The basename of a volume virtual path (`taxes/2024/<ts>/w2.pdf` -> `w2.pdf`).
@@ -101,6 +101,17 @@ fn opt_name(opt: &Option<String>, name_of: &impl Fn(&str) -> String) -> String {
 }
 
 // --- Per-tab exporters -------------------------------------------------------
+
+pub fn urgent_csv(rows: &[Urgent]) -> String {
+    let mut out = String::new();
+    row(&mut out, &["id", "title", "description", "created", "updated"]);
+    for r in rows {
+        let created = iso_utc(r.created_at);
+        let updated = iso_utc(r.updated_at);
+        row(&mut out, &[&r.id, &r.title, &r.description, &created, &updated]);
+    }
+    out
+}
 
 pub fn instructions_csv(rows: &[Instruction]) -> String {
     let mut out = String::new();
@@ -248,6 +259,7 @@ pub fn general_documents_csv(rows: &[GeneralDocument], name_of: impl Fn(&str) ->
 /// record type or changing a base filename is a single-site change here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CsvTab {
+    Urgent,
     Instructions,
     TrustWill,
     Assets,
@@ -263,6 +275,7 @@ pub enum CsvTab {
 /// Estate) by the user's explicit opt-in; the front-ends hold it in `Zeroizing`.
 pub fn build_tab_csv(v: &Vault, tab: CsvTab, name_of: impl Fn(&str) -> String) -> (&'static str, String, usize) {
     match tab {
+        CsvTab::Urgent => ("urgent", urgent_csv(&v.urgent), v.urgent.len()),
         CsvTab::Instructions => ("instructions", instructions_csv(&v.instructions), v.instructions.len()),
         CsvTab::TrustWill => ("trust-will", trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
         CsvTab::Assets => {

@@ -673,6 +673,7 @@ impl OpenVault {
             }
         };
         for tab in [
+            crate::csv::CsvTab::Urgent,
             crate::csv::CsvTab::Instructions,
             crate::csv::CsvTab::TrustWill,
             crate::csv::CsvTab::Assets,
@@ -1523,6 +1524,7 @@ impl OpenVault {
         // One closure per collection, run via the generic `plan_collection` helper so the
         // recency diff + blocked-record handling is written once. `docs_of` extracts the
         // blob ids a record references (empty for Instruction/Account).
+        self.plan_collection(crate::merge::RecordKind::Urgent, &self.vault.urgent, &source.vault.urgent, |_r| Vec::new(), &resolve, &mut blobs, &mut plan)?;
         self.plan_collection(crate::merge::RecordKind::Instruction, &self.vault.instructions, &source.vault.instructions, |_r| Vec::new(), &resolve, &mut blobs, &mut plan)?;
         self.plan_collection(crate::merge::RecordKind::TrustWill, &self.vault.trust_wills, &source.vault.trust_wills, |r| r.file.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
         self.plan_collection(crate::merge::RecordKind::Asset, &self.vault.assets, &source.vault.assets, |r| r.statement.iter().cloned().collect(), &resolve, &mut blobs, &mut plan)?;
@@ -1707,6 +1709,7 @@ impl OpenVault {
         let accepted = |kind: crate::merge::RecordKind| -> std::collections::HashSet<&str> {
             plan.records.iter().filter(|r| r.kind == kind).map(|r| r.id.as_str()).collect()
         };
+        let (a0, u0) = crate::merge::merge_records(&mut self.vault.urgent, &source.vault.urgent, &accepted(crate::merge::RecordKind::Urgent));
         let (a1, u1) = crate::merge::merge_records(&mut self.vault.instructions, &source.vault.instructions, &accepted(crate::merge::RecordKind::Instruction));
         let (a2, u2) = crate::merge::merge_records(&mut self.vault.trust_wills, &source.vault.trust_wills, &accepted(crate::merge::RecordKind::TrustWill));
         let (a3, u3) = crate::merge::merge_records(&mut self.vault.assets, &source.vault.assets, &accepted(crate::merge::RecordKind::Asset));
@@ -1714,8 +1717,8 @@ impl OpenVault {
         let (a5, u5) = crate::merge::merge_records(&mut self.vault.real_estate, &source.vault.real_estate, &accepted(crate::merge::RecordKind::RealEstate));
         let (a6, u6) = crate::merge::merge_records(&mut self.vault.tax_filings, &source.vault.tax_filings, &accepted(crate::merge::RecordKind::TaxFiling));
         let (a7, u7) = crate::merge::merge_records(&mut self.vault.general_documents, &source.vault.general_documents, &accepted(crate::merge::RecordKind::GeneralDocument));
-        report.records_added = a1 + a2 + a3 + a4 + a5 + a6 + a7;
-        report.records_updated = u1 + u2 + u3 + u4 + u5 + u6 + u7;
+        report.records_added = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+        report.records_updated = u0 + u1 + u2 + u3 + u4 + u5 + u6 + u7;
         report.records_skipped = plan.skipped.len();
 
         // (2b) Reconcile category TYPES so the merged records' asset/account types + subtypes
@@ -5249,7 +5252,7 @@ mod tests {
         assert!(tree_file.exists(), "documents/ tree file missing: {}", tree_file.display());
         assert_eq!(std::fs::read(&tree_file).unwrap(), body, "tree copy has the decrypted bytes");
         // A CSV per tab; the accounts CSV carries the row.
-        for f in ["accounts.csv", "general-documents.csv", "assets-liabilities.csv", "real-estate.csv", "taxes.csv", "trust-will.csv", "instructions.csv"] {
+        for f in ["urgent.csv", "accounts.csv", "general-documents.csv", "assets-liabilities.csv", "real-estate.csv", "taxes.csv", "trust-will.csv", "instructions.csv"] {
             assert!(mirror.join("csv").join(f).exists(), "missing csv/{f}");
         }
         assert!(std::fs::read_to_string(mirror.join("csv/accounts.csv")).unwrap().contains("jane"));

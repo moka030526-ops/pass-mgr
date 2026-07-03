@@ -245,6 +245,7 @@ fn old_vault_json_without_new_fields_still_deserializes() {
     // New top-level collections default to empty.
     assert!(vault.tax_filings.is_empty(), "missing tax_filings defaults to empty");
     assert!(vault.general_documents.is_empty(), "missing general_documents defaults to empty");
+    assert!(vault.urgent.is_empty(), "missing urgent defaults to empty");
 
     // Old-style asset loads with every later-added field defaulted.
     assert_eq!(vault.assets.len(), 1);

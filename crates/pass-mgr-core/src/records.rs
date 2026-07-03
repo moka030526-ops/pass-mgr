@@ -741,9 +741,10 @@ pub fn parse_ymd_utc(s: &str) -> Option<i64> {
 /// of history entries removed. Removed `Change`s are `ZeroizeOnDrop`, so their
 /// (possibly secret-bearing) before/after detail strings are wiped from RAM.
 pub fn compact_history(vault: &mut Vault, cutoff: Option<i64>, drop_all: bool) -> usize {
-    // Each of the six record collections shares the generic `Record` interface,
-    // so one helper trims them all.
-    trim_histories(&mut vault.instructions, cutoff, drop_all)
+    // Each record collection shares the generic `Record` interface, so one helper
+    // trims them all.
+    trim_histories(&mut vault.urgent, cutoff, drop_all)
+        + trim_histories(&mut vault.instructions, cutoff, drop_all)
         + trim_histories(&mut vault.trust_wills, cutoff, drop_all)
         + trim_histories(&mut vault.assets, cutoff, drop_all)
         + trim_histories(&mut vault.accounts, cutoff, drop_all)
@@ -766,6 +767,9 @@ pub fn history_stats(vault: &Vault, cutoff: Option<i64>, drop_all: bool) -> usiz
         }
     };
     let mut n = 0;
+    for r in &vault.urgent {
+        n += count(&r.history);
+    }
     for r in &vault.instructions {
         n += count(&r.history);
     }
@@ -994,10 +998,24 @@ pub fn remove<R: Record>(list: &mut Vec<R>, id: &str, audit: &mut Vec<Change>, k
     }
 }
 
-// --- The five record types ---------------------------------------------------
+// --- The record types --------------------------------------------------------
 // Each struct below is one record kind. They share the same derives as `Change`
 // (see that note): Serialize/Deserialize for disk, Clone/Debug/Default, and
 // Zeroize/ZeroizeOnDrop so every field (including secrets) is wiped on drop.
+
+/// Tab 0 — an URGENT free-text note. The first tab so the most time-critical
+/// things an executor must know (whom to call, where the safe key is, an in-flight
+/// crisis) are the first thing seen on unlock. Same shape as [`Instruction`]
+/// (title + free-text body) — a separate, prominent collection, not a subtype.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
+pub struct Urgent {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub history: Vec<Change>, // append-only audit trail for this record
+}
 
 /// Tab 1 — free-form instruction note.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Zeroize, ZeroizeOnDrop)]
@@ -1230,6 +1248,11 @@ macro_rules! new_record {
 // One `impl` block per type providing a `new()` constructor. Each returns
 // `Result<Self, CryptoError>` because id generation can fail; `Ok(...)` wraps the
 // success value.
+impl Urgent {
+    pub fn new() -> Result<Self, CryptoError> {
+        Ok(new_record!(Urgent))
+    }
+}
 impl Instruction {
     pub fn new() -> Result<Self, CryptoError> {
         Ok(new_record!(Instruction))
@@ -1285,7 +1308,8 @@ pub fn trim_all_accounts(accounts: &mut Vec<Account>) -> usize {
 /// number of records changed. Backs the "Trim all fields" maintenance action so the
 /// whole vault — not just accounts — has its leading/trailing whitespace removed.
 pub fn trim_all_records(vault: &mut Vault) -> usize {
-    trim_all(&mut vault.instructions)
+    trim_all(&mut vault.urgent)
+        + trim_all(&mut vault.instructions)
         + trim_all(&mut vault.trust_wills)
         + trim_all(&mut vault.assets)
         + trim_all(&mut vault.accounts)
@@ -1364,6 +1388,16 @@ macro_rules! impl_record {
 // Each call below passes: the type, a diff closure, and a label closure.
 // Diff closure args: `s` = self (old), `n` = new, `at` = timestamp, `out` = the
 // vector to append changes to. `&s.title` lends the field to `track` (read-only).
+impl_record!(
+    Urgent,
+    |s: &Urgent, n: &Urgent, at: i64, out: &mut Vec<Change>| {
+        track(out, at, "title", &s.title, &n.title);
+        track(out, at, "description", &s.description, &n.description);
+    },
+    |l: &Urgent| if l.title.is_empty() { "(urgent note)".to_string() } else { l.title.clone() },
+    |r: &mut Urgent| trim_strings_in_place(&mut [&mut r.title, &mut r.description])
+);
+
 impl_record!(
     Instruction,
     |s: &Instruction, n: &Instruction, at: i64, out: &mut Vec<Change>| {
@@ -1659,6 +1693,10 @@ pub struct Vault {
     pub generation: u64,
     #[serde(default)]
     pub last_opened_at: i64,
+    /// URGENT notes (Tab 0). `#[serde(default)]` keeps vaults written before this tab
+    /// existed loadable — a missing key decodes to an empty list.
+    #[serde(default)]
+    pub urgent: Vec<Urgent>,
     #[serde(default)]
     pub instructions: Vec<Instruction>,
     #[serde(default)]
@@ -1792,6 +1830,25 @@ mod tests {
         assert!(changes.iter().any(|c| c.detail.contains("closed_as_of") && c.detail.contains("2026-06-18")));
         // Unchanged record yields no changes.
         assert!(old.diff(&old.clone(), now).is_empty());
+    }
+
+    #[test]
+    fn urgent_record_new_diff_label_and_trim() {
+        let u = Urgent::new().unwrap();
+        assert_eq!(u.label(), "(urgent note)", "blank urgent shows a placeholder label");
+        let mut edited = u.clone();
+        edited.title = "  Call the lawyer  ".into();
+        edited.description = "Safe key is in the desk drawer.".into();
+        // Diff tracks both free-text fields.
+        let c = u.diff(&edited, unix_now());
+        assert!(c.iter().any(|x| x.detail.contains("title")));
+        assert!(c.iter().any(|x| x.detail.contains("description")));
+        // Trim tidies the fields; the trimmed title becomes the list label.
+        assert!(edited.trim_fields());
+        assert_eq!(edited.title, "Call the lawyer");
+        assert_eq!(edited.label(), "Call the lawyer");
+        // Unchanged record yields no diff.
+        assert!(edited.diff(&edited.clone(), unix_now()).is_empty());
     }
 
     #[test]

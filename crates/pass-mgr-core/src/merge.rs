@@ -37,10 +37,11 @@ use std::collections::HashSet;
 
 use crate::records::Record;
 
-/// Which of the seven record collections a planned change belongs to (used only for
+/// Which of the record collections a planned change belongs to (used only for
 /// display/grouping in the preview — the apply path matches on the concrete collections).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordKind {
+    Urgent,
     Instruction,
     TrustWill,
     Asset,
@@ -54,6 +55,7 @@ impl RecordKind {
     /// A short, human-readable name for the preview.
     pub fn as_str(self) -> &'static str {
         match self {
+            RecordKind::Urgent => "Urgent",
             RecordKind::Instruction => "Instruction",
             RecordKind::TrustWill => "Trust & Will",
             RecordKind::Asset => "Asset/Liability",

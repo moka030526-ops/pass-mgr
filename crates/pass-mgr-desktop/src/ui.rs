@@ -40,7 +40,7 @@ use crate::crypto::KdfParams;
 use crate::csv;
 use crate::password::{self, GenOptions};
 use crate::records::{
-    self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
+    self, Account, AssetLiability, Change, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill, Urgent,
 };
 use crate::vault::{CategoryRemoval, OpenVault, VaultError};
 
@@ -104,6 +104,7 @@ enum Screen {
 // passing a `Tab` around does not "move" (consume) it.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Tab {
+    Urgent,
     Instructions,
     TrustWill,
     Assets,
@@ -118,7 +119,8 @@ enum Tab {
 impl Tab {
     // `[Tab; 6]` is a fixed-size array of 6 `Tab` values. `const` = a
     // compile-time constant.
-    const ALL: [Tab; 8] = [
+    const ALL: [Tab; 9] = [
+        Tab::Urgent,
         Tab::Instructions,
         Tab::TrustWill,
         Tab::Assets,
@@ -135,6 +137,7 @@ impl Tab {
     // (`'static` is the lifetime of program-long data, e.g. string literals).
     fn title(self) -> &'static str {
         match self {
+            Tab::Urgent => "URGENT",
             Tab::Instructions => "Instructions",
             Tab::TrustWill => "Trust and Will",
             Tab::Assets => "Assets & Liabilities",
@@ -579,7 +582,7 @@ impl App {
             merge_source: None,
             merge_plan: None,
             merge_error: None,
-            tab: Tab::Instructions,
+            tab: Tab::Urgent,
             selected: 0,
             edit: None,
             acct_filter_type: None,
@@ -652,6 +655,7 @@ impl App {
     fn current_labels(&self) -> Vec<(String, String)> {
         let v = &self.vault_ref().vault;
         match self.tab {
+            Tab::Urgent => label_list(&v.urgent),
             Tab::Instructions => label_list(&v.instructions),
             Tab::TrustWill => label_list(&v.trust_wills),
             // Iterator pipeline: borrow each asset (`.iter()`), keep only those
@@ -1729,6 +1733,24 @@ impl App {
             Option<String>,
             Vec<Change>,
         ) = match tab {
+            Tab::Urgent => {
+                // Same two-field free-text form as Instructions, for the URGENT collection.
+                let r = sel_id
+                    .as_ref()
+                    .and_then(|id| v.urgent.iter().find(|r| &r.id == id).cloned())
+                    .unwrap_or_else(|| Urgent::new().unwrap_or_default());
+                let id = if existing { Some(r.id.clone()) } else { None };
+                (
+                    id,
+                    r.created_at,
+                    vec![
+                        Field::text("Title", r.title.clone()),
+                        Field::multiline("Details", r.description.clone()),
+                    ],
+                    None,
+                    r.history.clone(),
+                )
+            }
             Tab::Instructions => {
                 // Find the selected record, else build a fresh one:
                 //  - `.as_ref()` borrows inside the `Option` so it isn't consumed.
@@ -2447,6 +2469,7 @@ impl App {
     fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
         let ov = self.vault.as_ref()?;
         let tab = match self.tab {
+            Tab::Urgent => csv::CsvTab::Urgent,
             Tab::Instructions => csv::CsvTab::Instructions,
             Tab::TrustWill => csv::CsvTab::TrustWill,
             Tab::Assets => csv::CsvTab::Assets,
@@ -2775,6 +2798,15 @@ impl App {
         // `&mut ov.vault` — exclusive borrow so we can push/replace records.
         let v = &mut ov.vault;
         match es.tab {
+            Tab::Urgent => {
+                let mut r = Urgent::default();
+                r.id = id;
+                r.created_at = es.created_at;
+                r.title = f(0);
+                r.description = f(1);
+                r.trim_fields(); // left/right-trim every field before persisting
+                records::upsert(&mut v.urgent, r);
+            }
             Tab::Instructions => {
                 // `Instruction::default()` builds an all-default record, which we
                 // then overwrite field by field from the form.
@@ -3080,6 +3112,17 @@ impl App {
             let v = &mut ov.vault;
             let audit_len = v.audit.len();
             match self.tab {
+                Tab::Urgent => {
+                    if let Some(r) = v.urgent.iter().find(|r| r.id == id).cloned() {
+                        records::remove(&mut v.urgent, &id, &mut v.audit, "Urgent");
+                        rollback = Some(Box::new(move |s: &mut Self| {
+                            if let Some(ov) = s.vault.as_mut() {
+                                ov.vault.audit.truncate(audit_len);
+                                ov.vault.urgent.push(r);
+                            }
+                        }));
+                    }
+                }
                 Tab::Instructions => {
                     if let Some(r) = v.instructions.iter().find(|r| r.id == id).cloned() {
                         records::remove(&mut v.instructions, &id, &mut v.audit, "Instruction");
@@ -4681,7 +4724,7 @@ mod tests {
         app.reveal_all = true;
         app.re_reveal_all = true;
         // Any tab-change key routes through `switch_tab`, which clears both toggles.
-        app.handle_key(key(KeyCode::Char('5'))); // jump to the Real Estate tab
+        app.handle_key(key(KeyCode::Char('6'))); // jump to the Real Estate tab
         assert_eq!(app.tab, Tab::RealEstate);
         assert!(!app.reveal_all, "reveal_all cleared on tab switch");
         assert!(!app.re_reveal_all, "re_reveal_all cleared on tab switch");
@@ -4732,11 +4775,11 @@ mod tests {
         app.reveal_all = true;
         app.re_reveal_all = true;
         app.tab = Tab::Accounts;
-        app.handle_key(key(KeyCode::Char('5'))); // jump to Real Estate
+        app.handle_key(key(KeyCode::Char('6'))); // jump to Real Estate
         assert_eq!(app.tab, Tab::RealEstate);
         assert!(app.reveal_all, "reveal_all re-applied from pref on tab switch");
         assert!(app.re_reveal_all, "re_reveal_all re-applied from pref on tab switch");
-        app.handle_key(key(KeyCode::Char('4'))); // back to Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // back to Accounts
         assert!(app.reveal_all && app.re_reveal_all, "still revealed after another switch");
         cleanup(&path);
     }
@@ -4780,7 +4823,7 @@ mod tests {
         // reveal (`reveal_all` on Accounts) so the new value is visible — there is no
         // per-record reveal to flip.
         let (mut app, path) = app_unlocked("genglobal");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('n'))); // new record
         assert!(!app.reveal_all, "reveal starts off");
         app.handle_key(ctrl('g')); // generate into the account's password field
@@ -4838,6 +4881,7 @@ mod tests {
         assert_eq!(
             titles,
             vec![
+                "URGENT",
                 "Instructions",
                 "Trust and Will",
                 "Assets & Liabilities",
@@ -5407,20 +5451,49 @@ mod tests {
     #[test]
     fn tabs_cycle_and_number_select() {
         let (mut app, path) = app_unlocked("tabs");
-        assert_eq!(app.tab, Tab::Instructions);
+        // URGENT is the first tab and the default landing tab.
+        assert_eq!(app.tab, Tab::Urgent);
         app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.tab, Tab::TrustWill);
-        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.tab, Tab::Instructions);
-        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.tab, Tab::Urgent);
+        // Digit keys are 1-based over Tab::ALL, so '5' is now Accounts (URGENT shifted them).
+        app.handle_key(key(KeyCode::Char('5')));
         assert_eq!(app.tab, Tab::Accounts);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn urgent_tab_is_first_and_creates_a_free_text_note() {
+        let (mut app, path) = app_unlocked("urgent");
+        // URGENT is the default landing tab (tab 1).
+        assert_eq!(app.tab, Tab::Urgent);
+        app.handle_key(key(KeyCode::Char('n'))); // new -> Edit screen
+        assert_eq!(app.screen, Screen::Edit);
+        // Field order: 0 title, 1 details (both free text).
+        for c in "Call the lawyer".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Down)); // -> details
+        for c in "Safe key in desk".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(ctrl('s')); // save
+        assert_eq!(app.screen, Screen::Browse);
+        let v = &app.vault.as_ref().unwrap().vault;
+        assert_eq!(v.urgent.len(), 1);
+        assert_eq!(v.urgent[0].title, "Call the lawyer");
+        assert_eq!(v.urgent[0].description, "Safe key in desk");
+        // It shows in the URGENT list and NOT in Instructions (separate collections).
+        assert_eq!(app.current_labels().len(), 1);
+        assert!(v.instructions.is_empty());
         cleanup(&path);
     }
 
     #[test]
     fn create_account_via_keys_persists_fields_in_order() {
         let (mut app, path) = app_unlocked("acct");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts tab
         app.handle_key(key(KeyCode::Char('n'))); // new -> Edit screen
         assert_eq!(app.screen, Screen::Edit);
 
@@ -5458,7 +5531,7 @@ mod tests {
     #[test]
     fn saving_an_account_trims_every_field_in_tui() {
         let (mut app, path) = app_unlocked("trimsave");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('n'))); // new
         // title (focus 0) — mandatory; also exercises trimming.
         for c in "  Brokerage  ".chars() { app.handle_key(key(KeyCode::Char(c))); }
@@ -5497,7 +5570,7 @@ mod tests {
             records::upsert(&mut v.real_estate, re);
         }
         // Press T from a tab OTHER than the records being trimmed — it is whole-vault.
-        app.handle_key(key(KeyCode::Char('6'))); // Taxes tab
+        app.handle_key(key(KeyCode::Char('7'))); // Taxes tab
         app.handle_key(key(KeyCode::Char('T'))); // one-off trim-all (whole vault)
         let a = &app.vault.as_ref().unwrap().vault.accounts[0];
         assert_eq!(a.owner, "Alice");
@@ -5516,7 +5589,7 @@ mod tests {
     #[test]
     fn trim_all_key_is_blocked_in_read_only_tui() {
         let (mut app, path) = app_read_only("trimro");
-        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Char('5')));
         app.handle_key(key(KeyCode::Char('T')));
         assert!(app.status.contains("Read-only"), "read-only blocks the bulk trim: {}", app.status);
         cleanup(&path);
@@ -5581,7 +5654,7 @@ mod tests {
     #[test]
     fn review_choice_maps_to_bool_on_save() {
         let (mut app, path) = app_unlocked("review");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('n')));
         // title (focus 0) — mandatory.
         for c in "Acct".chars() { app.handle_key(key(KeyCode::Char(c))); }
@@ -5600,7 +5673,7 @@ mod tests {
     #[test]
     fn account_save_requires_a_title_in_tui() {
         let (mut app, path) = app_unlocked("titlereq");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('n'))); // new
         // Fill the username but leave the title (field 0) blank.
         for _ in 0..4 {
@@ -5617,7 +5690,7 @@ mod tests {
     #[test]
     fn account_save_requires_an_owner_in_tui() {
         let (mut app, path) = app_unlocked("ownerreq");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('n'))); // new
         // Give a title (field 0) but leave the owner (field 3) blank.
         for c in "Acct".chars() { app.handle_key(key(KeyCode::Char(c))); }
@@ -5636,7 +5709,7 @@ mod tests {
     #[test]
     fn read_only_edit_form_is_not_editable() {
         let (mut app, path) = app_read_only("roedit");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.selected = 0;
         app.handle_key(key(KeyCode::Enter)); // Enter opens the record as a VIEW
         assert_eq!(app.screen, Screen::Edit);
@@ -5674,7 +5747,7 @@ mod tests {
             records::upsert(&mut v.accounts, a);
             id
         };
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts tab
         app.handle_key(key(KeyCode::Char('g'))); // switch to grouped
         assert!(app.acct_grouped);
         // Collapsed by default: only the top-level owner row is visible, and the leaf
@@ -5792,7 +5865,7 @@ mod tests {
             records::upsert(&mut v.assets, a);
             id
         };
-        app.handle_key(key(KeyCode::Char('3'))); // Assets tab
+        app.handle_key(key(KeyCode::Char('4'))); // Assets tab
         app.handle_key(key(KeyCode::Char('g'))); // grouped
         assert!(app.asset_grouped);
         // Collapsed: only the top-level owner row; the leaf title is hidden.
@@ -5860,7 +5933,7 @@ mod tests {
             records::upsert(&mut v.accounts, a1);
             records::upsert(&mut v.accounts, a2);
         }
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts
         app.handle_key(key(KeyCode::Char('v'))); // review-only filter
         assert!(app.acct_filter_review);
         assert_eq!(app.current_labels().len(), 1); // only the flagged one
@@ -5880,6 +5953,7 @@ mod tests {
             let v = &mut app.vault.as_mut().unwrap().vault;
             records::upsert(&mut v.instructions, Instruction::new().unwrap());
         }
+        app.tab = Tab::Instructions; // the default landing tab is now URGENT
         assert_eq!(app.current_labels().len(), 1);
         app.selected = 0;
         app.handle_key(key(KeyCode::Char('d')));
@@ -5923,7 +5997,7 @@ mod tests {
     #[test]
     fn tui_subtype_reconstrains_on_type_change() {
         let (mut app, path) = app_unlocked("subrecon");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts tab
         app.handle_key(key(KeyCode::Char('n'))); // new record -> Edit
         assert_eq!(app.screen, Screen::Edit);
         {
@@ -5950,7 +6024,7 @@ mod tests {
     #[test]
     fn detach_on_non_doc_tab_is_noop() {
         let (mut app, path) = app_unlocked("detachnoop");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts (no docs)
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts (no docs)
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_key(ctrl('k')); // detach — should be a harmless no-op
         // Still on the edit screen with an intact buffer; no account created yet.
@@ -5962,7 +6036,7 @@ mod tests {
     #[test]
     fn read_only_keys_are_inert_but_reads_work() {
         let (mut app, path) = app_read_only("ro");
-        app.handle_key(key(KeyCode::Char('4'))); // Accounts tab
+        app.handle_key(key(KeyCode::Char('5'))); // Accounts tab
         assert_eq!(app.current_labels().len(), 1, "existing record is viewable");
 
         // New / delete / change-password do nothing and report read-only.

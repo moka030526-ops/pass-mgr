@@ -38,7 +38,7 @@ Each numbered requirement from the brief maps to a concrete design element.
 |---|-------------|----------------|
 | 1 | Standalone, no internet | No network/async crates in `Cargo.toml`; offline by construction (§3) |
 | 2 | Filter screens + custom category types | Per-tab filters (account type/subtype/owner/review; asset review); editable `categories` stored in-vault (§4.2, §4.3) |
-| 3 | Rich records (accounts, assets, real estate, trust/will, instructions, taxes, general documents) | Seven record types, one per tab (§4.1) |
+| 3 | Rich records (urgent notes, accounts, assets, real estate, trust/will, instructions, taxes, general documents) | Eight record types, one per tab (§4.1) |
 | 4 | Each change logged with timestamp | Per-record `history: Vec<Change>` + vault-level `audit` (§4.2) |
 | 5 | History maintained | Append-only `history` retained on every edit; field-level diffs (§4.2); trimmable on demand via `compact --json` (§11.1) |
 | 6 | Last access maintained | `Vault.last_opened_at` + a monotonic `generation`, surfaced on unlock (§4.2) |
@@ -111,6 +111,7 @@ Vault
 ├── id: String                   // random; binds this vault's manifests + volumes
 ├── last_opened_at: i64          // set on each successful unlock (req. 6)
 ├── generation: u64              // monotonic write counter (rollback hint, §9.12)
+├── urgent:        Vec<Urgent>        // Tab 0 (first): title, description (free text)
 ├── instructions:  Vec<Instruction>   // Tab 1: title, description
 ├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
@@ -673,11 +674,13 @@ UI-independent. Adding or changing a front-end touches no security-critical code
 - **Terminal (`ui.rs`, `--tui`)** — `ratatui`, keyboard-driven, works over SSH /
   headless. Key bindings are shown on-screen at all times; no mouse required.
 
-The desktop front-ends present the estate vault as **eight tabs**, laid out in two
-rows — seven record-type tabs (Instructions, Trust & Will, Assets & Liabilities,
-Accounts, Real Estate, Taxes, General Documents) plus a read-only **Summary**
-aggregate — over four screens. (The read-only mobile viewer, §8,
-currently exposes the first five record types.) The four screens are:
+The desktop front-ends present the estate vault as **nine tabs**, laid out in two
+rows — eight record-type tabs (URGENT, Instructions, Trust & Will, Assets &
+Liabilities, Accounts, Real Estate, Taxes, General Documents) plus a read-only
+**Summary** aggregate — over four screens. URGENT is deliberately first so the most
+time-critical notes an executor needs are the first thing shown on unlock. (The
+read-only mobile viewer, §8, exposes a subset of the record types and does not yet
+include URGENT.) The four screens are:
 
 1. **Auth (unlock / create).** Prompts for password 1, then password 2 (masked).
    The start page selects the vault by **root + a collapsed "Vault" control** rather than

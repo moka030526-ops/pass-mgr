@@ -35,7 +35,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::csv;
 use crate::password::{self, GenOptions};
 use crate::records::{
-    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill,
+    self, Account, AssetLiability, GeneralDocument, Instruction, RealEstate, Record, TaxFiling, TrustWill, Urgent,
 };
 use crate::ui::format_time;
 use crate::vault::{self, CategoryRemoval, OpenVault, VaultError};
@@ -412,6 +412,7 @@ enum AuthMode {
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
+    Urgent,
     Instructions,
     TrustWill,
     Assets,
@@ -510,6 +511,7 @@ struct GuiApp {
     // Tabs + per-tab working edit buffer. Each `edit_*` is the record currently
     // being edited on that tab, or `None` when nothing is selected.
     tab: Tab,
+    edit_urgent: Option<Urgent>,
     edit_instruction: Option<Instruction>,
     edit_trustwill: Option<TrustWill>,
     edit_asset: Option<AssetLiability>,
@@ -679,7 +681,8 @@ impl GuiApp {
             merge_source: None,
             merge_plan: None,
             merge_error: None,
-            tab: Tab::Instructions,
+            tab: Tab::Urgent,
+            edit_urgent: None,
             edit_instruction: None,
             edit_trustwill: None,
             edit_asset: None,
@@ -809,6 +812,7 @@ impl GuiApp {
     fn build_tab_csv(&self) -> Option<(&'static str, Zeroizing<String>, usize)> {
         let ov = self.vault.as_ref()?;
         let tab = match self.tab {
+            Tab::Urgent => csv::CsvTab::Urgent,
             Tab::Instructions => csv::CsvTab::Instructions,
             Tab::TrustWill => csv::CsvTab::TrustWill,
             Tab::Assets => csv::CsvTab::Assets,
@@ -1083,7 +1087,8 @@ impl GuiApp {
     /// leakage and confusing filter carryover. The edit buffers are `Zeroize`-on-drop, so
     /// replacing them here also wipes any secret they held.
     fn reset_per_vault_ui_state(&mut self) {
-        self.tab = Tab::Instructions;
+        self.tab = Tab::Urgent;
+        self.edit_urgent = None;
         self.edit_instruction = None;
         self.edit_trustwill = None;
         self.edit_asset = None;
@@ -1303,6 +1308,7 @@ impl GuiApp {
         // clipped and unselectable); no vertical scroll — each row is one line tall.
         egui::ScrollArea::horizontal().id_salt("topbar_tabs_scroll").show(ui, |ui| {
             ui.horizontal(|ui| {
+                tab_button(ui, &mut self.tab, Tab::Urgent, "URGENT");
                 tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
                 tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
                 tab_button(ui, &mut self.tab, Tab::Assets, "Assets and Liabilities");
@@ -2206,6 +2212,62 @@ impl GuiApp {
     }
 
     // --- Tab: Instructions ---------------------------------------------------
+
+    fn tab_urgent(&mut self, ui: &mut egui::Ui) {
+        // Same shape as tab_instructions — a title + free-text-body note list — but for the
+        // separate, first-in-order URGENT collection.
+        let labels = label_list(&self.vault_ref().vault.urgent);
+        let cur = self.edit_urgent.as_ref().map(|r| r.id.clone());
+        let mut new = false;
+        let mut select = None;
+        let mut export = false;
+        let mut action = FormAction::None;
+
+        ui.columns(2, |c| {
+            (new, select, export) = list_panel(&mut c[0], "URGENT", "➕ New", &labels, cur.as_deref(), self.writable, None);
+            let ui = &mut c[1];
+            if let Some(r) = self.edit_urgent.as_mut() {
+                egui::Grid::new("urgent_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    ui.label("Title");
+                    field_singleline(ui, &mut r.title, self.writable, 420.0);
+                    ui.end_row();
+                });
+                ui.label("Details");
+                field_multiline(ui, &mut r.description, self.writable, 12);
+                action = form_buttons(ui, self.writable);
+                history_view(ui, &r.history);
+            } else {
+                ui.label("Select an urgent note or click “New”.");
+            }
+        });
+
+        if export {
+            self.export_current_tab_csv();
+        }
+        if new {
+            self.edit_urgent = Urgent::new().ok();
+        }
+        if let Some(i) = select {
+            self.edit_urgent = self.vault_ref().vault.urgent.get(i).cloned();
+        }
+        match action {
+            FormAction::Save => {
+                if let Some(r) = self.edit_urgent.as_mut() {
+                    r.trim_fields();
+                }
+                if let Some(r) = self.edit_urgent.clone()
+                    && let Some(ov) = self.vault.as_mut()
+                {
+                    records::upsert(&mut ov.vault.urgent, r);
+                }
+                if self.persist() {
+                    self.status = "Saved.".into();
+                }
+            }
+            FormAction::Delete => self.delete_current(Tab::Urgent),
+            _ => {}
+        }
+    }
 
     fn tab_instructions(&mut self, ui: &mut egui::Ui) {
         // Build the left-hand list (id+label pairs) from the vault's records.
@@ -3887,6 +3949,24 @@ impl GuiApp {
             let v = &mut ov.vault;
             let audit_len = v.audit.len(); // snapshot to undo the remove() audit entry on rollback
             match tab {
+                Tab::Urgent => {
+                    if let Some(r) = self.edit_urgent.take() {
+                        // Restore the SAVED record, not the (possibly dirty) edit buffer — see
+                        // the Instructions arm.
+                        let stored = v.urgent.iter().find(|x| x.id == r.id).cloned();
+                        if records::remove(&mut v.urgent, &r.id, &mut v.audit, "Urgent") {
+                            rollback = Some(Box::new(move |s: &mut Self| {
+                                if let Some(ov) = s.vault.as_mut() {
+                                    ov.vault.audit.truncate(audit_len);
+                                    if let Some(stored) = stored {
+                                        ov.vault.urgent.push(stored); // restore the SAVED state verbatim
+                                    }
+                                }
+                                s.edit_urgent = Some(r); // restore the user's editing session (UI state)
+                            }));
+                        }
+                    }
+                }
                 Tab::Instructions => {
                     // `.take()` moves the edited record out of the Option, leaving
                     // `None` behind (so the form clears after deletion) and giving
@@ -4162,6 +4242,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::both().auto_shrink([false, false]).id_salt("main_scroll").show(ui, |ui| {
                 match self.tab {
+                    Tab::Urgent => self.tab_urgent(ui),
                     Tab::Instructions => self.tab_instructions(ui),
                     Tab::TrustWill => self.tab_trustwill(ui),
                     Tab::Assets => self.tab_assets(ui),
@@ -5405,6 +5486,30 @@ mod tests {
     }
 
     #[test]
+    fn urgent_tab_is_the_default_and_delete_removes_the_note() {
+        let (mut app, path) = app_unlocked("urgent");
+        // URGENT is the first/default tab.
+        assert!(matches!(app.tab, Tab::Urgent));
+        // Seed an urgent note, load it into the editor, and delete it via the tab arm.
+        let id = {
+            let ov = app.vault.as_mut().unwrap();
+            let mut u = Urgent::new().unwrap();
+            u.title = "Hospital".into();
+            u.description = "Contact Dr. Smith".into();
+            let id = u.id.clone();
+            records::upsert(&mut ov.vault.urgent, u.clone());
+            app.edit_urgent = Some(u);
+            id
+        };
+        assert_eq!(app.vault.as_ref().unwrap().vault.urgent.len(), 1);
+        app.delete_current(Tab::Urgent);
+        assert!(app.vault.as_ref().unwrap().vault.urgent.is_empty(), "note deleted");
+        assert!(app.edit_urgent.is_none(), "editor cleared");
+        assert!(!id.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
     fn mismatched_confirmation_is_rejected() {
         let path = tmp("mismatch");
         let mut app = GuiApp::new(path.clone(), true);
@@ -5629,7 +5734,7 @@ mod tests {
         assert!(app.acct_filter_owner.is_empty(), "filters cleared");
         assert!(app.acct_search_user.is_empty(), "search cleared");
         assert_eq!(app.reveal_all, app.reveal_default, "reveal back to the saved default");
-        assert!(matches!(app.tab, Tab::Instructions), "tab back to the first");
+        assert!(matches!(app.tab, Tab::Urgent), "tab back to the first (URGENT)");
         cleanup(&path);
     }
 

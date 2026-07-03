@@ -51,6 +51,14 @@ date and bump the crate versions to match.
 
 ### Added
 
+- **URGENT tab.** A new free-text note collection placed **first**, before Instructions, so
+  the most time-critical things an executor needs (whom to call, where the safe key is, an
+  in-flight crisis) are the first thing shown on unlock. Same shape as Instructions (a title
+  + free-text body per note), available in both the **GUI** and **TUI**, and the default
+  landing tab. Merges (`update-from`), CSV export (`urgent.csv`), history, and the bulk
+  trim/compact all cover it; old vaults load unchanged (`#[serde(default)]`, format stays v4).
+  The read-only mobile viewer does not expose it yet.
+
 - **Asset ↔ account links.** An asset/liability can now be linked to any number of
   Accounts records by **stable record id** (the vault's first record→record reference;
   design + trade-offs in [`docs/ASSET_ACCOUNT_LINKS.md`](docs/ASSET_ACCOUNT_LINKS.md)):
