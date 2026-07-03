@@ -114,7 +114,9 @@ Vault
 ├── instructions:  Vec<Instruction>   // Tab 1: title, description
 ├── trust_wills:   Vec<TrustWill>     // Tab 2: document, usage, file (doc id)
 ├── assets:        Vec<AssetLiability>// Tab 3: kind, description, owner, value, date,
-│                                     //         institution, type, statement (doc id)
+│                                     //         institution, type, statement (doc id),
+│                                     //         linked_accounts (Account record ids — see
+│                                     //         docs/ASSET_ACCOUNT_LINKS.md)
 ├── accounts:      Vec<Account>       // Tab 4: title, account_type, subtype, owner, username, password, url, closed_as_of, description, review
 ├── real_estate:   Vec<RealEstate>    // Tab 5: address, ownership, taxes, hoa, income/financing/payment account,
 │                                     //   financing_balance, 4 portal logins (mgmt/insurance/HOA/tax: url+username+password+comment),
@@ -610,6 +612,14 @@ are copied into the destination volume **preserving the id** via `VolumeStore::p
 re-encrypts the plaintext under the **destination** key + vault id with a fresh nonce — a
 cross-vault frame is never byte-copied (the AAD binds each frame to its vault id, §6.2).
 A blob already present in the destination is left as-is (skipped).
+
+**Record links.** `AssetLiability.linked_accounts` holds **Account record ids** (the
+vault's only record→record reference). Because an applied record replaces the slot
+verbatim and accounts merge in the same pass with their ids preserved, a link made in a
+shared-lineage vault resolves after the merge. The planner does **not** validate these
+ids (its `resolve`/skip machinery covers document blobs only): a merged asset may carry
+a link to an account absent here, which the UIs render tolerantly as the raw id — same
+as after a local account deletion. Rationale + trade-offs: `docs/ASSET_ACCOUNT_LINKS.md`.
 
 **Category reconciliation.** A merged record may carry an `asset_type`/`account_type`/
 `account_subtype` that the destination's editable category lists (§4.2) lack — without

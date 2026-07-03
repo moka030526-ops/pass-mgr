@@ -18,6 +18,25 @@ date and bump the crate versions to match.
 
 ### Added
 
+- **Asset ↔ account links.** An asset/liability can now be linked to any number of
+  Accounts records by **stable record id** (the vault's first record→record reference;
+  design + trade-offs in [`docs/ASSET_ACCOUNT_LINKS.md`](docs/ASSET_ACCOUNT_LINKS.md)):
+  - **GUI:** a "Linked accounts" section on the Assets editor — add via dropdown,
+    **Open** jumps to the account (retargeting any filters that would hide it),
+    **Unlink** removes; the Accounts editor shows a read-only **"Linked from"** list
+    with jump-back buttons.
+  - **TUI:** a numbered "Linked accounts" sub-list on the Assets edit screen with an
+    add-link chooser; **Ctrl+L** link, **Ctrl+O** open link `#N`, **Ctrl+X** unlink.
+  - **Semantics:** links survive save/reopen/merge (ids are copied verbatim by
+    `update-from`); deleting a linked account never cascades and is surfaced — the GUI
+    requires a second **Delete anyway** click behind a red linked-from-N warning, the
+    TUI reports the linked-from count in the status line — and a dangling link renders
+    as the raw id and stays removable (additive/no-silent-loss policy). History logs a content-free
+    "linked accounts changed" line; the assets CSV gains a `linked_accounts` column
+    holding account labels (raw id for dangling links). Old vaults load unchanged
+    (`#[serde(default)]`, format stays v4); the mobile FFI surface is intentionally
+    untouched.
+
 - **Update from another vault.** A new way to pull changes from a SECOND vault into the
   current one: records that are **newer** (by `updated_at`) or **new** in the other vault,
   together with the **documents** they reference, are previewed and then applied. It is

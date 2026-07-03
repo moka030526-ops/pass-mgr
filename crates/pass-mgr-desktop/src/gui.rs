@@ -547,6 +547,13 @@ struct GuiApp {
     asset_grouped: bool,
     // Assets-tab "review only" filter.
     asset_filter_review: bool,
+    /// Account id whose Delete click is awaiting confirmation because assets still
+    /// link to it: deleting such an account is allowed but never silent (the links are
+    /// NOT cascaded — they render as raw ids afterwards), so the first click arms this
+    /// and the form shows the linked-from count + a "Delete anyway"/"Cancel" pair.
+    /// Guarded by the record id so a warning armed for one account can never confirm
+    /// a delete of another; disarmed on selection change / New / cancel / confirm.
+    pending_account_delete: Option<String>,
     // Config screen inputs.
     new_asset_type: String,
     new_account_type: String,
@@ -694,6 +701,7 @@ impl GuiApp {
             acct_grouped: group_accounts_default,
             asset_grouped: group_assets_default,
             asset_filter_review: false,
+            pending_account_delete: None,
             new_asset_type: String::new(),
             new_account_type: String::new(),
             new_subtype_for: String::new(),
@@ -2420,11 +2428,27 @@ impl GuiApp {
         let attached: Vec<String> =
             self.attached_label(self.edit_asset.as_ref().and_then(|r| r.statement.clone())).into_iter().collect();
         let asset_types = self.vault_ref().categories().asset.clone();
+        // Linked-accounts data for the record under edit, resolved BEFORE the mutable
+        // `edit_asset` borrow inside the columns closure (same borrow discipline as the
+        // Accounts tab's `subtypes` precompute): the linked ids with display labels — a
+        // dangling id renders as the RAW id, see `linked_account_rows` — plus the
+        // not-yet-linked accounts offered by the "add link" dropdown.
+        let linked_rows: Vec<(String, String)> = self
+            .edit_asset
+            .as_ref()
+            .map(|r| linked_account_rows(&self.vault_ref().vault.accounts, &r.linked_accounts))
+            .unwrap_or_default();
+        let link_candidates: Vec<(String, String)> = self
+            .edit_asset
+            .as_ref()
+            .map(|r| link_candidates(&self.vault_ref().vault.accounts, &r.linked_accounts))
+            .unwrap_or_default();
         let mut new = false;
         let mut select = None;
         let mut export = false;
         let mut action = FormAction::None;
         let mut docreq = DocReq::None;
+        let mut linkreq = LinkReq::None;
 
         ui.columns(2, |c| {
             match &tree {
@@ -2491,6 +2515,10 @@ impl GuiApp {
                 ui.label("Description");
                 field_multiline(ui, &mut r.description, self.writable, 4);
                 ui.separator();
+                // Cross-record links to Accounts (edited on the asset side ONLY; the
+                // Accounts form shows the read-only reverse view). Deferred like docreq.
+                linkreq = linked_accounts_section(ui, &linked_rows, &link_candidates, self.writable);
+                ui.separator();
                 docreq = doc_section(
                     ui,
                     &attached,
@@ -2527,6 +2555,7 @@ impl GuiApp {
             self.clear_doc_inputs();
         }
         self.handle_doc(docreq, DocTarget::Asset);
+        self.handle_link_req(linkreq);
         match action {
             FormAction::Save => {
                 if let Some(r) = self.edit_asset.as_mut() {
@@ -2840,6 +2869,21 @@ impl GuiApp {
             .as_ref()
             .map(|r| self.vault_ref().categories().subtypes_for(&r.account_type))
             .unwrap_or_default();
+        // "Linked from": every Asset/Liability whose `linked_accounts` references the
+        // record under edit, resolved before the mutable `edit_account` borrow below
+        // (same borrow discipline as `subtypes`). Informational only — links are edited
+        // on the ASSET side; here each row just offers Open (navigation is a read).
+        let linked_from: Vec<(String, String)> = self
+            .edit_account
+            .as_ref()
+            .map(|r| records::assets_linking_account(&self.vault_ref().vault.assets, &r.id))
+            .unwrap_or_default();
+        // Deferred jump to a linking asset (its id), applied after the columns closure.
+        let mut open_asset: Option<String> = None;
+        // Deferred resolution of an armed linked-account delete warning (see the
+        // `pending_account_delete` field): confirm proceeds with the delete, cancel disarms.
+        let mut confirm_delete = false;
+        let mut cancel_delete = false;
 
         ui.columns(2, |c| {
             match &tree {
@@ -2932,7 +2976,38 @@ impl GuiApp {
                 });
                 ui.label("Description");
                 field_multiline(ui, &mut r.description, self.writable, 4);
+                // Read-only reverse view of the asset-side links (hidden when nothing
+                // links here). Open stays available read-only — navigation is a read.
+                if !linked_from.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Linked from").strong());
+                    for (id, label) in &linked_from {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("• {label}"));
+                            if ui.button("Open").clicked() {
+                                open_asset = Some(id.clone());
+                            }
+                        });
+                    }
+                }
                 action = form_buttons(ui, self.writable);
+                // Armed by the Delete handling below when assets link this account: the
+                // warning (count + consequence) with an explicit second-click pair. The
+                // id guard keeps a warning armed for one record from ever rendering —
+                // or confirming — against another.
+                if self.pending_account_delete.as_deref() == Some(r.id.as_str())
+                    && let Some(msg) = account_delete_link_warning(linked_from.len())
+                {
+                    ui.colored_label(egui::Color32::from_rgb(0xC0, 0x30, 0x30), msg);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete anyway").clicked() {
+                            confirm_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_delete = true;
+                        }
+                    });
+                }
                 history_view(ui, &r.history);
             } else {
                 ui.label("Select an account or click “New”.");
@@ -2944,6 +3019,9 @@ impl GuiApp {
         }
         if new {
             self.edit_account = self.new_account_from_filters();
+            // Loading a different record disarms any pending delete warning: the armed
+            // id no longer matches, so leaving it set could only go stale.
+            self.pending_account_delete = None;
         }
         // A click wins over keyboard nav (they can't both happen in one frame, but be safe).
         select = select.or(nav_target);
@@ -2954,6 +3032,7 @@ impl GuiApp {
             if let Some((id, _)) = labels.get(i) {
                 self.edit_account =
                     self.vault_ref().vault.accounts.iter().find(|a| &a.id == id).cloned();
+                self.pending_account_delete = None; // selection change disarms (see `new` above)
             }
         }
         // Pre-size the password buffer so typing in the egui field doesn't reallocate
@@ -3011,8 +3090,29 @@ impl GuiApp {
                     // On failure persist() has already set the "Save failed: …" status.
                 }
             }
-            FormAction::Delete => self.delete_current(Tab::Accounts),
+            FormAction::Delete => {
+                // Deleting a linked-from account is allowed but never silent: instead of
+                // deleting, ARM the confirmation (rendered next frame — the warning text
+                // + "Delete anyway"/"Cancel" above). The links are NOT cascaded, so the
+                // existing delete rollback stays correct — nothing else is touched. An
+                // unlinked account deletes immediately, exactly as before.
+                if linked_from.is_empty() {
+                    self.delete_current(Tab::Accounts);
+                } else {
+                    self.pending_account_delete = self.edit_account.as_ref().map(|r| r.id.clone());
+                }
+            }
             _ => {}
+        }
+        if confirm_delete {
+            self.confirm_pending_account_delete();
+        }
+        if cancel_delete {
+            self.pending_account_delete = None;
+            self.status = "Delete cancelled.".into();
+        }
+        if let Some(id) = open_asset {
+            self.open_linking_asset(&id);
         }
     }
 
@@ -3632,6 +3732,95 @@ impl GuiApp {
         }
     }
 
+    /// Apply a deferred linked-accounts request from the Assets form (see [`LinkReq`]).
+    /// Add/Unlink edit the WORKING BUFFER only — the link list persists through the
+    /// ordinary Save path with the rest of the form (never a direct vault write, so
+    /// abandoning the edit discards it like any other unsaved change). Open navigates.
+    /// Execute an armed "Delete anyway" confirmation for a linked-from account.
+    /// Confirm-time id re-check: the render-time guard alone is NOT enough — a bare
+    /// arrow-key nav event can land in the SAME egui frame as the "Delete anyway"
+    /// click, and the select/nav handler runs before this, swapping `edit_account`
+    /// to the neighboring record (and disarming `pending_account_delete`) after the
+    /// click was captured. Without this check the raced confirm would delete the
+    /// NEIGHBOR. Requiring the armed id to still match the loaded record drops such
+    /// a stale confirm (the swap set pending to None, so the equality fails).
+    fn confirm_pending_account_delete(&mut self) {
+        let armed_matches_current = self.pending_account_delete.is_some()
+            && self.pending_account_delete.as_deref()
+                == self.edit_account.as_ref().map(|r| r.id.as_str());
+        self.pending_account_delete = None;
+        if armed_matches_current {
+            self.delete_current(Tab::Accounts);
+        }
+    }
+
+    fn handle_link_req(&mut self, req: LinkReq) {
+        match req {
+            LinkReq::None => {}
+            LinkReq::Add(id) => {
+                // The dropdown only offers not-yet-linked accounts, but the request is
+                // re-checked here (deferred handling) so a duplicate can never slip in.
+                if let Some(r) = self.edit_asset.as_mut()
+                    && !r.linked_accounts.iter().any(|l| l == &id)
+                {
+                    r.linked_accounts.push(id);
+                }
+            }
+            LinkReq::Remove(i) => {
+                // Bounds-checked: the index was captured a frame ago against the same
+                // buffer, but a stale/raced index must drop the request, not panic.
+                if let Some(r) = self.edit_asset.as_mut()
+                    && i < r.linked_accounts.len()
+                {
+                    r.linked_accounts.remove(i);
+                }
+            }
+            LinkReq::Open(id) => self.open_linked_account(&id),
+        }
+    }
+
+    /// Jump from an asset's link row to the linked Account: load it in the Accounts
+    /// editor and switch tabs. A dangling link (the account was deleted — links are
+    /// never cascaded) surfaces a status message and does NOT navigate.
+    fn open_linked_account(&mut self, id: &str) {
+        let Some(a) = self.vault_ref().vault.accounts.iter().find(|a| a.id == id).cloned() else {
+            self.status = "Linked account not found — it may have been deleted.".into();
+            return;
+        };
+        // A programmatic tab change bypasses ui_top_bar's prev_tab compare, so perform
+        // the same switch resets here: re-mask to the saved reveal default and clear
+        // the shared document-input buffers (see the reset block in `ui_top_bar`).
+        self.tab = Tab::Accounts;
+        self.reveal_all = self.reveal_default;
+        self.re_reveal_all = self.reveal_default;
+        self.clear_doc_inputs();
+        // Retarget any ACTIVE Accounts filters/search to the jump target so the list
+        // can't hide the record we just navigated to (same rule as the after-save follow).
+        self.sync_account_filters_to(&a);
+        self.edit_account = Some(a);
+    }
+
+    /// Jump from an account's "Linked from" row to the Asset/Liability linking it —
+    /// the reverse of [`Self::open_linked_account`], with the same programmatic
+    /// tab-switch resets. The row list is rebuilt from the vault each frame, but the
+    /// id is still re-resolved here (deferred handling) rather than trusted.
+    fn open_linking_asset(&mut self, id: &str) {
+        let Some(r) = self.vault_ref().vault.assets.iter().find(|r| r.id == id).cloned() else {
+            self.status = "Linked record not found — it may have been deleted.".into();
+            return;
+        };
+        self.tab = Tab::Assets;
+        self.reveal_all = self.reveal_default;
+        self.re_reveal_all = self.reveal_default;
+        self.clear_doc_inputs();
+        // The Assets list's only hiding filter is the review-only toggle: clear it when
+        // it would hide the jump target (mirrors the Accounts-side filter follow).
+        if self.asset_filter_review && !r.review {
+            self.asset_filter_review = false;
+        }
+        self.edit_asset = Some(r);
+    }
+
     fn delete_current(&mut self, tab: Tab) {
         // Collect any attached document ids to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
@@ -4131,6 +4320,21 @@ fn account_required_field_error(a: &Account) -> Option<&'static str> {
     }
 }
 
+/// The warning shown before deleting an account that assets/liabilities still link to:
+/// states the linked-from count and the consequence — the links are KEPT (no cascade,
+/// per the additive/no-silent-loss policy) and will render as unresolved raw ids.
+/// `None` when nothing links to the account, in which case delete proceeds unwarned
+/// exactly as before. Shared by the form's warning banner and its tests.
+fn account_delete_link_warning(linked_from: usize) -> Option<String> {
+    if linked_from == 0 {
+        return None;
+    }
+    Some(format!(
+        "This account is linked from {linked_from} asset/liability record(s). Deleting it will NOT \
+         remove those links — they will show as unresolved ids."
+    ))
+}
+
 /// Give a freshly-cloned secret field 128 bytes of spare capacity so later per-keystroke
 /// edits don't reallocate (which frees the old buffer WITHOUT zeroizing, stranding cleartext
 /// in freed heap). Calling `String::reserve` directly on the clone would ITSELF reallocate —
@@ -4361,6 +4565,86 @@ fn doc_section(
         if ui.add_enabled(!over_limit, egui::Button::new("⬆ Attach (encrypt into volume)")).clicked() {
             req = DocSectionReq::Upload;
         }
+    }
+    req
+}
+
+/// Deferred linked-accounts action gathered while rendering the Assets form (see
+/// [`linked_accounts_section`]). `Add`/`Open` carry an Account id; `Remove` carries the
+/// index into the asset's `linked_accounts` list. Applied after the columns closure
+/// like every other deferred request, so mutation/navigation stays outside the form
+/// borrow. Not `Copy` (unlike [`DocSectionReq`]) — two variants own a `String`.
+#[derive(PartialEq, Eq, Clone)]
+enum LinkReq {
+    None,
+    Add(String),
+    Remove(usize),
+    Open(String),
+}
+
+/// Resolve an asset's linked-account ids to display rows `(id, resolved label)`. A
+/// dangling id (the account was deleted — links are never cascaded) resolves to the
+/// RAW id: tolerant and nothing hidden, per the additive/no-silent-loss policy.
+fn linked_account_rows(accounts: &[Account], linked: &[String]) -> Vec<(String, String)> {
+    linked
+        .iter()
+        .map(|id| (id.clone(), records::account_label(accounts, id).unwrap_or_else(|| id.clone())))
+        .collect()
+}
+
+/// The accounts offered by the Assets form's "add link" dropdown: every account NOT
+/// already linked (a second link to the same account would be meaningless).
+fn link_candidates(accounts: &[Account], linked: &[String]) -> Vec<(String, String)> {
+    accounts
+        .iter()
+        .filter(|a| !linked.iter().any(|id| id == &a.id))
+        .map(|a| (a.id.clone(), a.label()))
+        .collect()
+}
+
+/// The "Linked accounts" section of the Asset/Liability form (modeled on
+/// [`doc_section`]): one row per link — Open always (navigation is a read, kept in
+/// read-only mode), Unlink writable-only (it edits the record) — plus, when writable,
+/// an "add link" dropdown over `candidates`. `linked` comes from
+/// [`linked_account_rows`], `candidates` from [`link_candidates`]. The caller applies
+/// the returned request after rendering, keeping `self` borrows disjoint.
+fn linked_accounts_section(
+    ui: &mut egui::Ui,
+    linked: &[(String, String)],
+    candidates: &[(String, String)],
+    writable: bool,
+) -> LinkReq {
+    let mut req = LinkReq::None;
+    ui.label(egui::RichText::new("Linked accounts").strong());
+    if linked.is_empty() {
+        ui.label(egui::RichText::new("(no linked accounts)").weak());
+    }
+    for (i, (id, label)) in linked.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(format!("• {label}"));
+            if ui.button("Open").clicked() {
+                req = LinkReq::Open(id.clone());
+            }
+            if writable && ui.button("Unlink").clicked() {
+                req = LinkReq::Remove(i);
+            }
+        });
+    }
+    if writable {
+        // Hand-rolled (id, label) dropdown: the shared `combo`/`filter_combo` helpers
+        // bind a &mut String VALUE from a String list, but a link stores the account's
+        // ID while showing its LABEL — so there is no bound buffer; a click on an entry
+        // just emits the Add request (nothing is "currently selected").
+        egui::ComboBox::from_id_salt("asset_link_add").selected_text("Link an account…").show_ui(ui, |ui| {
+            if candidates.is_empty() {
+                ui.label(egui::RichText::new("(no more accounts to link)").weak());
+            }
+            for (id, label) in candidates {
+                if ui.selectable_label(false, label).clicked() {
+                    req = LinkReq::Add(id.clone());
+                }
+            }
+        });
     }
     req
 }
@@ -5154,6 +5438,162 @@ mod tests {
 
         let _ = std::fs::remove_file(&src);
         cleanup(&path);
+    }
+
+    #[test]
+    fn handle_link_req_adds_and_removes_links_in_edit_buffer_only() {
+        let (mut app, path) = app_unlocked("guilinkreq");
+        let acct_id = {
+            let ov = app.vault.as_mut().unwrap();
+            let mut a = Account::new().unwrap();
+            a.title = "Brokerage".into();
+            a.owner = "Jane".into();
+            let id = a.id.clone();
+            records::upsert(&mut ov.vault.accounts, a);
+            id
+        };
+        let mut asset = AssetLiability::new().unwrap();
+        asset.owner = "Jane".into();
+        asset.approx_value = "10".into();
+        app.edit_asset = Some(asset);
+
+        // Add appends to the WORKING BUFFER; a duplicate request is dropped (the
+        // dropdown never offers one, but the deferred handler re-checks anyway).
+        app.handle_link_req(LinkReq::Add(acct_id.clone()));
+        app.handle_link_req(LinkReq::Add(acct_id.clone()));
+        assert_eq!(app.edit_asset.as_ref().unwrap().linked_accounts, vec![acct_id.clone()]);
+        assert!(
+            app.vault.as_ref().unwrap().vault.assets.is_empty(),
+            "no direct vault write — the link persists through the ordinary Save path"
+        );
+        // An out-of-range Remove (stale index) is dropped, not a panic; in-range unlinks.
+        app.handle_link_req(LinkReq::Remove(5));
+        assert_eq!(app.edit_asset.as_ref().unwrap().linked_accounts.len(), 1);
+        app.handle_link_req(LinkReq::Remove(0));
+        assert!(app.edit_asset.as_ref().unwrap().linked_accounts.is_empty(), "unlinked");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn confirm_pending_account_delete_only_fires_when_the_armed_id_still_matches() {
+        let (mut app, path) = app_unlocked("guiconfirmrace");
+        let (x_id, y_id) = {
+            let ov = app.vault.as_mut().unwrap();
+            let mut x = Account::new().unwrap();
+            x.title = "Linked".into();
+            let mut y = Account::new().unwrap();
+            y.title = "Neighbor".into();
+            let ids = (x.id.clone(), y.id.clone());
+            records::upsert(&mut ov.vault.accounts, x);
+            records::upsert(&mut ov.vault.accounts, y);
+            ids
+        };
+
+        // The raced-confirm shape: the same-frame select handler swapped the
+        // editor to the NEIGHBOR and disarmed pending before the captured click
+        // is applied. The stale confirm must delete nothing.
+        app.edit_account =
+            app.vault.as_ref().unwrap().vault.accounts.iter().find(|a| a.id == y_id).cloned();
+        app.pending_account_delete = None;
+        app.confirm_pending_account_delete();
+        assert_eq!(app.vault.as_ref().unwrap().vault.accounts.len(), 2, "raced confirm dropped");
+
+        // Belt-and-braces: an armed id that no longer matches the loaded record
+        // (any other way the two could diverge) is also dropped — and disarmed.
+        app.pending_account_delete = Some(x_id.clone());
+        app.confirm_pending_account_delete();
+        assert_eq!(app.vault.as_ref().unwrap().vault.accounts.len(), 2, "mismatched confirm dropped");
+        assert!(app.pending_account_delete.is_none(), "always disarmed");
+
+        // The legitimate path: armed id matches the loaded record -> deletes it.
+        app.edit_account =
+            app.vault.as_ref().unwrap().vault.accounts.iter().find(|a| a.id == x_id).cloned();
+        app.pending_account_delete = Some(x_id.clone());
+        app.confirm_pending_account_delete();
+        let accounts = &app.vault.as_ref().unwrap().vault.accounts;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, y_id, "exactly the armed record was deleted");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_linked_account_jumps_with_tab_switch_resets_and_filter_follow() {
+        let (mut app, path) = app_unlocked("guilinkjump");
+        let mut a = Account::new().unwrap();
+        a.title = "Brokerage".into();
+        a.owner = "Jane".into();
+        a.account_type = "Financial".into();
+        let acct_id = a.id.clone();
+        records::upsert(&mut app.vault.as_mut().unwrap().vault.accounts, a);
+
+        app.tab = Tab::Assets;
+        app.reveal_default = false;
+        app.reveal_all = true; // momentary reveal left on — must not leak into Accounts
+        app.doc_filename = "half-typed.pdf".into(); // shared doc buffer — must not linger
+        app.acct_filter_type = "Email".into(); // active filter that would hide the target
+        app.acct_filter_review = true; // review-only would hide the (unflagged) target
+        app.open_linked_account(&acct_id);
+        assert!(app.tab == Tab::Accounts, "navigated to the Accounts tab");
+        assert_eq!(app.edit_account.as_ref().unwrap().id, acct_id, "target loaded in the editor");
+        assert!(!app.reveal_all, "programmatic switch performs ui_top_bar's reveal reset");
+        assert!(app.doc_filename.is_empty(), "doc inputs cleared like a real tab switch");
+        assert_eq!(app.acct_filter_type, "Financial", "active filter retargeted to the record");
+        assert!(!app.acct_filter_review, "review-only relaxed so the target is visible");
+
+        // A dangling link: a status message, and NO navigation.
+        app.tab = Tab::Assets;
+        app.open_linked_account("gone");
+        assert!(app.tab == Tab::Assets, "no navigation for a dangling link");
+        assert!(app.status.contains("not found"), "status: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_linking_asset_jumps_back_and_clears_hiding_review_filter() {
+        let (mut app, path) = app_unlocked("guilinkback");
+        let mut asset = AssetLiability::new().unwrap();
+        asset.owner = "Jane".into();
+        asset.approx_value = "10".into();
+        let asset_id = asset.id.clone();
+        records::upsert(&mut app.vault.as_mut().unwrap().vault.assets, asset);
+
+        app.tab = Tab::Accounts;
+        app.reveal_default = false;
+        app.reveal_all = true;
+        app.asset_filter_review = true; // would hide the (unflagged) jump target
+        app.open_linking_asset(&asset_id);
+        assert!(app.tab == Tab::Assets, "navigated back to the Assets tab");
+        assert_eq!(app.edit_asset.as_ref().unwrap().id, asset_id, "target loaded in the editor");
+        assert!(!app.reveal_all, "programmatic switch re-masks to the saved default");
+        assert!(!app.asset_filter_review, "review-only cleared so the target is visible");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_delete_link_warning_states_count_and_consequence() {
+        assert_eq!(account_delete_link_warning(0), None, "unlinked accounts delete unwarned, as before");
+        let msg = account_delete_link_warning(3).unwrap();
+        assert!(msg.contains("linked from 3 asset/liability record(s)"), "count stated: {msg}");
+        assert!(msg.contains("unresolved ids"), "consequence stated (links kept, no cascade): {msg}");
+    }
+
+    #[test]
+    fn linked_account_rows_resolve_labels_and_render_dangling_raw_ids() {
+        let mut a = Account::new().unwrap();
+        a.title = "Brokerage".into();
+        a.account_type = "Financial".into();
+        a.username = "jane".into();
+        let accounts = vec![a.clone()];
+        let rows = linked_account_rows(&accounts, &[a.id.clone(), "gone".into()]);
+        assert_eq!(rows[0], (a.id.clone(), a.label()), "live link resolves to the display label");
+        assert_eq!(
+            rows[1],
+            ("gone".to_string(), "gone".to_string()),
+            "dangling link renders the RAW id — tolerant, nothing hidden"
+        );
+        // The add-dropdown offers only the not-yet-linked accounts.
+        assert!(link_candidates(&accounts, &[a.id.clone()]).is_empty(), "already linked → not offered");
+        assert_eq!(link_candidates(&accounts, &[]).len(), 1, "unlinked account is offered");
     }
 
     #[test]

@@ -125,27 +125,35 @@ pub fn trust_wills_csv(rows: &[TrustWill], name_of: impl Fn(&str) -> String) -> 
     out
 }
 
-pub fn assets_csv(rows: &[AssetLiability], name_of: impl Fn(&str) -> String) -> String {
+/// `account_label_of` resolves a linked Account id to its display label; unlike the
+/// document resolver it should fall back to the RAW id for a dangling link (see
+/// `build_tab_csv`) so an unresolvable link is exported visibly, not dropped.
+pub fn assets_csv(
+    rows: &[AssetLiability],
+    name_of: impl Fn(&str) -> String,
+    account_label_of: impl Fn(&str) -> String,
+) -> String {
     let mut out = String::new();
     row(
         &mut out,
         &[
             "id", "kind", "description", "owner", "title", "approx_value", "as_of_date",
-            "institution", "asset_type", "url", "beneficiary", "review", "statement", "created",
-            "updated",
+            "institution", "asset_type", "url", "beneficiary", "review", "statement",
+            "linked_accounts", "created", "updated",
         ],
     );
     for r in rows {
         let review = yn(r.review);
         let statement = opt_name(&r.statement, &name_of);
+        let linked = join_names(&r.linked_accounts, &account_label_of);
         let created = iso_utc(r.created_at);
         let updated = iso_utc(r.updated_at);
         row(
             &mut out,
             &[
                 &r.id, &r.kind, &r.description, &r.owner, &r.title, &r.approx_value, &r.as_of_date,
-                &r.institution, &r.asset_type, &r.url, &r.beneficiary, review, &statement, &created,
-                &updated,
+                &r.institution, &r.asset_type, &r.url, &r.beneficiary, review, &statement, &linked,
+                &created, &updated,
             ],
         );
     }
@@ -257,7 +265,15 @@ pub fn build_tab_csv(v: &Vault, tab: CsvTab, name_of: impl Fn(&str) -> String) -
     match tab {
         CsvTab::Instructions => ("instructions", instructions_csv(&v.instructions), v.instructions.len()),
         CsvTab::TrustWill => ("trust-will", trust_wills_csv(&v.trust_wills, name_of), v.trust_wills.len()),
-        CsvTab::Assets => ("assets-liabilities", assets_csv(&v.assets, name_of), v.assets.len()),
+        CsvTab::Assets => {
+            // Linked-account cells hold the accounts' display labels. A dangling id
+            // (deleted account) falls back to the raw id — exported visibly rather
+            // than silently dropped (unlike unresolved doc ids, which have no
+            // meaning outside the volume).
+            let label_of =
+                |id: &str| records::account_label(&v.accounts, id).unwrap_or_else(|| id.to_string());
+            ("assets-liabilities", assets_csv(&v.assets, name_of, label_of), v.assets.len())
+        }
         CsvTab::Accounts => ("accounts", accounts_csv(&v.accounts), v.accounts.len()),
         CsvTab::RealEstate => ("real-estate", real_estate_csv(&v.real_estate, name_of), v.real_estate.len()),
         CsvTab::Taxes => ("taxes", tax_filings_csv(&v.tax_filings, name_of), v.tax_filings.len()),
@@ -369,13 +385,44 @@ mod tests {
         a.owner = "Jane".into();
         a.review = true;
         a.statement = Some("stmt".into());
-        let out = assets_csv(&[a], echo);
+        let out = assets_csv(&[a], echo, echo);
         let lines: Vec<&str> = out.split("\r\n").filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("id,kind,description,owner,title,approx_value"), "header field order: {}", lines[0]);
-        assert!(lines[0].ends_with(",statement,created,updated"));
+        assert!(lines[0].ends_with(",statement,linked_accounts,created,updated"));
         assert!(lines[1].contains(",yes,"), "review=true -> yes");
         assert!(lines[1].contains("stmt"), "statement doc id resolved to a name");
+    }
+
+    #[test]
+    fn assets_csv_exports_linked_account_labels_with_raw_id_fallback() {
+        let mut a = AssetLiability::new().unwrap();
+        a.id = "a1".into();
+        a.linked_accounts = vec!["acc1".into(), "gone".into()];
+        // Mirror build_tab_csv's resolver contract: label when the account exists,
+        // RAW id when it doesn't (a dangling link stays visible in the export).
+        let label_of = |id: &str| if id == "acc1" { "Bank - jane".to_string() } else { id.to_string() };
+        let out = assets_csv(&[a], echo, label_of);
+        let line = out.split("\r\n").nth(1).unwrap();
+        assert!(line.contains("Bank - jane; gone"), "labels joined with '; ', dangling id raw: {line}");
+    }
+
+    #[test]
+    fn build_tab_csv_assets_resolves_linked_accounts_from_the_vault() {
+        let mut v = Vault::default();
+        let mut acc = Account::new().unwrap();
+        acc.id = "acc1".into();
+        acc.title = "Bank".into();
+        acc.username = "jane".into();
+        v.accounts.push(acc);
+        let mut a = AssetLiability::new().unwrap();
+        a.linked_accounts = vec!["acc1".into(), "gone".into()];
+        v.assets.push(a);
+        let (_base, text, n) = build_tab_csv(&v, CsvTab::Assets, echo);
+        assert_eq!(n, 1);
+        let line = text.split("\r\n").nth(1).unwrap();
+        assert!(line.contains("Bank - jane"), "live link resolved to the account label: {line}");
+        assert!(line.contains("gone"), "dangling link exported as the raw id: {line}");
     }
 
     #[test]

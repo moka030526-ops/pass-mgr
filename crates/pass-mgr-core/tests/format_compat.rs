@@ -193,7 +193,24 @@ fn old_vault_json_without_new_fields_still_deserializes() {
         "last_opened_at": 1_700_000_000,
         "instructions": [],
         "trust_wills": [],
-        "assets": [],
+        // An "old-style" asset: predates `title`/`url`/`beneficiary`/`review` and
+        // `linked_accounts` — all of them #[serde(default)].
+        "assets": [
+            {
+                "id": "ast-old-1",
+                "kind": "Asset",
+                "description": "Old brokerage",
+                "owner": "Sole",
+                "approx_value": "100",
+                "as_of_date": "2020-01-01",
+                "institution": "Bank",
+                "asset_type": "Investment",
+                "statement": null,
+                "created_at": 1,
+                "updated_at": 2,
+                "history": []
+            }
+        ],
         "accounts": [],
         "real_estate": [
             {
@@ -228,6 +245,14 @@ fn old_vault_json_without_new_fields_still_deserializes() {
     // New top-level collections default to empty.
     assert!(vault.tax_filings.is_empty(), "missing tax_filings defaults to empty");
     assert!(vault.general_documents.is_empty(), "missing general_documents defaults to empty");
+
+    // Old-style asset loads with every later-added field defaulted.
+    assert_eq!(vault.assets.len(), 1);
+    let ast = &vault.assets[0];
+    assert_eq!(ast.description, "Old brokerage", "old field preserved");
+    assert_eq!(ast.title, "", "new field defaulted");
+    assert!(!ast.review);
+    assert!(ast.linked_accounts.is_empty(), "missing linked_accounts defaults to empty");
 
     // New RealEstate fields default to empty.
     let re = &vault.real_estate[0];

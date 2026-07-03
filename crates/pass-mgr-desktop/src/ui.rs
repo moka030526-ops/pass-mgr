@@ -329,6 +329,15 @@ struct EditState {
     /// Document file ids for the Real Estate tab, which manages several documents
     /// per property. Empty for the single-document tabs.
     re_docs: Vec<String>,
+    /// Linked Account record ids for the Assets tab (the edit-state mirror of
+    /// `AssetLiability::linked_accounts`). Staged by Ctrl+L / Ctrl+X and committed
+    /// wholesale on save, exactly like `tax_docs`/`re_docs`. Empty on other tabs.
+    linked: Vec<String>,
+    /// Account ids aligned 1:1 with the "Add link" picker's Choice options
+    /// (option i ↔ candidate i). Account labels CAN collide, so the picked id is
+    /// resolved by OPTION POSITION through this vec — never by a label→id string
+    /// match, which would silently link the first same-labelled account.
+    link_candidates: Vec<String>,
     history: Vec<Change>,
 }
 
@@ -1953,6 +1962,24 @@ impl App {
                 fields.push(Field::text("Doc # (export/remove)", String::new()));
             }
         }
+        // Asset↔account link inputs, appended AFTER the doc-upload inputs on
+        // purpose: the doc handlers address their inputs positionally from
+        // `record_fields` (rc+0..rc+2 for the single-doc Assets tab) and
+        // `commit_edit_record` maps the record fields by index (f(0)..f(10)),
+        // so appending at the very end leaves every existing offset untouched.
+        // The picker lists ALL accounts — an already-linked pick is rejected with
+        // a status hint on Ctrl+L instead of being filtered out, so the
+        // option↔candidate alignment never has to be rebuilt mid-edit. Options
+        // are numbered ("N. <label>") because `Field::cycle` resolves the current
+        // value by string position: two same-labelled accounts would otherwise be
+        // indistinguishable (cycling could never reach the second one).
+        if tab == Tab::Assets {
+            let options: Vec<String> =
+                v.accounts.iter().enumerate().map(|(i, a)| format!("{}. {}", i + 1, a.label())).collect();
+            let first = options.first().cloned().unwrap_or_default();
+            fields.push(Field::choice("Add link", first, options));
+            fields.push(Field::text("Link # (open/unlink)", String::new()));
+        }
         // Load the existing document list for the multi-document tabs.
         let tax_docs: Vec<String> = if tab == Tab::Taxes {
             sel_id
@@ -1970,6 +1997,18 @@ impl App {
         } else {
             Vec::new()
         };
+        // Load the existing account links (Assets) and the id list backing the
+        // "Add link" picker's options (same iteration order as the options above,
+        // so index i of each refers to the same account).
+        let (linked, link_candidates): (Vec<String>, Vec<String>) = if tab == Tab::Assets {
+            let linked = sel_id
+                .as_ref()
+                .and_then(|id| v.assets.iter().find(|r| &r.id == id).map(|r| r.linked_accounts.clone()))
+                .unwrap_or_default();
+            (linked, v.accounts.iter().map(|a| a.id.clone()).collect())
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         self.edit = Some(EditState {
             tab,
@@ -1981,6 +2020,8 @@ impl App {
             attached_file_id: attached,
             tax_docs,
             re_docs,
+            linked,
+            link_candidates,
             history,
         });
         self.screen = Screen::Edit;
@@ -2087,6 +2128,65 @@ impl App {
                         self.detach_document();
                     }
                 }
+            }
+            // Ctrl+L (Assets): stage the "Add link" picker's selected account into
+            // `es.linked`. EDIT-STATE only — it reaches the vault on Ctrl+S like
+            // every other field. Writable-gated: linking is an edit.
+            KeyCode::Char('l') if ctrl && es.tab == Tab::Assets => {
+                if !writable {
+                    self.require_writable();
+                } else {
+                    // Resolve the picker's selection BY POSITION in its option list,
+                    // then map to the same-index candidate id. Labels can collide
+                    // between accounts, so a label→id lookup could link the wrong one;
+                    // the numbered options make the position lookup unambiguous.
+                    let sel = es.fields.iter().find(|f| f.label == "Add link").and_then(|f| {
+                        let FieldKind::Choice(opts) = &f.kind else { return None };
+                        opts.iter().position(|o| o == &f.value)
+                    });
+                    self.status = match sel.and_then(|i| es.link_candidates.get(i)) {
+                        None => "No accounts to link — add one on the Accounts tab first.".into(),
+                        // Duplicate links carry no information; refuse with a hint
+                        // instead of silently growing the list.
+                        Some(id) if es.linked.iter().any(|l| l == id) => {
+                            "Already linked to that account.".into()
+                        }
+                        Some(id) => {
+                            es.linked.push(id.clone());
+                            format!("Linked ({} total) — Ctrl+S to save.", es.linked.len())
+                        }
+                    };
+                }
+            }
+            // Ctrl+X (Assets): unstage the link addressed by the "Link #" field
+            // (blank = #1). EDIT-STATE only, like Ctrl+L — persisted on Ctrl+S; the
+            // account record itself is never touched.
+            KeyCode::Char('x') if ctrl && es.tab == Tab::Assets => {
+                if !writable {
+                    self.require_writable();
+                } else {
+                    let li = es.fields.iter().position(|f| f.label == "Link # (open/unlink)");
+                    let idx = li.and_then(|i| parse_link_index(&es.fields[i].value, es.linked.len()));
+                    self.status = match idx {
+                        None if es.linked.is_empty() => "No linked accounts to unlink.".into(),
+                        None => format!("Link # must be 1..={}.", es.linked.len()),
+                        Some(i) => {
+                            es.linked.remove(i);
+                            // Clear the consumed # so a stale number can't silently
+                            // address a different link on the next Ctrl+X.
+                            if let Some(fi) = li {
+                                es.fields[fi].value.clear();
+                            }
+                            format!("Unlinked ({} left) — Ctrl+S to save.", es.linked.len())
+                        }
+                    };
+                }
+            }
+            // Ctrl+O (Assets): open the linked account addressed by "Link #".
+            // Navigation is a READ — deliberately NOT writable-gated, so a
+            // read-only vault can still be browsed through its links.
+            KeyCode::Char('o') if ctrl && es.tab == Tab::Assets => {
+                self.open_linked_account();
             }
             KeyCode::Tab | KeyCode::Down => {
                 es.focus = (es.focus + 1) % es.fields.len();
@@ -2713,6 +2813,9 @@ impl App {
                 // The "Review" Choice stores "Yes"/"No"; compare to get a bool.
                 r.review = f(10) == "Yes";
                 r.statement = es.attached_file_id.clone();
+                // Committed wholesale like the doc lists (`re_docs`/`tax_docs`);
+                // `trim_fields` leaves record-link id lists untouched (core contract).
+                r.linked_accounts = es.linked.clone();
                 r.trim_fields(); // left/right-trim every field before persisting
                 records::upsert(&mut v.assets, r);
             }
@@ -2866,6 +2969,87 @@ impl App {
         }
     }
 
+    /// Ctrl+O on the Assets edit screen: jump to the linked account addressed by
+    /// the "Link #" field (blank = #1). Leaving the editor discards unsaved edits
+    /// EXACTLY like Esc already does (silently, no confirmation) — same rule, and
+    /// nothing is saved implicitly. On a dangling link (the account was deleted,
+    /// or arrived via merge without its account) we stay in the editor with a
+    /// status hint — there is nothing to navigate to.
+    fn open_linked_account(&mut self) {
+        // Take the buffer like attach_document does: every stay-put path puts it back.
+        let Some(es) = self.edit.take() else { return };
+        if es.tab != Tab::Assets {
+            self.edit = Some(es);
+            return;
+        }
+        let num = es
+            .fields
+            .iter()
+            .find(|f| f.label == "Link # (open/unlink)")
+            .map(|f| f.value.clone())
+            .unwrap_or_default();
+        let Some(idx) = parse_link_index(&num, es.linked.len()) else {
+            self.status = if es.linked.is_empty() {
+                "No linked accounts to open.".into()
+            } else {
+                format!("Link # must be 1..={}.", es.linked.len())
+            };
+            self.edit = Some(es);
+            return;
+        };
+        let target = es.linked[idx].clone();
+        // Resolve the target account's filter-relevant fields in one shot (owned
+        // clones, so the vault borrow ends before we mutate filters below). `None`
+        // = dangling link, the same condition `records::account_label` reports.
+        let resolved = self.vault_ref().vault.accounts.iter().find(|a| a.id == target).map(|a| {
+            (a.title.clone(), a.account_type.clone(), a.account_subtype.clone(), a.owner.clone(), a.username.clone(), a.review)
+        });
+        let Some((title, ty, subty, owner, username, review)) = resolved else {
+            self.status = "Linked account not found — it may have been deleted.".into();
+            self.edit = Some(es);
+            return;
+        };
+        // Discard the editor (the Esc rule — `es` drops here) and jump to Accounts.
+        drop(es);
+        self.screen = Screen::Browse;
+        self.switch_tab(Tab::Accounts);
+        // Make the target VISIBLE: move any ACTIVE field filter to the target's
+        // value and relax the non-facet constraints — the same post-save relaxation
+        // `save_edit` applies, so the jump can never land on a hidden record.
+        let sync = |f: &mut Option<String>, v: &str| {
+            if f.is_some() {
+                *f = (!v.is_empty()).then(|| v.to_string());
+            }
+        };
+        sync(&mut self.acct_filter_title, &title);
+        sync(&mut self.acct_filter_type, &ty);
+        sync(&mut self.acct_filter_subtype, &subty);
+        sync(&mut self.acct_filter_owner, &owner);
+        if self.acct_filter_review && !review {
+            self.acct_filter_review = false;
+        }
+        // The visibility predicate (`acct_passes_filters`) matches the search over
+        // username OR title — clear it only when NEITHER matches, so an unrelated
+        // active search can't hide the jump target.
+        let search_keeps_target = self.acct_search.is_empty()
+            || records::matches_search(&username, &self.acct_search)
+            || records::matches_search(&title, &self.acct_search);
+        if !search_keeps_target {
+            self.acct_search.clear();
+        }
+        self.narrow_account_filters();
+        // Grouped mode: fall back to the FLAT list instead of expanding ancestors —
+        // the flat list selects by plain position in `current_labels`, while the
+        // tree would need the target's group path recomputed and force-inserted
+        // into `acct_expanded`. The user re-groups with 'g' as usual.
+        self.acct_grouped = false;
+        if let Some(pos) = self.current_labels().iter().position(|(rid, _)| rid == &target) {
+            self.selected = pos;
+        }
+        self.clamp_selection();
+        self.status = "Opened linked account.".into();
+    }
+
     fn delete_selected(&mut self) {
         // Resolve the selected record id. In the grouped Accounts tree the selection
         // may be a GROUP header (nothing to delete) — only a leaf has an id.
@@ -2882,6 +3066,11 @@ impl App {
         };
         // Collect any attached document blob to reclaim after removing the record.
         let mut doc_ids: Vec<String> = Vec::new();
+        // How many assets/liabilities link to a deleted ACCOUNT (0 for other tabs).
+        // Deleting a still-linked account is ALLOWED — no cascade, no block (the
+        // links stay on the assets and render as the raw id) — but the outcome is
+        // surfaced in the status line below so the loss of resolution isn't silent.
+        let mut linked_from = 0usize;
         // Roll back the in-memory removal if the save fails (same data-loss class as the GUI's
         // delete_current): re-insert the removed record VERBATIM and truncate the remove() audit
         // entry, so a later successful save can't silently commit a deletion the user was told
@@ -2932,6 +3121,9 @@ impl App {
                 }
                 Tab::Accounts => {
                     if let Some(r) = v.accounts.iter().find(|r| r.id == id).cloned() {
+                        // Counted BEFORE the remove (the reverse lookup scans the
+                        // assets, which the remove itself does not touch).
+                        linked_from = records::assets_linking_account(&v.assets, &id).len();
                         records::remove(&mut v.accounts, &id, &mut v.audit, "Account");
                         rollback = Some(Box::new(move |s: &mut Self| {
                             if let Some(ov) = s.vault.as_mut() {
@@ -2999,7 +3191,17 @@ impl App {
                     let _ = ov.remove_document(&fid);
                 }
             }
-            self.status = "Deleted.".into();
+            // The TUI delete is immediate (no confirm step exists to extend), so
+            // the still-linked warning is delivered with the outcome: the user
+            // learns which resolution was lost and can undo by re-creating or
+            // re-linking — the links themselves were deliberately NOT removed.
+            self.status = if linked_from > 0 {
+                format!(
+                    "Deleted. Linked from {linked_from} asset/liability record(s); those links now show as unresolved (raw id)."
+                )
+            } else {
+                "Deleted.".into()
+            };
         } else if let Some(rb) = rollback {
             // persist() already set "Save failed: …"; undo the in-memory removal so a later
             // successful save cannot silently commit the deletion the user was told failed.
@@ -3866,6 +4068,49 @@ impl App {
                 )));
             }
         }
+        if es.tab == Tab::Assets {
+            // List the asset's linked accounts with their 1-based numbers (what the
+            // "Link #" field addresses for Ctrl+O open / Ctrl+X unlink).
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Linked accounts ({})", es.linked.len()),
+                Style::default().fg(Color::Cyan),
+            )));
+            for (i, id) in es.linked.iter().enumerate() {
+                // A dangling link (its account deleted, or merged in without it)
+                // shows the RAW id — visible-but-unresolved, never silently hidden
+                // (the same tolerant fallback the doc lists use for `doc_path`).
+                let label = records::account_label(&self.vault_ref().vault.accounts, id)
+                    .unwrap_or_else(|| id.clone());
+                lines.push(Line::from(Span::styled(
+                    format!("  #{}  {label}", i + 1),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
+        // Reverse view on an EXISTING account: which assets/liabilities link here.
+        // Read-only (links are edited on the asset side only) and computed on
+        // demand — no stored back-pointers to drift. Hidden when empty: unlike the
+        // asset-side list there is nothing actionable here, so an empty header
+        // would be pure noise.
+        if es.tab == Tab::Accounts
+            && let Some(id) = es.id.as_ref()
+        {
+            let linked_from = records::assets_linking_account(&self.vault_ref().vault.assets, id);
+            if !linked_from.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("Linked from ({})", linked_from.len()),
+                    Style::default().fg(Color::Cyan),
+                )));
+                for (i, (_aid, label)) in linked_from.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  #{}  {label}", i + 1),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            }
+        }
         if !es.history.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("History:", Style::default().add_modifier(Modifier::BOLD))));
@@ -3894,6 +4139,10 @@ impl App {
             "Tab/↑↓ field · Ctrl+S save · Ctrl+U upload · Ctrl+E export(Doc#) · Ctrl+K remove(Doc#) · Esc cancel"
         } else if es.tab == Tab::RealEstate {
             "Tab/↑↓ field · Ctrl+R reveal · Ctrl+Y copy · Ctrl+U upload · Ctrl+E export(Doc#) · Ctrl+K remove(Doc#) · Ctrl+S save · Esc"
+        } else if es.tab == Tab::Assets {
+            // "(Link#)" follows the "(Doc#)" suffix convention: the # those actions
+            // read comes from the "Link #" field (blank = #1).
+            "Tab/↑↓ field · ←/→ choice · Ctrl+S save · Ctrl+U upload · Ctrl+E export · Ctrl+K detach · Ctrl+L link · Ctrl+O open(Link#) · Ctrl+X unlink(Link#) · Esc"
         } else if es.has_docs() {
             "Tab/↑↓ field · ←/→ choice · Ctrl+S save · Ctrl+U upload · Ctrl+E export · Ctrl+K detach · Esc cancel"
         } else {
@@ -3952,6 +4201,19 @@ fn target_password_index(fields: &[Field], focus: usize) -> Option<usize> {
 fn parse_doc_index(s: &str, len: usize) -> Option<usize> {
     let n: usize = s.trim().parse().ok()?;
     if n >= 1 && n <= len { Some(n - 1) } else { None }
+}
+
+/// The Assets "Link #" field resolved to a 0-based index into the linked-accounts
+/// list. Unlike `parse_doc_index`, BLANK defaults to #1: the common single-link
+/// case then needs no typing at all — which is also what keeps Ctrl+O usable in
+/// read-only mode, where typing into the field is inert. A non-blank value must be
+/// a valid 1-based number, exactly like the Doc # field.
+fn parse_link_index(s: &str, len: usize) -> Option<usize> {
+    if s.trim().is_empty() {
+        if len > 0 { Some(0) } else { None }
+    } else {
+        parse_doc_index(s, len)
+    }
 }
 
 /// Advance a filter through: None → opts[0] → opts[1] → … → None (wrap to off).
@@ -6067,5 +6329,236 @@ mod tests {
             expected.push(c);
         }
         assert_eq!(s, expected, "content intact across managed growth");
+    }
+
+    // --- Asset ↔ account links (Assets edit screen) --------------------------
+
+    /// Seed one account (returning its id) with a distinct title/owner so the
+    /// picker options and jump-target labels are recognisable in assertions.
+    fn seed_account(app: &mut App, title: &str, owner: &str) -> String {
+        let v = &mut app.vault.as_mut().unwrap().vault;
+        let mut a = Account::new().unwrap();
+        a.title = title.into();
+        a.owner = owner.into();
+        let id = a.id.clone();
+        records::upsert(&mut v.accounts, a);
+        id
+    }
+
+    /// Seed one asset with the save-mandatory fields (owner + numeric value) and
+    /// the given pre-existing links, returning its id.
+    fn seed_asset(app: &mut App, title: &str, linked: Vec<String>) -> String {
+        let v = &mut app.vault.as_mut().unwrap().vault;
+        let mut a = AssetLiability::new().unwrap();
+        a.title = title.into();
+        a.owner = "Jane".into();
+        a.approx_value = "100".into();
+        a.linked_accounts = linked;
+        let id = a.id.clone();
+        records::upsert(&mut v.assets, a);
+        id
+    }
+
+    /// The index of an edit field by label (panics if absent — a renamed label
+    /// would silently break the key handlers that look fields up the same way).
+    fn field_idx(app: &App, label: &str) -> usize {
+        let es = app.edit.as_ref().unwrap();
+        es.fields.iter().position(|f| f.label == label).unwrap_or_else(|| panic!("no field {label:?}"))
+    }
+
+    #[test]
+    fn ctrl_l_stages_link_and_ctrl_s_persists_it() {
+        let (mut app, path) = app_unlocked("uilinkadd");
+        let _a1 = seed_account(&mut app, "Bank A", "Jane");
+        let a2 = seed_account(&mut app, "Bank B", "Jane");
+        seed_asset(&mut app, "House", Vec::new());
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        // Cycle the picker to the SECOND account, then link it: the persisted id
+        // must be a2 — proves selection resolves through the aligned candidate vec
+        // (a first-match label lookup would also pass here, hence the raw-id and
+        // duplicate-guard assertions below pin the rest of the contract).
+        let pi = field_idx(&app, "Add link");
+        app.edit.as_mut().unwrap().focus = pi;
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(ctrl('l'));
+        assert_eq!(app.edit.as_ref().unwrap().linked, vec![a2.clone()], "staged in the edit state");
+        assert!(app.status.contains("Ctrl+S to save"), "status: {}", app.status);
+        // A duplicate add is refused with a hint — the list must not grow.
+        app.handle_key(ctrl('l'));
+        assert!(app.status.contains("Already linked"), "status: {}", app.status);
+        assert_eq!(app.edit.as_ref().unwrap().linked.len(), 1);
+        // Nothing reached the vault yet (edit-state only)…
+        assert!(app.vault.as_ref().unwrap().vault.assets[0].linked_accounts.is_empty());
+        // …until Ctrl+S commits the whole record, links included.
+        app.handle_key(ctrl('s'));
+        assert_eq!(app.screen, Screen::Browse, "saved; status: {}", app.status);
+        assert_eq!(app.vault.as_ref().unwrap().vault.assets[0].linked_accounts, vec![a2]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ctrl_x_unlinks_by_number_and_blank_defaults_to_first() {
+        let (mut app, path) = app_unlocked("uilinkdel");
+        let a1 = seed_account(&mut app, "Bank A", "Jane");
+        let a2 = seed_account(&mut app, "Bank B", "Jane");
+        seed_asset(&mut app, "House", vec![a1.clone(), a2.clone()]);
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        // "2" removes the second link; the consumed # is cleared afterwards.
+        let li = field_idx(&app, "Link # (open/unlink)");
+        app.edit.as_mut().unwrap().fields[li].value = "2".into();
+        app.handle_key(ctrl('x'));
+        assert_eq!(app.edit.as_ref().unwrap().linked, vec![a1.clone()]);
+        assert!(app.edit.as_ref().unwrap().fields[li].value.is_empty(), "consumed # cleared");
+        // Blank defaults to #1 (the only remaining link).
+        app.handle_key(ctrl('x'));
+        assert!(app.edit.as_ref().unwrap().linked.is_empty());
+        // Nothing left: a further unlink reports so instead of erroring.
+        app.handle_key(ctrl('x'));
+        assert!(app.status.contains("No linked accounts"), "status: {}", app.status);
+        // The removal persists on save like any other field.
+        app.handle_key(ctrl('s'));
+        assert!(app.vault.as_ref().unwrap().vault.assets[0].linked_accounts.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ctrl_o_jumps_to_the_linked_account_relaxing_filters_and_grouping() {
+        let (mut app, path) = app_unlocked("uilinkjump");
+        let _a1 = seed_account(&mut app, "Alpha", "Jane");
+        let a2 = seed_account(&mut app, "Beta", "Jane");
+        seed_asset(&mut app, "House", vec![a2.clone()]);
+        // Hostile view state: an owner filter that hides the target and grouped
+        // mode active — the jump must still land on a visible, selected target.
+        app.acct_filter_owner = Some("Nobody".into());
+        app.acct_grouped = true;
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        app.handle_key(ctrl('o')); // blank Link # defaults to #1
+        assert_eq!(app.screen, Screen::Browse);
+        assert_eq!(app.tab, Tab::Accounts);
+        assert!(app.edit.is_none(), "editor discarded (the Esc rule)");
+        assert!(!app.acct_grouped, "grouped mode falls back to the flat list");
+        let labels = app.current_labels();
+        assert_eq!(labels.get(app.selected).map(|(id, _)| id.as_str()), Some(a2.as_str()), "target row selected");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ctrl_o_on_dangling_link_stays_put_with_a_status_hint() {
+        let (mut app, path) = app_unlocked("uilinkghost");
+        seed_asset(&mut app, "House", vec!["ghost-123".into()]);
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        app.handle_key(ctrl('o'));
+        assert_eq!(app.screen, Screen::Edit, "stays in the editor");
+        assert!(app.edit.is_some(), "edit buffer kept");
+        assert_eq!(app.tab, Tab::Assets);
+        assert!(app.status.contains("not found"), "status: {}", app.status);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn linked_list_renders_raw_id_for_a_dangling_link() {
+        let (mut app, path) = app_unlocked("uilinkraw");
+        let a1 = seed_account(&mut app, "Bank A", "Jane");
+        seed_asset(&mut app, "House", vec![a1.clone(), "ghost-123".into()]);
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        let screen = render_to_string(&app);
+        assert!(screen.contains("Linked accounts (2)"), "numbered header drawn");
+        // Assert the LIST-ROW format ("  #N  <label>"), not a bare substring: the
+        // "Add link" picker on the same screen also renders "1. Bank A", which
+        // would satisfy a plain contains("Bank A") even if list resolution broke
+        // (mutation-verified: a raw-id-only list passed the old assertion).
+        assert!(screen.contains("#1  Bank A"), "resolved link row shows the account label");
+        // The dangling link is visible-but-unresolved (raw id), never hidden.
+        assert!(screen.contains("#2  ghost-123"), "dangling link row shows the raw id");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn account_edit_screen_lists_the_assets_linking_it() {
+        let (mut app, path) = app_unlocked("uilinkrev");
+        let a1 = seed_account(&mut app, "Bank A", "Jane");
+        seed_asset(&mut app, "House", vec![a1.clone()]);
+        app.tab = Tab::Accounts;
+        app.selected = 0;
+        app.start_edit(true);
+        let screen = render_to_string(&app);
+        assert!(screen.contains("Linked from (1)"), "reverse view drawn");
+        assert!(screen.contains("House"), "linking asset's label listed");
+        // An UNLINKED account shows no header at all (nothing actionable there).
+        app.handle_key(key(KeyCode::Esc));
+        seed_account(&mut app, "Lonely", "Jane");
+        app.selected = 1;
+        app.start_edit(true);
+        assert!(!render_to_string(&app).contains("Linked from"), "empty reverse view hidden");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn deleting_a_linked_account_warns_but_never_cascades() {
+        let (mut app, path) = app_unlocked("uilinkwarn");
+        let a1 = seed_account(&mut app, "Bank A", "Jane");
+        seed_asset(&mut app, "House", vec![a1.clone()]);
+        app.tab = Tab::Accounts;
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.vault.as_ref().unwrap().vault.accounts.is_empty(), "delete is allowed");
+        assert!(
+            app.status.contains("Linked from 1 asset/liability record(s)"),
+            "still-linked warning surfaced: {}",
+            app.status
+        );
+        // No cascade: the asset keeps its (now unresolved) link verbatim.
+        assert_eq!(app.vault.as_ref().unwrap().vault.assets[0].linked_accounts, vec![a1]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ctrl_o_works_read_only_while_link_and_unlink_are_gated() {
+        // Vault with a linked account+asset, reopened READ-ONLY: navigation (Ctrl+O)
+        // must work, the mutating link keys (Ctrl+L / Ctrl+X) must be inert.
+        let path = tmp_vault("uilinkro");
+        let acct_id;
+        {
+            let mut ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            let mut a = Account::new().unwrap();
+            a.title = "Bank".into();
+            a.owner = "Jane".into();
+            acct_id = a.id.clone();
+            records::upsert(&mut ov.vault.accounts, a);
+            let mut asset = AssetLiability::new().unwrap();
+            asset.owner = "Jane".into();
+            asset.approx_value = "100".into();
+            asset.linked_accounts = vec![acct_id.clone()];
+            records::upsert(&mut ov.vault.assets, asset);
+            ov.save().unwrap();
+        }
+        let ov = OpenVault::open_read_only(path.clone(), b"a", b"b").unwrap();
+        let mut app = App::new(path.clone(), false);
+        app.vault = Some(ov);
+        app.screen = Screen::Browse;
+        app.tab = Tab::Assets;
+        app.selected = 0;
+        app.start_edit(true);
+        app.handle_key(ctrl('l'));
+        assert!(app.status.contains("Read-only"), "link gated: {}", app.status);
+        app.handle_key(ctrl('x'));
+        assert!(app.status.contains("Read-only"), "unlink gated: {}", app.status);
+        assert_eq!(app.edit.as_ref().unwrap().linked, vec![acct_id.clone()], "links untouched");
+        app.handle_key(ctrl('o'));
+        assert_eq!(app.tab, Tab::Accounts, "navigation allowed read-only");
+        assert_eq!(app.screen, Screen::Browse);
+        let labels = app.current_labels();
+        assert_eq!(labels.get(app.selected).map(|(id, _)| id.as_str()), Some(acct_id.as_str()));
+        cleanup(&path);
     }
 }

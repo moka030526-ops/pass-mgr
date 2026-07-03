@@ -79,6 +79,11 @@ fn rand_asset(rng: &mut Rng, i: usize) -> AssetLiability {
     a.kind = rng.pick(KINDS).into();
     a.asset_type = rng.pick(ATYPES).into();
     a.title = rng.pick(TITLES).into();
+    // Sometimes link 1-2 (possibly dangling) account ids, so the round-trip and
+    // merge properties exercise the linked_accounts field too.
+    for n in 0..rng.below(3) {
+        a.linked_accounts.push(format!("acc{}", (i + n) % 7));
+    }
     a.updated_at = rng.i64();
     a
 }
@@ -150,7 +155,7 @@ fn save_reopen_round_trips_records() {
             (a.id.clone(), a.owner.clone(), a.account_type.clone(), a.account_subtype.clone(), a.title.clone(), a.username.clone(), a.password.clone(), a.created_at, a.updated_at)
         };
         let ast_key = |a: &AssetLiability| {
-            (a.id.clone(), a.owner.clone(), a.kind.clone(), a.asset_type.clone(), a.title.clone(), a.created_at, a.updated_at)
+            (a.id.clone(), a.owner.clone(), a.kind.clone(), a.asset_type.clone(), a.title.clone(), a.linked_accounts.clone(), a.created_at, a.updated_at)
         };
         assert_eq!(
             v.vault.accounts.iter().map(acc_key).collect::<Vec<_>>(),

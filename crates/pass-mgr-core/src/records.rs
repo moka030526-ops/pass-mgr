@@ -220,6 +220,34 @@ pub fn asset_tree<'a>(assets: impl IntoIterator<Item = &'a AssetLiability>) -> A
     root
 }
 
+// --- Asset ↔ account links ----------------------------------------------------
+//
+// `AssetLiability::linked_accounts` holds Account record ids. These two helpers are
+// the shared resolve/reverse-lookup used by both front-ends (GUI + TUI) and the CSV
+// export, so the display convention lives in ONE place.
+
+/// Resolve an account id to its display label ([`Record::label`]: "Title - Type -
+/// Username"). `None` when no account with that id exists — a dangling link (the
+/// account was deleted, or the link arrived via merge from a vault whose account
+/// isn't here). Callers then show the raw id, mirroring the tolerant `doc_path`
+/// fallback, so the link is visible-but-flagged rather than silently dropped.
+pub fn account_label(accounts: &[Account], id: &str) -> Option<String> {
+    accounts.iter().find(|a| a.id == id).map(|a| a.label())
+}
+
+/// Reverse lookup: `(id, label)` of every asset/liability whose `linked_accounts`
+/// contains `account_id`, in list order. Computed on demand by scanning the assets
+/// (same approach as the category-usage counts — no stored back-pointers to drift).
+/// Feeds the read-only "Linked from" view on an account and the delete-time
+/// warning: deleting a still-linked account is allowed but surfaced first.
+pub fn assets_linking_account(assets: &[AssetLiability], account_id: &str) -> Vec<(String, String)> {
+    assets
+        .iter()
+        .filter(|a| a.linked_accounts.iter().any(|id| id == account_id))
+        .map(|a| (a.id.clone(), a.label()))
+        .collect()
+}
+
 // --- Value summary (owner × asset/liability buckets) -------------------------
 //
 // The "Summary" tab aggregates every Asset/Liability's `approx_value` into a small matrix:
@@ -886,8 +914,9 @@ pub trait Record: Clone {
     fn label(&self) -> String;
     /// Left/right-trim every free-text field in place (including secrets such as
     /// passwords, per the project policy). Returns `true` if any field changed.
-    /// Bookkeeping fields (id/timestamps/history), booleans, and volume file ids are
-    /// left untouched. Applied on every save and by the bulk [`trim_all_records`].
+    /// Bookkeeping fields (id/timestamps/history), booleans, volume file ids, and
+    /// record-link id lists (`linked_accounts`) are left untouched. Applied on
+    /// every save and by the bulk [`trim_all_records`].
     fn trim_fields(&mut self) -> bool;
 }
 
@@ -1026,6 +1055,15 @@ pub struct AssetLiability {
     pub review: bool,
     /// Volume file id of the attached statement, if any.
     pub statement: Option<String>,
+    /// Ids of the [`Account`] records this entry is linked to (e.g. the brokerage
+    /// login plus the checking account that funds it). This is the vault's first
+    /// record→record reference: account ids are stable for a record's whole life
+    /// and the cross-vault merge copies records verbatim (id included), so a link
+    /// survives save/reopen/merge. Deleting a linked account does NOT touch this
+    /// list (additive/no-silent-loss policy) — the UIs warn at delete time and
+    /// afterwards render the unresolvable id raw, like a missing `doc_path`.
+    #[serde(default)]
+    pub linked_accounts: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub history: Vec<Change>,
@@ -1370,6 +1408,11 @@ impl_record!(
         track_bool(out, at, "review", s.review, n.review);
         if s.statement != n.statement {
             out.push(Change { at, action: "updated".into(), detail: "statement document changed".into() });
+        }
+        // Like `statement`, the link list is compared directly and logged without
+        // exposing the raw account ids (they are meaningless in a history line).
+        if s.linked_accounts != n.linked_accounts {
+            out.push(Change { at, action: "updated".into(), detail: "linked accounts changed".into() });
         }
     },
     |l: &AssetLiability| {
@@ -1759,11 +1802,56 @@ mod tests {
         new.beneficiary = "Spouse".into();
         new.review = true;
         new.statement = Some("blob1".into());
+        new.linked_accounts = vec!["acc1".into()];
         let c = old.diff(&new, unix_now());
         assert!(c.iter().any(|x| x.detail.contains("url")));
         assert!(c.iter().any(|x| x.detail.contains("beneficiary")));
         assert!(c.iter().any(|x| x.detail.contains("review")));
         assert!(c.iter().any(|x| x.detail.contains("statement document changed")));
+        // Link changes are logged generically, never exposing the raw ids.
+        assert!(c.iter().any(|x| x.detail == "linked accounts changed"));
+        assert!(!c.iter().any(|x| x.detail.contains("acc1")), "raw link ids stay out of history");
+    }
+
+    #[test]
+    fn account_link_helpers_resolve_and_reverse_lookup() {
+        let mut acc = Account::new().unwrap();
+        acc.id = "acc1".into();
+        acc.title = "Brokerage".into();
+        acc.account_type = "Financial".into();
+        acc.username = "jane".into();
+        let accounts = vec![acc];
+
+        // Forward: id -> label, None for a dangling id.
+        assert_eq!(account_label(&accounts, "acc1").unwrap(), "Brokerage - Financial - jane");
+        assert!(account_label(&accounts, "gone").is_none(), "dangling id resolves to None");
+
+        // Reverse: which assets link to the account (in list order).
+        let mut a1 = AssetLiability::new().unwrap();
+        a1.id = "ast1".into();
+        a1.title = "Index fund".into();
+        a1.linked_accounts = vec!["acc1".into(), "other".into()];
+        let mut a2 = AssetLiability::new().unwrap();
+        a2.id = "ast2".into();
+        a2.linked_accounts = vec!["other".into()];
+        let assets = vec![a1, a2];
+        let linked = assets_linking_account(&assets, "acc1");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].0, "ast1");
+        assert_eq!(linked[0].1, "[Asset] Index fund");
+        assert!(assets_linking_account(&assets, "nobody").is_empty());
+    }
+
+    #[test]
+    fn trim_fields_leaves_linked_account_ids_untouched() {
+        // Link ids are bookkeeping, not free text: a save-time trim must never
+        // rewrite them (a "trimmed" id would dangle).
+        let mut a = AssetLiability::new().unwrap();
+        a.linked_accounts = vec![" acc1 ".into()];
+        a.owner = " Jane ".into();
+        assert!(a.trim_fields(), "owner is trimmed");
+        assert_eq!(a.owner, "Jane");
+        assert_eq!(a.linked_accounts, vec![" acc1 ".to_string()], "ids untouched");
     }
 
     #[test]

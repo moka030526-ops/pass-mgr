@@ -6464,6 +6464,11 @@ mod tests {
             for f in &asset {
                 let mut r = records::AssetLiability::default();
                 r.statement = Some(f.clone());
+                // Account LINKS are record ids, not volume blobs: they must never
+                // surface as doc ids (the open-time `referenced ⊆ stored` check
+                // would brick every vault with links). Guarded by the exact-count
+                // assertion below.
+                r.linked_accounts = vec![format!("link-{f}")];
                 v.assets.push(r);
                 want.push(f.clone());
             }
