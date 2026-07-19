@@ -968,14 +968,14 @@ impl GuiApp {
     /// document export (which a read-only heir may use), a CSV can hold every record's
     /// plaintext password, so a read-only session must not be able to bulk-dump it.
     fn export_current_tab_csv(&mut self) {
-        // Defense in depth — the per-tab "⤓ CSV" buttons are also hidden when not writable.
+        // Defense in depth — the per-tab "⬇ CSV" buttons are also hidden when not writable.
         if !self.writable {
             self.fail("Export to CSV needs write mode (re-open the vault with write access).");
             return;
         }
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
-            self.fail("Set an export directory in Config first (Config → Export directory).");
+            self.fail("Set an export directory in Config first (Config > Export directory).");
             return;
         }
         let Some((base, text, n)) = self.build_tab_csv() else {
@@ -996,7 +996,7 @@ impl GuiApp {
     fn export_doc_to_config_dir(&mut self, id: &str) {
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
-            self.status = "Set an export directory in Config first (Config → Export directory).".into();
+            self.status = "Set an export directory in Config first (Config > Export directory).".into();
             return;
         }
         if let Some(ov) = self.vault.as_ref() {
@@ -1572,7 +1572,7 @@ impl GuiApp {
                 tab_button(ui, &mut self.tab, Tab::Assets, "💰 Assets and Liabilities", accent);
                 tab_button(ui, &mut self.tab, Tab::Accounts, "🔑 Accounts", accent);
                 tab_button(ui, &mut self.tab, Tab::RealEstate, "🏠 Real Estate", accent);
-                tab_button(ui, &mut self.tab, Tab::Taxes, "🧾 Taxes", accent);
+                tab_button(ui, &mut self.tab, Tab::Taxes, "📃 Taxes", accent);
                 tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "📁 General Documents", accent);
                 tab_button(ui, &mut self.tab, Tab::Summary, "📊 Summary", accent);
             });
@@ -2101,7 +2101,7 @@ impl GuiApp {
     fn ui_merge(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("⟵ Back to Config").clicked() {
+            if ui.button("⬅ Back to Config").clicked() {
                 self.reset_merge();
                 self.screen = Screen::Config;
             }
@@ -2181,7 +2181,7 @@ impl GuiApp {
                             ui.label(r.change.as_str());
                             ui.label(r.kind.as_str());
                             let recency = match r.current_updated_at {
-                                Some(cur) => format!("{} ({} → {})", r.label, format_time(cur), format_time(r.source_updated_at)),
+                                Some(cur) => format!("{} ({} -> {})", r.label, format_time(cur), format_time(r.source_updated_at)),
                                 None => format!("{} (new @ {})", r.label, format_time(r.source_updated_at)),
                             };
                             ui.label(recency);
@@ -2649,7 +2649,7 @@ impl GuiApp {
                 ui.label(egui::RichText::new("View").strong().small().color(accent_c));
                 // Grouped tree: owner → Asset/Liability → type (empty levels skipped).
                 ui.checkbox(&mut self.asset_grouped, "grouped tree")
-                    .on_hover_text("Group the list by owner → asset/liability → type");
+                    .on_hover_text("Group the list by owner > asset/liability > type");
                 ui.checkbox(&mut self.asset_filter_review, "review only")
                     .on_hover_text("Show only items flagged for review");
                 if self.asset_filter_review {
@@ -2721,7 +2721,7 @@ impl GuiApp {
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
-                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                        if self.writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
                             export = true;
                         }
                     });
@@ -3125,7 +3125,7 @@ impl GuiApp {
                 // Only offer Clear when there is something to clear, and mark it when
                 // filters are hiding rows — an unexplained short list is the single
                 // most common "where did my records go" confusion.
-                if ui.button("✕ Clear").on_hover_text("Reset every filter and the search box").clicked() {
+                if ui.button("× Clear").on_hover_text("Reset every filter and the search box").clicked() {
                     self.acct_filter_type.clear();
                     self.acct_filter_subtype.clear();
                     self.acct_filter_owner.clear();
@@ -3144,7 +3144,7 @@ impl GuiApp {
                 ui.label(egui::RichText::new("View").strong().small().color(accent_c));
                 // Flat filtered list ⇄ grouped tree (type → subtype → owner → title).
                 ui.checkbox(&mut self.acct_grouped, "grouped tree")
-                    .on_hover_text("Group the list by owner → type → subtype → title");
+                    .on_hover_text("Group the list by owner > type > subtype > title");
                 // Global reveal: the ONLY reveal control on this screen.
                 ui.checkbox(&mut self.reveal_all, "👁 reveal all passwords")
                     .on_hover_text("Unmask every password on this screen. Resets when you switch tabs.");
@@ -3233,7 +3233,7 @@ impl GuiApp {
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
-                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                        if self.writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
                             export = true;
                         }
                     });
@@ -4512,10 +4512,10 @@ impl GuiApp {
                 ui,
                 |ui| {
                     if self.status.is_empty() {
-                        ui.label(egui::RichText::new("●").color(accent.gamma_multiply(0.5)).small());
+                        ui.label(egui::RichText::new("•").color(accent.gamma_multiply(0.5)).small());
                         ui.label(egui::RichText::new("Ready").weak().small());
                     } else {
-                        ui.label(egui::RichText::new("●").color(accent).small());
+                        ui.label(egui::RichText::new("•").color(accent).small());
                         // A long failure message truncates here rather than widening the
                         // window; the banner above carries the full text.
                         ui.add(egui::Label::new(egui::RichText::new(&self.status).small()).truncate())
@@ -4602,7 +4602,7 @@ fn show_error_banner(error: &mut Option<String>, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new(&msg).color(egui::Color32::WHITE).strong().size(15.0));
                 },
                 |ui| {
-                    if ui.button("Dismiss ✕").clicked() {
+                    if ui.button("Dismiss ×").clicked() {
                         *error = None;
                     }
                 },
@@ -4756,7 +4756,7 @@ fn list_panel(
     let accent = ui_accent(ui);
     // Heading, count, then the two actions — all left-to-right and wrapping, so the
     // buttons stay next to the title they belong to. Right-aligning them pushed them
-    // against the divider between the panes, where "⤓ CSV" read as part of the form
+    // against the divider between the panes, where "⬇ CSV" read as part of the form
     // and was easy to miss entirely on a narrow window.
     ui.horizontal_wrapped(|ui| {
         section_heading(ui, title, accent);
@@ -4768,7 +4768,7 @@ fn list_panel(
         }
         // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
         // only (offered only when writable) — a read-only heir must not bulk-export secrets.
-        if writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+        if writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
             export = true;
         }
     });
@@ -5180,7 +5180,7 @@ fn doc_section(
                     // writes into the directory configured in Config, recreating the document's
                     // volume folder structure — there is no per-export path prompt.
                     if ui
-                        .button("⤓ Export")
+                        .button("⬇ Export")
                         .on_hover_text("Write a DECRYPTED copy into the export directory set in Config")
                         .clicked()
                     {
@@ -5313,7 +5313,7 @@ fn linked_accounts_section(
                 if writable && ui.button("Unlink").on_hover_text("Remove this link (the account itself is untouched)").clicked() {
                     req = LinkReq::Remove(i);
                 }
-                if ui.button("Open ➜").on_hover_text("Jump to this account on the Accounts tab").clicked() {
+                if ui.button("Open").on_hover_text("Jump to this account on the Accounts tab").clicked() {
                     req = LinkReq::Open(id.clone());
                 }
             },
@@ -5578,7 +5578,7 @@ mod tests {
     ///   layout that cannot decide whether it needs a scrollbar never stops asking.
     ///   (This is a necessary condition, not a sufficient one — a headless harness does
     ///   not reproduce every real-window oscillation — so it is a guard, not a proof.)
-    /// - **Reachability.** "⤓ CSV" must still be present at every width on every tab
+    /// - **Reachability.** "⬇ CSV" must still be present at every width on every tab
     ///   that has a CSV form. It once sat in a right-aligned group where a narrow pane
     ///   pushed it against the divider; Summary is the sole tab with no CSV, because it
     ///   is a calculated view with no `csv::CsvTab` of its own.
@@ -5617,7 +5617,7 @@ mod tests {
 
                 if tab != Tab::Summary {
                     assert_eq!(
-                        h.query_all_by_label("⤓ CSV").count(),
+                        h.query_all_by_label("⬇ CSV").count(),
                         1,
                         "the CSV export button must stay reachable at {w}x420 on {tab:?}"
                     );
@@ -6766,16 +6766,16 @@ mod kittest_tests {
         h.run();
         // The banner is on-screen (its Dismiss button is the deterministic, queryable marker).
         assert!(
-            h.query_by_label("Dismiss ✕").is_some(),
+            h.query_by_label("Dismiss ×").is_some(),
             "the conspicuous error banner renders while an error is set"
         );
 
         // Clicking Dismiss clears the error and removes the banner entirely.
-        h.get_by_label("Dismiss ✕").click();
+        h.get_by_label("Dismiss ×").click();
         h.run();
         assert!(error.borrow().is_none(), "Dismiss clears the stored error");
         assert!(
-            h.query_by_label("Dismiss ✕").is_none(),
+            h.query_by_label("Dismiss ×").is_none(),
             "the banner is gone after dismissal (nothing rendered when error is None)"
         );
     }
@@ -6828,6 +6828,59 @@ mod kittest_tests {
         assert!(
             asset_leaks_after_expanding_accounts(false),
             "control: the pre-fix shared id leaks the expand to the Assets tab (reproduces the bug)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use eframe::egui;
+    use egui_kittest::Harness;
+
+    /// Every non-ASCII character in the GUI's source must exist in the fonts egui
+    /// BUNDLES — the app ships as a single self-contained binary with no asset files,
+    /// so it cannot rely on what fonts the target machine happens to have. A character
+    /// outside the bundled set renders as a tofu box (□) on the user's screen, which no
+    /// test that merely queries labels would ever notice.
+    ///
+    /// The character set is taken from the source with `include_str!` rather than
+    /// hand-listed, so introducing a new glyph automatically brings it under this check
+    /// instead of quietly shipping. It over-approximates (comments are scanned too),
+    /// which is the safe direction: a comment-only character that the fonts lack costs
+    /// one line in the allow-list below, whereas a missed rendered one costs a tofu box.
+    #[test]
+    fn every_glyph_in_the_gui_source_exists_in_the_bundled_fonts() {
+        const SOURCES: [&str; 2] = [include_str!("gui.rs"), include_str!("gui_help.rs")];
+
+        // Characters that appear only in prose/comments and are never drawn as UI
+        // chrome. Listed explicitly so the exemption is a decision, not an accident;
+        // each was checked against the source when it was added here.
+        const COMMENT_ONLY: &str = "→↑↓⇄□";
+
+        let mut chars: Vec<char> = SOURCES
+            .iter()
+            .flat_map(|s| s.chars())
+            .filter(|c| !c.is_ascii() && !COMMENT_ONLY.contains(*c))
+            .collect();
+        chars.sort_unstable();
+        chars.dedup();
+
+        let mut h = Harness::new_ui(|_ui| {});
+        h.run();
+        let (missing, control_present, control_absent): (Vec<char>, bool, bool) = h.ctx.fonts_mut(|f| {
+            let id = egui::FontId::proportional(14.0);
+            (
+                chars.iter().copied().filter(|c| !f.has_glyph(&id, *c)).collect(),
+                // Controls, so a broken probe cannot pass silently: a plain letter must
+                // be present and a Gothic codepoint must not.
+                f.has_glyph(&id, 'A'),
+                !f.has_glyph(&id, '\u{10348}'),
+            )
+        });
+        assert!(control_present && control_absent, "the glyph probe itself is broken");
+        assert!(
+            missing.is_empty(),
+            "these characters are NOT in egui's bundled fonts and render as tofu boxes: {missing:?}"
         );
     }
 }

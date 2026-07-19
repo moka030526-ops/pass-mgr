@@ -320,7 +320,7 @@ pub(crate) const TOPICS: &[Topic] = &[
             Block::Sub("Grouped view"),
             Block::P(
                 "The grouped checkbox switches the list from a flat list to a tree of \
-                 owner → asset or liability → type, so a large estate stays navigable. Groups \
+                 owner > asset or liability > type, so a large estate stays navigable. Groups \
                  expand and collapse independently and remember their state.",
             ),
             Block::Sub("Linking to accounts"),
@@ -360,7 +360,7 @@ pub(crate) const TOPICS: &[Topic] = &[
                 ("type / subtype / owner / title", "Faceted dropdowns; blank means no filter."),
                 ("review only", "Show only accounts flagged for review."),
                 ("reveal all", "Unmask every password on this screen. See “Passwords”."),
-                ("grouped", "Switch between a flat list and an owner → type → subtype → title tree."),
+                ("grouped", "Switch between a flat list and an owner > type > subtype > title tree."),
                 ("search", "Case-insensitive substring match on the username OR the title."),
                 ("Clear", "Reset every filter, the review flag, and the search box at once."),
                 ("Trim all fields", "One-off maintenance: strip leading/trailing whitespace from every field of every record in the whole vault (write mode; recorded in history)."),
@@ -814,7 +814,7 @@ pub(crate) const TOPICS: &[Topic] = &[
         blurb: "The shortcuts this window understands.",
         body: &[
             Block::Rows(&[
-                ("↑ / ↓", "Move to the previous/next record in a flat list, scrolling it into view."),
+                ("Up / Down arrow", "Move to the previous/next record in a flat list, scrolling it into view."),
                 ("Click a row", "Open that record in the form."),
                 ("Click a group header", "Expand or collapse it in a grouped tree."),
                 ("Tab / Shift+Tab", "Move between fields."),
@@ -1064,7 +1064,7 @@ pub(crate) fn ui(ui: &mut egui::Ui, state: &mut HelpState, ctx: &HelpContext, ac
             );
             // Right-align the search box so it keeps its place as the window resizes.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !state.query.is_empty() && ui.button("✕").on_hover_text("Clear the search").clicked() {
+                if !state.query.is_empty() && ui.button("×").on_hover_text("Clear the search").clicked() {
                     state.query.clear();
                 }
                 ui.add(

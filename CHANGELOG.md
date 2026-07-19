@@ -174,6 +174,16 @@ date and bump the crate versions to match.
 
 ### Changed
 
+- **Tofu boxes removed from the GUI.** The app ships as a single self-contained binary with
+  no asset files, so it can only draw glyphs present in the fonts egui *bundles*. Several
+  characters were outside that set and rendered as `□` on screen — including three that
+  predate the visual overhaul: `⤓` (the CSV/Export buttons), `✕` (Dismiss), `⟵` (Back to
+  Config), plus `→` in several status messages and tooltips. All replaced with bundled
+  equivalents (`⬇`, `×`, `⬅`, `>`). A new test derives the character set from the GUI source
+  with `include_str!` — so a newly introduced glyph is checked automatically rather than
+  quietly shipping — and verifies each against egui's bundled fonts, with a control pair so a
+  broken probe cannot pass silently.
+
 - **GUI scrolling put on the right frames.** The tab body no longer sits inside one
   both-axis `ScrollArea`. Scrolling now belongs to the frames that actually overflow: each
   tab's **list pane** and its **form pane** scroll vertically and independently, and only
