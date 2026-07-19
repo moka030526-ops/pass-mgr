@@ -2371,6 +2371,37 @@ mod tests {
     }
 
     #[test]
+    fn compact_history_includes_urgent_notes() {
+        // The URGENT collection must be trimmed by compact_history and counted by
+        // history_stats like every other record type.
+        //
+        // Found by mutation testing: `n += count(...)` in the urgent loop of
+        // `history_stats` could be changed to `-=` or `*=` and the whole suite still
+        // passed. That loop runs FIRST, while `n` is still 0, so with no urgent history
+        // anywhere in the tests all three operators are indistinguishable. `history_stats`
+        // is what `compact --json` reports as "would remove N history entries", so an
+        // undetected break there is a dry-run that lies about a destructive operation.
+        let mut vault = Vault::default();
+        let mut u = Urgent::default();
+        u.history = vec![
+            Change { at: 1, action: "u".into(), detail: String::new() },
+            Change { at: 500, action: "u".into(), detail: String::new() },
+        ];
+        vault.urgent.push(u);
+
+        // Counted, and counted BEFORE any other collection contributes — so an urgent-only
+        // vault pins the first loop on its own.
+        assert_eq!(history_stats(&vault, None, true), 2, "drop-all counts both entries");
+        assert_eq!(history_stats(&vault, Some(300), false), 1, "cutoff counts only the older one");
+
+        // And the count agrees with what removal actually does.
+        assert_eq!(compact_history(&mut vault, Some(300), false), 1);
+        assert_eq!(vault.urgent[0].history.len(), 1, "the newer entry is kept");
+        assert_eq!(compact_history(&mut vault, None, true), 1);
+        assert!(vault.urgent[0].history.is_empty());
+    }
+
+    #[test]
     fn compact_history_includes_tax_filings() {
         // The Taxes collection must be trimmed by compact_history and counted by
         // history_stats like the other five record types.
