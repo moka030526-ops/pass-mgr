@@ -62,6 +62,13 @@ pub fn run(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
 
     // Back up the encrypted tree first (unless opted out). MUST precede the staged rewrite
     // (`vault::backup` refuses while a `.rekey` is staged). Default: sibling `<name>-backups/`.
+    //
+    // It must also precede the `OpenVault::open` below, and NOT merely by luck: this is the
+    // FREE `vault::backup`, which acquires the single-writer lock itself. Moving it after the
+    // open would self-deadlock (flock binds to the open file description, so a second
+    // in-process acquire returns WouldBlock → `Locked`, reported as a phantom "another
+    // writable session"). That is exactly what `compact` did. If this ever needs to move
+    // below the open, switch it to the `v.backup(...)` method, which reuses the held lock.
     if !f.no_backup {
         let dest = default_backup_dir(&dir);
         if dest_inside(&dir, &dest) {

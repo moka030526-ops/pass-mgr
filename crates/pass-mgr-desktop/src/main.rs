@@ -657,7 +657,15 @@ fn cli_compact(pos: &[String], f: &CompactFlags) -> anyhow::Result<()> {
         if dest_inside(&dir, &dest) {
             anyhow::bail!("backup destination must be OUTSIDE the vault directory");
         }
-        let bp = vault::backup(&path, &dest)?;
+        // `v.backup(...)`, NOT the free `vault::backup(...)`: this session already holds
+        // the single-writer lock, and the free function re-acquires it. flock binds to the
+        // open file description, so a second in-process acquire returns WouldBlock →
+        // `Locked`, reported as "another writable session already has this vault open" —
+        // naming a session that does not exist. That made the DEFAULT path of this
+        // destructive command fail outright and funnelled users to `--no-backup`, i.e. an
+        // irreversible volume re-pack / history trim with no backup at all. The GUI and TUI
+        // were fixed for exactly this (audit R-9); this call site was missed.
+        let bp = v.backup(&dest)?;
         eprintln!("Backed up to {} before compacting.", bp.display());
         backup_path = Some(bp);
     }

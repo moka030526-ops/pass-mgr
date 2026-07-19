@@ -81,3 +81,102 @@ fn part_flag_on_a_command_that_rejects_it_errors() {
         "got stderr: {stderr}"
     );
 }
+
+// --- End-to-end `compact` -----------------------------------------------------
+//
+// The unit tests stop at flag validation and nothing ran the real subcommand, so
+// the documented DEFAULT path (back up first, then compact) was never exercised.
+// It self-deadlocked: the session opens the vault writable (taking the
+// single-writer lock) and then called the FREE `vault::backup`, which re-acquires
+// it — flock binds to the open file description, so a second in-process acquire
+// returns WouldBlock. The user saw "another writable session already has this
+// vault open", naming a session that does not exist, and the documented escape
+// hatch (`--no-backup`) runs an irreversible rewrite with no backup.
+//
+// The same shape was found and fixed for the GUI and TUI as audit R-9; this call
+// site was missed.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Build a real vault with one document, then delete the document so compaction
+/// has dead bytes to reclaim (`compact` returns early when there is nothing to do,
+/// which would make this test pass without reaching the backup).
+fn vault_with_dead_bytes(tag: &str) -> PathBuf {
+    use pass_mgr::crypto::KdfParams;
+    use pass_mgr::vault::OpenVault;
+
+    let dir = std::env::temp_dir().join(format!(
+        "passmgr-cli-{tag}-{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("vault.pmv");
+    let fast = KdfParams { m_cost: 256, t_cost: 1, p_cost: 1 };
+    let mut v = OpenVault::create(path.clone(), b"p1", b"p2", fast).unwrap();
+    let src = dir.join("payload.bin");
+    std::fs::write(&src, vec![7u8; 32 * 1024]).unwrap();
+    let id = v.add_document("doc", "payload.bin", &src).unwrap();
+    v.remove_document(&id).unwrap(); // tombstone it -> dead volume bytes
+    drop(v); // release the single-writer lock before the CLI runs
+    let _ = std::fs::remove_file(&src);
+    path
+}
+
+fn run_compact(dir: &Path, extra: &[&str]) -> std::process::Output {
+    let mut child = std::process::Command::new(bin())
+        .arg("compact")
+        .arg(dir)
+        .args(extra)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn compact");
+    // The two passwords, in order, on stdin.
+    child.stdin.as_mut().unwrap().write_all(b"p1\np2\n").unwrap();
+    child.wait_with_output().expect("compact finished")
+}
+
+#[test]
+fn compact_succeeds_on_its_default_backup_first_path() {
+    let path = vault_with_dead_bytes("compactdefault");
+    let dir = path.parent().unwrap().to_path_buf();
+
+    let out = run_compact(&dir, &["--volume"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The precise regression: the lock this session already holds must not be
+    // re-acquired by the backup step.
+    assert!(
+        !stderr.contains("already has this vault open"),
+        "compact must not self-deadlock on its own write lock; stderr: {stderr}"
+    );
+    assert!(out.status.success(), "compact --volume should exit 0; stderr: {stderr}");
+    assert!(stderr.contains("Backed up to"), "the default path backs up first; stderr: {stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_succeeds_with_an_explicit_backup_destination() {
+    let path = vault_with_dead_bytes("compactexplicit");
+    let dir = path.parent().unwrap().to_path_buf();
+    // Must be OUTSIDE the vault directory (the CLI rejects an inside destination).
+    let dest = dir.parent().unwrap().join(format!(
+        "passmgr-cli-backupdest-{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+
+    let out = run_compact(&dir, &["--volume", "--backup", dest.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("already has this vault open"),
+        "an explicit --backup must not self-deadlock either; stderr: {stderr}"
+    );
+    assert!(out.status.success(), "compact --backup should exit 0; stderr: {stderr}");
+    assert!(dest.exists(), "the backup destination was created");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dest);
+}
