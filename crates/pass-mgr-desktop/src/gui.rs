@@ -2353,20 +2353,20 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_urgent").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_urgent.as_mut() {
-                egui::Grid::new("urgent_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Title");
-                    field_singleline(ui, &mut r.title, self.writable, 420.0);
-                    ui.end_row();
-                });
-                ui.label("Details");
-                field_multiline(ui, &mut r.description, self.writable, 12);
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "an urgent note");
-            }
-        });
+                if let Some(r) = self.edit_urgent.as_mut() {
+                    egui::Grid::new("urgent_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Title");
+                        field_singleline(ui, &mut r.title, self.writable, 420.0);
+                        ui.end_row();
+                    });
+                    ui.label("Details");
+                    field_multiline(ui, &mut r.description, self.writable, 12);
+                    action = form_buttons(ui, self.writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "an urgent note");
+                }
+            });
         });
 
         if export {
@@ -2423,22 +2423,22 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_instructions").show(&mut c[1], |ui| {
-            // `.as_mut()` borrows the edited record mutably so the form widgets
-            // below can write directly into its fields.
-            if let Some(r) = self.edit_instruction.as_mut() {
-                egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Title");
-                    field_singleline(ui, &mut r.title, self.writable, 420.0);
-                    ui.end_row();
-                });
-                ui.label("Description");
-                field_multiline(ui, &mut r.description, self.writable, 12);
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "an instruction");
-            }
-        });
+                // `.as_mut()` borrows the edited record mutably so the form widgets
+                // below can write directly into its fields.
+                if let Some(r) = self.edit_instruction.as_mut() {
+                    egui::Grid::new("instr_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Title");
+                        field_singleline(ui, &mut r.title, self.writable, 420.0);
+                        ui.end_row();
+                    });
+                    ui.label("Description");
+                    field_multiline(ui, &mut r.description, self.writable, 12);
+                    action = form_buttons(ui, self.writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "an instruction");
+                }
+            });
         });
 
         // Now apply the deferred actions outside the render closure.
@@ -2504,30 +2504,30 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_trustwill").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_trustwill.as_mut() {
-                egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Document");
-                    field_singleline(ui, &mut r.document, self.writable, 420.0);
-                    ui.end_row();
-                });
-                ui.label("Usage");
-                field_multiline(ui, &mut r.usage, self.writable, 8);
-                ui.separator();
-                docreq = doc_section(
-                    ui,
-                    &attached,
-                    &mut self.doc_subfolder,
-                    &mut self.doc_filename,
-                    &mut self.doc_source,
-                    self.writable,
-                )
-                .to_single();
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "a document");
-            }
-        });
+                if let Some(r) = self.edit_trustwill.as_mut() {
+                    egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Document");
+                        field_singleline(ui, &mut r.document, self.writable, 420.0);
+                        ui.end_row();
+                    });
+                    ui.label("Usage");
+                    field_multiline(ui, &mut r.usage, self.writable, 8);
+                    ui.separator();
+                    docreq = doc_section(
+                        ui,
+                        &attached,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        self.writable,
+                    )
+                    .to_single();
+                    action = form_buttons(ui, self.writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "a document");
+                }
+            });
         });
 
         if export {
@@ -2583,30 +2583,30 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_general").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_general.as_mut() {
-                egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Title");
-                    field_singleline(ui, &mut r.title, self.writable, 420.0);
-                    ui.end_row();
-                });
-                ui.label("Description");
-                field_multiline(ui, &mut r.description, self.writable, 8);
-                ui.separator();
-                docreq = doc_section(
-                    ui,
-                    &attached,
-                    &mut self.doc_subfolder,
-                    &mut self.doc_filename,
-                    &mut self.doc_source,
-                    self.writable,
-                )
-                .to_single();
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "a document");
-            }
-        });
+                if let Some(r) = self.edit_general.as_mut() {
+                    egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Title");
+                        field_singleline(ui, &mut r.title, self.writable, 420.0);
+                        ui.end_row();
+                    });
+                    ui.label("Description");
+                    field_multiline(ui, &mut r.description, self.writable, 8);
+                    ui.separator();
+                    docreq = doc_section(
+                        ui,
+                        &attached,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        self.writable,
+                    )
+                    .to_single();
+                    action = form_buttons(ui, self.writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "a document");
+                }
+            });
         });
 
         if export {
@@ -2753,62 +2753,62 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_assets").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_asset.as_mut() {
-                let w = self.writable;
-                egui::Grid::new("asset_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Asset / Liability");
-                    combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()], w);
-                    ui.end_row();
-                    ui.label("Owner");
-                    field_singleline(ui, &mut r.owner, w, 420.0);
-                    ui.end_row();
-                    ui.label("Title");
-                    field_singleline(ui, &mut r.title, w, 420.0);
-                    ui.end_row();
-                    ui.label("Beneficiary");
-                    field_singleline(ui, &mut r.beneficiary, w, 420.0);
-                    ui.end_row();
-                    ui.label("Approximate value");
-                    field_singleline(ui, &mut r.approx_value, w, 420.0);
-                    ui.end_row();
-                    ui.label("As-of date");
-                    field_singleline_hint(ui, &mut r.as_of_date, w, 420.0, "YYYY-MM-DD");
-                    ui.end_row();
-                    ui.label("Institution");
-                    field_singleline(ui, &mut r.institution, w, 420.0);
-                    ui.end_row();
-                    ui.label("Type");
-                    combo(ui, "asset_type", &mut r.asset_type, &asset_types, w);
-                    ui.end_row();
-                    ui.label("URL");
-                    field_singleline(ui, &mut r.url, w, 420.0);
-                    ui.end_row();
-                    ui.label("Review");
-                    ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
-                    ui.end_row();
-                });
-                ui.label("Description");
-                field_multiline(ui, &mut r.description, self.writable, 4);
-                ui.separator();
-                // Cross-record links to Accounts (edited on the asset side ONLY; the
-                // Accounts form shows the read-only reverse view). Deferred like docreq.
-                linkreq = linked_accounts_section(ui, &linked_rows, &link_candidates, self.writable);
-                ui.separator();
-                docreq = doc_section(
-                    ui,
-                    &attached,
-                    &mut self.doc_subfolder,
-                    &mut self.doc_filename,
-                    &mut self.doc_source,
-                    self.writable,
-                )
-                .to_single();
-                action = form_buttons(ui, self.writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "an asset or liability");
-            }
-        });
+                if let Some(r) = self.edit_asset.as_mut() {
+                    let w = self.writable;
+                    egui::Grid::new("asset_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Asset / Liability");
+                        combo(ui, "asset_kind", &mut r.kind, &["Asset".to_string(), "Liability".to_string()], w);
+                        ui.end_row();
+                        ui.label("Owner");
+                        field_singleline(ui, &mut r.owner, w, 420.0);
+                        ui.end_row();
+                        ui.label("Title");
+                        field_singleline(ui, &mut r.title, w, 420.0);
+                        ui.end_row();
+                        ui.label("Beneficiary");
+                        field_singleline(ui, &mut r.beneficiary, w, 420.0);
+                        ui.end_row();
+                        ui.label("Approximate value");
+                        field_singleline(ui, &mut r.approx_value, w, 420.0);
+                        ui.end_row();
+                        ui.label("As-of date");
+                        field_singleline_hint(ui, &mut r.as_of_date, w, 420.0, "YYYY-MM-DD");
+                        ui.end_row();
+                        ui.label("Institution");
+                        field_singleline(ui, &mut r.institution, w, 420.0);
+                        ui.end_row();
+                        ui.label("Type");
+                        combo(ui, "asset_type", &mut r.asset_type, &asset_types, w);
+                        ui.end_row();
+                        ui.label("URL");
+                        field_singleline(ui, &mut r.url, w, 420.0);
+                        ui.end_row();
+                        ui.label("Review");
+                        ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
+                        ui.end_row();
+                    });
+                    ui.label("Description");
+                    field_multiline(ui, &mut r.description, self.writable, 4);
+                    ui.separator();
+                    // Cross-record links to Accounts (edited on the asset side ONLY; the
+                    // Accounts form shows the read-only reverse view). Deferred like docreq.
+                    linkreq = linked_accounts_section(ui, &linked_rows, &link_candidates, self.writable);
+                    ui.separator();
+                    docreq = doc_section(
+                        ui,
+                        &attached,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        self.writable,
+                    )
+                    .to_single();
+                    action = form_buttons(ui, self.writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "an asset or liability");
+                }
+            });
         });
 
         if export {
@@ -3272,106 +3272,106 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_accounts").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_account.as_mut() {
-                let w = self.writable;
-                egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Title", &mut r.title, w);
-                    ui.label("Account type");
-                    let prev_type = r.account_type.clone();
-                    combo(ui, "acct_type", &mut r.account_type, &type_names, w);
-                    if r.account_type != prev_type {
-                        // Subtypes are type-specific; drop a now-mismatched subtype.
-                        r.account_subtype.clear();
-                    }
-                    ui.end_row();
-                    ui.label("Subtype");
-                    combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes, w);
-                    ui.end_row();
-                    ui.label("Owner");
-                    field_singleline(ui, &mut r.owner, w, 420.0);
-                    ui.end_row();
-                    ui.label("Username");
-                    ui.horizontal(|ui| {
-                        field_singleline(ui, &mut r.username, w, 380.0);
-                        // Copy is a read, so it stays available even in read-only mode;
-                        // disabled only when the field is empty (nothing to copy).
-                        if ui.add_enabled(!r.username.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
-                            copy_plain = Some(r.username.clone());
+                if let Some(r) = self.edit_account.as_mut() {
+                    let w = self.writable;
+                    egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        text_row(ui, "Title", &mut r.title, w);
+                        ui.label("Account type");
+                        let prev_type = r.account_type.clone();
+                        combo(ui, "acct_type", &mut r.account_type, &type_names, w);
+                        if r.account_type != prev_type {
+                            // Subtypes are type-specific; drop a now-mismatched subtype.
+                            r.account_subtype.clear();
                         }
-                    });
-                    ui.end_row();
-                    ui.label("Password");
-                    ui.horizontal(|ui| {
-                        // Masked unless the single global "reveal all" toggle is on (there
-                        // is no per-record reveal). `secret_text_edit` (audit R-7) scrubs
-                        // egui's undo buffer and re-routes the built-in copy through the
-                        // history-excluded clipboard path. Read-only: the field is shown,
-                        // selectable, and copyable, but not editable.
-                        secret_text_edit(ui, "acct_pw", &mut r.password, self.reveal_all, w, 280.0, &mut copy_pw);
-                        // Generate is only useful when you can save; copy is a read.
-                        if w && ui.button("🎲").on_hover_text("Generate").clicked() {
-                            generate = true;
-                        }
-                        if ui.button("📋").on_hover_text("Copy").clicked() {
-                            // Stash a self-wiping copy to act on after rendering.
-                            copy_pw = Some(Zeroizing::new(r.password.clone()));
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("URL");
-                    ui.horizontal(|ui| {
-                        field_singleline(ui, &mut r.url, w, 380.0);
-                        if ui.add_enabled(!r.url.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
-                            copy_plain = Some(r.url.clone());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Closed as of");
-                    field_singleline_hint(ui, &mut r.closed_as_of, w, 420.0, "YYYY-MM-DD");
-                    ui.end_row();
-                    ui.label("Review");
-                    ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
-                    ui.end_row();
-                });
-                ui.label("Description");
-                field_multiline(ui, &mut r.description, self.writable, 4);
-                // Read-only reverse view of the asset-side links (hidden when nothing
-                // links here). Open stays available read-only — navigation is a read.
-                if !linked_from.is_empty() {
-                    ui.separator();
-                    ui.label(egui::RichText::new("Linked from").strong());
-                    for (id, label) in &linked_from {
+                        ui.end_row();
+                        ui.label("Subtype");
+                        combo(ui, "acct_subtype", &mut r.account_subtype, &subtypes, w);
+                        ui.end_row();
+                        ui.label("Owner");
+                        field_singleline(ui, &mut r.owner, w, 420.0);
+                        ui.end_row();
+                        ui.label("Username");
                         ui.horizontal(|ui| {
-                            ui.label(format!("• {label}"));
-                            if ui.button("Open").clicked() {
-                                open_asset = Some(id.clone());
+                            field_singleline(ui, &mut r.username, w, 380.0);
+                            // Copy is a read, so it stays available even in read-only mode;
+                            // disabled only when the field is empty (nothing to copy).
+                            if ui.add_enabled(!r.username.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
+                                copy_plain = Some(r.username.clone());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.horizontal(|ui| {
+                            // Masked unless the single global "reveal all" toggle is on (there
+                            // is no per-record reveal). `secret_text_edit` (audit R-7) scrubs
+                            // egui's undo buffer and re-routes the built-in copy through the
+                            // history-excluded clipboard path. Read-only: the field is shown,
+                            // selectable, and copyable, but not editable.
+                            secret_text_edit(ui, "acct_pw", &mut r.password, self.reveal_all, w, 280.0, &mut copy_pw);
+                            // Generate is only useful when you can save; copy is a read.
+                            if w && ui.button("🎲").on_hover_text("Generate").clicked() {
+                                generate = true;
+                            }
+                            if ui.button("📋").on_hover_text("Copy").clicked() {
+                                // Stash a self-wiping copy to act on after rendering.
+                                copy_pw = Some(Zeroizing::new(r.password.clone()));
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("URL");
+                        ui.horizontal(|ui| {
+                            field_singleline(ui, &mut r.url, w, 380.0);
+                            if ui.add_enabled(!r.url.is_empty(), egui::Button::new("📋")).on_hover_text("Copy").clicked() {
+                                copy_plain = Some(r.url.clone());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Closed as of");
+                        field_singleline_hint(ui, &mut r.closed_as_of, w, 420.0, "YYYY-MM-DD");
+                        ui.end_row();
+                        ui.label("Review");
+                        ui.add_enabled(w, egui::Checkbox::new(&mut r.review, "flag for review"));
+                        ui.end_row();
+                    });
+                    ui.label("Description");
+                    field_multiline(ui, &mut r.description, self.writable, 4);
+                    // Read-only reverse view of the asset-side links (hidden when nothing
+                    // links here). Open stays available read-only — navigation is a read.
+                    if !linked_from.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Linked from").strong());
+                        for (id, label) in &linked_from {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("• {label}"));
+                                if ui.button("Open").clicked() {
+                                    open_asset = Some(id.clone());
+                                }
+                            });
+                        }
+                    }
+                    action = form_buttons(ui, self.writable);
+                    // Armed by the Delete handling below when assets link this account: the
+                    // warning (count + consequence) with an explicit second-click pair. The
+                    // id guard keeps a warning armed for one record from ever rendering —
+                    // or confirming — against another.
+                    if self.pending_account_delete.as_deref() == Some(r.id.as_str())
+                        && let Some(msg) = account_delete_link_warning(linked_from.len())
+                    {
+                        ui.colored_label(egui::Color32::from_rgb(0xC0, 0x30, 0x30), msg);
+                        ui.horizontal(|ui| {
+                            if ui.button("Delete anyway").clicked() {
+                                confirm_delete = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel_delete = true;
                             }
                         });
                     }
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "an account");
                 }
-                action = form_buttons(ui, self.writable);
-                // Armed by the Delete handling below when assets link this account: the
-                // warning (count + consequence) with an explicit second-click pair. The
-                // id guard keeps a warning armed for one record from ever rendering —
-                // or confirming — against another.
-                if self.pending_account_delete.as_deref() == Some(r.id.as_str())
-                    && let Some(msg) = account_delete_link_warning(linked_from.len())
-                {
-                    ui.colored_label(egui::Color32::from_rgb(0xC0, 0x30, 0x30), msg);
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete anyway").clicked() {
-                            confirm_delete = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel_delete = true;
-                        }
-                    });
-                }
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "an account");
-            }
-        });
+            });
         });
 
         if export {
@@ -3529,59 +3529,59 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_realestate").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_realestate.as_mut() {
-                // No inner ScrollArea here: the whole tab is already wrapped in the
-                // CentralPanel's both-axis scroll. A nested vertical scroll over this
-                // form would capture the wheel and (having no overflow of its own)
-                // scroll nothing, while the outer area never saw the event.
-                egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Address", &mut r.address, writable);
-                    text_row(ui, "Owner", &mut r.owner, writable);
-                    text_row(ui, "Taxes", &mut r.taxes, writable);
-                    text_row(ui, "HOA dues / info", &mut r.hoa, writable);
-                    text_row(ui, "Income account", &mut r.income_account, writable);
-                    text_row(ui, "Financing account", &mut r.financing_account, writable);
-                    text_row(ui, "Financing balance", &mut r.financing_balance, writable);
-                    text_row(ui, "Payment account", &mut r.payment_account, writable);
-                });
+                if let Some(r) = self.edit_realestate.as_mut() {
+                    // No inner ScrollArea here: the whole tab is already wrapped in the
+                    // CentralPanel's both-axis scroll. A nested vertical scroll over this
+                    // form would capture the wheel and (having no overflow of its own)
+                    // scroll nothing, while the outer area never saw the event.
+                    egui::Grid::new("re_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        text_row(ui, "Address", &mut r.address, writable);
+                        text_row(ui, "Owner", &mut r.owner, writable);
+                        text_row(ui, "Taxes", &mut r.taxes, writable);
+                        text_row(ui, "HOA dues / info", &mut r.hoa, writable);
+                        text_row(ui, "Income account", &mut r.income_account, writable);
+                        text_row(ui, "Financing account", &mut r.financing_account, writable);
+                        text_row(ui, "Financing balance", &mut r.financing_balance, writable);
+                        text_row(ui, "Payment account", &mut r.payment_account, writable);
+                    });
 
-                portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, &mut r.property_mgmt_comment, reveal, writable, &mut copy_pw);
-                portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, &mut r.insurance_comment, reveal, writable, &mut copy_pw);
-                portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, &mut r.hoa_comment, reveal, writable, &mut copy_pw);
-                portal_section(ui, "Tax portal", &mut r.tax_portal_url, &mut r.tax_portal_username, &mut r.tax_portal_password, &mut r.tax_portal_comment, reveal, writable, &mut copy_pw);
+                    portal_section(ui, "Property Management portal", &mut r.property_mgmt_url, &mut r.property_mgmt_username, &mut r.property_mgmt_password, &mut r.property_mgmt_comment, reveal, writable, &mut copy_pw);
+                    portal_section(ui, "Insurance portal", &mut r.insurance_url, &mut r.insurance_username, &mut r.insurance_password, &mut r.insurance_comment, reveal, writable, &mut copy_pw);
+                    portal_section(ui, "HOA portal", &mut r.hoa_url, &mut r.hoa_username, &mut r.hoa_password, &mut r.hoa_comment, reveal, writable, &mut copy_pw);
+                    portal_section(ui, "Tax portal", &mut r.tax_portal_url, &mut r.tax_portal_username, &mut r.tax_portal_password, &mut r.tax_portal_comment, reveal, writable, &mut copy_pw);
 
-                ui.separator();
-                ui.label("Comments");
-                field_multiline(ui, &mut r.comments, writable, 3);
+                    ui.separator();
+                    ui.label("Comments");
+                    field_multiline(ui, &mut r.comments, writable, 3);
 
-                ui.separator();
-                ui.label(format!(
-                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
-                    r.documents.len(),
-                    records::real_estate_doc_location(&r.address)
-                ));
-                // Same uniform widget as Trust & Will (multi-document: the list
-                // holds every attached doc); map its request to ReDocReq.
-                docreq = match doc_section(
-                    ui,
-                    &doc_labels,
-                    &mut self.doc_subfolder,
-                    &mut self.doc_filename,
-                    &mut self.doc_source,
-                    writable,
-                ) {
-                    DocSectionReq::Upload => ReDocReq::Upload,
-                    DocSectionReq::Export(i) => ReDocReq::Export(i),
-                    DocSectionReq::Remove(i) => ReDocReq::Remove(i),
-                    DocSectionReq::None => ReDocReq::None,
-                };
+                    ui.separator();
+                    ui.label(format!(
+                        "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
+                        r.documents.len(),
+                        records::real_estate_doc_location(&r.address)
+                    ));
+                    // Same uniform widget as Trust & Will (multi-document: the list
+                    // holds every attached doc); map its request to ReDocReq.
+                    docreq = match doc_section(
+                        ui,
+                        &doc_labels,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        writable,
+                    ) {
+                        DocSectionReq::Upload => ReDocReq::Upload,
+                        DocSectionReq::Export(i) => ReDocReq::Export(i),
+                        DocSectionReq::Remove(i) => ReDocReq::Remove(i),
+                        DocSectionReq::None => ReDocReq::None,
+                    };
 
-                action = form_buttons(ui, writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "a property");
-            }
-        });
+                    action = form_buttons(ui, writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "a property");
+                }
+            });
         });
 
         if export {
@@ -3659,42 +3659,42 @@ impl GuiApp {
             // another one and was handed unbounded height — the layout could not settle
             // on a scrollbar, which is what flickered on a small window.
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_taxes").show(&mut c[1], |ui| {
-            if let Some(r) = self.edit_taxfiling.as_mut() {
-                egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    text_row(ui, "Owner", &mut r.owner, writable);
-                    text_row(ui, "Filing year", &mut r.year, writable);
-                });
-                ui.label("Notes");
-                field_multiline(ui, &mut r.notes, writable, 4);
-                ui.separator();
+                if let Some(r) = self.edit_taxfiling.as_mut() {
+                    egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        text_row(ui, "Owner", &mut r.owner, writable);
+                        text_row(ui, "Filing year", &mut r.year, writable);
+                    });
+                    ui.label("Notes");
+                    field_multiline(ui, &mut r.notes, writable, 4);
+                    ui.separator();
 
-                // Attached documents — all live under <owner>/taxes/<year>/…/<ts>_<file>
-                ui.label(format!(
-                    "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
-                    r.documents.len(),
-                    records::tax_doc_location(&r.year)
-                ));
-                // Same uniform widget as Trust & Will; map its request to TaxDocReq.
-                docreq = match doc_section(
-                    ui,
-                    &doc_labels,
-                    &mut self.doc_subfolder,
-                    &mut self.doc_filename,
-                    &mut self.doc_source,
-                    writable,
-                ) {
-                    DocSectionReq::Upload => TaxDocReq::Upload,
-                    DocSectionReq::Export(i) => TaxDocReq::Export(i),
-                    DocSectionReq::Remove(i) => TaxDocReq::Remove(i),
-                    DocSectionReq::None => TaxDocReq::None,
-                };
+                    // Attached documents — all live under <owner>/taxes/<year>/…/<ts>_<file>
+                    ui.label(format!(
+                        "Documents ({}) — under <owner>/{}[/subfolder]/<ts>_<file>",
+                        r.documents.len(),
+                        records::tax_doc_location(&r.year)
+                    ));
+                    // Same uniform widget as Trust & Will; map its request to TaxDocReq.
+                    docreq = match doc_section(
+                        ui,
+                        &doc_labels,
+                        &mut self.doc_subfolder,
+                        &mut self.doc_filename,
+                        &mut self.doc_source,
+                        writable,
+                    ) {
+                        DocSectionReq::Upload => TaxDocReq::Upload,
+                        DocSectionReq::Export(i) => TaxDocReq::Export(i),
+                        DocSectionReq::Remove(i) => TaxDocReq::Remove(i),
+                        DocSectionReq::None => TaxDocReq::None,
+                    };
 
-                action = form_buttons(ui, writable);
-                history_view(ui, &r.history);
-            } else {
-                empty_form_hint(ui, "a tax year");
-            }
-        });
+                    action = form_buttons(ui, writable);
+                    history_view(ui, &r.history);
+                } else {
+                    empty_form_hint(ui, "a tax year");
+                }
+            });
         });
 
         if export {
@@ -4744,8 +4744,16 @@ fn list_nav_target(
 
 /// Step a flat-list cursor by `delta` (±1), clamped to `[0, len-1]` (the ends don't wrap).
 /// With nothing currently selected, ↓ (`delta > 0`) starts at the top and ↑ at the bottom.
-/// `len` must be > 0 (callers guard on a non-empty list).
+///
+/// `len == 0` returns 0 rather than panicking. The sole caller ([`list_nav_target`]) does
+/// guard on a non-empty list, so that case is unreachable today — but the arithmetic here
+/// panics two different ways on an empty list (`clamp(0, -1)` panics because min > max, and
+/// `len - 1` underflows), which is a sharp edge to leave lying in a mission-critical app
+/// for the next caller to find. Saturating is the honest behaviour: "no rows, so row 0".
 fn stepped_list_index(current: Option<usize>, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
     match current {
         Some(i) => (i as isize + delta).clamp(0, len as isize - 1) as usize,
         None if delta > 0 => 0,
@@ -5627,6 +5635,13 @@ mod tests {
         // Single-item list: both directions stay on the only row.
         assert_eq!(stepped_list_index(Some(0), 1, 1), 0);
         assert_eq!(stepped_list_index(None, -1, 1), 0);
+        // Empty list: must not panic. `clamp(0, -1)` panics (min > max) and `len - 1`
+        // underflows, so an empty list would have crashed the app two different ways.
+        // The caller guards today; this makes the guard non-load-bearing.
+        assert_eq!(stepped_list_index(None, 1, 0), 0);
+        assert_eq!(stepped_list_index(None, -1, 0), 0);
+        assert_eq!(stepped_list_index(Some(0), 1, 0), 0);
+        assert_eq!(stepped_list_index(Some(3), -1, 0), 0);
     }
 
     #[test]
