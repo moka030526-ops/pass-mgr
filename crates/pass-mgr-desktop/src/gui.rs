@@ -5830,6 +5830,139 @@ mod tests {
         assert!(width_of(true) > 200.0, "editable fields keep their designed width");
     }
 
+    /// A keyboard arrow landing in the SAME egui frame as a Delete click on the Assets
+    /// tab must not retarget the delete at the neighbouring record.
+    ///
+    /// The 2026-07-03 audit found and fixed exactly this on the ACCOUNTS tab, where the
+    /// fix is an explicit `record_action_pending` guard. The Assets call site has no such
+    /// guard — it still carries the pre-fix comment ("they can't both happen in one
+    /// frame") — so it looks like the sibling bug was missed. It was not: Assets is
+    /// protected by a subtler mechanism, the `focused()` check inside `list_nav_target`
+    /// (clicking a button focuses it, which suppresses list nav for that frame).
+    ///
+    /// That protection is emergent rather than stated, so this test exists to pin it: if
+    /// the focus guard is ever relaxed, Assets silently regains the data-loss bug that
+    /// Accounts was explicitly fixed for. The controls below keep the test honest.
+    #[test]
+    fn same_frame_arrow_does_not_retarget_a_delete_on_the_assets_tab() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        let (mut app, path) = app_unlocked("navrace");
+        {
+            let ov = app.vault.as_mut().unwrap();
+            for name in ["AAA-first", "BBB-second"] {
+                let mut a = AssetLiability::new().unwrap();
+                a.title = name.into();
+                a.owner = "Jane".into();
+                a.approx_value = "1".into();
+                ov.vault.assets.push(a);
+            }
+        }
+        app.tab = Tab::Assets;
+        app.asset_grouped = false;
+        // Editing the FIRST asset: this is the record the form shows and the one the
+        // user's Delete click is aimed at.
+        let first_id = app.vault_ref().vault.assets[0].id.clone();
+        let second_id = app.vault_ref().vault.assets[1].id.clone();
+        app.edit_asset = app.vault_ref().vault.assets.first().cloned();
+
+        let app = std::cell::RefCell::new(app);
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1200.0, 1600.0))
+            .build_ui(|ui| app.borrow_mut().render(ui));
+        h.run();
+
+        // Queue BOTH in the same frame: the arrow key and the Delete click. egui batches
+        // input per repaint, so this is exactly what a real keypress landing alongside a
+        // click looks like.
+        // CONTROL: the arrow key alone must really move the selection. Without this the
+        // assertion below would pass vacuously — an arrow key that does nothing in the
+        // harness would "prove" the absence of a race it never exercised.
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert_eq!(
+            app.borrow().edit_asset.as_ref().map(|r| r.title.clone()).as_deref(),
+            Some("BBB-second"),
+            "control: a lone ArrowDown must move the selection"
+        );
+        h.key_press(egui::Key::ArrowUp);
+        h.run();
+        assert_eq!(
+            app.borrow().edit_asset.as_ref().map(|r| r.title.clone()).as_deref(),
+            Some("AAA-first"),
+            "control: ArrowUp must move it back, so the delete below targets the first record"
+        );
+
+        h.get_by_label("🗑 Delete").click();
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+
+        let a = app.borrow();
+        let ids: Vec<String> = a.vault_ref().vault.assets.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            !ids.contains(&first_id),
+            "the asset the user was looking at should have been deleted; remaining={:?}",
+            a.vault_ref().vault.assets.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            ids.contains(&second_id),
+            "the NEIGHBOUR must survive — a same-frame arrow must not retarget the delete"
+        );
+        drop(a);
+        cleanup(&path);
+    }
+
+    /// No password may ever reach the PLAINTEXT render path.
+    ///
+    /// Read-only values are drawn as ordinary selectable text (`read_only_value`), which
+    /// is right for an address and catastrophic for a password. Secrets are supposed to
+    /// go through `secret_text_edit`, which masks unless the screen's reveal toggle is
+    /// on. This walks the real accessibility tree of the real window and asserts the
+    /// secret is not in it while masked — the check a label-name assertion cannot make,
+    /// since the widget is present either way and only its CONTENT differs.
+    #[test]
+    fn a_masked_password_never_appears_in_the_rendered_tree() {
+        use egui_kittest::{kittest::NodeT as _, Harness};
+
+        const SECRET: &str = "correct-horse-battery-staple";
+
+        // Both modes: read-only is the one whose render path just changed, write mode is
+        // where the field is a real editable box.
+        for writable in [false, true] {
+            for reveal in [false, true] {
+                let path = tmp("nopwleak");
+                let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+                let mut app = GuiApp::new(path.clone(), writable);
+                app.vault = Some(ov);
+                app.screen = Screen::Main;
+                app.tab = Tab::Accounts;
+                app.reveal_all = reveal;
+                let mut a = Account::new().unwrap();
+                a.title = "Bank".into();
+                a.owner = "Jane".into();
+                a.password = SECRET.into();
+                app.edit_account = Some(a);
+                let app = std::cell::RefCell::new(app);
+                let mut h = Harness::builder()
+                    .with_size(egui::vec2(1200.0, 1600.0))
+                    .build_ui(|ui| app.borrow_mut().render(ui));
+                h.run();
+
+                let exposed = h
+                    .root()
+                    .children_recursive()
+                    .filter_map(|n| n.value())
+                    .any(|v| v.contains(SECRET));
+                assert_eq!(
+                    exposed, reveal,
+                    "password in the rendered tree should match the reveal toggle \
+                     (writable={writable}, reveal={reveal})"
+                );
+                cleanup(&path);
+            }
+        }
+    }
+
     #[test]
     fn every_tab_renders_in_real_egui() {
         use egui_kittest::Harness;
