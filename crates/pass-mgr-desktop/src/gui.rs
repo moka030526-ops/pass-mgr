@@ -4947,6 +4947,93 @@ fn presize_secret(s: &mut String) {
     *s = roomy;
 }
 
+/// Break `text` into lines that fit `max_width`, putting a HYPHEN at the break when
+/// a single word has to be split.
+///
+/// egui wraps at word boundaries and, for a word longer than the line, splits it with
+/// no visual cue — so a long path or id just stops mid-character and resumes on the
+/// next line, reading as two unrelated fragments. A trailing dash is the typographic
+/// convention that says "this word continues".
+///
+/// Pure: `measure` supplies the width of a string, so the line-breaking logic is
+/// unit-testable without a font or a UI. Existing newlines in `text` are preserved as
+/// hard breaks.
+fn wrap_hyphenated(text: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
+    // Degenerate width: nothing sensible to compute, so hand the text back untouched
+    // rather than emit one character per line.
+    if max_width <= 0.0 {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for (i, para) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            // `rest` is what remains of the current word; a word too long for a whole
+            // line is consumed a piece at a time by the inner loop.
+            let mut rest = word;
+            loop {
+                let candidate =
+                    if line.is_empty() { rest.to_owned() } else { format!("{line} {rest}") };
+                if measure(&candidate) <= max_width {
+                    line = candidate;
+                    break;
+                }
+                // Doesn't fit. If something is already on the line, flush it and retry
+                // this word on a fresh line.
+                if !line.is_empty() {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line.clear();
+                    continue;
+                }
+                // The word alone overflows an empty line: split it, reserving room for
+                // the hyphen. Walk char boundaries (never byte offsets — that would
+                // panic on multi-byte UTF-8) and take the longest prefix that fits.
+                let mut cut = 0;
+                for (idx, _) in rest.char_indices().skip(1) {
+                    if measure(&format!("{}-", &rest[..idx])) > max_width {
+                        break;
+                    }
+                    cut = idx;
+                }
+                // Guarantee progress even when a single character overflows, so this
+                // loop can never spin forever on a very narrow pane.
+                if cut == 0 {
+                    cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
+                }
+                out.push_str(&rest[..cut]);
+                out.push_str("-\n");
+                rest = &rest[cut..];
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// Render a stored value as READ-ONLY text: left-justified, wrapped to the pane with
+/// [`wrap_hyphenated`], and still selectable so it can be copied.
+///
+/// The alternative — a disabled text box — gave every value the same full-pane width
+/// whatever its length, so a one-word owner name occupied as much screen as an
+/// address. This shows the text and nothing else. It is display-only: the vault value
+/// behind it is never touched, so the dashes exist purely on screen.
+fn read_only_value(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let avail = fit(ui, f32::INFINITY);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let wrapped = wrap_hyphenated(text, avail, |s| {
+        ui.painter().layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER).size().x
+    });
+    // Already broken to width, so egui must not wrap it a second time.
+    ui.add(egui::Label::new(wrapped).wrap_mode(egui::TextWrapMode::Extend).selectable(true))
+}
+
 /// Treat a designed field width as a MAXIMUM, shrinking it to whatever the pane
 /// actually offers.
 ///
@@ -4965,23 +5052,19 @@ fn fit(ui: &egui::Ui, desired: f32) -> f32 {
 /// highlight and Ctrl+C, exactly what read-only mode wants (vs. `add_enabled(false)`,
 /// which greys it out and blocks selection entirely).
 fn field_singleline(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32) -> egui::Response {
-    let width = fit(ui, width);
     if writable {
-        ui.add(egui::TextEdit::singleline(value).desired_width(width))
+        ui.add(egui::TextEdit::singleline(value).desired_width(fit(ui, width)))
     } else {
-        let mut ro = value.as_str();
-        ui.add(egui::TextEdit::singleline(&mut ro).desired_width(width))
+        read_only_value(ui, value)
     }
 }
 
 /// Like [`field_singleline`] but with a placeholder hint (shown only when editable).
 fn field_singleline_hint(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32, hint: &str) -> egui::Response {
-    let width = fit(ui, width);
     if writable {
-        ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(width))
+        ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(fit(ui, width)))
     } else {
-        let mut ro = value.as_str();
-        ui.add(egui::TextEdit::singleline(&mut ro).desired_width(width))
+        read_only_value(ui, value)
     }
 }
 
@@ -4991,8 +5074,7 @@ fn field_multiline(ui: &mut egui::Ui, value: &mut String, writable: bool, rows: 
     if writable {
         ui.add(egui::TextEdit::multiline(value).desired_rows(rows).desired_width(f32::INFINITY))
     } else {
-        let mut ro = value.as_str();
-        ui.add(egui::TextEdit::multiline(&mut ro).desired_rows(rows).desired_width(f32::INFINITY))
+        read_only_value(ui, value)
     }
 }
 
@@ -5058,8 +5140,8 @@ fn portal_section(
                     .desired_width(f32::INFINITY),
             );
         } else {
-            let mut ro = comment.as_str();
-            ui.add(egui::TextEdit::multiline(&mut ro).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
+            let _ = salt; // the id salt only matters for the editable widget
+            read_only_value(ui, comment);
         }
     });
 }
@@ -5626,6 +5708,87 @@ mod tests {
             }
             w += 16.0;
         }
+    }
+
+    /// The read-only line-breaker, driven by a fake measurer (1 unit per character) so
+    /// the breaking logic is pinned without a font.
+    #[test]
+    fn wrap_hyphenated_breaks_words_with_a_dash_and_always_progresses() {
+        let w = |s: &str| s.chars().count() as f32;
+
+        // Fits: untouched.
+        assert_eq!(wrap_hyphenated("hello there", 20.0, w), "hello there");
+
+        // Word boundary preferred over splitting — no dash appears.
+        assert_eq!(wrap_hyphenated("hello there", 6.0, w), "hello\nthere");
+
+        // A word too long for the line is split WITH a trailing dash, and every
+        // fragment respects the width (the dash is part of the measured line).
+        let out = wrap_hyphenated("supercalifragilistic", 8.0, w);
+        assert!(out.contains('-'), "an over-long word must break with a dash: {out:?}");
+        for line in out.lines() {
+            assert!(w(line) <= 8.0, "line {line:?} exceeds the width in {out:?}");
+        }
+        // Nothing is lost or invented: dropping the added dashes and newlines
+        // reconstitutes the original word.
+        assert_eq!(out.replace("-\n", ""), "supercalifragilistic");
+
+        // Existing newlines stay hard breaks.
+        assert_eq!(wrap_hyphenated("a\nb", 40.0, w), "a\nb");
+
+        // Pathological widths must terminate rather than spin: one character cannot
+        // fit alongside a dash at width 1, and the loop still has to make progress.
+        let tiny = wrap_hyphenated("abcd", 1.0, w);
+        assert_eq!(tiny.replace("-\n", ""), "abcd");
+        // A nonsense width is handed back untouched instead of exploding.
+        assert_eq!(wrap_hyphenated("abcd", 0.0, w), "abcd");
+
+        // Multi-byte text must split on character boundaries, not bytes (a byte-index
+        // split would panic).
+        let uni = wrap_hyphenated("ααααααααββββββββ", 5.0, w);
+        assert_eq!(uni.replace("-\n", ""), "ααααααααββββββββ");
+    }
+
+    /// A read-only value must occupy the width of its TEXT, not the width of the pane.
+    /// It used to render as a disabled text box, so a one-word owner name took as much
+    /// room as a full address and the form read as a column of empty boxes.
+    #[test]
+    fn read_only_values_are_not_stretched_to_the_pane_in_real_egui() {
+        use egui_kittest::{kittest::NodeT as _, Harness};
+
+        let width_of = |writable: bool| -> f32 {
+            let path = tmp("rowidth");
+            let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            let mut app = GuiApp::new(path.clone(), writable);
+            app.vault = Some(ov);
+            app.screen = Screen::Main;
+            app.tab = Tab::RealEstate;
+            let mut r = RealEstate::new().unwrap();
+            r.owner = "Jane".into();
+            app.edit_realestate = Some(r);
+            let app = std::cell::RefCell::new(app);
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(1000.0, 680.0))
+                .build_ui(|ui| app.borrow_mut().render(ui));
+            h.run();
+            let w = h
+                .root()
+                .children_recursive()
+                .filter(|n| n.value().as_deref() == Some("Jane"))
+                .filter_map(|n| n.accesskit_node().bounding_box().map(|b| b.width() as f32))
+                .fold(0.0_f32, f32::max);
+            cleanup(&path);
+            w
+        };
+
+        let ro = width_of(false);
+        assert!(ro > 0.0, "the read-only value must render at all");
+        assert!(
+            ro < 120.0,
+            "a four-letter read-only value should take the width of its text, not the pane (got {ro})"
+        );
+        // Write mode still uses a real edit box, which is meant to be a uniform target.
+        assert!(width_of(true) > 200.0, "editable fields keep their designed width");
     }
 
     #[test]

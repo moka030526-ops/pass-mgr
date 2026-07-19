@@ -184,6 +184,16 @@ date and bump the crate versions to match.
   quietly shipping — and verifies each against egui's bundled fonts, with a control pair so a
   broken probe cannot pass silently.
 
+- **Read-only values are text again, not boxes.** A read-only session rendered every stored
+  value in a disabled text box sized to the pane, so a four-letter owner name occupied the same
+  356 px as a full address and a form read as a column of near-empty boxes. Values now render
+  as left-justified, wrapped, still-selectable text that takes the width of its content. When a
+  single word (a path, a URL, a record id) is too long for the line it breaks with a **trailing
+  hyphen** rather than stopping mid-character, via a pure `wrap_hyphenated` line-breaker that is
+  unit-tested against a fake measurer — including multi-byte text and degenerate widths.
+  Display-only: the stored value never changes, so the dashes exist purely on screen. Editable
+  fields in write mode keep their designed box width.
+
 - **GUI scrolling put on the right frames.** The tab body no longer sits inside one
   both-axis `ScrollArea`. Scrolling now belongs to the frames that actually overflow: each
   tab's **list pane** and its **form pane** scroll vertically and independently, and only
