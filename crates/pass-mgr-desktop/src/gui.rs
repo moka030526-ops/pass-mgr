@@ -67,7 +67,10 @@ pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([720.0, 480.0])
+            // A low floor on purpose: every pane now scrolls on its own axis, so the
+            // window stays usable when it is squeezed. The old 720x480 floor meant a
+            // small screen could not shrink the window to fit at all.
+            .with_min_inner_size([560.0, 400.0])
             .with_title("pass-mgr"),
         ..Default::default()
     };
@@ -539,7 +542,7 @@ enum AuthMode {
     ChangePassword,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Tab {
     Urgent,
     Instructions,
@@ -1479,59 +1482,81 @@ impl GuiApp {
         let prev_tab = self.tab;
         let accent = accent(self.theme);
 
-        // Row 1 — identity + global actions. `horizontal_wrapped` rather than a
-        // scroll area: on a narrow window the row wraps onto a second line instead
-        // of hiding controls behind a scrollbar, so nothing is ever unreachable.
-        ui.horizontal_wrapped(|ui| {
-            // Which vault is open — the folder name, with the full path on hover.
-            // Two windows onto two vaults look identical without this.
-            let vault_name = self
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "vault".to_string());
-            ui.label(egui::RichText::new("🗄").color(accent).size(16.0))
-                .on_hover_text(self.path.display().to_string());
-            ui.label(egui::RichText::new(vault_name).strong())
-                .on_hover_text(self.path.display().to_string());
-            // The mode badge: quiet when writable, loud when not. A read-only session
-            // hides its write controls, so the badge is what explains their absence.
-            if self.writable {
-                badge(ui, "WRITE", accent);
-            } else {
-                badge(ui, "🔒 READ-ONLY", egui::Color32::from_rgb(190, 105, 10));
-            }
+        // Row 1 — identity on the left, global actions on the right. `Sides` is the
+        // primitive built for exactly this: it sizes the gap between the two groups
+        // from the actual available width in a single pass. `shrink_left` lays the
+        // ACTIONS out first and lets the vault name give up space, so the buttons can
+        // never be pushed out of the window by a long name — and, unlike a
+        // right-to-left layout nested in a wrapping row, there is no width estimate to
+        // disagree with itself between frames.
+        // Precomputed so the two `Sides` closures capture only plain values, not
+        // `self` — the actions closure needs to MUTATE self, and the file's standard
+        // deferred-action pattern (record the click, act after rendering) keeps the
+        // borrows disjoint.
+        let vault_path = self.path.display().to_string();
+        let vault_name = self
+            .path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "vault".to_string());
+        let writable = self.writable;
+        let (mut go_help, mut go_config, mut go_passwords, mut do_quit) = (false, false, false, false);
 
-            // Actions, pushed to the right edge so they hold one place as the window
-            // resizes. Drawn right-to-left, hence the reversed order.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Quit").on_hover_text("Close the window (secrets are wiped and the clipboard cleared)").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        egui::containers::Sides::new().shrink_left().show(
+            ui,
+            |ui| {
+                // Which vault is open — the folder name, with the full path on hover.
+                // Two windows onto two vaults look identical without this.
+                ui.label(egui::RichText::new("🗄").color(accent).size(16.0)).on_hover_text(&vault_path);
+                ui.add(egui::Label::new(egui::RichText::new(&vault_name).strong()).truncate())
+                    .on_hover_text(&vault_path);
+                // The mode badge: quiet when writable, loud when not. A read-only session
+                // hides its write controls, so the badge is what explains their absence.
+                if writable {
+                    badge(ui, "WRITE", accent);
+                } else {
+                    badge(ui, "🔒 READ-ONLY", egui::Color32::from_rgb(190, 105, 10));
                 }
-                if ui.button("❓ Help").on_hover_text("The built-in manual").clicked() {
-                    self.screen = Screen::Help;
-                }
-                if ui.button("⚙ Config").on_hover_text("Appearance, view defaults, type lists, export, backup, storage").clicked() {
-                    // Seed the redundancy picker from the live setting each time Config
-                    // opens, so the combo reflects the current value (and its selection
-                    // survives across frames until Apply).
-                    self.cfg_redundancy = self.vault_ref().redundancy();
-                    self.screen = Screen::Config;
-                }
+            },
+            |ui| {
+                // The right group is laid out right-to-left, hence the reversed order.
+                do_quit = ui
+                    .button("Quit")
+                    .on_hover_text("Close the window (secrets are wiped and the clipboard cleared)")
+                    .clicked();
+                go_help = ui.button("❓ Help").on_hover_text("The built-in manual").clicked();
+                go_config = ui
+                    .button("⚙ Config")
+                    .on_hover_text("Appearance, view defaults, type lists, export, backup, storage")
+                    .clicked();
                 // Change-password is a write; only offer it when writable.
                 // `&&` short-circuits: the button is only drawn/evaluated when
-                // `self.writable` is true, so read-only mode hides it entirely.
-                if self.writable
-                    && ui.button("🔑 Passwords").on_hover_text("Change the vault's two passwords").clicked()
-                {
-                    self.auth_mode = AuthMode::ChangePassword;
-                    self.auth_error = None;
-                    self.wipe_passwords();
-                    self.screen = Screen::Auth;
-                }
-            });
-        });
+                // `writable` is true, so read-only mode hides it entirely.
+                go_passwords =
+                    writable && ui.button("🔑 Passwords").on_hover_text("Change the vault's two passwords").clicked();
+            },
+        );
+
+        if do_quit {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if go_help {
+            self.screen = Screen::Help;
+        }
+        if go_config {
+            // Seed the redundancy picker from the live setting each time Config opens, so
+            // the combo reflects the current value (and its selection survives across
+            // frames until Apply).
+            self.cfg_redundancy = self.vault_ref().redundancy();
+            self.screen = Screen::Config;
+        }
+        if go_passwords {
+            self.auth_mode = AuthMode::ChangePassword;
+            self.auth_error = None;
+            self.wipe_passwords();
+            self.screen = Screen::Auth;
+        }
 
         ui.add_space(6.0);
 
@@ -2321,7 +2346,11 @@ impl GuiApp {
 
         ui.columns(2, |c| {
             (new, select, export) = list_panel(&mut c[0], "URGENT", "➕ New", &labels, cur.as_deref(), self.writable, None);
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_urgent").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_urgent.as_mut() {
                 egui::Grid::new("urgent_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
@@ -2335,6 +2364,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "an urgent note");
             }
+        });
         });
 
         if export {
@@ -2386,7 +2416,11 @@ impl GuiApp {
             (new, select, export) = list_panel(&mut c[0], "Instructions", "➕ New", &labels, cur.as_deref(), self.writable, None);
             // Shadow `ui` with a mutable borrow of the right column. "Shadowing"
             // reuses the name `ui` for a new binding within this block.
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_instructions").show(&mut c[1], |ui| {
             // `.as_mut()` borrows the edited record mutably so the form widgets
             // below can write directly into its fields.
             if let Some(r) = self.edit_instruction.as_mut() {
@@ -2402,6 +2436,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "an instruction");
             }
+        });
         });
 
         // Now apply the deferred actions outside the render closure.
@@ -2462,7 +2497,11 @@ impl GuiApp {
 
         ui.columns(2, |c| {
             (new, select, export) = list_panel(&mut c[0], "Trust and Will", "➕ New", &labels, cur.as_deref(), self.writable, None);
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_trustwill").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_trustwill.as_mut() {
                 egui::Grid::new("tw_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Document");
@@ -2486,6 +2525,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "a document");
             }
+        });
         });
 
         if export {
@@ -2536,7 +2576,11 @@ impl GuiApp {
         ui.columns(2, |c| {
             (new, select, export) =
                 list_panel(&mut c[0], "General Documents", "➕ New", &labels, cur.as_deref(), self.writable, None);
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_general").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_general.as_mut() {
                 egui::Grid::new("gen_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Title");
@@ -2560,6 +2604,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "a document");
             }
+        });
         });
 
         if export {
@@ -2668,18 +2713,17 @@ impl GuiApp {
                     let lp = &mut c[0];
                     // Same header as the flat `list_panel`, so switching to the tree
                     // does not change what the top of the pane looks like.
-                    lp.horizontal(|ui| {
+                    lp.horizontal_wrapped(|ui| {
                         let accent = ui_accent(ui);
                         section_heading(ui, "Assets and Liabilities", accent);
                         badge(ui, &format!("{}", labels.len()), accent);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.writable && ui.button("➕ New").clicked() {
-                                new = true;
-                            }
-                            if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-                                export = true;
-                            }
-                        });
+                        ui.add_space(4.0);
+                        if self.writable && ui.button("➕ New").clicked() {
+                            new = true;
+                        }
+                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                            export = true;
+                        }
                     });
                     lp.add_space(4.0);
                     lp.separator();
@@ -2695,7 +2739,11 @@ impl GuiApp {
                         list_panel(&mut c[0], "Assets and Liabilities", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_assets").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_asset.as_mut() {
                 let w = self.writable;
                 egui::Grid::new("asset_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -2751,6 +2799,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "an asset or liability");
             }
+        });
         });
 
         if export {
@@ -3070,7 +3119,7 @@ impl GuiApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.acct_search_user)
                         .hint_text("🔍 username or title…")
-                        .desired_width(180.0),
+                        .desired_width(fit(ui, 180.0)),
                 );
                 ui.checkbox(&mut self.acct_filter_review, "review only");
                 // Only offer Clear when there is something to clear, and mark it when
@@ -3176,18 +3225,17 @@ impl GuiApp {
                     let lp = &mut c[0];
                     // Same header as the flat `list_panel`, so switching to the tree
                     // does not change what the top of the pane looks like.
-                    lp.horizontal(|ui| {
+                    lp.horizontal_wrapped(|ui| {
                         let accent = ui_accent(ui);
                         section_heading(ui, "Accounts", accent);
                         badge(ui, &format!("{}", labels.len()), accent);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.writable && ui.button("➕ New").clicked() {
-                                new = true;
-                            }
-                            if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-                                export = true;
-                            }
-                        });
+                        ui.add_space(4.0);
+                        if self.writable && ui.button("➕ New").clicked() {
+                            new = true;
+                        }
+                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                            export = true;
+                        }
                     });
                     lp.add_space(4.0);
                     lp.separator();
@@ -3203,7 +3251,11 @@ impl GuiApp {
                         list_panel(&mut c[0], "Accounts", "➕ New", &labels, cur.as_deref(), self.writable, nav_target);
                 }
             }
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_accounts").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_account.as_mut() {
                 let w = self.writable;
                 egui::Grid::new("acct_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
@@ -3303,6 +3355,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "an account");
             }
+        });
         });
 
         if export {
@@ -3455,7 +3508,11 @@ impl GuiApp {
 
         ui.columns(2, |c| {
             (new, select, export) = list_panel(&mut c[0], "Real Estate", "➕ New", &labels, cur.as_deref(), writable, None);
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_realestate").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_realestate.as_mut() {
                 // No inner ScrollArea here: the whole tab is already wrapped in the
                 // CentralPanel's both-axis scroll. A nested vertical scroll over this
@@ -3508,6 +3565,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "a property");
             }
+        });
         });
 
         if export {
@@ -3580,7 +3638,11 @@ impl GuiApp {
 
         ui.columns(2, |c| {
             (new, select, export) = list_panel(&mut c[0], "Taxes", "➕ New", &labels, cur.as_deref(), writable, None);
-            let ui = &mut c[1];
+            // The form pane scrolls on its OWN axis. Previously the whole tab sat inside
+            // one both-axis ScrollArea, so this vertical scroller was nested inside
+            // another one and was handed unbounded height — the layout could not settle
+            // on a scrollbar, which is what flickered on a small window.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("form_pane_taxes").show(&mut c[1], |ui| {
             if let Some(r) = self.edit_taxfiling.as_mut() {
                 egui::Grid::new("tax_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     text_row(ui, "Owner", &mut r.owner, writable);
@@ -3616,6 +3678,7 @@ impl GuiApp {
             } else {
                 empty_form_hint(ui, "a tax year");
             }
+        });
         });
 
         if export {
@@ -4384,6 +4447,16 @@ enum DocTarget {
 impl eframe::App for GuiApp {
     // The leading `_` in `_frame` marks the parameter as intentionally unused.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl GuiApp {
+    /// Draw the whole window. Split out of [`eframe::App::ui`] (which only forwards
+    /// to it) because it needs nothing from `eframe::Frame` — so a headless
+    /// `egui_kittest` harness can lay out the REAL window, panels and all, rather
+    /// than a hand-assembled approximation of it.
+    fn render(&mut self, ui: &mut egui::Ui) {
         self.tick_clipboard(ui.ctx());
         // Apply (and persist) the color theme only when the selection changed.
         if self.theme != self.applied_theme {
@@ -4434,40 +4507,50 @@ impl eframe::App for GuiApp {
         // a fixed strip keeps the layout still and gives the message a known home.
         egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                let accent = accent(self.theme);
-                if self.status.is_empty() {
-                    ui.label(egui::RichText::new("●").color(accent.gamma_multiply(0.5)).small());
-                    ui.label(egui::RichText::new("Ready").weak().small());
-                } else {
-                    ui.label(egui::RichText::new("●").color(accent).small());
-                    ui.label(egui::RichText::new(&self.status).small());
-                }
-                // The clipboard's auto-clear countdown belongs where the eye already
-                // looks for state — otherwise a copied password's lifetime is invisible.
-                if self.clipboard_dirty {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let accent = accent(self.theme);
+            egui::containers::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    if self.status.is_empty() {
+                        ui.label(egui::RichText::new("●").color(accent.gamma_multiply(0.5)).small());
+                        ui.label(egui::RichText::new("Ready").weak().small());
+                    } else {
+                        ui.label(egui::RichText::new("●").color(accent).small());
+                        // A long failure message truncates here rather than widening the
+                        // window; the banner above carries the full text.
+                        ui.add(egui::Label::new(egui::RichText::new(&self.status).small()).truncate())
+                            .on_hover_text(&self.status);
+                    }
+                },
+                |ui| {
+                    // The clipboard's auto-clear state belongs where the eye already looks
+                    // for state — otherwise a copied password's lifetime is invisible.
+                    if self.clipboard_dirty {
                         ui.label(
                             egui::RichText::new("📋 clipboard clears automatically")
                                 .small()
                                 .color(egui::Color32::from_rgb(190, 105, 10)),
                         );
-                    });
-                }
-            });
+                    }
+                },
+            );
             ui.add_space(3.0);
         });
-        // Draw the active tab inside a both-axis scroll area, so when a tab's content
-        // is larger than the window the user gets vertical AND horizontal scrollbars
-        // instead of clipped content. `auto_shrink([false, false])` makes the area fill
-        // the panel (so the two-column layouts get full width); egui constrains the
-        // content to the viewport, so scrollbars appear only on genuine overflow.
-        // A little breathing room between the window chrome and the content. The tab
-        // bodies used to start flush against the top bar and the window edge.
+        // The tab body fills the panel and does NOT scroll as a whole. Scrolling belongs
+        // to the frames that actually hold overflowing content — each tab's list pane and
+        // its form pane scroll independently (and Summary's wide table scrolls both ways
+        // on its own).
+        //
+        // It used to be one both-axis ScrollArea wrapped around everything, with the list
+        // and form scrollers nested inside it. A scroll area gives its contents unbounded
+        // space on its scrolling axes, so those inner vertical scrollers were laid out
+        // against infinite height and never decided they needed a scrollbar; meanwhile the
+        // outer horizontal bar appeared, took width away, forced a re-layout, and
+        // disappeared again. On a window too small for the content that oscillation ran
+        // every frame — the flicker.
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)))
             .show_inside(ui, |ui| {
-            egui::ScrollArea::both().auto_shrink([false, false]).id_salt("main_scroll").show(ui, |ui| {
                 match self.tab {
                     Tab::Urgent => self.tab_urgent(ui),
                     Tab::Instructions => self.tab_instructions(ui),
@@ -4480,7 +4563,6 @@ impl eframe::App for GuiApp {
                     Tab::GeneralDocuments => self.tab_general(ui),
                 }
             });
-        });
     }
 }
 
@@ -4510,18 +4592,21 @@ fn show_error_banner(error: &mut Option<String>, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show_inside(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("⚠").color(egui::Color32::WHITE).strong().size(18.0));
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(&msg).color(egui::Color32::WHITE).strong().size(15.0));
-                // Dismiss is pushed to the right edge of the banner rather than sitting
-                // on a second line under the message.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Dismiss is placed first and the MESSAGE yields space, so the button is
+            // reachable no matter how long the failure text is.
+            egui::containers::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    ui.label(egui::RichText::new("⚠").color(egui::Color32::WHITE).strong().size(18.0));
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&msg).color(egui::Color32::WHITE).strong().size(15.0));
+                },
+                |ui| {
                     if ui.button("Dismiss ✕").clicked() {
                         *error = None;
                     }
-                });
-            });
+                },
+            );
         });
 }
 
@@ -4669,21 +4754,23 @@ fn list_panel(
     // `apply_style` parks the theme's accent in the selection stroke, so free widgets
     // can pick it up without every call site having to pass it down.
     let accent = ui_accent(ui);
-    ui.horizontal(|ui| {
+    // Heading, count, then the two actions — all left-to-right and wrapping, so the
+    // buttons stay next to the title they belong to. Right-aligning them pushed them
+    // against the divider between the panes, where "⤓ CSV" read as part of the form
+    // and was easy to miss entirely on a narrow window.
+    ui.horizontal_wrapped(|ui| {
         section_heading(ui, title, accent);
         badge(ui, &format!("{}", labels.len()), accent);
-        // Actions sit at the right edge of the list header, away from the title.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // "New" is a write; only offered when writable.
-            if writable && ui.button(new_label).clicked() {
-                new = true;
-            }
-            // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
-            // only (offered only when writable) — a read-only heir must not bulk-export secrets.
-            if writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-                export = true;
-            }
-        });
+        ui.add_space(4.0);
+        // "New" is a write; only offered when writable.
+        if writable && ui.button(new_label).clicked() {
+            new = true;
+        }
+        // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
+        // only (offered only when writable) — a read-only heir must not bulk-export secrets.
+        if writable && ui.button("⤓ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+            export = true;
+        }
     });
     ui.add_space(4.0);
     ui.separator();
@@ -4860,6 +4947,17 @@ fn presize_secret(s: &mut String) {
     *s = roomy;
 }
 
+/// Treat a designed field width as a MAXIMUM, shrinking it to whatever the pane
+/// actually offers.
+///
+/// The form pane scrolls vertically only, so a field wider than the pane is clipped
+/// rather than scrolled to. Wide windows are unaffected (the designed width already
+/// fits); narrow ones shrink the field instead of losing its right-hand end. The
+/// floor keeps a field from collapsing to nothing.
+fn fit(ui: &egui::Ui, desired: f32) -> f32 {
+    desired.min(ui.available_width() - 8.0).max(90.0)
+}
+
 /// A single-line text field that is editable when `writable`, and otherwise shown as
 /// an **immutable but still selectable/copyable** field. egui edits require a *mutable*
 /// `TextBuffer` while selection only needs an interactive widget — so binding a `&str`
@@ -4867,6 +4965,7 @@ fn presize_secret(s: &mut String) {
 /// highlight and Ctrl+C, exactly what read-only mode wants (vs. `add_enabled(false)`,
 /// which greys it out and blocks selection entirely).
 fn field_singleline(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32) -> egui::Response {
+    let width = fit(ui, width);
     if writable {
         ui.add(egui::TextEdit::singleline(value).desired_width(width))
     } else {
@@ -4877,6 +4976,7 @@ fn field_singleline(ui: &mut egui::Ui, value: &mut String, writable: bool, width
 
 /// Like [`field_singleline`] but with a placeholder hint (shown only when editable).
 fn field_singleline_hint(ui: &mut egui::Ui, value: &mut String, writable: bool, width: f32, hint: &str) -> egui::Response {
+    let width = fit(ui, width);
     if writable {
         ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(width))
     } else {
@@ -5058,11 +5158,16 @@ fn doc_section(
         ui.label(egui::RichText::new("No documents attached.").weak().italics());
     } else {
         for (i, label) in attached.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("📄").color(accent));
-                ui.label(label);
-                // Actions right-aligned so a long filename never pushes them off-screen.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // `shrink_left`: the buttons are placed first and the FILENAME gives up
+            // space, so a long name truncates instead of shoving Export/Remove out of
+            // the pane.
+            egui::containers::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    ui.label(egui::RichText::new("📄").color(accent));
+                    ui.add(egui::Label::new(label).truncate()).on_hover_text(label);
+                },
+                |ui| {
                     if writable
                         && ui
                             .button("🗑 Remove")
@@ -5081,8 +5186,8 @@ fn doc_section(
                     {
                         req = DocSectionReq::Export(i);
                     }
-                });
-            });
+                },
+            );
         }
     }
     if writable {
@@ -5092,16 +5197,16 @@ fn doc_section(
         ui.label(egui::RichText::new("Attach a file").strong().small());
         egui::Grid::new("doc_attach").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Subfolder (optional)");
-            ui.add(egui::TextEdit::singleline(subfolder).hint_text("statements").desired_width(300.0));
+            ui.add(egui::TextEdit::singleline(subfolder).hint_text("statements").desired_width(fit(ui, 300.0)));
             ui.end_row();
             ui.label("Filename");
-            ui.add(egui::TextEdit::singleline(filename).hint_text("statement.pdf").desired_width(300.0));
+            ui.add(egui::TextEdit::singleline(filename).hint_text("statement.pdf").desired_width(fit(ui, 300.0)));
             ui.end_row();
             ui.label("Upload from");
             ui.add(
                 egui::TextEdit::singleline(source)
                     .hint_text("/path/on/disk/file.pdf")
-                    .desired_width(300.0),
+                    .desired_width(fit(ui, 300.0)),
             )
             .on_hover_text("The full path to the file. A double-quoted path is accepted as-is.");
             ui.end_row();
@@ -5198,18 +5303,21 @@ fn linked_accounts_section(
         ui.label(egui::RichText::new("No linked accounts.").weak().italics());
     }
     for (i, (id, label)) in linked.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("🔑").color(accent));
-            ui.label(label);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        egui::containers::Sides::new().shrink_left().show(
+            ui,
+            |ui| {
+                ui.label(egui::RichText::new("🔑").color(accent));
+                ui.add(egui::Label::new(label).truncate()).on_hover_text(label);
+            },
+            |ui| {
                 if writable && ui.button("Unlink").on_hover_text("Remove this link (the account itself is untouched)").clicked() {
                     req = LinkReq::Remove(i);
                 }
                 if ui.button("Open ➜").on_hover_text("Jump to this account on the Accounts tab").clicked() {
                     req = LinkReq::Open(id.clone());
                 }
-            });
-        });
+            },
+        );
     }
     if writable {
         ui.add_space(4.0);
@@ -5290,6 +5398,7 @@ fn secret_text_edit(
     width: f32,
     copied_out: &mut Option<Zeroizing<String>>,
 ) -> egui::Response {
+    let width = fit(ui, width);
     let id = ui.make_persistent_id(id_salt);
     // Read-only: bind a `&str` (immutable TextBuffer) so the field stays selectable and
     // copyable (incl. the hardened Ctrl+C reroute below) but cannot be edited; writable
@@ -5460,6 +5569,65 @@ mod tests {
     /// the stat tiles, the empty-state pane) fails here rather than in front of the
     /// user. Nested layouts and duplicate widget ids only misbehave once something
     /// actually measures them.
+    /// Lay the real window out across a fine sweep of widths, including sizes well
+    /// below the 720 px minimum, and require that it SETTLES and that the per-tab
+    /// controls survive the squeeze.
+    ///
+    /// Two things this pins down:
+    /// - **Settling.** `try_run` drives frames until egui stops asking to repaint. A
+    ///   layout that cannot decide whether it needs a scrollbar never stops asking.
+    ///   (This is a necessary condition, not a sufficient one — a headless harness does
+    ///   not reproduce every real-window oscillation — so it is a guard, not a proof.)
+    /// - **Reachability.** "⤓ CSV" must still be present at every width on every tab
+    ///   that has a CSV form. It once sat in a right-aligned group where a narrow pane
+    ///   pushed it against the divider; Summary is the sole tab with no CSV, because it
+    ///   is a calculated view with no `csv::CsvTab` of its own.
+    #[test]
+    fn window_settles_and_keeps_its_controls_at_every_width() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        let mut w = 480.0f32;
+        while w <= 1040.0 {
+            for tab in [Tab::Accounts, Tab::Assets, Tab::RealEstate, Tab::Taxes, Tab::Summary] {
+                let (mut app, path) = app_unlocked("settle");
+                // Enough rows, and long enough labels, that a small window genuinely
+                // overflows — the condition under which scroll geometry gets decided.
+                {
+                    let ov = app.vault.as_mut().unwrap();
+                    for i in 0..40 {
+                        let mut a = Account::new().unwrap();
+                        a.title = format!("A rather long account title number {i}");
+                        a.owner = "Jane Q. Longname".into();
+                        ov.vault.accounts.push(a);
+                    }
+                }
+                app.tab = tab;
+                app.edit_account = Account::new().ok();
+                app.edit_asset = AssetLiability::new().ok();
+                app.edit_realestate = RealEstate::new().ok();
+                app.edit_taxfiling = TaxFiling::new().ok();
+                app.status = "Exported 3 record(s) to /a/deliberately/long/export/path/file.csv".into();
+                let app = std::cell::RefCell::new(app);
+
+                let mut h = Harness::builder()
+                    .with_size(egui::vec2(w, 420.0))
+                    .with_max_steps(64)
+                    .build_ui(|ui| app.borrow_mut().render(ui));
+                h.try_run().unwrap_or_else(|e| panic!("window never settled at {w}x420 on {tab:?}: {e}"));
+
+                if tab != Tab::Summary {
+                    assert_eq!(
+                        h.query_all_by_label("⤓ CSV").count(),
+                        1,
+                        "the CSV export button must stay reachable at {w}x420 on {tab:?}"
+                    );
+                }
+                cleanup(&path);
+            }
+            w += 16.0;
+        }
+    }
+
     #[test]
     fn every_tab_renders_in_real_egui() {
         use egui_kittest::Harness;

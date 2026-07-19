@@ -174,6 +174,29 @@ date and bump the crate versions to match.
 
 ### Changed
 
+- **GUI scrolling put on the right frames.** The tab body no longer sits inside one
+  both-axis `ScrollArea`. Scrolling now belongs to the frames that actually overflow: each
+  tab's **list pane** and its **form pane** scroll vertically and independently, and only
+  Summary's wide table scrolls both ways. A scroll area hands its contents unbounded space on
+  its scrolling axes, so the old nesting laid the inner vertical scrollers out against
+  infinite height — they never decided they needed a scrollbar, while the outer horizontal bar
+  appeared, took width, forced a re-layout, and vanished again. Alongside it:
+  - Every right-aligned row (top bar, list headers, document and link rows, status bar, error
+    banner) now uses `egui::Sides`, which sizes the gap from the real available width in one
+    pass, instead of a right-to-left layout nested in a wrapping row whose width estimate
+    could disagree with itself between frames. Long vault names, filenames, and status
+    messages truncate (full text on hover) rather than pushing controls out of the window.
+  - Designed field widths are now **maxima** that shrink to the pane (`fit`), so a narrow form
+    pane shrinks its fields instead of clipping their right-hand end.
+  - The window's minimum size drops from 720×480 to **560×400**, so a small screen can shrink
+    the window to fit.
+  - **"⤓ CSV" and "➕ New" moved back beside their list heading.** Right-aligning them pushed
+    them against the divider between the panes, where CSV read as part of the form and was
+    easy to miss. (Summary has no CSV button by design — it is a calculated view with no
+    `csv::CsvTab`.)
+  - Guarded by a test that lays the real window out across a width sweep from 480 px up,
+    requiring it to settle and keeping the CSV control reachable at every width.
+
 - **Graphical interface visual overhaul.** A shared design system replaces egui's
   debug-tool defaults, applied through `apply_theme` (palette + typography/spacing/shape) with
   one accent color per theme. **Purely presentational — no control changed what it does:**
