@@ -985,7 +985,17 @@ impl OpenVault {
         // A fresh mirror of the just-committed vault, and a bak1 copy of the live
         // primary (the post-rekey generations legitimately reset to the new epoch).
         let _ = write_vault_file(&mirror_path(&self.path), &self.vault, &self.key, &self.salt, self.params);
-        if let Ok(bytes) = read_capped_vault(&self.path) {
+        // Ring bak1 in ONLY if the primary still decodes under the current key — the same
+        // A-3 invariant `save_internal` enforces via `prev_decodes`. This is the other
+        // site that feeds the recovery ring, and it was reading the primary back with no
+        // AEAD check: a primary that bit-rotted between the rename above and this read
+        // would be copied into bak1 as an unrecoverable "generation". In practice the
+        // bytes were just written and fsync'd by this process under the single-writer
+        // lock, so this is defence in depth — but an invariant enforced at one of two
+        // sites is not an invariant.
+        if let Ok(bytes) = read_capped_vault(&self.path)
+            && decode_vault_with_key(&bytes, &self.key).is_ok()
+        {
             let _ = write_bytes_atomic(&bak_path(&self.path, 1), &bytes);
         }
         prune_generations_above(&self.path, depth);
@@ -2299,10 +2309,19 @@ fn decrypt_file(path: &Path, pw1: &[u8], pw2: &[u8]) -> Result<(Vault, Header, K
 /// file maps to [`VaultError::NotFound`].
 fn read_capped_vault(path: &Path) -> Result<Vec<u8>, VaultError> {
     use std::io::Read;
+    // O_NOFOLLOW, like every other read in the vault directory. That directory is treated
+    // as attacker-reachable (see `open_read_nofollow`'s callers: the recovery candidates,
+    // the header probe, the lock file, and the whole storage layer), and the primary
+    // `vault.pmv` was the one file still opened with a symlink-following `File::open` —
+    // an inconsistency, not a considered exception. Nothing legitimate is broken by
+    // closing it: every write goes through temp+rename (`write_bytes_atomic`,
+    // `write_vault_file`), which REPLACES a symlink with a regular file, so a symlinked
+    // vault.pmv is already destroyed by the first save.
+    //
     // Open first so the cap can be enforced on the READ (a bounded `take`), not on a
     // separate stat that a concurrent grow could outrun. A missing file maps to
     // NotFound (the create flow + redundancy recovery rely on this).
-    let f = match fs::File::open(path) {
+    let f = match open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VaultError::NotFound(path.to_path_buf())),
         Err(e) => return Err(e.into()),
@@ -2443,7 +2462,7 @@ fn decrypt_with_redundancy(
     // EXACTLY O(candidates) full AEAD decrypts, closing a CPU-amplification DoS where a
     // vault-dir-write attacker plants many max-size distinct-salt copies.
     for (idx, c) in candidates.iter().enumerate() {
-        let Ok(raw) = read_capped_vault_nofollow(c) else { continue };
+        let Ok(raw) = read_capped_vault(c) else { continue };
         let Some(k) = cand_key[idx] else { continue }; // header unreadable / salt past the cap
         // Cross-epoch guard (see `restrict_salt` above): when the primary's salt is known and
         // corroborated, never recover from a copy under a DIFFERENT salt — that would roll
@@ -2511,21 +2530,6 @@ fn open_read_nofollow(path: &Path) -> std::io::Result<fs::File> {
     }
 }
 
-/// Like [`read_capped_vault`] but O_NOFOLLOW (for attacker-reachable recovery candidates).
-fn read_capped_vault_nofollow(path: &Path) -> Result<Vec<u8>, VaultError> {
-    use std::io::Read;
-    let f = match open_read_nofollow(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VaultError::NotFound(path.to_path_buf())),
-        Err(e) => return Err(e.into()),
-    };
-    let mut buf = Vec::new();
-    f.take(MAX_VAULT_SIZE.saturating_add(1)).read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_VAULT_SIZE {
-        return Err(VaultError::TooLarge);
-    }
-    Ok(buf)
-}
 
 // --- In-place redundancy file management (§12.8) -----------------------------
 
@@ -6858,6 +6862,41 @@ mod tests {
             "one byte over `max` must be TooLarge"
         );
         fs::remove_file(&over).ok();
+    }
+
+    /// The primary `vault.pmv` must be read with O_NOFOLLOW, like every other file in
+    /// the vault directory (which the design treats as attacker-reachable). A local
+    /// process that can write to that directory could otherwise swap the vault for a
+    /// symlink and have the app read an arbitrary file into memory on the next open.
+    ///
+    /// Nothing legitimate is broken by this: every write is temp+rename, which replaces
+    /// a symlink with a regular file, so a symlinked vault.pmv never survives a save
+    /// anyway. Unix-only — O_NOFOLLOW has no portable Windows equivalent here.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_vault_file_is_refused_rather_than_followed() {
+        let target = tmp_path("symlink_target");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"not a vault, but readable").unwrap();
+
+        let link = tmp_path("symlink_vault");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_capped_vault(&link).expect_err("a symlinked vault.pmv must not be followed");
+        // ELOOP surfaces as a plain Io error, NOT as NotFound (which would wrongly read
+        // as "no vault here" and could send the caller down the create path).
+        assert!(
+            matches!(err, VaultError::Io(_)),
+            "expected an Io error from O_NOFOLLOW, got {err:?}"
+        );
+        // The control: the very same bytes ARE readable through a real file, so the test
+        // is detecting the symlink and not merely an unreadable path.
+        assert!(read_capped_vault(&target).is_ok(), "control: the target itself reads fine");
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
     }
 
     #[test]
