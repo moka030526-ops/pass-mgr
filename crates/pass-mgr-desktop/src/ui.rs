@@ -732,11 +732,23 @@ impl App {
     }
 
     /// The grouped rows for whichever tab is in grouped mode (empty otherwise).
+    // Exhaustive on purpose — no `_` arm. Only Accounts and Assets have a grouped tree,
+    // and a third one added later must be a COMPILE error here rather than silently
+    // rendering an empty list. It also has to be added to `toggle_group_expanded` below,
+    // which nothing else links to this: with a wildcard there, a new grouped tab writes
+    // its expand paths into the Accounts set and the two trees share expand state — the
+    // exact collision audit A-7 fixed.
     fn grouped_rows(&self) -> Vec<AcctRow> {
         match self.tab {
             Tab::Accounts => self.account_rows(),
             Tab::Assets => self.asset_rows(),
-            _ => Vec::new(),
+            Tab::Urgent
+            | Tab::Instructions
+            | Tab::TrustWill
+            | Tab::RealEstate
+            | Tab::Taxes
+            | Tab::GeneralDocuments
+            | Tab::Summary => Vec::new(),
         }
     }
 
@@ -747,9 +759,18 @@ impl App {
 
     /// Toggle a group's expand state in the CURRENT tab's expand set.
     fn toggle_group_expanded(&mut self, path: Vec<String>) {
+        // Exhaustive (see `grouped_rows`): a new grouped tab must not silently fall into
+        // the Accounts expand set and share its expand state.
         let set = match self.tab {
             Tab::Assets => &mut self.asset_expanded,
-            _ => &mut self.acct_expanded,
+            Tab::Accounts
+            | Tab::Urgent
+            | Tab::Instructions
+            | Tab::TrustWill
+            | Tab::RealEstate
+            | Tab::Taxes
+            | Tab::GeneralDocuments
+            | Tab::Summary => &mut self.acct_expanded,
         };
         if !set.remove(&path) {
             set.insert(path);

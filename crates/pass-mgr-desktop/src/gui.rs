@@ -2818,8 +2818,24 @@ impl GuiApp {
             self.edit_asset = AssetLiability::new().ok();
             self.clear_doc_inputs();
         }
-        // A click wins over keyboard nav (they can't both happen in one frame, but be safe).
-        select = select.or(nav_target);
+        // A click wins over keyboard nav. A keyboard arrow CAN land in the same egui frame
+        // as a button click (events are batched per repaint), and the deferred requests
+        // below — Save/Delete, the document Export/Remove, and the link Add/Unlink — were
+        // all captured against the CURRENTLY shown asset. Applying a same-frame nav swap
+        // first would retarget them at the NEIGHBOUR.
+        //
+        // Today `list_nav_target`'s `focused()` guard already blocks this (clicking a
+        // button focuses it), which is why the pinned test passes without this line. But
+        // that protection is emergent, and Accounts was given this explicit guard by audit
+        // A-8 while Assets — which has strictly MORE record-targeted deferred actions —
+        // was left relying on the implicit one. Belt and braces, matching Accounts.
+        let record_action_pending = new
+            || !matches!(action, FormAction::None)
+            || !matches!(docreq, DocReq::None)
+            || !matches!(linkreq, LinkReq::None);
+        if !record_action_pending {
+            select = select.or(nav_target);
+        }
         if let Some(i) = select
             && let Some((id, _)) = labels.get(i)
         {
@@ -4821,7 +4837,11 @@ fn list_panel(
             .italics(),
         );
     }
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    // `id_salt(title)` because `ui.columns` builds both panes with the same child id, so
+    // an unsalted scroller here resolves to ONE id shared by every tab's flat list —
+    // scrolling the Instructions list moved the Trust & Will list to the same offset.
+    // Every other scroller in this file is salted; this was the one that was not.
+    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(title).show(ui, |ui| {
         // `.enumerate()` pairs each item with its index `i`; the `(i, (id, label))`
         // pattern destructures the index and the inner tuple together.
         for (i, (id, label)) in labels.iter().enumerate() {
@@ -4979,91 +4999,25 @@ fn presize_secret(s: &mut String) {
     *s = roomy;
 }
 
-/// Break `text` into lines that fit `max_width`, putting a HYPHEN at the break when
-/// a single word has to be split.
-///
-/// egui wraps at word boundaries and, for a word longer than the line, splits it with
-/// no visual cue — so a long path or id just stops mid-character and resumes on the
-/// next line, reading as two unrelated fragments. A trailing dash is the typographic
-/// convention that says "this word continues".
-///
-/// Pure: `measure` supplies the width of a string, so the line-breaking logic is
-/// unit-testable without a font or a UI. Existing newlines in `text` are preserved as
-/// hard breaks.
-fn wrap_hyphenated(text: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
-    // Degenerate width: nothing sensible to compute, so hand the text back untouched
-    // rather than emit one character per line.
-    if max_width <= 0.0 {
-        return text.to_owned();
-    }
-    let mut out = String::with_capacity(text.len() + 8);
-    for (i, para) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let mut line = String::new();
-        for word in para.split_whitespace() {
-            // `rest` is what remains of the current word; a word too long for a whole
-            // line is consumed a piece at a time by the inner loop.
-            let mut rest = word;
-            loop {
-                let candidate =
-                    if line.is_empty() { rest.to_owned() } else { format!("{line} {rest}") };
-                if measure(&candidate) <= max_width {
-                    line = candidate;
-                    break;
-                }
-                // Doesn't fit. If something is already on the line, flush it and retry
-                // this word on a fresh line.
-                if !line.is_empty() {
-                    out.push_str(&line);
-                    out.push('\n');
-                    line.clear();
-                    continue;
-                }
-                // The word alone overflows an empty line: split it, reserving room for
-                // the hyphen. Walk char boundaries (never byte offsets — that would
-                // panic on multi-byte UTF-8) and take the longest prefix that fits.
-                let mut cut = 0;
-                for (idx, _) in rest.char_indices().skip(1) {
-                    if measure(&format!("{}-", &rest[..idx])) > max_width {
-                        break;
-                    }
-                    cut = idx;
-                }
-                // Guarantee progress even when a single character overflows, so this
-                // loop can never spin forever on a very narrow pane.
-                if cut == 0 {
-                    cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
-                }
-                out.push_str(&rest[..cut]);
-                out.push_str("-\n");
-                rest = &rest[cut..];
-                if rest.is_empty() {
-                    break;
-                }
-            }
-        }
-        out.push_str(&line);
-    }
-    out
-}
-
-/// Render a stored value as READ-ONLY text: left-justified, wrapped to the pane with
-/// [`wrap_hyphenated`], and still selectable so it can be copied.
+/// Render a stored value as READ-ONLY text: left-justified, wrapped to the pane, and
+/// still selectable so it can be copied.
 ///
 /// The alternative — a disabled text box — gave every value the same full-pane width
-/// whatever its length, so a one-word owner name occupied as much screen as an
-/// address. This shows the text and nothing else. It is display-only: the vault value
-/// behind it is never touched, so the dashes exist purely on screen.
+/// whatever its length, so a one-word owner name occupied as much screen as an address
+/// and a form read as a column of near-empty boxes.
+///
+/// **The text handed to the label is the stored text, byte for byte.** An earlier version
+/// pre-wrapped it and inserted a hyphen at each break, which was wrong in a way that is
+/// easy to miss: egui copies a label's GALLEY text, so whatever string is passed here is
+/// what Ctrl+C returns. That version also normalised whitespace via `split_whitespace`,
+/// so it corrupted values that never wrapped at all — "1234  N Elm Street" (two spaces)
+/// was displayed and COPIED as "1234 N Elm Street". A read-only session is the mode an
+/// heir is told to use, and the manual promises these fields can be selected and copied;
+/// handing them a silently altered account number or address is worse than any layout
+/// problem it solved. egui's own wrapping breaks long words without a hyphen but leaves
+/// the source string untouched, so a copy is exact.
 fn read_only_value(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let avail = fit(ui, f32::INFINITY);
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let wrapped = wrap_hyphenated(text, avail, |s| {
-        ui.painter().layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER).size().x
-    });
-    // Already broken to width, so egui must not wrap it a second time.
-    ui.add(egui::Label::new(wrapped).wrap_mode(egui::TextWrapMode::Extend).selectable(true))
+    ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap).selectable(true))
 }
 
 /// Treat a designed field width as a MAXIMUM, shrinking it to whatever the pane
@@ -5749,44 +5703,6 @@ mod tests {
         }
     }
 
-    /// The read-only line-breaker, driven by a fake measurer (1 unit per character) so
-    /// the breaking logic is pinned without a font.
-    #[test]
-    fn wrap_hyphenated_breaks_words_with_a_dash_and_always_progresses() {
-        let w = |s: &str| s.chars().count() as f32;
-
-        // Fits: untouched.
-        assert_eq!(wrap_hyphenated("hello there", 20.0, w), "hello there");
-
-        // Word boundary preferred over splitting — no dash appears.
-        assert_eq!(wrap_hyphenated("hello there", 6.0, w), "hello\nthere");
-
-        // A word too long for the line is split WITH a trailing dash, and every
-        // fragment respects the width (the dash is part of the measured line).
-        let out = wrap_hyphenated("supercalifragilistic", 8.0, w);
-        assert!(out.contains('-'), "an over-long word must break with a dash: {out:?}");
-        for line in out.lines() {
-            assert!(w(line) <= 8.0, "line {line:?} exceeds the width in {out:?}");
-        }
-        // Nothing is lost or invented: dropping the added dashes and newlines
-        // reconstitutes the original word.
-        assert_eq!(out.replace("-\n", ""), "supercalifragilistic");
-
-        // Existing newlines stay hard breaks.
-        assert_eq!(wrap_hyphenated("a\nb", 40.0, w), "a\nb");
-
-        // Pathological widths must terminate rather than spin: one character cannot
-        // fit alongside a dash at width 1, and the loop still has to make progress.
-        let tiny = wrap_hyphenated("abcd", 1.0, w);
-        assert_eq!(tiny.replace("-\n", ""), "abcd");
-        // A nonsense width is handed back untouched instead of exploding.
-        assert_eq!(wrap_hyphenated("abcd", 0.0, w), "abcd");
-
-        // Multi-byte text must split on character boundaries, not bytes (a byte-index
-        // split would panic).
-        let uni = wrap_hyphenated("ααααααααββββββββ", 5.0, w);
-        assert_eq!(uni.replace("-\n", ""), "ααααααααββββββββ");
-    }
 
     /// A read-only value must occupy the width of its TEXT, not the width of the pane.
     /// It used to render as a disabled text box, so a one-word owner name took as much
@@ -5960,6 +5876,64 @@ mod tests {
                 );
                 cleanup(&path);
             }
+        }
+    }
+
+
+    /// A read-only field must render the STORED text, byte for byte.
+    ///
+    /// egui copies a label's galley text, so the string handed to the label is exactly
+    /// what Ctrl+C returns — and a read-only session is the mode an heir is told to use,
+    /// with the manual promising these fields can be selected and copied. A previous
+    /// version pre-wrapped the text and inserted hyphens at the breaks, and normalised
+    /// whitespace with `split_whitespace`, so it silently altered values that never even
+    /// wrapped: a double space in an address vanished from the copy.
+    ///
+    /// This reads the value back out of the real accessibility tree, which is what a
+    /// screen reader and the copy path both see.
+    #[test]
+    fn read_only_fields_render_the_stored_text_byte_for_byte() {
+        use egui_kittest::{kittest::NodeT as _, Harness};
+
+        // Values chosen for the ways the old implementation corrupted them: a run of
+        // spaces, a tab, leading indentation, and a long unbreakable token that forces
+        // a wrap in a narrow pane.
+        let cases = [
+            "1234  N Elm Street, Apt 5",
+            "a\tb",
+            "  indented",
+            "https://portal.example.com/customer/login?ref=abcdefghijklmnopqrstuvwxyz0123456789",
+        ];
+
+        for value in cases {
+            let path = tmp("rofidelity");
+            let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            let mut app = GuiApp::new(path.clone(), false); // read-only: the heir's mode
+            app.vault = Some(ov);
+            app.screen = Screen::Main;
+            app.tab = Tab::RealEstate;
+            let mut r = RealEstate::new().unwrap();
+            r.address = value.to_string();
+            app.edit_realestate = Some(r);
+            let app = std::cell::RefCell::new(app);
+            // Deliberately narrow, so the long value must wrap and any wrap-time
+            // transformation would show up.
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(620.0, 900.0))
+                .build_ui(|ui| app.borrow_mut().render(ui));
+            h.run();
+
+            let found = h
+                .root()
+                .children_recursive()
+                .filter_map(|n| n.value())
+                .any(|v| v == value);
+            assert!(
+                found,
+                "the read-only field must expose the stored text unaltered; \
+                 {value:?} was not found verbatim in the rendered tree"
+            );
+            cleanup(&path);
         }
     }
 
