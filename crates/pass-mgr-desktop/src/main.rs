@@ -711,17 +711,56 @@ fn default_backup_dir(vault_dir: &Path) -> PathBuf {
 /// there would be copied into the very tree being rewritten). Best-effort: uses
 /// canonical paths when both exist, else a lexical prefix check.
 fn dest_inside(vault_dir: &Path, dest: &Path) -> bool {
-    match (std::fs::canonicalize(vault_dir).ok(), std::fs::canonicalize(dest).ok()) {
-        (Some(v), Some(d)) => d == v || d.starts_with(&v),
-        // The dest usually does not exist yet (it is a fresh backup dir), so we fall
-        // back to a LEXICAL comparison. Normalize both first — absolutize against the
-        // cwd and fold away `.`/`..` — so equivalent spellings like `./vault/inside`
-        // are still recognized as inside `vault` (a raw component-wise `starts_with`
-        // would miss the leading `CurDir` component and wrongly allow it).
-        _ => {
-            let v = lexical_normalize(vault_dir);
-            let d = lexical_normalize(dest);
-            d == v || d.starts_with(&v)
+    // Both sides are resolved AS FAR AS THE FILESYSTEM ALLOWS (see `resolve_existing`),
+    // never by text alone.
+    //
+    // This used to canonicalize both and fall back to a purely LEXICAL comparison when
+    // either failed. A destination almost never exists yet — it is a fresh export or
+    // backup directory — so the lexical path was the normal one, and it folds `..` and
+    // absolutizes without ever touching the filesystem. A destination reached through a
+    // SYMLINKED PARENT therefore compared as "outside" while physically resolving inside
+    // the vault directory, and `extract`/`export-tree` would write a full cleartext
+    // mirror (vault.json holds every password) right next to vault.pmv — exactly what
+    // this guard exists to prevent, since the user's next backup of the vault folder
+    // sweeps the plaintext up with it.
+    let v = resolve_existing(vault_dir);
+    let d = resolve_existing(dest);
+    d == v || d.starts_with(&v)
+}
+
+/// Resolve `path` as far as it exists: canonicalize the deepest ancestor that is really
+/// there (following symlinks, folding `..` truthfully) and re-append the components below
+/// it, folding any `.`/`..` left in that non-existent tail lexically.
+///
+/// Canonicalizing the whole path is not an option — the interesting paths here are ones
+/// that have not been created yet — and comparing them purely as text is what let a
+/// symlinked parent slip past. This gives the filesystem the final say over every
+/// component that exists, which is every component that can carry a symlink.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    };
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.clone();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&cur) {
+            let mut out = real;
+            // `suffix` was collected from the leaf upward, so replay it in reverse.
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return lexical_normalize(&out);
+        }
+        // Not there (yet): peel one component and try the parent.
+        match cur.file_name() {
+            Some(name) => suffix.push(name.to_os_string()),
+            // No file name (root, or a trailing `..`): nothing left to peel.
+            None => return lexical_normalize(&abs),
+        }
+        if !cur.pop() {
+            return lexical_normalize(&abs);
         }
     }
 }
@@ -1796,6 +1835,50 @@ mod tests {
         assert!(super::dest_inside(&vault, &link), "a symlink into the vault resolves to inside");
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dest_inside_sees_through_a_symlinked_parent_of_a_dest_that_does_not_exist_yet() {
+        // The realistic shape, and the one that used to slip through: the destination
+        // has NOT been created yet (it is a fresh export/backup dir), and it is named
+        // through a symlink that points into the vault directory.
+        //
+        // With no destination to canonicalize, the old code fell back to comparing the
+        // paths as TEXT, which cannot see a symlink — so it answered "outside" and
+        // `extract`/`export-tree` wrote a full cleartext mirror inside the live vault
+        // directory, next to vault.pmv.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let vault = std::env::temp_dir().join(format!("pmdi-symparent-{nanos}"));
+        std::fs::create_dir_all(&vault).unwrap();
+
+        // `link` -> the vault dir itself. `link/plaintext` does not exist.
+        let link = std::env::temp_dir().join(format!("pmdi-symparentlink-{nanos}"));
+        std::os::unix::fs::symlink(&vault, &link).unwrap();
+        let dest = link.join("plaintext");
+        assert!(!dest.exists(), "the destination must NOT exist — that is the whole case");
+
+        assert!(
+            super::dest_inside(&vault, &dest),
+            "a not-yet-created destination reached through a symlinked parent resolves \
+             INSIDE the vault and must be refused"
+        );
+
+        // Control: the same shape pointing somewhere else must still be allowed, so the
+        // guard is not simply rejecting everything.
+        let outside = std::env::temp_dir().join(format!("pmdi-symparent-out-{nanos}"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let outlink = std::env::temp_dir().join(format!("pmdi-symparent-outlink-{nanos}"));
+        std::os::unix::fs::symlink(&outside, &outlink).unwrap();
+        assert!(
+            !super::dest_inside(&vault, &outlink.join("plaintext")),
+            "control: a symlinked parent pointing OUTSIDE the vault stays allowed"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&outlink);
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

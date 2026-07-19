@@ -49,6 +49,33 @@ use crate::types::TypeLists;
 // deletion + compaction. Delete this line and `src/vault/migrate.rs` to remove it.
 pub mod migrate;
 
+/// Take the single-writer lock for a read-only operation on `dir`, tolerating a source
+/// we are not allowed to write to.
+///
+/// `backup` locks the SOURCE so a multi-file copy cannot straddle a concurrent rekey
+/// (which would pair an old-key vault.pmv with a new-key store). But acquiring the lock
+/// CREATES `pass-mgr.lock` in that directory, which is impossible on read-only media, a
+/// restored snapshot, or a `chmod 500` directory — and those are exactly the cases where
+/// a backup matters most. Refusing there meant you could not back up a vault you could
+/// only read, and the error was a bare "Permission denied" naming no cause.
+///
+/// So: if the lock cannot be created *because we lack write access*, proceed without it.
+/// That is sound rather than merely convenient — a directory we cannot create a file in
+/// is one no other process can be writing the vault in either, so there is no concurrent
+/// rekey for the lock to protect against. Every other failure (including `Locked`, i.e. a
+/// real concurrent holder) is still propagated.
+fn lock_for_read_only_copy(dir: &Path) -> Result<Option<WriteLock>, VaultError> {
+    match WriteLock::acquire(dir) {
+        Ok(l) => Ok(Some(l)),
+        Err(VaultError::Io(e))
+            if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// A decrypted document returned to the CLI: its manifest metadata plus its
 /// plaintext bytes (which wipe on drop).
 // `type` is an alias (a nickname for a longer type). A tuple `(A, B)` pairs two
@@ -1038,8 +1065,9 @@ impl OpenVault {
         }
         let src_dir = parent_dir(&self.path);
         if self.read_only {
-            // No write lock held by this session — take one for the snapshot.
-            let _lock = WriteLock::acquire(&src_dir)?;
+            // No write lock held by this session — take one for the snapshot, tolerating
+            // a source we cannot write to (see `lock_for_read_only_copy`).
+            let _lock = lock_for_read_only_copy(&src_dir)?;
             backup_snapshot(&self.path, &src_dir, dest_dir)
         } else {
             // Writable session already holds the lock; reuse it (do NOT re-acquire).
@@ -2937,7 +2965,7 @@ pub fn backup(vault_path: &Path, dest_dir: &Path) -> Result<PathBuf, VaultError>
     // copy atomic vs. a concurrent rekey (which would otherwise pair an old-key
     // vault.pmv with a new-key store). On the mobile build (no single-writer-lock
     // feature) this is a no-op — that build serializes all access behind one mutex.
-    let _lock = WriteLock::acquire(&src_dir)?;
+    let _lock = lock_for_read_only_copy(&src_dir)?;
     backup_snapshot(vault_path, &src_dir, dest_dir)
 }
 
@@ -3265,6 +3293,55 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*; // pull every item from the parent module (this file) into the tests
+
+    /// Backing up a vault you can only READ must work.
+    ///
+    /// `backup` takes the single-writer lock on the SOURCE so the multi-file copy cannot
+    /// straddle a concurrent rekey. Acquiring it CREATES `pass-mgr.lock` in the source
+    /// directory — impossible on read-only media, a restored snapshot, or a `chmod 500`
+    /// directory. A restored backup is exactly this case (a snapshot carries no lock
+    /// file), so the first thing you want to do with a recovered vault failed with a bare
+    /// "Permission denied" that named no cause.
+    ///
+    /// A source we cannot even create a file in cannot be being written by anyone else
+    /// either, which is what makes a lock-less snapshot safe precisely there.
+    #[cfg(unix)]
+    #[test]
+    fn backup_works_when_the_source_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_path("robackup_src");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let v = OpenVault::create(path.clone(), b"p1", b"p2", fast()).unwrap();
+        drop(v); // release the lock
+        let src_dir = path.parent().unwrap().to_path_buf();
+        let dest = tmp_path("robackup_dest").parent().unwrap().to_path_buf();
+
+        // A restored snapshot carries no lock file: remove it, then make the directory
+        // unwritable so one cannot be created either.
+        let _ = std::fs::remove_file(src_dir.join(LOCK_FILE));
+        let orig = std::fs::metadata(&src_dir).unwrap().permissions();
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = backup(&path, &dest);
+
+        // Restore permissions before asserting, so a failing assert cannot leave an
+        // undeletable directory behind.
+        std::fs::set_permissions(&src_dir, orig).unwrap();
+
+        // `backup` returns the copied vault FILE, not its directory.
+        let made = result.expect("a read-only source must still be backup-able");
+        assert!(made.exists(), "the vault file was copied");
+        assert_eq!(made.file_name().unwrap(), "vault.pmv");
+        // A lock-less snapshot is still a real one.
+        assert!(
+            OpenVault::open_read_only(made.clone(), b"p1", b"p2").is_ok(),
+            "the backed-up vault opens"
+        );
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 
     // ---- Documents: taxes + real estate (hardening) ------------------------
 
