@@ -82,7 +82,7 @@ pub fn run(path: std::path::PathBuf, writable: bool) -> anyhow::Result<()> {
             focus.serve(cc.egui_ctx.clone());
             // Apply the saved color theme before the first frame (avoids a flash of
             // the default theme); the app re-applies it live when the user changes it.
-            cc.egui_ctx.set_visuals(visuals_for(load_theme()));
+            apply_theme(&cc.egui_ctx, load_theme());
             Ok(Box::new(GuiApp::new(path, writable)))
         }),
     )
@@ -358,6 +358,135 @@ fn visuals_for(theme: Theme) -> egui::Visuals {
     }
 }
 
+// --- The visual design system ------------------------------------------------
+//
+// Everything below shapes how the app LOOKS, and nothing below changes what any
+// control does. It is kept in one block so the whole app restyles from a single
+// place: `apply_theme` sets both the palette (`visuals_for`, above) and the
+// typography/spacing/shape rules (`apply_style`), and `accent` gives each palette
+// one signature color used for headings, section labels, and the active tab.
+
+/// The signature color of a theme. Used for headings, the active tab's underline,
+/// section labels, and list badges — the small amount of color that tells the eye
+/// where the structure of a screen is.
+fn accent(theme: Theme) -> egui::Color32 {
+    use egui::Color32;
+    let rgb = Color32::from_rgb;
+    match theme {
+        Theme::Light => rgb(21, 92, 170),
+        Theme::Dark => rgb(110, 170, 240),
+        Theme::HighContrast => rgb(120, 200, 255),
+        Theme::Solarized => rgb(38, 139, 210),
+        Theme::Sepia => rgb(140, 88, 38),
+        Theme::Nord => rgb(136, 192, 208),
+        Theme::Dracula => rgb(189, 147, 249),
+        Theme::GruvboxDark => rgb(254, 128, 25),
+        Theme::GruvboxLight => rgb(175, 58, 3),
+        Theme::RosePine => rgb(196, 167, 231),
+    }
+}
+
+/// Apply a theme to the egui context: its palette AND the shared typography and
+/// spacing rules. Called once before the first frame and again whenever the user
+/// picks a different theme.
+fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    ctx.set_visuals(visuals_for(theme));
+    apply_style(ctx, theme);
+}
+
+/// The typography, spacing, and shape rules shared by every screen.
+///
+/// egui's defaults are tuned for debug tooling: 14 px text, tight 8/3 spacing, and
+/// small corner radii. This is a document-shaped application that people read, so
+/// the scale is opened up — larger body text, a real heading step, roomier control
+/// padding, and softer corners — which is most of what makes the window feel less
+/// like a debug panel and more like an application.
+fn apply_style(ctx: &egui::Context, theme: Theme) {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    let mut style = (*ctx.global_style()).clone();
+
+    // A deliberate type scale rather than one size for everything: headings lead,
+    // body text is comfortable to read for a while, and small text is genuinely
+    // secondary instead of merely greyer.
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(21.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace)),
+    ]
+    .into();
+
+    // Spacing: more air between rows, and buttons with enough padding to look
+    // pressable. `indent` widens the step of collapsing trees so the grouped
+    // Accounts/Assets views read as a hierarchy at a glance.
+    let s = &mut style.spacing;
+    s.item_spacing = egui::vec2(8.0, 7.0);
+    s.button_padding = egui::vec2(10.0, 5.0);
+    s.indent = 20.0;
+    s.window_margin = egui::Margin::same(10);
+    s.menu_margin = egui::Margin::same(8);
+    s.interact_size.y = 24.0;
+    s.scroll.bar_width = 10.0;
+    s.scroll.floating = false;
+
+    // Shape: consistently rounded controls, and a visible focus ring in the
+    // accent color so keyboard focus is never guesswork.
+    let v = &mut style.visuals;
+    let radius = egui::CornerRadius::same(6);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = radius;
+    }
+    v.window_corner_radius = egui::CornerRadius::same(8);
+    v.menu_corner_radius = egui::CornerRadius::same(8);
+    v.selection.stroke = egui::Stroke::new(1.0, accent(theme));
+    v.widgets.hovered.expansion = 1.0;
+    v.widgets.active.expansion = 1.0;
+
+    ctx.set_global_style(style);
+}
+
+/// A framed content card: a subtly filled, rounded, hairlined box used to group a
+/// form or a panel so the eye can tell one region from the next.
+///
+/// Purely presentational — it wraps whatever the caller draws and returns what the
+/// closure returned, so wrapping an existing block in a card never changes it.
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, add)
+        .inner
+}
+
+/// A small filled pill — used for counts and mode badges, where a number needs to
+/// read as a label rather than as body text.
+fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.18))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(color).small().strong());
+        });
+}
+
+/// A screen or panel heading in the accent color, with the vertical rhythm the
+/// rest of the design system expects.
+fn section_heading(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.label(egui::RichText::new(text).heading().color(color));
+}
+
 // The color theme is stored in the shared, non-secret `prefs.json` alongside the
 // export directory (see `crate::prefs_path` / `crate::read_prefs_obj` in lib.rs). The
 // theme accessors live here because they reference the GUI-only `Theme` type; the
@@ -594,6 +723,9 @@ struct GuiApp {
     /// only call `set_visuals` (and persist) when the selection actually changes.
     theme: Theme,
     applied_theme: Theme,
+    /// The in-app manual's browser state (search box + selected topic), kept here
+    /// so the user's place in it survives leaving and re-entering Help.
+    help: crate::gui_help::HelpState,
 }
 
 /// How long a copied password stays on the clipboard before it is auto-cleared.
@@ -724,6 +856,7 @@ impl GuiApp {
             clipboard_clear_at: None,
             theme,
             applied_theme: theme,
+            help: crate::gui_help::HelpState::default(),
         }
     }
 
@@ -1135,9 +1268,44 @@ impl GuiApp {
     // `&mut egui::Ui` is the drawing surface, borrowed mutably so widgets can be
     // added to it. egui is immediate-mode: this method re-runs every frame.
     fn ui_auth(&mut self, ui: &mut egui::Ui) {
+        // The lock screen is the app's front door and the only screen an heir may ever
+        // see, so it is presented as one centered, width-limited card rather than a
+        // full-width form: a narrow measure is easier to read, and the card gives the
+        // password fields a visible boundary. Purely presentational — `ui_auth_inner`
+        // holds the entire flow unchanged.
+        let accent = accent(self.theme);
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("🗄  pass-mgr").heading().color(accent));
+            ui.label(egui::RichText::new("Offline, two-password estate vault").weak().small());
+        });
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(560.0);
+            card(ui, |ui| {
+                self.ui_auth_inner(ui);
+            });
+            ui.add_space(10.0);
+            // The mode the session will open in, stated before the password is typed
+            // rather than discovered afterwards by a control that is missing.
+            if self.writable {
+                ui.label(egui::RichText::new("This session can make changes (--write).").weak().small());
+            } else {
+                ui.label(
+                    egui::RichText::new("🔒 Read-only session — relaunch with --write to make changes.")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+    }
+
+    /// The unlock/create/change-password form itself (see [`Self::ui_auth`], which
+    /// frames it).
+    fn ui_auth_inner(&mut self, ui: &mut egui::Ui) {
         // `match` used as an expression: it yields a `(heading, help)` pair which
         // we immediately destructure into two named bindings.
-        ui.add_space(28.0);
+        ui.add_space(4.0);
         // On the start page (not the in-vault Change-password flow) the user picks the vault
         // by ROOT + a collapsed "Vault" box: an editable ROOT path scanned (one level deep)
         // for vaults, and a Vault box that the dropdown fills — pick an existing vault, or
@@ -1276,10 +1444,18 @@ impl GuiApp {
         ui.horizontal(|ui| {
             let label = match self.auth_mode {
                 AuthMode::Create => "Create vault",
-                AuthMode::Unlock => "Unlock",
+                AuthMode::Unlock => "🔓 Unlock",
                 AuthMode::ChangePassword => "Change passwords",
             };
-            if ui.button(label).clicked() {
+            // The one action of this screen, drawn as the primary (filled) button.
+            let accent = accent(self.theme);
+            if ui
+                .add_sized(
+                    [150.0, 28.0],
+                    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(accent),
+                )
+                .clicked()
+            {
                 submit = true;
             }
             if self.auth_mode == AuthMode::ChangePassword && ui.button("Cancel").clicked() {
@@ -1301,58 +1477,79 @@ impl GuiApp {
         // below: reveal is meant to be a momentary, in-context action, so it must not
         // persist into a later visit and expose every password to a bystander.
         let prev_tab = self.tab;
-        // Two-row toolbar: the record-type tabs on the first row, the global actions
-        // (passwords / config / help / quit + the read-only badge) on the second. Each
-        // row is its own horizontal ScrollArea so it stays fully reachable when the
-        // window is narrower than the row (otherwise the rightmost items would be
-        // clipped and unselectable); no vertical scroll — each row is one line tall.
-        egui::ScrollArea::horizontal().id_salt("topbar_tabs_scroll").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                tab_button(ui, &mut self.tab, Tab::Urgent, "URGENT");
-                tab_button(ui, &mut self.tab, Tab::Instructions, "Instructions");
-                tab_button(ui, &mut self.tab, Tab::TrustWill, "Trust and Will");
-                tab_button(ui, &mut self.tab, Tab::Assets, "Assets and Liabilities");
-                tab_button(ui, &mut self.tab, Tab::Accounts, "Accounts");
-                tab_button(ui, &mut self.tab, Tab::RealEstate, "Real Estate");
-                tab_button(ui, &mut self.tab, Tab::Taxes, "Taxes");
-                tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "General Documents");
-                tab_button(ui, &mut self.tab, Tab::Summary, "Summary");
-            });
-        });
-        egui::ScrollArea::horizontal().id_salt("topbar_actions_scroll").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Change-password is a write; only offer it when writable.
-                // `&&` short-circuits: the button is only drawn/evaluated when
-                // `self.writable` is true, so read-only mode hides it entirely.
-                if self.writable
-                    && ui.button("🔑 Passwords").clicked()
-                {
-                    self.auth_mode = AuthMode::ChangePassword;
-                    self.auth_error = None;
-                    self.wipe_passwords();
-                    self.screen = Screen::Auth;
+        let accent = accent(self.theme);
+
+        // Row 1 — identity + global actions. `horizontal_wrapped` rather than a
+        // scroll area: on a narrow window the row wraps onto a second line instead
+        // of hiding controls behind a scrollbar, so nothing is ever unreachable.
+        ui.horizontal_wrapped(|ui| {
+            // Which vault is open — the folder name, with the full path on hover.
+            // Two windows onto two vaults look identical without this.
+            let vault_name = self
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "vault".to_string());
+            ui.label(egui::RichText::new("🗄").color(accent).size(16.0))
+                .on_hover_text(self.path.display().to_string());
+            ui.label(egui::RichText::new(vault_name).strong())
+                .on_hover_text(self.path.display().to_string());
+            // The mode badge: quiet when writable, loud when not. A read-only session
+            // hides its write controls, so the badge is what explains their absence.
+            if self.writable {
+                badge(ui, "WRITE", accent);
+            } else {
+                badge(ui, "🔒 READ-ONLY", egui::Color32::from_rgb(190, 105, 10));
+            }
+
+            // Actions, pushed to the right edge so they hold one place as the window
+            // resizes. Drawn right-to-left, hence the reversed order.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Quit").on_hover_text("Close the window (secrets are wiped and the clipboard cleared)").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if ui.button("⚙ Config").clicked() {
+                if ui.button("❓ Help").on_hover_text("The built-in manual").clicked() {
+                    self.screen = Screen::Help;
+                }
+                if ui.button("⚙ Config").on_hover_text("Appearance, view defaults, type lists, export, backup, storage").clicked() {
                     // Seed the redundancy picker from the live setting each time Config
                     // opens, so the combo reflects the current value (and its selection
                     // survives across frames until Apply).
                     self.cfg_redundancy = self.vault_ref().redundancy();
                     self.screen = Screen::Config;
                 }
-                if ui.button("❓ Help").clicked() {
-                    self.screen = Screen::Help;
+                // Change-password is a write; only offer it when writable.
+                // `&&` short-circuits: the button is only drawn/evaluated when
+                // `self.writable` is true, so read-only mode hides it entirely.
+                if self.writable
+                    && ui.button("🔑 Passwords").on_hover_text("Change the vault's two passwords").clicked()
+                {
+                    self.auth_mode = AuthMode::ChangePassword;
+                    self.auth_error = None;
+                    self.wipe_passwords();
+                    self.screen = Screen::Auth;
                 }
-                if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if !self.writable {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("🔒 READ-ONLY")
-                            .strong()
-                            .color(egui::Color32::from_rgb(170, 90, 0)),
-                    );
-                }
+            });
+        });
+
+        ui.add_space(6.0);
+
+        // Row 2 — the tab strip. Each tab carries a glyph so it is recognisable by
+        // shape before the label is read, and the active one gets an accent
+        // underline. Kept in a horizontal ScrollArea so a narrow window scrolls the
+        // strip rather than clipping the tabs off the end.
+        egui::ScrollArea::horizontal().id_salt("topbar_tabs_scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                tab_button(ui, &mut self.tab, Tab::Urgent, "❗ URGENT", accent);
+                tab_button(ui, &mut self.tab, Tab::Instructions, "📝 Instructions", accent);
+                tab_button(ui, &mut self.tab, Tab::TrustWill, "⚖ Trust and Will", accent);
+                tab_button(ui, &mut self.tab, Tab::Assets, "💰 Assets and Liabilities", accent);
+                tab_button(ui, &mut self.tab, Tab::Accounts, "🔑 Accounts", accent);
+                tab_button(ui, &mut self.tab, Tab::RealEstate, "🏠 Real Estate", accent);
+                tab_button(ui, &mut self.tab, Tab::Taxes, "🧾 Taxes", accent);
+                tab_button(ui, &mut self.tab, Tab::GeneralDocuments, "📁 General Documents", accent);
+                tab_button(ui, &mut self.tab, Tab::Summary, "📊 Summary", accent);
             });
         });
         // Reset the global reveal toggles when the user switches tabs (see prev_tab above):
@@ -1371,159 +1568,50 @@ impl GuiApp {
 
     // --- Help screen ---------------------------------------------------------
 
-    /// In-app help: a sectioned guide (the README, condensed) plus the on-disk
-    /// locations of this vault and the preferences file. Reachable from the top-bar
-    /// "❓ Help" button.
+    /// The in-app manual: a searchable, topic-navigated browser over the content in
+    /// [`crate::gui_help`]. Reachable from the top-bar "Help" button.
+    ///
+    /// All of the text (and the search) lives in `gui_help`; this only supplies the
+    /// live facts the manual quotes back — where this vault and the preferences file
+    /// are — and routes the Back button.
     fn ui_help(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Help");
-            if ui.button("⬅ Back").clicked() {
-                self.screen = Screen::Main;
-            }
-        });
-        ui.separator();
-
-        // Each section is a collapsible header with a body of short lines. The whole
-        // page scrolls vertically so labels wrap to the window width.
-        let sections: &[(&str, &[&str])] = &[
-            (
-                "What this is",
-                &[
-                    "pass-mgr is an offline, two-password encrypted vault for the records an \
-                     estate's executor or heirs need: account logins, instructions, trust & will \
-                     documents, assets & liabilities, real estate, and tax filings.",
-                    "It is fully local — there is no network code and nothing ever leaves your \
-                     machine. The vault is a directory holding the encrypted vault file plus an \
-                     encrypted document store.",
-                ],
-            ),
-            (
-                "The two passwords",
-                &[
-                    "Opening the vault requires BOTH passwords, in order. They are chained through \
-                     Argon2id key derivation into one XChaCha20-Poly1305 key — neither password \
-                     alone reveals anything, and the order matters.",
-                    "There is NO recovery: if you lose either password the data is unrecoverable by \
-                     design. A wrong password and a corrupted/tampered vault fail the same way (no \
-                     oracle). Change both via 'Change passwords' on the unlock screen.",
-                ],
-            ),
-            (
-                "Read-only vs. writable",
-                &[
-                    "Launched read-only by default; pass --write to make changes. A read-only \
-                     session writes nothing to the vault.",
-                    "In read-only mode the record forms are a VIEW: fields can't be edited, but you \
-                     can still select and copy their text, reveal and copy passwords, export \
-                     documents, and run a backup. The only settings you can change read-only are the \
-                     color theme and the export directory (both are local preferences, not vault \
-                     data).",
-                ],
-            ),
-            (
-                "Tabs & records",
-                &[
-                    "Instructions · Trust & Will · Assets & Liabilities · Accounts · Real Estate · \
-                     Taxes · General Documents · Summary (a read-only overview). Switch with the \
-                     top tabs (or 1–8 in the TUI).",
-                    "Accounts can be shown as a grouped tree (owner → type → subtype → title); \
-                     title and owner are required. Filters cross-narrow each other, and the search \
-                     box matches a username OR a title.",
-                ],
-            ),
-            (
-                "Passwords: reveal, generate, copy",
-                &[
-                    "Reveal is a single global toggle per screen ('reveal all') on Accounts and Real \
-                     Estate — there is no per-record reveal. Switching tabs resets reveal to your \
-                     'Reveal all passwords by default' setting in Config: OFF (the default) re-masks \
-                     every tab; ON re-reveals every tab.",
-                    "🎲 generates a strong random password (and turns reveal on so you can see it). \
-                     📋 copies a password through a history-excluded clipboard path; the clipboard \
-                     auto-clears after 15 seconds and is wiped on exit.",
-                ],
-            ),
-            (
-                "Documents: attach & export",
-                &[
-                    "Attach a file with 'Upload from' (and an optional subfolder). If you leave the \
-                     Filename blank, the source file's own name is used.",
-                    "Export writes the DECRYPTED document to the directory set in Config → 'Export \
-                     destination', recreating its folder structure there \
-                     (<export dir>/<location>/<filename>). You are not asked for a path each time, \
-                     and an export never overwrites an existing file (it adds a _N suffix).",
-                    "Real Estate has four portal logins (Property Mgmt / Insurance / HOA / Tax), each \
-                     with a URL, username, password, and a free-form comment.",
-                ],
-            ),
-            (
-                "Config",
-                &[
-                    "Color theme (10 palettes) · Asset/Account types & subtypes (add, or delete when \
-                     unused) · Export directory · Backup · Storage volume size · Vault \
-                     file redundancy.",
-                    "Backup copies the encrypted vault + document store into a timestamped folder \
-                     (nothing is decrypted). Redundancy keeps extra in-place encrypted copies of the \
-                     small vault file so a damaged one can be recovered — it does NOT replace backups.",
-                ],
-            ),
-            (
-                "Security notes",
-                &[
-                    "Encryption: chained Argon2id → XChaCha20-Poly1305, with the whole file header \
-                     authenticated. Secrets are zeroized in memory and (on desktop) memory-locked.",
-                    "Plaintext only leaves the vault when you explicitly ask (document export, the \
-                     CLI decrypt/extract/export-tree). Keep those copies somewhere you trust and \
-                     delete them when done.",
-                ],
-            ),
-        ];
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("help_scroll").show(ui, |ui| {
-            for (title, body) in sections {
-                egui::CollapsingHeader::new(egui::RichText::new(*title).strong()).default_open(true).show(ui, |ui| {
-                    for line in *body {
-                        ui.label(*line);
-                        ui.add_space(4.0);
-                    }
-                });
-            }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.label(egui::RichText::new("Files on this machine").strong());
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Vault:");
-                ui.label(egui::RichText::new(self.path.display().to_string()).monospace());
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Preferences (theme + export directory; non-secret):");
-                let pref = crate::prefs_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(unavailable)".into());
-                ui.label(egui::RichText::new(pref).monospace());
-            });
-        });
+        let ctx = crate::gui_help::HelpContext {
+            vault: self.path.display().to_string(),
+            prefs: crate::prefs_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(unavailable)".into()),
+            writable: self.writable,
+        };
+        if crate::gui_help::ui(ui, &mut self.help, &ctx, accent(self.theme)) {
+            self.screen = Screen::Main;
+        }
     }
 
     // --- Config screen -------------------------------------------------------
 
     fn ui_config(&mut self, ui: &mut egui::Ui) {
+        let accent = accent(self.theme);
+        // Back sits FIRST, at the left edge where a back control is looked for, and
+        // the heading follows it — the old order put the way out after the title.
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.heading("Configuration");
             if ui.button("⬅ Back").clicked() {
                 self.screen = Screen::Main;
             }
+            ui.add_space(4.0);
+            section_heading(ui, "Configuration", accent);
         });
+        ui.add_space(4.0);
         ui.separator();
         // Show where this vault lives on disk (the vault.pmv path; its parent dir holds
         // the manifest/ and volume/ too).
         ui.horizontal(|ui| {
-            ui.label("Vault location:");
-            ui.label(egui::RichText::new(self.path.display().to_string()).strong());
+            ui.label(egui::RichText::new("Vault location").weak().small());
+            ui.label(egui::RichText::new(self.path.display().to_string()).monospace().small());
         });
         if !self.writable {
+            ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(
-                    "Read-only: no vault field can be edited. The color theme and the view \
+                    "🔒  Read-only: no vault field can be edited. The color theme and the view \
                      defaults below can still be changed (they are local preferences); \
                      backup and document export are still available.",
                 )
@@ -1568,7 +1656,7 @@ impl GuiApp {
             // Appearance: a color-theme picker. Changing it applies live and is
             // saved to a small preferences file (it carries no vault data), so it
             // works in read-only mode too and persists to the next launch.
-            ui.label(egui::RichText::new("Appearance").strong());
+            config_heading(ui, "Appearance");
             egui::ComboBox::from_label("Color theme").selected_text(self.theme.label()).show_ui(ui, |ui| {
                 for t in Theme::ALL {
                     ui.selectable_value(&mut self.theme, t, t.label());
@@ -1581,7 +1669,7 @@ impl GuiApp {
             // to the saved-default field, saves the preference on change, and applies it to
             // the live view state so the effect is immediate; the saved value re-seeds these
             // on the next vault open (see `GuiApp::new` and the tab-switch reset).
-            ui.label(egui::RichText::new("View defaults").strong());
+            config_heading(ui, "View defaults");
             if ui
                 .checkbox(&mut self.reveal_default, "Reveal all passwords by default")
                 .changed()
@@ -1606,7 +1694,7 @@ impl GuiApp {
             }
             ui.add_space(14.0);
 
-            ui.label(egui::RichText::new("Asset / Liability types").strong());
+            config_heading(ui, "Asset / Liability types");
             // One chip per type with a delete (×) button. The × only deletes when the
             // type is unused by a live record (else a status message explains why).
             ui.horizontal_wrapped(|ui| {
@@ -1636,7 +1724,7 @@ impl GuiApp {
             });
 
             ui.add_space(14.0);
-            ui.label(egui::RichText::new("Account types & subtypes").strong());
+            config_heading(ui, "Account types & subtypes");
             // Each type on its own row: a × to delete the type (blocked while it has
             // subtypes or is in use), then each subtype with its own × (blocked if used).
             for (name, subs) in &account_list {
@@ -1704,7 +1792,7 @@ impl GuiApp {
 
             ui.add_space(16.0);
             ui.separator();
-            ui.label(egui::RichText::new("Export directory").strong());
+            config_heading(ui, "Export directory");
             ui.label(
                 egui::RichText::new(
                     "Where the per-document Export buttons write the decrypted file. Each export \
@@ -1726,7 +1814,7 @@ impl GuiApp {
 
             ui.add_space(16.0);
             ui.separator();
-            ui.label(egui::RichText::new("Backup").strong());
+            config_heading(ui, "Backup");
             ui.label(
                 egui::RichText::new(
                     "Copies the encrypted vault and its document archive into a directory, \
@@ -1745,7 +1833,7 @@ impl GuiApp {
             if self.writable {
                 ui.add_space(16.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Storage — volume size").strong());
+                config_heading(ui, "Storage — volume size");
                 ui.label(
                     egui::RichText::new(format!(
                         "New documents roll into a fresh volume once a partition passes this size. \
@@ -1763,7 +1851,7 @@ impl GuiApp {
 
                 ui.add_space(16.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Vault file redundancy (advanced)").strong());
+                config_heading(ui, "Vault file redundancy (advanced)");
                 ui.label(
                     egui::RichText::new(
                         "Keeps extra encrypted copies of the small vault file so a damaged \
@@ -1790,7 +1878,7 @@ impl GuiApp {
 
                 ui.add_space(16.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Update from another vault").strong());
+                config_heading(ui, "Update from another vault");
                 ui.label(
                     egui::RichText::new(
                         "Pull records that are newer (or new) in ANOTHER vault — together with the \
@@ -1806,7 +1894,7 @@ impl GuiApp {
 
                 ui.add_space(16.0);
                 ui.separator();
-                ui.label(egui::RichText::new("Sync types from records").strong());
+                config_heading(ui, "Sync types from records");
                 ui.label(
                     egui::RichText::new(
                         "Scan every record and add any asset/account type or subtype it uses that \
@@ -1986,14 +2074,22 @@ impl GuiApp {
     /// Only reachable in `--write` mode (the entry button is gated). The opened source
     /// handle + computed plan live in `self.merge_*` between the preview and the apply.
     fn ui_merge(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("⟵ Back to Config").clicked() {
                 self.reset_merge();
                 self.screen = Screen::Config;
             }
-            ui.heading("Update from another vault");
+            ui.add_space(4.0);
+            section_heading(ui, "Update from another vault", accent(self.theme));
         });
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("One-way and additive — nothing in this vault is ever deleted by an update.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
         ui.separator();
 
         // Deferred actions (set in the render below, run after to avoid borrow clashes).
@@ -2237,7 +2333,7 @@ impl GuiApp {
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select an urgent note or click “New”.");
+                empty_form_hint(ui, "an urgent note");
             }
         });
 
@@ -2304,7 +2400,7 @@ impl GuiApp {
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select an instruction or click “New”.");
+                empty_form_hint(ui, "an instruction");
             }
         });
 
@@ -2388,7 +2484,7 @@ impl GuiApp {
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select a document or click “New”.");
+                empty_form_hint(ui, "a document");
             }
         });
 
@@ -2462,7 +2558,7 @@ impl GuiApp {
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select a document or click “New”.");
+                empty_form_hint(ui, "a document");
             }
         });
 
@@ -2500,11 +2596,23 @@ impl GuiApp {
     // --- Tab: Assets and Liabilities ----------------------------------------
 
     fn tab_assets(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.asset_filter_review, "Show only items flagged for review");
-            // Grouped tree: owner → Asset/Liability → type (empty levels skipped).
-            ui.checkbox(&mut self.asset_grouped, "grouped");
+        // Same card treatment as the Accounts filter row, so the two list tabs have
+        // the same control strip in the same place.
+        let accent_c = accent(self.theme);
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("View").strong().small().color(accent_c));
+                // Grouped tree: owner → Asset/Liability → type (empty levels skipped).
+                ui.checkbox(&mut self.asset_grouped, "grouped tree")
+                    .on_hover_text("Group the list by owner → asset/liability → type");
+                ui.checkbox(&mut self.asset_filter_review, "review only")
+                    .on_hover_text("Show only items flagged for review");
+                if self.asset_filter_review {
+                    badge(ui, "filtered", egui::Color32::from_rgb(190, 105, 10));
+                }
+            });
         });
+        ui.add_space(6.0);
         let fr = self.asset_filter_review;
         // In grouped mode, the same review-filtered assets as an owner→kind→type tree
         // (built here so the render closure doesn't re-borrow `self`).
@@ -2558,15 +2666,23 @@ impl GuiApp {
                 // skipped. egui's CollapsingHeader gives the +/- expand control.
                 Some(root) => {
                     let lp = &mut c[0];
+                    // Same header as the flat `list_panel`, so switching to the tree
+                    // does not change what the top of the pane looks like.
                     lp.horizontal(|ui| {
-                        ui.heading("Assets and Liabilities");
-                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-                            export = true;
-                        }
-                        if self.writable && ui.button("➕ New").clicked() {
-                            new = true;
-                        }
+                        let accent = ui_accent(ui);
+                        section_heading(ui, "Assets and Liabilities", accent);
+                        badge(ui, &format!("{}", labels.len()), accent);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.writable && ui.button("➕ New").clicked() {
+                                new = true;
+                            }
+                            if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
+                                export = true;
+                            }
+                        });
                     });
+                    lp.add_space(4.0);
+                    lp.separator();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("asset_tree").show(lp, |ui| {
                         let mut path: Vec<String> = Vec::new();
                         if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels, "asset") {
@@ -2633,7 +2749,7 @@ impl GuiApp {
                 action = form_buttons(ui, self.writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select an asset/liability or click “New”.");
+                empty_form_hint(ui, "an asset or liability");
             }
         });
 
@@ -2693,18 +2809,30 @@ impl GuiApp {
     /// buckets (Before Tax / After Tax), with per-owner totals + net worth and a grand-total
     /// row. Before Tax = retirement + HSA; After Tax = everything else (records::value_bucket).
     fn tab_summary(&mut self, ui: &mut egui::Ui) {
+        let accent_c = accent(self.theme);
         ui.add_space(6.0);
-        ui.heading("Summary of Assets & Liabilities");
+        section_heading(ui, "Summary of Assets & Liabilities", accent_c);
         ui.label(
             egui::RichText::new(
                 "Aggregated approximate values by owner. Cash = cash/savings/checking; Before Tax = retirement + HSA; After Tax = everything else.",
             )
-            .weak(),
+            .weak()
+            .small(),
         );
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         let rows = records::owner_value_summary(self.vault_ref().vault.assets.iter());
         if rows.is_empty() {
-            ui.label("No assets or liabilities yet — add some on the Assets and Liabilities tab.");
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("📊").size(28.0).color(accent_c.gamma_multiply(0.7)));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Nothing to summarise yet").strong());
+                ui.label(
+                    egui::RichText::new("Add records on the Assets and Liabilities tab and their values total up here.")
+                        .weak()
+                        .small(),
+                );
+            });
             return;
         }
         // Grand total across all owners.
@@ -2716,16 +2844,33 @@ impl GuiApp {
             total.asset_after_tax += r.asset_after_tax;
             total.liability += r.liability;
         }
+        // A headline row before the table: the three numbers someone opens this tab
+        // to find, at a size they can read across a desk, instead of having to pick
+        // them out of the bottom-right corner of an eight-column grid.
+        ui.horizontal_wrapped(|ui| {
+            stat_tile(ui, "Total assets", &crate::fmt_money(total.asset_total()), STAT_GOOD);
+            stat_tile(ui, "Total liabilities", &crate::fmt_money(total.liability), STAT_BAD);
+            // Net worth is the polarity number, so it takes the sign's color — and the
+            // sign is in the text too, never color alone.
+            stat_tile(
+                ui,
+                "Net worth",
+                &crate::fmt_money(total.net()),
+                if total.net() < 0.0 { STAT_BAD } else { STAT_GOOD },
+            );
+            stat_tile(ui, "Owners", &rows.len().to_string(), accent_c);
+        });
+        ui.add_space(12.0);
         egui::ScrollArea::both().auto_shrink([false, false]).id_salt("summary_scroll").show(ui, |ui| {
             egui::Grid::new("summary_grid").striped(true).num_columns(8).spacing([18.0, 6.0]).show(ui, |ui| {
                 // Group header: ASSETS over its 5 value columns, LIABILITIES over its 1.
                 ui.label("");
-                ui.label(egui::RichText::new("ASSETS").strong().color(egui::Color32::from_rgb(40, 120, 60)));
+                ui.label(egui::RichText::new("ASSETS").strong().small().color(STAT_GOOD));
                 ui.label("");
                 ui.label("");
                 ui.label("");
                 ui.label("");
-                ui.label(egui::RichText::new("LIABILITIES").strong().color(egui::Color32::from_rgb(170, 70, 70)));
+                ui.label(egui::RichText::new("LIABILITIES").strong().small().color(STAT_BAD));
                 ui.label("");
                 ui.end_row();
                 // Column headers (Cash = cash/savings/checking; liabilities are not tax-split).
@@ -2735,14 +2880,22 @@ impl GuiApp {
                 ui.end_row();
                 // One row per owner (monospace amounts so the digits line up).
                 for r in &rows {
-                    ui.label(r.owner.as_str());
+                    ui.label(egui::RichText::new(r.owner.as_str()).strong());
                     ui.monospace(crate::fmt_money(r.asset_real_estate));
                     ui.monospace(crate::fmt_money(r.asset_cash));
                     ui.monospace(crate::fmt_money(r.asset_before_tax));
                     ui.monospace(crate::fmt_money(r.asset_after_tax));
                     ui.monospace(crate::fmt_money(r.asset_total()));
-                    ui.monospace(crate::fmt_money(r.liability));
-                    ui.monospace(crate::fmt_money(r.net()));
+                    // Liability and Net carry the reserved status colors; the sign is in
+                    // the text as well, so the meaning never rests on color alone.
+                    ui.label(egui::RichText::new(crate::fmt_money(r.liability)).monospace().color(
+                        if r.liability > 0.0 { STAT_BAD } else { ui.visuals().text_color() },
+                    ));
+                    ui.label(
+                        egui::RichText::new(crate::fmt_money(r.net()))
+                            .monospace()
+                            .color(if r.net() < 0.0 { STAT_BAD } else { STAT_GOOD }),
+                    );
                     ui.end_row();
                 }
                 // Grand-total row (bold).
@@ -2892,44 +3045,72 @@ impl GuiApp {
         // Set inside the filter row's closure when the one-off trim button is clicked;
         // handled just after so the bulk vault mutation isn't tangled in the UI borrow.
         let mut trim_all = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Filter — type:");
-            filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &facets.types);
-            ui.label("subtype:");
-            filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &facets.subtypes);
-            ui.label("owner:");
-            filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &facets.owners);
-            ui.label("title:");
-            filter_combo(ui, "acct_ftitle", &mut self.acct_filter_title, &facets.titles);
-            ui.checkbox(&mut self.acct_filter_review, "review only");
-            // Global reveal: overrides the per-record "reveal" toggle below.
-            ui.checkbox(&mut self.reveal_all, "reveal all");
-            // Flat filtered list ⇄ grouped tree (type → subtype → owner → title).
-            ui.checkbox(&mut self.acct_grouped, "grouped");
-            ui.label("search:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.acct_search_user)
-                    .hint_text("username or title…")
-                    .desired_width(160.0),
-            );
-            if ui.button("Clear").clicked() {
-                self.acct_filter_type.clear();
-                self.acct_filter_subtype.clear();
-                self.acct_filter_owner.clear();
-                self.acct_filter_title.clear();
-                self.acct_filter_review = false;
-                self.acct_search_user.clear();
-            }
-            // One-off maintenance: left/right-trim every field on every record (all tabs).
-            if self.writable
-                && ui
-                    .button("Trim all fields")
-                    .on_hover_text("One-off: left/right-trim every field on every record in the whole vault (recorded in history)")
-                    .clicked()
-            {
-                trim_all = true;
-            }
+        // The filter row is a card with two labelled lines — the narrowing controls on
+        // one, the view toggles on the other. Previously all eleven controls ran
+        // together on a single wrapped line, where "reveal all" (which exposes every
+        // password on screen) sat between two dropdowns and read like one of them.
+        let accent_c = accent(self.theme);
+        let filters_active = !self.acct_filter_type.is_empty()
+            || !self.acct_filter_subtype.is_empty()
+            || !self.acct_filter_owner.is_empty()
+            || !self.acct_filter_title.is_empty()
+            || self.acct_filter_review
+            || !self.acct_search_user.is_empty();
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Filter").strong().small().color(accent_c));
+                ui.label(egui::RichText::new("type").weak().small());
+                filter_combo(ui, "acct_ftype", &mut self.acct_filter_type, &facets.types);
+                ui.label(egui::RichText::new("subtype").weak().small());
+                filter_combo(ui, "acct_fsub", &mut self.acct_filter_subtype, &facets.subtypes);
+                ui.label(egui::RichText::new("owner").weak().small());
+                filter_combo(ui, "acct_fowner", &mut self.acct_filter_owner, &facets.owners);
+                ui.label(egui::RichText::new("title").weak().small());
+                filter_combo(ui, "acct_ftitle", &mut self.acct_filter_title, &facets.titles);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.acct_search_user)
+                        .hint_text("🔍 username or title…")
+                        .desired_width(180.0),
+                );
+                ui.checkbox(&mut self.acct_filter_review, "review only");
+                // Only offer Clear when there is something to clear, and mark it when
+                // filters are hiding rows — an unexplained short list is the single
+                // most common "where did my records go" confusion.
+                if ui.button("✕ Clear").on_hover_text("Reset every filter and the search box").clicked() {
+                    self.acct_filter_type.clear();
+                    self.acct_filter_subtype.clear();
+                    self.acct_filter_owner.clear();
+                    self.acct_filter_title.clear();
+                    self.acct_filter_review = false;
+                    self.acct_search_user.clear();
+                }
+                // A badge when filters are actually hiding rows — an unexplained short
+                // list is the most common "where did my records go" confusion.
+                if filters_active {
+                    badge(ui, "filtered", egui::Color32::from_rgb(190, 105, 10));
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("View").strong().small().color(accent_c));
+                // Flat filtered list ⇄ grouped tree (type → subtype → owner → title).
+                ui.checkbox(&mut self.acct_grouped, "grouped tree")
+                    .on_hover_text("Group the list by owner → type → subtype → title");
+                // Global reveal: the ONLY reveal control on this screen.
+                ui.checkbox(&mut self.reveal_all, "👁 reveal all passwords")
+                    .on_hover_text("Unmask every password on this screen. Resets when you switch tabs.");
+                // One-off maintenance: left/right-trim every field on every record (all tabs).
+                if self.writable
+                    && ui
+                        .button("Trim all fields")
+                        .on_hover_text("One-off: left/right-trim every field on every record in the whole vault (recorded in history)")
+                        .clicked()
+                {
+                    trim_all = true;
+                }
+            });
         });
+        ui.add_space(6.0);
 
         // Perform the one-off bulk trim (after the filter row, before the list is
         // built, so the cleaned values show this frame).
@@ -2993,15 +3174,23 @@ impl GuiApp {
                 // levels skipped. egui's CollapsingHeader gives the +/- expand control.
                 Some(root) => {
                     let lp = &mut c[0];
+                    // Same header as the flat `list_panel`, so switching to the tree
+                    // does not change what the top of the pane looks like.
                     lp.horizontal(|ui| {
-                        ui.heading("Accounts");
-                        if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-                            export = true;
-                        }
-                        if self.writable && ui.button("➕ New").clicked() {
-                            new = true;
-                        }
+                        let accent = ui_accent(ui);
+                        section_heading(ui, "Accounts", accent);
+                        badge(ui, &format!("{}", labels.len()), accent);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.writable && ui.button("➕ New").clicked() {
+                                new = true;
+                            }
+                            if self.writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
+                                export = true;
+                            }
+                        });
                     });
+                    lp.add_space(4.0);
+                    lp.separator();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("acct_tree").show(lp, |ui| {
                         let mut path: Vec<String> = Vec::new();
                         if let Some(s) = render_acct_node(ui, root, &mut path, cur.as_deref(), &labels, "acct") {
@@ -3112,7 +3301,7 @@ impl GuiApp {
                 }
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select an account or click “New”.");
+                empty_form_hint(ui, "an account");
             }
         });
 
@@ -3245,9 +3434,16 @@ impl GuiApp {
         };
         // The single global "reveal all" toggle for this screen (mirrors Accounts): when
         // on, all four portal passwords are shown. There is no per-record reveal.
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.re_reveal_all, "reveal all portal passwords");
+        let accent_c = accent(self.theme);
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("View").strong().small().color(accent_c));
+                ui.checkbox(&mut self.re_reveal_all, "👁 reveal all portal passwords").on_hover_text(
+                    "Unmask the four portal passwords on this screen. Resets when you switch tabs.",
+                );
+            });
         });
+        ui.add_space(6.0);
         let reveal = self.re_reveal_all;
         let writable = self.writable;
         let mut new = false;
@@ -3310,7 +3506,7 @@ impl GuiApp {
                 action = form_buttons(ui, writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select a property or click “New”.");
+                empty_form_hint(ui, "a property");
             }
         });
 
@@ -3418,7 +3614,7 @@ impl GuiApp {
                 action = form_buttons(ui, writable);
                 history_view(ui, &r.history);
             } else {
-                ui.label("Select a tax year or click “New”.");
+                empty_form_hint(ui, "a tax year");
             }
         });
 
@@ -4191,7 +4387,8 @@ impl eframe::App for GuiApp {
         self.tick_clipboard(ui.ctx());
         // Apply (and persist) the color theme only when the selection changed.
         if self.theme != self.applied_theme {
-            ui.ctx().set_visuals(visuals_for(self.theme));
+            // The palette AND the accent-colored parts of the style change together.
+            apply_theme(ui.ctx(), self.theme);
             save_theme(self.theme);
             self.applied_theme = self.theme;
         }
@@ -4232,17 +4429,44 @@ impl eframe::App for GuiApp {
             self.ui_top_bar(ui);
             ui.add_space(4.0);
         });
-        if !self.status.is_empty() {
-            egui::Panel::bottom("status").show_inside(ui, |ui| {
-                ui.label(egui::RichText::new(&self.status).weak());
+        // The status bar is ALWAYS drawn, even when idle. Showing it conditionally
+        // made the whole tab jump by a row whenever a message arrived or aged out;
+        // a fixed strip keeps the layout still and gives the message a known home.
+        egui::Panel::bottom("status").show_inside(ui, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let accent = accent(self.theme);
+                if self.status.is_empty() {
+                    ui.label(egui::RichText::new("●").color(accent.gamma_multiply(0.5)).small());
+                    ui.label(egui::RichText::new("Ready").weak().small());
+                } else {
+                    ui.label(egui::RichText::new("●").color(accent).small());
+                    ui.label(egui::RichText::new(&self.status).small());
+                }
+                // The clipboard's auto-clear countdown belongs where the eye already
+                // looks for state — otherwise a copied password's lifetime is invisible.
+                if self.clipboard_dirty {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("📋 clipboard clears automatically")
+                                .small()
+                                .color(egui::Color32::from_rgb(190, 105, 10)),
+                        );
+                    });
+                }
             });
-        }
+            ui.add_space(3.0);
+        });
         // Draw the active tab inside a both-axis scroll area, so when a tab's content
         // is larger than the window the user gets vertical AND horizontal scrollbars
         // instead of clipped content. `auto_shrink([false, false])` makes the area fill
         // the panel (so the two-column layouts get full width); egui constrains the
         // content to the viewport, so scrollbars appear only on genuine overflow.
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        // A little breathing room between the window chrome and the content. The tab
+        // bodies used to start flush against the top bar and the window edge.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)))
+            .show_inside(ui, |ui| {
             egui::ScrollArea::both().auto_shrink([false, false]).id_salt("main_scroll").show(ui, |ui| {
                 match self.tab {
                     Tab::Urgent => self.tab_urgent(ui),
@@ -4283,29 +4507,47 @@ fn show_error_banner(error: &mut Option<String>, ui: &mut egui::Ui) {
         .frame(
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(176, 0, 32))
-                .inner_margin(egui::Margin::same(10)),
+                .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("⚠  {msg}"))
-                        .color(egui::Color32::WHITE)
-                        .strong()
-                        .size(15.0),
-                );
+                ui.label(egui::RichText::new("⚠").color(egui::Color32::WHITE).strong().size(18.0));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&msg).color(egui::Color32::WHITE).strong().size(15.0));
+                // Dismiss is pushed to the right edge of the banner rather than sitting
+                // on a second line under the message.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Dismiss ✕").clicked() {
+                        *error = None;
+                    }
+                });
             });
-            ui.add_space(2.0);
-            if ui.button("Dismiss ✕").clicked() {
-                *error = None;
-            }
         });
 }
 
 // `current` is borrowed mutably so the click can change it. `*current` is a
 // *dereference*: it reads/writes the value behind the `&mut` reference (compare
 // `*current == tab`, assign `*current = tab`).
-fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
-    if ui.selectable_label(*current == tab, label).clicked() {
+fn tab_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str, accent: egui::Color32) {
+    let selected = *current == tab;
+    // The active tab is bolded and tinted, then underlined with an accent bar drawn
+    // just under its rect — the underline is what makes "which tab am I on" readable
+    // at a glance across ten differently-colored themes.
+    let text = if selected {
+        egui::RichText::new(label).strong().color(accent)
+    } else {
+        egui::RichText::new(label)
+    };
+    let resp = ui.selectable_label(selected, text);
+    if selected {
+        let r = resp.rect;
+        ui.painter().hline(
+            r.min.x + 2.0..=r.max.x - 2.0,
+            r.max.y + 1.0,
+            egui::Stroke::new(2.0, accent),
+        );
+    }
+    if resp.clicked() {
         *current = tab;
     }
 }
@@ -4424,20 +4666,42 @@ fn list_panel(
     let mut new = false;
     let mut select = None;
     let mut export = false;
+    // `apply_style` parks the theme's accent in the selection stroke, so free widgets
+    // can pick it up without every call site having to pass it down.
+    let accent = ui_accent(ui);
     ui.horizontal(|ui| {
-        ui.heading(title);
-        // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
-        // only (offered only when writable) — a read-only heir must not bulk-export secrets.
-        if writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
-            export = true;
-        }
+        section_heading(ui, title, accent);
+        badge(ui, &format!("{}", labels.len()), accent);
+        // Actions sit at the right edge of the list header, away from the title.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // "New" is a write; only offered when writable.
+            if writable && ui.button(new_label).clicked() {
+                new = true;
+            }
+            // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
+            // only (offered only when writable) — a read-only heir must not bulk-export secrets.
+            if writable && ui.button("⤓ CSV").on_hover_text("Export all rows to a timestamped CSV in the export directory (write mode)").clicked() {
+                export = true;
+            }
+        });
     });
-    // "New" is a write; only offered when writable.
-    if writable && ui.button(new_label).clicked() {
-        new = true;
-    }
+    ui.add_space(4.0);
     ui.separator();
-    ui.label(egui::RichText::new(format!("{} item(s)", labels.len())).weak());
+    ui.add_space(2.0);
+    if labels.is_empty() {
+        // An empty list previously read as a blank panel, which is indistinguishable
+        // from a broken one. Say which it is.
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(if writable {
+                "Nothing here yet — click New to add the first record."
+            } else {
+                "Nothing here (or every record is hidden by a filter)."
+            })
+            .weak()
+            .italics(),
+        );
+    }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // `.enumerate()` pairs each item with its index `i`; the `(i, (id, label))`
         // pattern destructures the index and the inner tuple together.
@@ -4457,6 +4721,64 @@ fn list_panel(
     (new, select, export)
 }
 
+/// The right-hand pane before anything is selected. A bare one-line label read as
+/// a stray sentence; this centers a glyph and the instruction so the empty pane
+/// looks deliberate rather than unfinished.
+fn empty_form_hint(ui: &mut egui::Ui, noun: &str) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new("👈").size(28.0).color(ui_accent(ui).gamma_multiply(0.7)));
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(format!("Select {noun} from the list")).strong());
+        ui.label(egui::RichText::new("…or click New to add one.").weak().small());
+    });
+}
+
+// The two reserved status colors for money. They are NOT part of the accent
+// family and are never reused as decoration: green means "this is what is owned",
+// red "this is what is owed". Both are readable on the light and the dark
+// surfaces of all ten themes.
+const STAT_GOOD: egui::Color32 = egui::Color32::from_rgb(45, 130, 80);
+const STAT_BAD: egui::Color32 = egui::Color32::from_rgb(185, 70, 70);
+
+/// A headline figure with its label: the Summary tab's KPI row.
+///
+/// Label above in secondary ink (never in the value's color — the number carries
+/// the meaning), value below at display size. Read-only presentation of numbers
+/// the table below already contains.
+fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.35)))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_min_width(140.0);
+                ui.label(egui::RichText::new(label).weak().small());
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(value).size(22.0).strong().color(color));
+            });
+        });
+    ui.add_space(6.0);
+}
+
+/// A Config-screen section heading: accent-colored, with the vertical rhythm that
+/// separates one settings group from the next. Config used to run every group
+/// together in one undifferentiated column.
+fn config_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(text).strong().size(16.0).color(ui_accent(ui)));
+    ui.add_space(4.0);
+}
+
+/// The theme's accent color, recovered from the style. `apply_style` parks it in
+/// the selection stroke so free-standing widgets (which have no `GuiApp` to ask)
+/// can stay in the palette without threading a color through every call.
+fn ui_accent(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().selection.stroke.color
+}
+
 /// Save / Delete buttons; returns the chosen action. Renders nothing (and stays
 /// `None`) in read-only mode.
 fn form_buttons(ui: &mut egui::Ui, writable: bool) -> FormAction {
@@ -4464,12 +4786,26 @@ fn form_buttons(ui: &mut egui::Ui, writable: bool) -> FormAction {
         return FormAction::None;
     }
     let mut action = FormAction::None;
+    ui.add_space(10.0);
+    ui.separator();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("💾 Save").clicked() {
+        // Save is the primary action, so it is the filled one; delete is destructive,
+        // so it is tinted red and sits apart from the button you actually want.
+        let accent = ui_accent(ui);
+        if ui
+            .add(egui::Button::new(egui::RichText::new("💾 Save").strong().color(egui::Color32::WHITE)).fill(accent))
+            .on_hover_text("Write this record to the vault")
+            .clicked()
+        {
             action = FormAction::Save;
         }
-        if ui.button("🗑 Delete").clicked() {
+        ui.add_space(10.0);
+        if ui
+            .add(egui::Button::new(egui::RichText::new("🗑 Delete").color(egui::Color32::from_rgb(200, 60, 60))))
+            .on_hover_text("Remove this record from the vault")
+            .clicked()
+        {
             action = FormAction::Delete;
         }
     });
@@ -4582,33 +4918,50 @@ fn portal_section(
     writable: bool,
     copy_pw: &mut Option<Zeroizing<String>>,
 ) {
-    ui.separator();
-    ui.label(egui::RichText::new(title).strong());
-    egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-        text_row(ui, "URL", url, writable);
-        text_row(ui, "Username", username, writable);
-        ui.label("Password");
-        ui.horizontal(|ui| {
-            // `title` is unique per portal (Property Mgmt / Insurance / HOA / Tax), so
-            // it is a valid per-field id salt for the secret-field hardening. Copy stays
-            // available read-only (it is a read, not an edit).
-            secret_text_edit(ui, title, password, reveal, writable, 260.0, copy_pw);
-            if ui.button("📋").on_hover_text("Copy").clicked() {
-                *copy_pw = Some(Zeroizing::new(password.clone()));
-            }
+    let accent = ui_accent(ui);
+    ui.add_space(4.0);
+    // Each of the four portals is its own card, so they read as four separate
+    // logins rather than one long run of near-identical fields.
+    card(ui, |ui| {
+        ui.label(egui::RichText::new(format!("🔐 {title}")).strong().color(accent));
+        ui.add_space(4.0);
+        egui::Grid::new(title).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            text_row(ui, "URL", url, writable);
+            text_row(ui, "Username", username, writable);
+            ui.label("Password");
+            ui.horizontal(|ui| {
+                // `title` is unique per portal (Property Mgmt / Insurance / HOA / Tax), so
+                // it is a valid per-field id salt for the secret-field hardening. Copy stays
+                // available read-only (it is a read, not an edit).
+                secret_text_edit(ui, title, password, reveal, writable, 260.0, copy_pw);
+                if ui
+                    .button("📋")
+                    .on_hover_text("Copy to the clipboard (cleared automatically after 15 seconds)")
+                    .clicked()
+                {
+                    *copy_pw = Some(Zeroizing::new(password.clone()));
+                }
+            });
+            ui.end_row();
         });
-        ui.end_row();
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Comment").weak().small());
+        // Editable when writable, else immutable-but-selectable (see `field_singleline`).
+        // The per-portal `id_salt` keeps the four comment boxes' ids distinct.
+        let salt = (title, "comment");
+        if writable {
+            ui.add(
+                egui::TextEdit::multiline(comment)
+                    .id_salt(salt)
+                    .hint_text("security questions, account numbers, who to ask for…")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+        } else {
+            let mut ro = comment.as_str();
+            ui.add(egui::TextEdit::multiline(&mut ro).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
+        }
     });
-    ui.label("Comment");
-    // Editable when writable, else immutable-but-selectable (see `field_singleline`).
-    // The per-portal `id_salt` keeps the four comment boxes' ids distinct.
-    let salt = (title, "comment");
-    if writable {
-        ui.add(egui::TextEdit::multiline(comment).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
-    } else {
-        let mut ro = comment.as_str();
-        ui.add(egui::TextEdit::multiline(&mut ro).id_salt(salt).desired_rows(2).desired_width(f32::INFINITY));
-    }
 }
 
 /// Sorted, de-duplicated, non-empty values — used to populate filter dropdowns.
@@ -4691,27 +5044,52 @@ fn doc_section(
     writable: bool,
 ) -> DocSectionReq {
     let mut req = DocSectionReq::None;
-    ui.label(egui::RichText::new("Documents (encrypted volume)").strong());
+    let accent = ui_accent(ui);
+    ui.add_space(4.0);
+    // The whole document area is one card, so a form reads as "fields, then the
+    // files that belong to them" rather than as an undifferentiated column.
+    card(ui, |ui| {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("📎 Documents").strong().color(accent));
+        ui.label(egui::RichText::new("stored encrypted inside the vault").weak().small());
+    });
+    ui.add_space(6.0);
     if attached.is_empty() {
-        ui.label(egui::RichText::new("(no documents attached)").weak());
+        ui.label(egui::RichText::new("No documents attached.").weak().italics());
     } else {
         for (i, label) in attached.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(format!("• {label}"));
-                // Export is a read (always allowed); Remove mutates the vault. Export
-                // writes into the directory configured in Config, recreating the document's
-                // volume folder structure — there is no per-export path prompt.
-                if ui.button("Export").clicked() {
-                    req = DocSectionReq::Export(i);
-                }
-                if writable && ui.button("Remove").clicked() {
-                    req = DocSectionReq::Remove(i);
-                }
+                ui.label(egui::RichText::new("📄").color(accent));
+                ui.label(label);
+                // Actions right-aligned so a long filename never pushes them off-screen.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if writable
+                        && ui
+                            .button("🗑 Remove")
+                            .on_hover_text("Detach this document from the record and reclaim its space")
+                            .clicked()
+                    {
+                        req = DocSectionReq::Remove(i);
+                    }
+                    // Export is a read (always allowed); Remove mutates the vault. Export
+                    // writes into the directory configured in Config, recreating the document's
+                    // volume folder structure — there is no per-export path prompt.
+                    if ui
+                        .button("⤓ Export")
+                        .on_hover_text("Write a DECRYPTED copy into the export directory set in Config")
+                        .clicked()
+                    {
+                        req = DocSectionReq::Export(i);
+                    }
+                });
             });
         }
     }
     if writable {
+        ui.add_space(6.0);
         ui.separator();
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Attach a file").strong().small());
         egui::Grid::new("doc_attach").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Subfolder (optional)");
             ui.add(egui::TextEdit::singleline(subfolder).hint_text("statements").desired_width(300.0));
@@ -4720,9 +5098,20 @@ fn doc_section(
             ui.add(egui::TextEdit::singleline(filename).hint_text("statement.pdf").desired_width(300.0));
             ui.end_row();
             ui.label("Upload from");
-            ui.add(egui::TextEdit::singleline(source).hint_text("/path/on/disk/file.pdf").desired_width(300.0));
+            ui.add(
+                egui::TextEdit::singleline(source)
+                    .hint_text("/path/on/disk/file.pdf")
+                    .desired_width(300.0),
+            )
+            .on_hover_text("The full path to the file. A double-quoted path is accepted as-is.");
             ui.end_row();
         });
+        ui.label(
+            egui::RichText::new("Leave Filename blank to keep the source file's own name. The original file is not moved.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
         // Approximate the virtual path length: the stored path also includes the
         // owner-initials/group levels and the <ts>_ filename prefix (~80 bytes, not
         // visible here), so reserve for them. `handle_doc`/`handle_*_doc` do the
@@ -4735,10 +5124,19 @@ fn doc_section(
                 format!("Path may be too long (~{vpath_len} / {} bytes) — shorten the filename or subfolder.", crate::storage::MAX_PATH_LEN),
             );
         }
-        if ui.add_enabled(!over_limit, egui::Button::new("⬆ Attach (encrypt into volume)")).clicked() {
+        if ui
+            .add_enabled(
+                !over_limit,
+                egui::Button::new(egui::RichText::new("⬆ Attach").strong().color(egui::Color32::WHITE)).fill(accent),
+            )
+            .on_hover_text("Encrypt a copy of the file into the vault's document archive")
+            .clicked()
+        {
             req = DocSectionReq::Upload;
         }
     }
+    });
+    ui.add_space(4.0);
     req
 }
 
@@ -4788,27 +5186,38 @@ fn linked_accounts_section(
     writable: bool,
 ) -> LinkReq {
     let mut req = LinkReq::None;
-    ui.label(egui::RichText::new("Linked accounts").strong());
+    let accent = ui_accent(ui);
+    ui.add_space(4.0);
+    card(ui, |ui| {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("🔗 Linked accounts").strong().color(accent));
+        ui.label(egui::RichText::new("the logins that hold or service this").weak().small());
+    });
+    ui.add_space(6.0);
     if linked.is_empty() {
-        ui.label(egui::RichText::new("(no linked accounts)").weak());
+        ui.label(egui::RichText::new("No linked accounts.").weak().italics());
     }
     for (i, (id, label)) in linked.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(format!("• {label}"));
-            if ui.button("Open").clicked() {
-                req = LinkReq::Open(id.clone());
-            }
-            if writable && ui.button("Unlink").clicked() {
-                req = LinkReq::Remove(i);
-            }
+            ui.label(egui::RichText::new("🔑").color(accent));
+            ui.label(label);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if writable && ui.button("Unlink").on_hover_text("Remove this link (the account itself is untouched)").clicked() {
+                    req = LinkReq::Remove(i);
+                }
+                if ui.button("Open ➜").on_hover_text("Jump to this account on the Accounts tab").clicked() {
+                    req = LinkReq::Open(id.clone());
+                }
+            });
         });
     }
     if writable {
+        ui.add_space(4.0);
         // Hand-rolled (id, label) dropdown: the shared `combo`/`filter_combo` helpers
         // bind a &mut String VALUE from a String list, but a link stores the account's
         // ID while showing its LABEL — so there is no bound buffer; a click on an entry
         // just emits the Add request (nothing is "currently selected").
-        egui::ComboBox::from_id_salt("asset_link_add").selected_text("Link an account…").show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("asset_link_add").selected_text("➕ Link an account…").show_ui(ui, |ui| {
             if candidates.is_empty() {
                 ui.label(egui::RichText::new("(no more accounts to link)").weak());
             }
@@ -4819,16 +5228,25 @@ fn linked_accounts_section(
             }
         });
     }
+    });
+    ui.add_space(4.0);
     req
 }
 
 /// A collapsing, timestamped history view for a record.
 // `&[records::Change]` is a read-only slice of change entries.
 fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
-    ui.add_space(8.0);
-    egui::CollapsingHeader::new("History").default_open(false).show(ui, |ui| {
+    ui.add_space(10.0);
+    // The entry count sits in the header so it is visible without expanding —
+    // "has this record ever been touched" is answerable at a glance.
+    let title = if history.is_empty() {
+        "🕘 History".to_string()
+    } else {
+        format!("🕘 History  ({} entr{})", history.len(), if history.len() == 1 { "y" } else { "ies" })
+    };
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong()).default_open(false).show(ui, |ui| {
         if history.is_empty() {
-            ui.label(egui::RichText::new("(no changes recorded)").weak());
+            ui.label(egui::RichText::new("No changes recorded yet.").weak().italics());
         }
         egui::ScrollArea::vertical().max_height(180.0).id_salt("hist").show(ui, |ui| {
             // `.iter().rev()` walks the entries newest-first (reverse order).
@@ -4838,7 +5256,12 @@ fn history_view(ui: &mut egui::Ui, history: &[records::Change]) {
                 // and the live field's reveal toggle deliberately does not extend here).
                 let detail =
                     if c.detail.is_empty() { c.action.clone() } else { records::display_detail(&c.detail) };
-                ui.label(format!("{}  —  {detail}", format_time(c.at)));
+                ui.horizontal_top(|ui| {
+                    // A fixed-width monospace timestamp column makes the log scannable
+                    // instead of a ragged run of prose.
+                    ui.label(egui::RichText::new(format_time(c.at)).monospace().weak().small());
+                    ui.label(egui::RichText::new(detail).small());
+                });
             }
         });
     });
@@ -5030,6 +5453,79 @@ mod tests {
         app.vault = Some(ov);
         app.screen = Screen::Main;
         (app, path)
+    }
+
+    /// Lay out every tab in a real egui — with and without a record selected — so a
+    /// layout fault in the shared chrome (the cards, the right-aligned action rows,
+    /// the stat tiles, the empty-state pane) fails here rather than in front of the
+    /// user. Nested layouts and duplicate widget ids only misbehave once something
+    /// actually measures them.
+    #[test]
+    fn every_tab_renders_in_real_egui() {
+        use egui_kittest::Harness;
+
+        let (app, path) = app_unlocked("tabrender");
+        let app = std::cell::RefCell::new(app);
+        let tabs = [
+            Tab::Urgent,
+            Tab::Instructions,
+            Tab::TrustWill,
+            Tab::Assets,
+            Tab::Accounts,
+            Tab::RealEstate,
+            Tab::Taxes,
+            Tab::GeneralDocuments,
+            Tab::Summary,
+        ];
+        // `selected == true` starts a blank record on the tab first, which is what
+        // brings the form, its document/link/portal cards, and the history view into
+        // the frame; `false` exercises the empty-state pane.
+        for selected in [false, true] {
+            for tab in tabs {
+                {
+                    let mut a = app.borrow_mut();
+                    a.tab = tab;
+                    if selected {
+                        // Seed the tab's edit buffer directly (the same thing its "New"
+                        // button does) so the form half of the split renders.
+                        match tab {
+                            Tab::Urgent => a.edit_urgent = Urgent::new().ok(),
+                            Tab::Instructions => a.edit_instruction = Instruction::new().ok(),
+                            Tab::TrustWill => a.edit_trustwill = TrustWill::new().ok(),
+                            Tab::Assets => a.edit_asset = AssetLiability::new().ok(),
+                            Tab::Accounts => a.edit_account = Account::new().ok(),
+                            Tab::RealEstate => a.edit_realestate = RealEstate::new().ok(),
+                            Tab::Taxes => a.edit_taxfiling = TaxFiling::new().ok(),
+                            Tab::GeneralDocuments => a.edit_general = GeneralDocument::new().ok(),
+                            Tab::Summary => {} // a calculated view — no edit buffer
+                        }
+                    }
+                }
+                let mut h = Harness::new_ui(|ui| {
+                    let mut a = app.borrow_mut();
+                    a.ui_top_bar(ui);
+                    let tab = a.tab;
+                    match tab {
+                        Tab::Urgent => a.tab_urgent(ui),
+                        Tab::Instructions => a.tab_instructions(ui),
+                        Tab::TrustWill => a.tab_trustwill(ui),
+                        Tab::Assets => a.tab_assets(ui),
+                        Tab::Accounts => a.tab_accounts(ui),
+                        Tab::RealEstate => a.tab_realestate(ui),
+                        Tab::Taxes => a.tab_taxes(ui),
+                        Tab::GeneralDocuments => a.tab_general(ui),
+                        Tab::Summary => a.tab_summary(ui),
+                    }
+                });
+                h.run();
+            }
+        }
+        // The Config and Help screens go through the same treatment.
+        let mut h = Harness::new_ui(|ui| app.borrow_mut().ui_config(ui));
+        h.run();
+        let mut h = Harness::new_ui(|ui| app.borrow_mut().ui_help(ui));
+        h.run();
+        cleanup(&path);
     }
 
     #[test]
@@ -6003,6 +6499,63 @@ mod kittest_tests {
     use crate::records::{AccountLeaf, AcctNode};
     use eframe::egui;
     use egui_kittest::{kittest::Queryable, Harness};
+
+    /// Every article in the manual must actually render. The help browser nests
+    /// panels (top + left + central) inside the screen's own CentralPanel and builds
+    /// per-table grid ids from content pointers, so a layout or duplicate-id fault
+    /// would only ever show up when a real egui lays it out — not in a data test.
+    #[test]
+    fn every_help_topic_renders_in_real_egui() {
+        use crate::gui_help::{HelpContext, HelpState, TOPICS};
+
+        for (i, topic) in TOPICS.iter().enumerate() {
+            let state = std::cell::RefCell::new(HelpState { query: String::new(), topic: i });
+            let ctx = HelpContext {
+                vault: "/tmp/vault/vault.pmv".into(),
+                prefs: "/tmp/prefs.json".into(),
+                writable: true,
+            };
+            let mut h = Harness::new_ui(|ui| {
+                let mut s = state.borrow_mut();
+                crate::gui_help::ui(ui, &mut s, &ctx, egui::Color32::from_rgb(21, 92, 170));
+            });
+            h.run();
+            // The title renders twice — once in the index, once as the article's
+            // heading — so this counts matches rather than expecting exactly one.
+            assert!(
+                h.query_all_by_label(topic.title).count() >= 2,
+                "help topic {:?} did not render in both the index and the body",
+                topic.id
+            );
+        }
+    }
+
+    /// Searching must narrow the visible index and leave the browser on a topic the
+    /// index still lists — the case where the previously-selected article is filtered
+    /// away is exactly where a stale index would render an unreachable page.
+    #[test]
+    fn help_search_narrows_the_index_and_follows_the_selection_in_real_egui() {
+        use crate::gui_help::{HelpContext, HelpState};
+
+        // Start on the LAST topic, then search for something only an early topic
+        // matches: the selection must move to a topic that is still listed.
+        let last = crate::gui_help::TOPICS.len() - 1;
+        let state = std::cell::RefCell::new(HelpState { query: "argon2id".into(), topic: last });
+        let ctx =
+            HelpContext { vault: "/v".into(), prefs: "/p".into(), writable: false };
+        let mut h = Harness::new_ui(|ui| {
+            let mut s = state.borrow_mut();
+            crate::gui_help::ui(ui, &mut s, &ctx, egui::Color32::from_rgb(21, 92, 170));
+        });
+        h.run();
+        let landed = state.borrow().topic;
+        let hits = crate::gui_help::search("argon2id");
+        assert!(hits.contains(&landed), "the browser must land on a topic the filtered index lists");
+        assert!(
+            h.query_all_by_label(crate::gui_help::TOPICS[landed].title).count() >= 2,
+            "the followed-to article renders, in the index and as the article heading"
+        );
+    }
 
     fn one_group_tree(group: &str, leaf_id: &str, leaf_title: &str) -> AcctNode {
         AcctNode {

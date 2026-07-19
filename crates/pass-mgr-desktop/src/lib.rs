@@ -21,6 +21,8 @@ pub use pass_mgr_core::{crypto, csv, fault, merge, password, records, storage, t
 
 #[cfg(feature = "gui")]
 pub mod gui; // graphical front-end (drives the same vault API as `ui`); behind `gui`
+#[cfg(feature = "gui")]
+pub mod gui_help; // the GUI's built-in manual (content + the help browser); behind `gui`
 pub mod launch; // vault-path/flag resolution shared by the console + windowed binaries
 #[cfg(feature = "gui")]
 pub mod single_instance; // GUI single-instance guard (raises the egui window); behind `gui`

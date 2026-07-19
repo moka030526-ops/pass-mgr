@@ -51,6 +51,16 @@ date and bump the crate versions to match.
 
 ### Added
 
+- **A comprehensive in-app manual (GUI).** The Help screen is now a searchable, two-pane
+  browser — a topic index on the left, the article on the right — over **22 articles in 5
+  sections**: getting started, one article per tab, working with records (editing, secrets,
+  documents, links, history), settings & maintenance (every Config setting, merges, backups,
+  compaction), and reference (security model, keyboard, the full CLI, troubleshooting, FAQ).
+  Search matches every word of every article, not just titles (AND semantics across words).
+  The content lives as plain data in the new `gui_help` module, so the search is a pure
+  function and the manual's structure is unit-tested; a headless `egui_kittest` test lays out
+  every article. Replaces the previous eight collapsible blurbs. **No behavior change.**
+
 - **URGENT tab.** A new free-text note collection placed **first**, before Instructions, so
   the most time-critical things an executor needs (whom to call, where the safe key is, an
   in-flight crisis) are the first thing shown on unlock. Same shape as Instructions (a title
@@ -163,6 +173,30 @@ date and bump the crate versions to match.
   checks; a release-mode test job.
 
 ### Changed
+
+- **Graphical interface visual overhaul.** A shared design system replaces egui's
+  debug-tool defaults, applied through `apply_theme` (palette + typography/spacing/shape) with
+  one accent color per theme. **Purely presentational — no control changed what it does:**
+  - **Type & spacing:** a real heading step, 14.5 px body, roomier control padding, rounded
+    corners, and an accent focus ring.
+  - **Top bar:** shows *which* vault is open (folder name, full path on hover) with a
+    WRITE / 🔒 READ-ONLY badge; global actions right-aligned; the tab strip gained per-tab
+    glyphs and an accent underline on the active tab.
+  - **Cards:** documents, linked accounts, the four Real Estate portals, and the
+    Accounts/Assets/Real-Estate control strips are each framed, so a form reads as grouped
+    regions instead of one long column. Config's ten settings groups gained accent headings.
+  - **Summary tab:** a headline stat row (total assets, total liabilities, net worth, owners)
+    above the table, with the two reserved status colors also applied to the Liability and Net
+    columns — always alongside a word label or the number's own sign, never color alone.
+  - **Status bar** is now always present (it used to appear and disappear, shifting the whole
+    tab by a row) and reports when the clipboard is holding a copied secret.
+  - **Empty states:** the unselected form pane and an empty list now say what to do instead of
+    rendering blank; the Accounts filter row shows a "filtered" badge when filters are hiding
+    rows.
+  - **Lock screen** is a centered, width-limited card that states the session's mode before a
+    password is typed.
+  - Verified by a headless `egui_kittest` test that lays out every tab (with and without a
+    record selected), Config, and Help.
 
 - **Cargo workspace split** into `pass-mgr-core` (audited, `#![forbid(unsafe_code)]`),
   `pass-mgr-desktop` (GUI/TUI/CLI), and `pass-mgr-ffi` (the only `unsafe`-permitting
