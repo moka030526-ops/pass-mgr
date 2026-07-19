@@ -187,13 +187,19 @@ pub(crate) const TOPICS: &[Topic] = &[
                  writes nothing to the vault at all, so it cannot damage anything — it is the safe \
                  default, and the mode an heir should use.",
             ),
-            Block::P("When read-only, an orange 🔒 READ-ONLY badge sits in the top bar and every write control is hidden."),
+            Block::P(
+                "When read-only, an orange 🔒 READ-ONLY badge sits in the top bar and the controls \
+                 that would change the vault are hidden.",
+            ),
             Block::Sub("What still works read-only"),
             Block::Bullets(&[
                 "Reading every record on every tab. The forms become a view: the text cannot be \
                  edited, but it can still be selected and copied.",
                 "Revealing and copying passwords.",
                 "Exporting documents to the export directory.",
+                "Exporting a tab to CSV. Note the file is UNENCRYPTED and an Accounts or Real \
+                 Estate CSV contains every password in plain text — treat it exactly as you would \
+                 the passwords themselves.",
                 "Running a backup of the encrypted vault.",
                 "Changing the color theme, the view defaults, and the export directory — these are \
                  local preferences on this machine, not vault content.",
@@ -205,8 +211,6 @@ pub(crate) const TOPICS: &[Topic] = &[
                 "Changing the passwords.",
                 "Editing the type and subtype lists, the volume size, and the redundancy setting.",
                 "Updating from another vault.",
-                "Exporting a tab to CSV — a CSV of Accounts or Real Estate holds every password in \
-                 plain text, so a read-only heir is deliberately not able to bulk-dump secrets.",
             ]),
             Block::Note("To switch modes, close the window and relaunch with the --write flag."),
         ],

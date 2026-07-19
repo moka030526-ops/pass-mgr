@@ -184,6 +184,17 @@ date and bump the crate versions to match.
   quietly shipping — and verifies each against egui's bundled fonts, with a control pair so a
   broken probe cannot pass silently.
 
+- **CSV export is now available in read-only sessions** (GUI and TUI), at the vault owner's
+  explicit request. It was previously write-mode-only on the reasoning that an Accounts or Real
+  Estate CSV holds every password in plain text and a read-only heir should not be able to
+  bulk-dump secrets. That gate is removed; the warning it enforced is now carried where the user
+  can act on it — the button's tooltip states the file is unencrypted and includes plaintext
+  passwords, and every successful export reports "… — UNENCRYPTED, incl. any passwords." rather
+  than a bare success. `➕ New` and the other record-mutating controls remain write-only. The
+  manual's read-only/write-mode lists were updated to match, and the two tests that pinned the
+  refusal now pin the new behaviour (including that the written CSV really does contain the
+  plaintext password it warns about).
+
 - **Read-only values are text again, not boxes.** A read-only session rendered every stored
   value in a disabled text box sized to the pane, so a four-letter owner name occupied the same
   356 px as a full address and a form read as a column of near-empty boxes. Values now render

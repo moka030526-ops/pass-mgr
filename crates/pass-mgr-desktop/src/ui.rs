@@ -1369,9 +1369,9 @@ impl App {
                 self.screen = Screen::Config;
             }
             // Export every record on the current tab to a timestamped CSV in the configured
-            // export directory. Because the Accounts / Real Estate CSVs contain passwords in
-            // PLAINTEXT, this requires WRITE mode (export_current_tab_csv gates on
-            // require_writable) — a read-only heir must not bulk-dump every secret.
+            // export directory. Allowed in read-only sessions (as in the GUI); the resulting
+            // file is UNENCRYPTED and the Accounts / Real Estate CSVs contain passwords in
+            // PLAINTEXT, which the status line states after each export.
             KeyCode::Char('e') => self.export_current_tab_csv(),
             _ => {}
         }
@@ -2490,9 +2490,9 @@ impl App {
     /// document export (which a read-only heir may use), a CSV can hold every record's
     /// plaintext password, so a read-only session must not be able to bulk-dump it.
     fn export_current_tab_csv(&mut self) {
-        if !self.require_writable() {
-            return; // sets the "Read-only — relaunch with --write" status hint
-        }
+        // Available in READ-ONLY sessions too (matching the GUI), at the vault owner's
+        // explicit request. The file is plain, unencrypted text and — on Accounts and
+        // Real Estate — holds every password in the clear, which the status line says.
         let dir = self.cfg_export_dir.trim().to_string();
         if dir.is_empty() {
             self.status = "Set an export directory in Config first (Config → Export directory).".into();
@@ -2505,7 +2505,10 @@ impl App {
         };
         let filename = format!("{base}-{}.csv", records::compact_utc(records::unix_now()));
         match crate::vault::write_export_bytes(Path::new(&dir), &filename, text.as_bytes()) {
-            Ok(p) => self.status = format!("Exported {n} record(s) to {}", p.display()),
+            Ok(p) => {
+                self.status =
+                    format!("Exported {n} record(s) to {} — UNENCRYPTED, incl. any passwords.", p.display());
+            }
             Err(e) => self.status = format!("CSV export failed: {e}"),
         }
     }
@@ -5085,9 +5088,10 @@ mod tests {
     }
 
     #[test]
-    fn export_current_tab_csv_is_refused_in_read_only_mode() {
-        // A CSV can hold every record's plaintext password, so export requires WRITE mode —
-        // a read-only (heir) session must not be able to bulk-dump secrets.
+    fn export_current_tab_csv_works_in_read_only_mode() {
+        // CSV export is deliberately available to a READ-ONLY session (the vault owner
+        // asked for it). The file is unencrypted and may hold plaintext passwords, so the
+        // status line has to say so rather than report a bare success.
         let (mut app, path) = app_unlocked("uicsvro");
         let outdir = path.parent().unwrap().join("uicsvro-out");
         {
@@ -5098,10 +5102,18 @@ mod tests {
         }
         app.tab = Tab::Accounts;
         app.cfg_export_dir = outdir.to_string_lossy().into();
-        app.writable = false; // simulate a read-only session
+        app.writable = false; // a read-only session
         app.export_current_tab_csv();
-        assert!(app.status.contains("Read-only"), "refused with a read-only hint: {}", app.status);
-        assert!(!outdir.exists(), "no CSV written in read-only mode");
+        assert!(app.status.starts_with("Exported"), "export ran read-only: {}", app.status);
+        assert!(
+            app.status.contains("UNENCRYPTED"),
+            "the plaintext warning must ride along with the success: {}",
+            app.status
+        );
+        let written: Vec<_> = std::fs::read_dir(&outdir).unwrap().filter_map(Result::ok).collect();
+        assert_eq!(written.len(), 1, "one CSV written");
+        let body = std::fs::read_to_string(written[0].path()).unwrap();
+        assert!(body.contains("hunter2"), "the CSV carries the plaintext password it warns about");
         cleanup(&path);
     }
 

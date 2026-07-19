@@ -968,11 +968,10 @@ impl GuiApp {
     /// document export (which a read-only heir may use), a CSV can hold every record's
     /// plaintext password, so a read-only session must not be able to bulk-dump it.
     fn export_current_tab_csv(&mut self) {
-        // Defense in depth — the per-tab "⬇ CSV" buttons are also hidden when not writable.
-        if !self.writable {
-            self.fail("Export to CSV needs write mode (re-open the vault with write access).");
-            return;
-        }
+        // Available in READ-ONLY sessions too, at the vault owner's explicit request. The
+        // file it writes is plain, unencrypted text and — on Accounts and Real Estate —
+        // contains every password in the clear, so the status line below says so rather
+        // than reporting a bare success.
         let dir = self.export_dir.trim().to_string();
         if dir.is_empty() {
             self.fail("Set an export directory in Config first (Config > Export directory).");
@@ -984,7 +983,10 @@ impl GuiApp {
         };
         let filename = format!("{base}-{}.csv", records::compact_utc(records::unix_now()));
         match vault::write_export_bytes(Path::new(&dir), &filename, text.as_bytes()) {
-            Ok(p) => self.status = format!("Exported {n} record(s) to {}", p.display()),
+            Ok(p) => {
+                self.status =
+                    format!("Exported {n} record(s) to {} — UNENCRYPTED, incl. any passwords.", p.display());
+            }
             Err(e) => self.fail(format!("CSV export failed: {e}")),
         }
     }
@@ -2721,7 +2723,14 @@ impl GuiApp {
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
-                        if self.writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                        if ui
+                            .button("⬇ CSV")
+                            .on_hover_text(
+                                "Export every row on this tab to a timestamped CSV in the export directory.\n\
+                                 The file is UNENCRYPTED and includes passwords in plain text.",
+                            )
+                            .clicked()
+                        {
                             export = true;
                         }
                     });
@@ -3233,7 +3242,14 @@ impl GuiApp {
                         if self.writable && ui.button("➕ New").clicked() {
                             new = true;
                         }
-                        if self.writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+                        if ui
+                            .button("⬇ CSV")
+                            .on_hover_text(
+                                "Export every row on this tab to a timestamped CSV in the export directory.\n\
+                                 The file is UNENCRYPTED and includes passwords in plain text.",
+                            )
+                            .clicked()
+                        {
                             export = true;
                         }
                     });
@@ -4766,9 +4782,17 @@ fn list_panel(
         if writable && ui.button(new_label).clicked() {
             new = true;
         }
-        // "Export to CSV" can dump every record's plaintext password, so it is WRITE-MODE
-        // only (offered only when writable) — a read-only heir must not bulk-export secrets.
-        if writable && ui.button("⬇ CSV").on_hover_text("Export every row on this tab to a timestamped CSV in the export directory (write mode)").clicked() {
+        // Offered in read-only sessions too. The tooltip carries the warning the old
+        // write-mode gate used to enforce: the file is unencrypted and, on Accounts and
+        // Real Estate, holds every password in the clear.
+        if ui
+            .button("⬇ CSV")
+            .on_hover_text(
+                "Export every row on this tab to a timestamped CSV in the export directory.\n\
+                 The file is UNENCRYPTED and includes passwords in plain text.",
+            )
+            .clicked()
+        {
             export = true;
         }
     });
@@ -6037,8 +6061,10 @@ mod tests {
     }
 
     #[test]
-    fn export_current_tab_csv_is_refused_in_read_only_mode_in_gui() {
-        // Write-mode-only: a read-only (heir) session must not bulk-export plaintext passwords.
+    fn export_current_tab_csv_works_in_read_only_mode_in_gui() {
+        // CSV export is deliberately available to a READ-ONLY session (the vault owner
+        // asked for it). The file is unencrypted and may hold plaintext passwords, so the
+        // status line has to say so rather than report a bare success.
         let (mut app, path) = app_unlocked("guicsvro");
         let outdir = path.parent().unwrap().join("guicsvro-out");
         {
@@ -6051,11 +6077,50 @@ mod tests {
         }
         app.tab = Tab::Accounts;
         app.export_dir = outdir.to_string_lossy().into();
-        app.writable = false; // simulate a read-only session
+        app.writable = false; // a read-only session
         app.export_current_tab_csv();
-        assert!(app.status.contains("write mode"), "refused with a write-mode message: {}", app.status);
-        assert!(!outdir.exists(), "no CSV written in read-only mode");
+        assert!(app.status.starts_with("Exported"), "export ran read-only: {}", app.status);
+        assert!(
+            app.status.contains("UNENCRYPTED"),
+            "the plaintext warning must ride along with the success: {}",
+            app.status
+        );
+        assert!(app.error.is_none(), "a successful export raises no failure banner");
+        let written: Vec<_> = std::fs::read_dir(&outdir).unwrap().filter_map(Result::ok).collect();
+        assert_eq!(written.len(), 1, "one CSV written");
+        let body = std::fs::read_to_string(written[0].path()).unwrap();
+        assert!(body.contains("hunter2"), "the CSV carries the plaintext password it warns about");
         cleanup(&path);
+    }
+
+    /// The button itself must be present in a read-only session, on both the flat list
+    /// and the grouped tree — the export is useless if it cannot be reached.
+    #[test]
+    fn csv_button_is_offered_in_read_only_mode_in_real_egui() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        for grouped in [false, true] {
+            let path = tmp("rocsvbtn");
+            let ov = OpenVault::create(path.clone(), b"a", b"b", fast()).unwrap();
+            let mut app = GuiApp::new(path.clone(), false); // read-only
+            app.vault = Some(ov);
+            app.screen = Screen::Main;
+            app.tab = Tab::Accounts;
+            app.acct_grouped = grouped;
+            let app = std::cell::RefCell::new(app);
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(1000.0, 680.0))
+                .build_ui(|ui| app.borrow_mut().render(ui));
+            h.run();
+            assert_eq!(
+                h.query_all_by_label("⬇ CSV").count(),
+                1,
+                "CSV must be reachable read-only (grouped={grouped})"
+            );
+            // "New" stays hidden: creating records is still a write.
+            assert_eq!(h.query_all_by_label("➕ New").count(), 0, "New stays write-only");
+            cleanup(&path);
+        }
     }
 
     #[test]
