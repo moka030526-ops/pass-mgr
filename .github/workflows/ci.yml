@@ -34,6 +34,16 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test (default)
         run: cargo test --workspace --all-targets
+      - name: Test (shipped mobile / static-musl feature set)
+        # Every other test step is `--workspace`, which UNIFIES features across the
+        # workspace and so switches `mlock` + `single-writer-lock` back on via the
+        # desktop crate — meaning the configuration the phone and the static musl
+        # binary actually ship was never executed. Under resolver v2 a `-p` build does
+        # not unify, so these two run the real thing. This gap hid a test that failed
+        # outright without the lock feature.
+        run: |
+          cargo test -p pass-mgr-core --no-default-features
+          cargo test -p pass-mgr-ffi
       - name: Test (fault-injection — crash / full-disk recovery)
         # fault-injection lives on pass-mgr-core; the desktop crate forwards it so the
         # `__crashop` binary + tests/crash_recovery.rs exercise the real fault points.

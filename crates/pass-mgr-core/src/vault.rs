@@ -3305,7 +3305,13 @@ mod tests {
     ///
     /// A source we cannot even create a file in cannot be being written by anyone else
     /// either, which is what makes a lock-less snapshot safe precisely there.
-    #[cfg(unix)]
+    // Gated on `single-writer-lock` as well as unix: `LOCK_FILE` only exists with that
+    // feature, and without it `WriteLock::acquire` is an unconditional `Ok`, so there is
+    // no lock-creation failure for this test to be about. Omitting the feature gate broke
+    // `cargo test -p pass-mgr-core --no-default-features` — the configuration the mobile
+    // and static-musl builds actually use, and the one CI never exercises because every
+    // CI invocation is `--workspace`, which unifies features and switches the lock back on.
+    #[cfg(all(unix, feature = "single-writer-lock"))]
     #[test]
     fn backup_works_when_the_source_directory_is_not_writable() {
         use std::os::unix::fs::PermissionsExt;
@@ -6458,6 +6464,14 @@ mod tests {
         let bp = v.backup(&dest).expect("OpenVault::backup succeeds while the session holds the lock");
         assert!(bp.exists());
         // ...whereas the free function self-deadlocks (the regression we fixed).
+        //
+        // Only meaningful WITH the lock feature. Without it `WriteLock::acquire` is an
+        // unconditional `Ok`, so the free function simply succeeds and there is no
+        // self-deadlock to assert. This assertion was ungated, so the whole test failed
+        // under `--no-default-features` — the configuration the mobile and static-musl
+        // builds use, and one CI never runs (every CI invocation is `--workspace`, which
+        // unifies features and turns the lock back on).
+        #[cfg(feature = "single-writer-lock")]
         assert!(matches!(backup(&path, &dest), Err(VaultError::Locked)), "free backup is Locked while a session is open");
         // The produced backup actually opens.
         OpenVault::open(bp.clone(), b"a", b"b").expect("backup is a valid, openable vault");
