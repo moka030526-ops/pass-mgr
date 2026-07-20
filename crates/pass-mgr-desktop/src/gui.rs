@@ -596,6 +596,10 @@ enum ReDocReq {
 // Field types tell you the shape of each piece: `String` (owned text),
 // `bool` (flag), `Option<T>` (maybe present). egui calls our `ui()` method each
 // frame with `&mut GuiApp`, so every field is freely readable/writable there.
+/// Undo for an in-memory change that a failed save must not leave behind (see
+/// `delete_current`): a one-shot closure that puts the app back the way it was.
+type Rollback = Box<dyn FnOnce(&mut GuiApp)>;
+
 struct GuiApp {
     path: std::path::PathBuf,
     /// When false the vault is opened read-only and write controls are hidden.
@@ -4239,7 +4243,7 @@ impl GuiApp {
         // successful save would silently serialize the whole vault and commit the deletion —
         // unrecoverable data loss. The closure re-inserts the removed record, truncates the
         // remove() audit entry, and restores the edit buffer. (Mirrors the merge path's care.)
-        let mut rollback: Option<Box<dyn FnOnce(&mut Self)>> = None;
+        let mut rollback: Option<Rollback> = None;
         if let Some(ov) = self.vault.as_mut() {
             // `&mut ov.vault` is an exclusive borrow of the in-memory vault data,
             // reused below as `v` to keep the match arms terse.

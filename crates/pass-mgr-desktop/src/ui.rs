@@ -415,6 +415,10 @@ impl EditState {
 
 // The whole application state lives in one struct, passed around as `&self`
 // (read) or `&mut self` (mutate).
+/// Undo for an in-memory change that a failed save must not leave behind (see
+/// `delete_selected`): a one-shot closure that puts the app back the way it was.
+type Rollback = Box<dyn FnOnce(&mut App)>;
+
 struct App {
     path: PathBuf,
     /// When false the vault is opened read-only and mutating keys are inert.
@@ -3137,7 +3141,7 @@ impl App {
         // delete_current): re-insert the removed record VERBATIM and truncate the remove() audit
         // entry, so a later successful save can't silently commit a deletion the user was told
         // failed. Re-insert with push (not upsert) to keep the record's own updated_at + history.
-        let mut rollback: Option<Box<dyn FnOnce(&mut Self)>> = None;
+        let mut rollback: Option<Rollback> = None;
         if let Some(ov) = self.vault.as_mut() {
             let v = &mut ov.vault;
             let audit_len = v.audit.len();

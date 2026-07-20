@@ -156,7 +156,9 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(&scratch, b"SAMPLE STATEMENT - brokerage, Q4 (fictional).\n")?;
     let stmt_doc = v.add_document("assets", "brokerage-q4.txt", &scratch)?;
 
-    let assets: Vec<(&str, &str, &str, &str, &str, &str, Vec<&str>)> = vec![
+    // (kind, title, owner, value, type, institution, titles of accounts to link)
+    type SampleAsset<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str, &'a str, Vec<&'a str>);
+    let assets: Vec<SampleAsset> = vec![
         ("Asset", "412 Alder Street", "Jordan Vale", "540000", "Real Estate", "", vec![]),
         ("Asset", "Brokerage — taxable", "Jordan Vale", "128400.55", "Brokerage", "Meridian Brokerage", vec!["Brokerage — taxable"]),
         ("Asset", "Rollover IRA", "Jordan Vale", "233900", "Retirement", "Meridian Brokerage", vec!["Rollover IRA"]),

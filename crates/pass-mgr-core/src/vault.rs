@@ -622,6 +622,7 @@ impl OpenVault {
     /// - `out/documents/<virtual/path>` — the SAME documents recreated in their human-browsable
     ///   folder tree (like `extract`; duplicate paths get a `_N` suffix). For viewing only.
     /// - `out/csv/<tab>.csv` — a CSV export of every record tab.
+    ///
     /// Reuses the standard decrypt + store-read paths (no new crypto) and refuses a
     /// half-committed rekey.
     ///
@@ -726,7 +727,7 @@ impl OpenVault {
             crate::csv::CsvTab::Taxes,
             crate::csv::CsvTab::GeneralDocuments,
         ] {
-            let (base, text, _) = crate::csv::build_tab_csv(&vault, tab, &name_of);
+            let (base, text, _) = crate::csv::build_tab_csv(&vault, tab, name_of);
             write_new_bytes(&csv_dir.join(format!("{base}.csv")), text.as_bytes())?;
         }
         Ok(())
