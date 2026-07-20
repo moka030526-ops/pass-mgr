@@ -4625,8 +4625,11 @@ fn show_error_banner(error: &mut Option<String>, ui: &mut egui::Ui) {
         )
         .show_inside(ui, |ui| {
             // Dismiss is placed first and the MESSAGE yields space, so the button is
-            // reachable no matter how long the failure text is.
-            egui::containers::Sides::new().shrink_left().show(
+            // reachable no matter how long the failure text is. `.wrap()` makes that
+            // yielded space actually hold the text: a shrinking side defaults to
+            // Extend, so a long failure ran off the window and could only be read by
+            // widening it — now the banner grows downward and stays readable.
+            egui::containers::Sides::new().shrink_left().wrap().show(
                 ui,
                 |ui| {
                     ui.label(egui::RichText::new("⚠").color(egui::Color32::WHITE).strong().size(18.0));
@@ -7127,6 +7130,44 @@ mod kittest_tests {
         assert!(
             h.query_by_label("Dismiss ×").is_none(),
             "the banner is gone after dismissal (nothing rendered when error is None)"
+        );
+    }
+
+    /// A long failure must reflow inside the banner, not run off the window.
+    ///
+    /// `Sides` shrinks the message side to leave room for Dismiss, but a shrinking
+    /// side still defaults to `TextWrapMode::Extend` — so the text simply overflowed
+    /// the window and the only way to read the end of it was to widen the window,
+    /// which defeats the whole point of a conspicuous banner. Wrapping makes the
+    /// banner grow DOWNWARD instead, which is what this asserts: the same banner is
+    /// taller for a long message than for a short one.
+    #[test]
+    fn a_long_error_message_wraps_and_grows_the_banner_in_real_egui() {
+        use super::show_error_banner;
+        use std::cell::{Cell, RefCell};
+
+        let height_of = |msg: &str| -> f32 {
+            let error = RefCell::new(Some(msg.to_string()));
+            let drawn = Cell::new(0.0f32);
+            let mut h = Harness::builder().with_size(egui::vec2(420.0, 300.0)).build_ui(|ui| {
+                let before = ui.min_rect().height();
+                show_error_banner(&mut error.borrow_mut(), ui);
+                drawn.set(ui.min_rect().height() - before);
+            });
+            h.run();
+            drawn.get()
+        };
+
+        let short = height_of("Save failed.");
+        let long = height_of(
+            "Save failed: no space left on device while writing the vault to \
+             /a/very/long/path/that/keeps/going/somewhere/deep/on/disk/vault.pmv — \
+             the vault on disk is unchanged and still openable.",
+        );
+        assert!(
+            long > short,
+            "a long failure must wrap onto more lines ({long}pt) than a short one ({short}pt) \
+             instead of running off the window"
         );
     }
 

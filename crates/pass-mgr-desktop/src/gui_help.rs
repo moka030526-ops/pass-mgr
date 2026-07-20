@@ -21,6 +21,7 @@ use eframe::egui;
 /// One renderable piece of an article. Keeping these as an `enum` (a closed set
 /// of alternatives) means the renderer decides what each kind *looks* like in
 /// exactly one place, so the whole manual restyles at once.
+#[derive(Debug)]
 pub(crate) enum Block {
     /// A paragraph of prose.
     P(&'static str),
@@ -1074,7 +1075,7 @@ pub(crate) fn ui(ui: &mut egui::Ui, state: &mut HelpState, ctx: &HelpContext, ac
                 ui.add(
                     egui::TextEdit::singleline(&mut state.query)
                         .hint_text("🔍  Search the manual…")
-                        .desired_width(260.0),
+                        .desired_width(260.0_f32.min(ui.available_width() - 8.0).max(90.0)),
                 );
             });
         });
@@ -1143,6 +1144,28 @@ pub(crate) fn ui(ui: &mut egui::Ui, state: &mut HelpState, ctx: &HelpContext, ac
     back
 }
 
+/// Add a label that wraps at the pane's right edge.
+///
+/// egui only wraps text by DEFAULT in a vertical layout: inside a horizontal one
+/// (a bullet's glyph + its text, a callout's icon + its text) `Ui::wrap_mode`
+/// returns `Extend`, so the line runs off the window and the reader has to widen
+/// the window to finish the sentence. Asking for `Wrap` explicitly makes the text
+/// reflow to whatever width the window currently offers.
+fn wrapped(ui: &mut egui::Ui, text: egui::RichText) -> egui::Response {
+    ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap))
+}
+
+/// The per-column cap that makes a [`egui::Grid`]'s cells wrap.
+///
+/// A grid also defaults to `Extend` — it wraps only once a finite max column width
+/// is set. 70% of the pane lets the wide right-hand column use most of the width
+/// while still bounding the left one, and because the last column additionally gets
+/// only the space its neighbour left over, no pair of cells can overflow the pane.
+/// The floor keeps the columns legible in a very narrow window.
+fn wrap_width(ui: &egui::Ui) -> f32 {
+    (ui.available_width() * 0.7).max(160.0)
+}
+
 /// Render one content block. All of the manual's typography lives here.
 fn render_block(ui: &mut egui::Ui, block: &Block, accent: egui::Color32) {
     match block {
@@ -1159,7 +1182,7 @@ fn render_block(ui: &mut egui::Ui, block: &Block, accent: egui::Color32) {
             for item in *items {
                 ui.horizontal_top(|ui| {
                     ui.label(egui::RichText::new("•").color(accent).strong());
-                    ui.label(*item);
+                    wrapped(ui, egui::RichText::new(*item));
                 });
                 ui.add_space(3.0);
             }
@@ -1169,7 +1192,7 @@ fn render_block(ui: &mut egui::Ui, block: &Block, accent: egui::Color32) {
             for (n, item) in items.iter().enumerate() {
                 ui.horizontal_top(|ui| {
                     ui.label(egui::RichText::new(format!("{}.", n + 1)).color(accent).strong());
-                    ui.label(*item);
+                    wrapped(ui, egui::RichText::new(*item));
                 });
                 ui.add_space(3.0);
             }
@@ -1182,6 +1205,7 @@ fn render_block(ui: &mut egui::Ui, block: &Block, accent: egui::Color32) {
                 .num_columns(2)
                 .striped(true)
                 .spacing([16.0, 8.0])
+                .max_col_width(wrap_width(ui))
                 .show(ui, |ui| {
                     for (k, v) in *rows {
                         ui.label(egui::RichText::new(*k).strong());
@@ -1210,7 +1234,7 @@ fn callout(ui: &mut egui::Ui, glyph: &str, text: &str, color: egui::Color32) {
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.label(egui::RichText::new(glyph).color(color).strong());
-                ui.label(text);
+                wrapped(ui, egui::RichText::new(text));
             });
         });
     ui.add_space(10.0);
@@ -1225,7 +1249,9 @@ fn paths_card(ui: &mut egui::Ui, ctx: &HelpContext) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new("Files on this machine").strong());
             ui.add_space(6.0);
-            egui::Grid::new("help_paths").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+            // Vault/prefs paths are long; without a cap the card runs off the window.
+            let cap = wrap_width(ui);
+            egui::Grid::new("help_paths").num_columns(2).spacing([14.0, 6.0]).max_col_width(cap).show(ui, |ui| {
                 ui.label("This vault");
                 ui.label(egui::RichText::new(&ctx.vault).monospace());
                 ui.end_row();
@@ -1248,6 +1274,51 @@ fn paths_card(ui: &mut egui::Ui, ctx: &HelpContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every block kind, rendered in a deliberately NARROW pane, must stay inside it.
+    ///
+    /// The bug this pins: egui wraps text by default only in a vertical layout, so
+    /// the manual's bullets, numbered steps, callouts and two-column tables — all of
+    /// which draw their text in a horizontal layout or a grid — silently defaulted to
+    /// `TextWrapMode::Extend` and ran off the right edge of the window. The reader had
+    /// to widen the window to see the end of a sentence. Asserting on the drawn width
+    /// (rather than eyeballing a screenshot) catches a regression in any one block kind.
+    #[test]
+    fn every_block_kind_wraps_inside_a_narrow_pane() {
+        use egui_kittest::Harness;
+        use std::cell::Cell;
+
+        const LONG: &str = "This sentence is deliberately far longer than any narrow \
+                            window could ever show on a single line, so if it does not \
+                            wrap it will run off the right-hand edge of the pane.";
+        const ROWS: &[(&str, &str)] = &[("A key", LONG), ("Another key", LONG)];
+        const PANE: f32 = 320.0;
+
+        for block in [
+            Block::P(LONG),
+            Block::Sub(LONG),
+            Block::Bullets(&[LONG, LONG]),
+            Block::Steps(&[LONG, LONG]),
+            Block::Rows(ROWS),
+            Block::Note(LONG),
+            Block::Warn(LONG),
+        ] {
+            let drawn = Cell::new(0.0f32);
+            let mut h = Harness::new_ui(|ui| {
+                ui.set_max_width(PANE);
+                render_block(ui, &block, egui::Color32::from_rgb(0, 120, 200));
+                drawn.set(ui.min_rect().width());
+            });
+            // Two frames: a grid only knows its column widths from the previous frame.
+            h.run();
+            h.run();
+            assert!(
+                drawn.get() <= PANE + 1.0,
+                "{block:?} drew {}pt wide in a {PANE}pt pane — it is not wrapping",
+                drawn.get()
+            );
+        }
+    }
 
     #[test]
     fn every_topic_is_well_formed_and_uniquely_identified() {
