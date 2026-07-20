@@ -766,17 +766,23 @@ include URGENT.) The four screens are:
    overwrites — `_N` suffix). The GUI exposes one global **Export** button per page; the
    TUI exports the document whose 1-based number is in the **Doc #** field (`Ctrl+E`).
    Both read the export directory from the shared `prefs.json` (see Config below).
-   Each record tab also offers **Export to CSV** (GUI: a "⤓ CSV" button in the list
+   Each record tab also offers **Export to CSV** (GUI: a "⬇ CSV" button in the list
    header; TUI: the `e` key) — it writes **all** of that tab's records, one row per
    record, to a timestamped file (`<tab>-<YYYYMMDD-HHMMSS>.csv`) in the same export
    directory via `csv::*` + `vault::write_export_bytes` (0600, no-clobber `_N`, fsync).
    Document/file columns hold the file **names** (not blob ids). The Accounts and
    Real-Estate CSVs contain **passwords in plaintext** by design (for migrating into
    another manager); the in-memory CSV is held in `Zeroizing` and the file is mode 0600.
-   Because a CSV can bulk-dump every record's plaintext password, Export to CSV requires
-   **write mode** — UNLIKE document export, which a read-only heir may still use. The GUI
-   hides the "⤓ CSV" button when not writable; the TUI `e` key (and `export_current_tab_csv`)
-   gate on `require_writable`, so a read-only/heir session cannot bulk-export secrets.
+   Export to CSV works in **read-only** sessions too — like document export, and at the
+   vault owner's explicit request. It was write-mode-only until 2026-07-19 on the reasoning
+   that a CSV bulk-dumps every plaintext password; that gate was removed, and the warning it
+   used to enforce now travels with the feature instead: the GUI button's tooltip says the
+   file is UNENCRYPTED and includes passwords in plain text, and both UIs append
+   "— UNENCRYPTED, incl. any passwords." to every success line. Both front-ends behave
+   identically here on purpose: the same vault behaving differently depending on which UI
+   was opened would be a defect, not a safety measure. Record-MUTATING controls (new, edit,
+   delete, attach, password change, merge) remain write-only, so a read-only session still
+   cannot alter the vault.
 4. **Config.** Edit the category lists (asset types, account types + subtypes), the
    **volume size** (`volume_max_size`), and the **redundancy** depth, and run a
    `backup` — all **write-mode only**, persisting into the encrypted vault (no external

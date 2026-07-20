@@ -64,11 +64,28 @@ pub mod migrate;
 /// is one no other process can be writing the vault in either, so there is no concurrent
 /// rekey for the lock to protect against. Every other failure (including `Locked`, i.e. a
 /// real concurrent holder) is still propagated.
+///
+/// That argument holds only while the lock file DOES NOT EXIST, which is why this checks.
+/// `WriteLock::acquire` opens `pass-mgr.lock` read+write+create, and `PermissionDenied`
+/// from that open has two causes that are indistinguishable by error kind alone: the
+/// directory is unwritable (above — nothing can be holding a lock that cannot exist), or
+/// the lock file is already there and WE cannot open it, e.g. it belongs to another user
+/// on a shared vault directory or was left by a `sudo` session. In that second case a
+/// concurrent writer may well be holding it and rekeying, and proceeding unlocked is
+/// precisely the torn snapshot the lock exists to prevent — an old-key `vault.pmv` paired
+/// with a new-key `volume/`+`manifest/`, i.e. a backup that will not open. Every case the
+/// tolerance was added for has no lock file: read-only media and a `chmod 500` directory
+/// cannot have one created, and a restored snapshot never carries one (`backup_snapshot`
+/// copies only `vault.pmv`, `manifest/` and `volume/`).
 fn lock_for_read_only_copy(dir: &Path) -> Result<Option<WriteLock>, VaultError> {
     match WriteLock::acquire(dir) {
         Ok(l) => Ok(Some(l)),
         Err(VaultError::Io(e))
-            if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) =>
+            if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem)
+                // `symlink_metadata` so a link planted at the lock path counts as PRESENT
+                // rather than being resolved (a symlink there is refused as `Locked` by
+                // `acquire` anyway, so it does not reach here).
+                && fs::symlink_metadata(dir.join(LOCK_FILE)).is_err() =>
         {
             Ok(None)
         }
@@ -3343,6 +3360,53 @@ mod tests {
         assert!(
             OpenVault::open_read_only(made.clone(), b"p1", b"p2").is_ok(),
             "the backed-up vault opens"
+        );
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// The lock tolerance above must not swallow a lock file we simply cannot OPEN.
+    ///
+    /// `PermissionDenied` from `WriteLock::acquire` means either "the directory is
+    /// unwritable, so no lock can exist" (safe to proceed — the test above) or "the lock
+    /// file is right there and belongs to someone else" (NOT safe: a concurrent writer may
+    /// be mid-rekey, and a lock-less snapshot could then pair an old-key vault.pmv with a
+    /// new-key volume/manifest). Only the first may proceed unlocked.
+    #[cfg(unix)]
+    #[test]
+    fn backup_does_not_skip_the_lock_when_the_lock_file_merely_cannot_be_opened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_path("lockperm_src");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let v = OpenVault::create(path.clone(), b"p1", b"p2", fast()).unwrap();
+        drop(v); // release the lock, leaving the lock FILE behind
+        let src_dir = path.parent().unwrap().to_path_buf();
+        let dest = tmp_path("lockperm_dest").parent().unwrap().to_path_buf();
+        let lock = src_dir.join(LOCK_FILE);
+
+        // The lock file exists (a concurrent holder's, as far as we can tell) but is not
+        // ours to open. The DIRECTORY stays writable, so this is unambiguously the second
+        // case: nothing about it says "no one else can be writing here".
+        assert!(lock.exists(), "the vault left a lock file behind");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root ignores the permission bits this test is built on, so there would be no
+        // PermissionDenied to react to. Detect that by the same means (`#![forbid(unsafe_code)]`
+        // rules out `geteuid`) and skip rather than assert something untrue.
+        if fs::File::open(&lock).is_ok() {
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let _ = std::fs::remove_dir_all(&src_dir);
+            return;
+        }
+
+        let result = backup(&path, &dest);
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            result.is_err(),
+            "an unopenable EXISTING lock file must not be read as 'nobody can be writing here'"
         );
 
         let _ = std::fs::remove_dir_all(&src_dir);

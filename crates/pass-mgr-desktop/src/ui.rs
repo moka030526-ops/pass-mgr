@@ -2507,9 +2507,12 @@ impl App {
     }
 
     /// Export every record on the current tab to a timestamped CSV in the configured
-    /// export directory (e.g. `accounts-20240628-143000.csv`). Requires WRITE mode: unlike
-    /// document export (which a read-only heir may use), a CSV can hold every record's
-    /// plaintext password, so a read-only session must not be able to bulk-dump it.
+    /// export directory (e.g. `accounts-20240628-143000.csv`).
+    ///
+    /// Available in READ-ONLY sessions, like document export and matching the GUI — the
+    /// vault owner asked for this explicitly, overriding the earlier write-mode gate. A
+    /// CSV can hold every record's plaintext password, so the warning the gate used to
+    /// enforce rides on the success line instead.
     fn export_current_tab_csv(&mut self) {
         // Available in READ-ONLY sessions too (matching the GUI), at the vault owner's
         // explicit request. The file is plain, unencrypted text and — on Accounts and
