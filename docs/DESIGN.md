@@ -707,9 +707,16 @@ include URGENT.) The four screens are:
    The **root is persisted** across sessions as a local, non-secret preference
    (`vault_root` in `prefs.json`, alongside the theme and export dir — **never** in the
    vault), written on a successful open/create (`save_vault_root`) and re-seeded at startup
-   by `launch::initial_root_and_name`: an explicitly launched vault (`pass-mgr DIR`) always
-   wins (root = its parent, name = its folder), while a default launch adopts the saved root
-   and pre-selects a name only when the default vault lives directly under it. The chosen
+   by `launch::initial_root_and_name`, whose precedence is **argument > cwd > saved
+   preference > per-user default**: an explicitly launched vault (`pass-mgr DIR`) always
+   wins (root = its parent, name = its folder); otherwise a **launch directory that is
+   itself a vault root** wins (`launch::cwd_vault_root` — the cwd qualifies iff
+   `discover_vaults` finds at least one vault directly beneath it, so the `vault.pmv` marker
+   stays the app's single definition of "a vault"; a cwd that is itself a vault is *not*
+   special-cased), pre-selecting the remembered `last_vault` only when that name is actually
+   among the vaults discovered there; otherwise a default launch adopts the saved root
+   and pre-selects a name only when the default vault lives directly under it. A cwd-derived
+   open persists like any other (`save_vault_root`/`save_last_vault` on success). The chosen
    root also seeds the Config **backup destination** default (still freely editable there).
    The mode flip rebuilds
    the password fields (Create asks for each password twice to confirm). After unlock

@@ -97,7 +97,9 @@ Choose passwords that are long and memorable to you but hard for others to guess
    next time (saved in a small local settings file, never inside a vault). If the root
    can't be read, or some sub-folders are inaccessible, a short notice says so. The line
    below shows the exact vault that will open, and whether it already exists (**Unlock**)
-   or will be created (**Create**).
+   or will be created (**Create**). If you **start the program from a folder that already
+   holds vaults** (a terminal launch, or a shortcut whose "start in" folder is set to it),
+   that folder is used as the root automatically — no need to have remembered it.
 3. Type your **first password**, then your **second password**, in the same order
    as when you created the vault.
 4. Click **Unlock**. You'll briefly see when the vault was last opened.
@@ -495,6 +497,11 @@ pass-mgr --help               Show help
   passwords. A read-only session writes **nothing** to disk. The window shows a
   `🔒 READ-ONLY` badge and hides write controls when not in edit mode.
 - Pass a path to use a specific file: `pass-mgr ./work-vault.pmv`.
+- **Launching from a folder of vaults** (`cd /my/vaults && pass-mgr`) uses that folder as
+  the start page's **Vault root**, ahead of the remembered root and the per-user default.
+  It applies only when the folder actually holds vaults — i.e. at least one sub-folder
+  with a `vault.pmv` in it, the same test the dropdown uses. An explicit `[VAULT]`
+  argument still wins over it.
 - **`--vol PATH`** relocates the encrypted document archive (default
   `<VAULT>.vol`, kept beside the vault) — e.g. onto a removable drive:
   `pass-mgr --write --vol /mnt/usb/docs.vol`. Works with the UI, `extract`, and
